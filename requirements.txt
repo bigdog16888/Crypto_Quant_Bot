@@ -1,4 +1,6 @@
 streamlit
 ccxt
-pandas-ta
+# pandas_ta
 python-dotenv
+
+plotly

@@ -1,0 +1,745 @@
+2025-12-29 21:41:50,816 - BotRunner - INFO - Bot Service Started.
+2025-12-29 21:41:50,865 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:41:50,873 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:41:53,500 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:41:53,547 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:41:53,599 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:41:53,659 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:42:03,718 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:42:03,746 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:42:03,800 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:42:03,862 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:42:03,913 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:42:03,913 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:42:13,925 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:42:13,932 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:42:13,991 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:42:14,039 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:42:14,114 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:42:14,114 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:42:24,119 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:42:24,120 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:42:24,169 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:42:24,215 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:42:24,262 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:42:24,263 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:42:34,269 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:42:34,269 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:42:34,315 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:42:34,362 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:42:34,408 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:42:34,408 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:42:44,428 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:42:44,433 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:42:44,518 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:42:44,565 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:42:44,611 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:42:44,611 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:42:54,618 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:42:54,618 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:42:54,695 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:42:54,745 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:42:54,793 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:42:54,793 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:43:04,799 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:43:04,799 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:43:04,846 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:43:04,895 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:43:04,942 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:43:04,943 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:43:14,950 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:43:14,951 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:43:15,066 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:43:15,173 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:43:15,220 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:43:15,221 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:43:25,237 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:43:25,237 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:43:25,288 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:43:25,334 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:43:25,384 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:43:25,385 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:43:35,387 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:43:35,389 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:43:35,441 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:43:35,487 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:43:35,535 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:43:35,536 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:43:45,549 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:43:45,552 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:43:45,608 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:43:45,674 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:43:45,747 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:43:45,753 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:43:55,754 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:43:55,757 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:43:55,811 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:43:55,865 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:43:55,923 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:43:55,924 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:44:05,939 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:44:05,940 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:44:05,990 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:44:06,044 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:44:06,092 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:44:06,092 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:44:16,094 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:44:16,096 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:44:16,154 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:44:16,204 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:44:16,255 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:44:16,256 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:44:26,269 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:44:26,274 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:44:26,329 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:44:26,383 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:44:26,438 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:44:26,441 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:44:36,443 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:44:36,444 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:44:36,493 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:44:36,541 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:44:36,589 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:44:36,590 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:44:46,598 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:44:46,604 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:44:46,657 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:44:46,705 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:44:46,757 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:44:46,759 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:44:56,771 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:44:56,771 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:44:56,821 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:44:56,870 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:44:56,917 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:44:56,918 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:45:06,926 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:45:06,927 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:45:06,974 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:45:07,024 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:45:07,079 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:45:07,079 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:45:17,087 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:45:17,088 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:45:17,139 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:45:17,187 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:45:17,237 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:45:17,238 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:45:27,246 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:45:27,247 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:45:27,295 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:45:27,341 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:45:27,388 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:45:27,389 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:45:37,399 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:45:37,400 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:45:37,449 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:45:37,496 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:45:37,604 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:45:37,604 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:45:47,612 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:45:47,612 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:45:47,676 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:45:47,733 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:45:47,788 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:45:47,791 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:45:57,793 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:45:57,795 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:45:57,842 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:45:57,890 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:45:57,937 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:45:57,938 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:46:07,943 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:46:07,955 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:46:08,005 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:46:08,057 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:46:08,104 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:46:08,107 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:46:18,119 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:46:18,133 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:46:18,182 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:46:18,235 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:46:18,297 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:46:18,320 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:46:28,327 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:46:28,337 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:46:28,417 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:46:28,522 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:46:28,586 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:46:28,605 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:46:38,624 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:46:38,688 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:46:38,749 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:46:38,798 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:46:38,864 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:46:38,865 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:46:48,866 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:46:48,869 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:46:48,918 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:46:48,969 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:46:49,081 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:46:49,081 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:46:59,185 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:46:59,200 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:46:59,275 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:46:59,335 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:46:59,399 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:46:59,404 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:47:09,408 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:47:09,458 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:47:09,535 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:47:09,633 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:47:09,737 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:47:09,742 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:47:19,744 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:47:19,754 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:47:19,807 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:47:19,872 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:47:19,930 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:47:19,936 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:47:29,949 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:47:29,960 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:47:30,018 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:47:30,067 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:47:30,119 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:47:30,123 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:47:40,126 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:47:40,134 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:47:40,184 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:47:40,236 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:47:40,286 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:47:40,289 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:47:50,293 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:47:50,320 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:47:50,395 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:47:50,449 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:47:50,535 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:47:50,606 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:48:00,613 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:48:00,639 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:48:00,692 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:48:00,739 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:48:00,787 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:48:00,792 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:48:10,803 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:48:10,806 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:48:10,857 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:48:10,904 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:48:10,953 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:48:10,956 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:48:20,963 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:48:20,972 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:48:21,020 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:48:21,070 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:48:21,126 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:48:21,126 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:48:31,130 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:48:31,131 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:48:31,190 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:48:31,239 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:48:31,295 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:48:31,295 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:48:41,299 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:48:41,308 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:48:41,360 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:48:41,411 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:48:41,458 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:48:41,460 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:48:51,473 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:48:51,476 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:48:51,526 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:48:51,572 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:48:51,621 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:48:51,630 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:49:01,637 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:49:01,640 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:49:01,688 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:49:01,745 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:49:01,792 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:49:01,794 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:49:11,801 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:49:11,832 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:49:11,894 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:49:11,960 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:49:12,029 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:49:12,033 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:49:22,040 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:49:22,047 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:49:22,094 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:49:22,147 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:49:22,209 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:49:22,216 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:49:32,223 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:49:32,229 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:49:32,279 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:49:32,328 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:49:32,375 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:49:32,377 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:49:42,384 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:49:42,395 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:49:42,446 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:49:42,496 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:49:42,558 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:49:42,563 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:49:52,578 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:49:52,580 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:49:52,695 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:49:52,748 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:49:52,821 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:49:52,832 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:50:02,842 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:50:02,899 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:50:02,966 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:50:03,019 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:50:03,147 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:50:03,166 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:50:13,280 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:50:13,299 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:50:13,352 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:50:13,403 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:50:13,481 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:50:13,517 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:50:23,533 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:50:23,570 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:50:23,886 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:50:23,965 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:50:24,037 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:50:24,051 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:50:34,064 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:50:34,072 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:50:34,119 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:50:34,203 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:50:34,296 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:50:34,333 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:50:44,373 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:50:44,390 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:50:44,454 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:50:44,599 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:50:44,649 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:50:44,651 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:50:54,662 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:50:54,672 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:50:54,722 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:50:54,782 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:50:54,836 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:50:54,837 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:51:04,846 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:51:04,853 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:51:04,904 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:51:04,972 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:51:05,051 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:51:05,091 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:51:15,103 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:51:15,106 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:51:15,154 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:51:15,204 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:51:15,253 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:51:15,253 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:51:25,265 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:51:25,273 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:51:25,322 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:51:25,370 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:51:25,419 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:51:25,421 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:51:35,426 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:51:35,442 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:51:35,497 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:51:35,594 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:51:35,776 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:51:35,897 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:51:45,911 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:51:45,912 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:51:45,962 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:51:46,006 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:51:46,082 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:51:46,106 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:51:56,120 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:51:56,120 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:51:56,171 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:51:56,220 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:51:56,267 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:51:56,267 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:52:06,273 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:52:06,280 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:52:06,338 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:52:06,411 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:52:06,462 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:52:06,463 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:52:16,466 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:52:16,467 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:52:16,517 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:52:16,564 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:52:16,612 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:52:16,612 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:52:26,619 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:52:26,620 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:52:26,670 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:52:26,716 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:52:26,765 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:52:26,770 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:52:36,783 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:52:36,791 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:52:36,840 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:52:36,905 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:52:36,957 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:52:36,990 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:52:47,000 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:52:47,001 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:52:47,057 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:52:47,106 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:52:47,153 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:52:47,153 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:52:57,158 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:52:57,160 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:52:57,211 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:52:57,258 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:52:57,304 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:52:57,305 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:53:07,310 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:53:07,310 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:53:07,361 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:53:07,411 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:53:07,462 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:53:07,462 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:53:17,480 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:53:17,482 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:53:17,551 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:53:17,621 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:53:17,674 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:53:17,682 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:53:27,692 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:53:27,693 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:53:27,742 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:53:27,790 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:53:27,839 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:53:27,839 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:53:37,842 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:53:37,842 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:53:37,894 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:53:37,941 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:53:37,987 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:53:37,987 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:53:47,998 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:53:48,225 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:53:48,375 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:53:48,499 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:53:48,608 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:53:48,640 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:53:58,652 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:53:58,652 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:53:58,704 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:53:58,750 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:53:58,799 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:53:58,799 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:54:08,803 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:54:08,875 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:54:08,958 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:54:09,013 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:54:09,086 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:54:09,086 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:54:19,093 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:54:19,094 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:54:19,146 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:54:19,195 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:54:19,244 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:54:19,244 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:54:29,256 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:54:29,256 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:54:29,305 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:54:29,372 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:54:29,446 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:54:29,446 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:54:39,449 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:54:39,454 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:54:39,505 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:54:39,560 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:54:39,624 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:54:39,630 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:54:49,631 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:54:49,631 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:54:49,689 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:54:49,776 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:54:49,859 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:54:49,875 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:54:59,892 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:54:59,893 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:54:59,945 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:54:59,991 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:55:00,041 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:55:00,041 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:55:10,054 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:55:10,055 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:55:10,105 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:55:10,154 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:55:10,202 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:55:10,202 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:55:20,212 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:55:20,213 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:55:20,264 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:55:20,314 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:55:20,363 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:55:20,363 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:55:30,374 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:55:30,375 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:55:30,423 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:55:30,470 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:55:30,517 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:55:30,517 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:55:40,519 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:55:40,519 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:55:40,573 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:55:40,621 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:55:40,670 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:55:40,670 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:55:50,680 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:55:50,680 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:55:50,731 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:55:50,779 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:55:50,825 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:55:50,826 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:56:00,839 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:56:00,840 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:56:00,892 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:56:00,938 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:56:00,986 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:56:00,986 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:56:11,002 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:56:11,003 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:56:11,054 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:56:11,100 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:56:11,149 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:56:11,149 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:56:21,153 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:56:21,154 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:56:21,204 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:56:21,251 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:56:21,305 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:56:21,305 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:56:31,315 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:56:31,316 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:56:31,377 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:56:31,424 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:56:31,473 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:56:31,474 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:56:41,479 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:56:41,479 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:56:41,530 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:56:41,577 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:56:41,624 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:56:41,624 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:56:51,635 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:56:51,636 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:56:51,688 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:56:51,736 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:56:51,785 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:56:51,785 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:57:01,800 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:57:01,800 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:57:01,852 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:57:01,899 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:57:01,943 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:57:01,943 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:57:11,948 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:57:11,948 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:57:11,999 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:57:12,047 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:57:12,093 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:57:12,094 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:57:22,095 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:57:22,095 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:57:22,145 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:57:22,191 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:57:22,238 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:57:22,239 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:57:32,253 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:57:32,255 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:57:32,303 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:57:32,351 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:57:32,398 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:57:32,398 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:57:42,411 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:57:42,412 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:57:42,460 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:57:42,508 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:57:42,558 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:57:42,558 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:57:52,572 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:57:53,030 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:57:53,245 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:57:53,343 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:57:53,469 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:57:53,496 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:58:03,510 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:58:03,511 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:58:03,561 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:58:03,616 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:58:03,665 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:58:03,665 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:58:13,678 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:58:13,847 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:58:13,970 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:58:14,045 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:58:14,099 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:58:14,100 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:58:24,109 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:58:24,111 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:58:24,162 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:58:24,210 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:58:24,259 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:58:24,260 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:58:34,264 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:58:34,265 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:58:34,314 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:58:34,362 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:58:34,411 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:58:34,411 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:58:44,426 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:58:44,427 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:58:44,494 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:58:44,540 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:58:44,585 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:58:44,585 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:58:54,600 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:58:54,601 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:58:54,670 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:58:54,721 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:58:54,769 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:58:54,769 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:59:04,781 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:59:04,781 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:59:04,832 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:59:04,878 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:59:04,928 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:59:04,930 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:59:14,944 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:59:14,944 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:59:14,996 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:59:15,058 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:59:15,105 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:59:15,105 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:59:25,112 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:59:25,113 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:59:25,167 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:59:25,214 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:59:25,261 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:59:25,261 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:59:35,266 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:59:35,267 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:59:35,314 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:59:35,361 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:59:35,410 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:59:35,410 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:59:45,423 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:59:45,444 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:59:45,502 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:59:45,620 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:59:45,676 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:59:45,729 - BotRunner - INFO - Cycle complete.
+2025-12-29 21:59:55,757 - BotRunner - INFO - Starting run cycle...
+2025-12-29 21:59:55,759 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 21:59:55,805 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 21:59:55,855 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 21:59:55,905 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 21:59:55,908 - BotRunner - INFO - Cycle complete.
+2025-12-29 22:00:05,909 - BotRunner - INFO - Starting run cycle...
+2025-12-29 22:00:05,910 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 22:00:05,963 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 22:00:06,056 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 22:00:06,108 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 22:00:06,109 - BotRunner - INFO - Cycle complete.
+2025-12-29 22:00:16,116 - BotRunner - INFO - Starting run cycle...
+2025-12-29 22:00:16,167 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 22:00:16,237 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 22:00:16,290 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 22:00:16,341 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 22:00:16,359 - BotRunner - INFO - Cycle complete.
+2025-12-29 22:00:26,364 - BotRunner - INFO - Starting run cycle...
+2025-12-29 22:00:26,366 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 22:00:26,424 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 22:00:26,475 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 22:00:26,525 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 22:00:26,529 - BotRunner - INFO - Cycle complete.
+2025-12-29 22:00:36,544 - BotRunner - INFO - Starting run cycle...
+2025-12-29 22:00:36,545 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 22:00:36,596 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 22:00:36,644 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 22:00:36,693 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 22:00:36,716 - BotRunner - INFO - Cycle complete.
+2025-12-29 22:00:46,732 - BotRunner - INFO - Starting run cycle...
+2025-12-29 22:00:46,742 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 22:00:46,799 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 22:00:46,863 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 22:00:46,931 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 22:00:46,933 - BotRunner - INFO - Cycle complete.
+2025-12-29 22:00:56,939 - BotRunner - INFO - Starting run cycle...
+2025-12-29 22:00:56,941 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 22:00:56,998 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 22:00:57,049 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 22:00:57,113 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 22:00:57,117 - BotRunner - INFO - Cycle complete.
+2025-12-29 22:01:07,127 - BotRunner - INFO - Starting run cycle...
+2025-12-29 22:01:07,127 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 22:01:07,177 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 22:01:07,224 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 22:01:07,272 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 22:01:07,272 - BotRunner - INFO - Cycle complete.
+2025-12-29 22:01:17,279 - BotRunner - INFO - Starting run cycle...
+2025-12-29 22:01:17,280 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 22:01:17,334 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 22:01:17,383 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 22:01:17,431 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 22:01:17,432 - BotRunner - INFO - Cycle complete.
+2025-12-29 22:01:27,445 - BotRunner - INFO - Starting run cycle...
+2025-12-29 22:01:27,450 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 22:01:27,617 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 22:01:27,678 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 22:01:27,757 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 22:01:27,780 - BotRunner - INFO - Cycle complete.
+2025-12-29 22:01:37,783 - BotRunner - INFO - Starting run cycle...
+2025-12-29 22:01:37,784 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 22:01:37,831 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 22:01:37,884 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 22:01:37,930 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 22:01:37,930 - BotRunner - INFO - Cycle complete.
+2025-12-29 22:01:47,939 - BotRunner - INFO - Starting run cycle...
+2025-12-29 22:01:47,940 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 22:01:47,990 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 22:01:48,038 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 22:01:48,085 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 22:01:48,085 - BotRunner - INFO - Cycle complete.
+2025-12-29 22:01:58,088 - BotRunner - INFO - Starting run cycle...
+2025-12-29 22:01:58,088 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 22:01:58,138 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 22:01:58,184 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 22:01:58,232 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 22:01:58,232 - BotRunner - INFO - Cycle complete.
+2025-12-29 22:02:08,245 - BotRunner - INFO - Starting run cycle...
+2025-12-29 22:02:08,245 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 22:02:08,295 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 22:02:08,344 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 22:02:08,391 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 22:02:08,392 - BotRunner - INFO - Cycle complete.
+2025-12-29 22:02:18,401 - BotRunner - INFO - Starting run cycle...
+2025-12-29 22:02:18,474 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 22:02:18,543 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 22:02:18,602 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 22:02:18,670 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 22:02:18,703 - BotRunner - INFO - Cycle complete.
+2025-12-29 22:02:29,076 - BotRunner - INFO - Starting run cycle...
+2025-12-29 22:02:29,490 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 22:02:29,991 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 22:02:30,039 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 22:02:30,088 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 22:02:30,089 - BotRunner - INFO - Cycle complete.
+2025-12-29 22:02:40,104 - BotRunner - INFO - Starting run cycle...
+2025-12-29 22:02:40,104 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 22:02:40,154 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 22:02:40,203 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 22:02:40,248 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 22:02:40,248 - BotRunner - INFO - Cycle complete.
+2025-12-29 22:02:50,258 - BotRunner - INFO - Starting run cycle...
+2025-12-29 22:02:50,263 - BotRunner - INFO - Found 3 active bots.
+2025-12-29 22:02:50,323 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-29 22:02:50,383 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
+2025-12-29 22:02:50,460 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
+2025-12-29 22:02:50,573 - BotRunner - INFO - Cycle complete.

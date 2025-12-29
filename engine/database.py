@@ -17,14 +17,30 @@ def init_db():
         CREATE TABLE IF NOT EXISTS bots (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT UNIQUE NOT NULL,
+            strategy_type TEXT DEFAULT 'MQL4',
             pair TEXT NOT NULL,
             direction TEXT CHECK(direction IN ('LONG', 'SHORT')) NOT NULL,
             rsi_limit REAL NOT NULL,
             martingale_multiplier REAL NOT NULL,
             base_size REAL NOT NULL,
+            config TEXT DEFAULT '{}',
             is_active BOOLEAN DEFAULT 1
         )
     ''')
+    
+    # Check if strategy_type exists (migration for existing db)
+    try:
+        cursor.execute('SELECT strategy_type FROM bots LIMIT 1')
+    except sqlite3.OperationalError:
+        cursor.execute('ALTER TABLE bots ADD COLUMN strategy_type TEXT DEFAULT "MQL4"')
+        conn.commit()
+
+    # Check if config exists (migration for existing db)
+    try:
+        cursor.execute('SELECT config FROM bots LIMIT 1')
+    except sqlite3.OperationalError:
+        cursor.execute('ALTER TABLE bots ADD COLUMN config TEXT DEFAULT "{}"')
+        conn.commit()
     
     # Trades table: Tracks active positions and Martingale steps
     # bot_id is a foreign key linked to bots.id
@@ -43,15 +59,21 @@ def init_db():
     conn.close()
     print(f"Database initialized at {DB_PATH}")
 
-def add_bot(name, pair, direction, rsi_limit, martingale_multiplier, base_size):
+def add_bot(name, pair, direction, rsi_limit, martingale_multiplier, base_size, strategy_type="MQL4", config_dict=None):
     """Adds a new bot and initializes its trade state."""
+    if config_dict is None:
+        config_dict = {}
+    
+    import json
+    config_json = json.dumps(config_dict)
+
     conn = get_connection()
     cursor = conn.cursor()
     try:
         cursor.execute('''
-            INSERT INTO bots (name, pair, direction, rsi_limit, martingale_multiplier, base_size) 
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (name, pair, direction.upper(), rsi_limit, martingale_multiplier, base_size))
+            INSERT INTO bots (name, pair, direction, rsi_limit, martingale_multiplier, base_size, strategy_type, config) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (name, pair, direction.upper(), rsi_limit, martingale_multiplier, base_size, strategy_type, config_json))
         
         bot_id = cursor.lastrowid
         
@@ -109,6 +131,47 @@ def get_bot_status(bot_id):
     result = cursor.fetchone()
     conn.close()
     return result
+
+def get_all_bots():
+    """Fetches all bots status for the manager UI."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    # Return everything needed for the table
+    cursor.execute('''
+        SELECT b.id, b.name, b.pair, b.is_active, b.strategy_type, t.total_invested, t.current_step
+        FROM bots b
+        LEFT JOIN trades t ON b.id = t.bot_id
+    ''')
+    results = cursor.fetchall()
+    conn.close()
+    return results
+
+def toggle_bot_active(bot_id, new_status):
+    """Updates the is_active flag for a bot."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    # Ensure status is integer 0 or 1
+    status_int = 1 if new_status else 0
+    cursor.execute('UPDATE bots SET is_active = ? WHERE id = ?', (status_int, bot_id))
+    conn.commit()
+    conn.close()
+
+def delete_bot(bot_id):
+    """Deletes a bot and its trade history."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        # Delete from trades first (FK)
+        cursor.execute('DELETE FROM trades WHERE bot_id = ?', (bot_id,))
+        # Delete from bots
+        cursor.execute('DELETE FROM bots WHERE id = ?', (bot_id,))
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"Error deleting bot {bot_id}: {e}")
+        return False
+    finally:
+        conn.close()
 
 if __name__ == "__main__":
     # Self-test block

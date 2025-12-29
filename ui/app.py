@@ -1,6 +1,19 @@
+# Streamlit Main App Entry Point
+# Updated for force reload
 import streamlit as st
+
 import os
+import sys
+import subprocess
 from dotenv import load_dotenv
+
+# Add root to sys.path to ensure module resolution
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from engine.database import init_db
+from ui.views.monitor import render_monitor_view
+from ui.views.bot_creator import render_bot_creator_view
+from ui.views.bot_manager import render_bot_manager_view
 
 # Load environment variables
 load_dotenv()
@@ -12,6 +25,9 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# Initialize Database
+init_db()
 
 # Custom Styling (Rich Aesthetics)
 st.markdown("""
@@ -50,38 +66,61 @@ with st.sidebar:
     
     st.divider()
     
-    st.subheader("Strategy Parameters")
-    trading_pair = st.selectbox("Trading Pair", ["BTC/USDT", "ETH/USDT", "SOL/USDT", "DOGE/USDT"], index=0)
-    timeframe = st.selectbox("Timeframe", ["1m", "5m", "15m", "1h", "4h", "1d"], index=2)
-    
-    st.divider()
-    
     if st.button("Apply Settings", use_container_width=True):
         st.success("Settings saved locally for this session.")
+
+    st.divider()
+    st.header("🚀 Engine Control")
+    
+    PID_FILE = "engine.pid"
+    
+    def is_engine_running():
+        if os.path.exists(PID_FILE):
+            try:
+                with open(PID_FILE, "r") as f:
+                    pid = int(f.read().strip())
+                # Check existance
+                os.kill(pid, 0)
+                return True, pid
+            except Exception:
+                return False, None
+        return False, None
+
+    running, pid = is_engine_running()
+    
+    if running:
+        st.success(f"Running (PID: {pid})")
+        if st.button("Stop Engine", type="primary"):
+            try:
+                # Force kill on Windows using taskkill
+                subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True)
+                if os.path.exists(PID_FILE): os.remove(PID_FILE)
+                st.rerun()
+            except Exception as e:
+                st.error(f"Stop failed: {e}")
+    else:
+        st.warning("Engine Stopped")
+        if st.button("Start Engine"):
+            try:
+                # Launch independent process with NEW_CONSOLE to avoid killing Streamlit on stop
+                CREATE_NEW_CONSOLE = 0x00000010
+                process = subprocess.Popen([sys.executable, "engine/runner.py"], creationflags=CREATE_NEW_CONSOLE)
+                with open(PID_FILE, "w") as f:
+                    f.write(str(process.pid))
+                st.rerun()
+            except Exception as e:
+                st.error(f"Start failed: {e}")
 
 # Main Area - Tabs
 st.title("🤖 Multi-Bot Crypto Trading System")
 
-tab1, tab2 = st.tabs(["📊 Live Monitor", "🛠️ Bot Creator"])
+tab1, tab2, tab3 = st.tabs(["📊 Live Monitor", "🛠️ Bot Creator", "⚙️ Bot Manager"])
 
 with tab1:
-    st.header("Live Market Monitor")
-    st.info("Visualizing live data from " + trading_pair + " on " + timeframe + " timeframe.")
-    # Placeholder for future live charts
-    st.empty()
+    render_monitor_view()
 
 with tab2:
-    st.header("Bot Creator & Configuration")
-    st.write("Configure and launch new trading bots here.")
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        st.text_input("Bot Name", placeholder="e.g., Scalper_BTC_01")
-        st.selectbox("Strategy Type", ["MACD Crossover", "RSI Mean Reversion", "Bollinger Band Breakout"])
-    
-    with col2:
-        st.number_input("Initial Investment (USDT)", min_value=10.0, step=10.0, value=100.0)
-        st.slider("Risk Tolerance (%)", 1, 10, 2)
-        
-    if st.button("Deploy Bot", type="primary"):
-        st.warning("Bot deployment logic will be implemented in the next phase.")
+    render_bot_creator_view()
+
+with tab3:
+    render_bot_manager_view()
