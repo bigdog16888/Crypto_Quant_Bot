@@ -1,4 +1,4 @@
 streamlit
 ccxt
-pandas_ta
+pandas-ta
 python-dotenv
