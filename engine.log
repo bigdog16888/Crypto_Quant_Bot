@@ -743,3 +743,24 @@
 2025-12-29 22:02:50,383 - BotRunner - INFO - Bot 00 (0G/USDT 5m) - Buy: False, Sell: False
 2025-12-29 22:02:50,460 - BotRunner - INFO - Bot PaperTestBot (BTC/USDT 1m) - Buy: False, Sell: False
 2025-12-29 22:02:50,573 - BotRunner - INFO - Cycle complete.
+2025-12-30 11:48:13,290 - BotRunner - INFO - Bot Service Started.
+2025-12-30 11:48:13,304 - BotRunner - INFO - Starting run cycle...
+2025-12-30 11:48:13,318 - BotRunner - ERROR - Error fetching active bots: no such column: strategy_type
+2025-12-30 11:48:13,318 - BotRunner - INFO - Found 0 active bots.
+2025-12-30 11:48:13,318 - BotRunner - INFO - Cycle complete.
+2025-12-30 11:48:23,331 - BotRunner - INFO - Stop signal detected. Exiting gracefully...
+2025-12-30 11:48:23,331 - BotRunner - INFO - Bot Service Permanently Stopped.
+2025-12-30 11:53:33,720 - BotRunner - INFO - Bot Service Started.
+2025-12-30 11:53:33,731 - BotRunner - INFO - Starting run cycle...
+2025-12-30 11:53:33,734 - BotRunner - INFO - Found 1 active bots.
+2025-12-30 11:53:36,108 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-30 11:53:36,109 - BotRunner - INFO - Cycle complete.
+2025-12-30 11:53:46,114 - BotRunner - INFO - Stop signal detected. Exiting gracefully...
+2025-12-30 11:53:46,115 - BotRunner - INFO - Bot Service Permanently Stopped.
+2025-12-30 15:42:32,557 - BotRunner - INFO - Bot Service Started.
+2025-12-30 15:42:32,567 - BotRunner - INFO - Starting run cycle...
+2025-12-30 15:42:32,567 - BotRunner - INFO - Found 1 active bots.
+2025-12-30 15:42:34,907 - BotRunner - INFO - Bot RSI_Scalper_01 (BTC/USDT 1h) - Buy: False, Sell: False
+2025-12-30 15:42:34,907 - BotRunner - INFO - Cycle complete.
+2025-12-30 15:42:44,914 - BotRunner - INFO - Stop signal detected. Exiting gracefully...
+2025-12-30 15:42:44,915 - BotRunner - INFO - Bot Service Permanently Stopped.

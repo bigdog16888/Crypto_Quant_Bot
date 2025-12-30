@@ -59,6 +59,15 @@ class ExchangeInterface:
             self.logger.error(f"Unexpected error on {method}: {e}")
             raise
 
+    def get_last_price(self, symbol: str) -> float:
+        """Fetches the latest ticker price for a symbol."""
+        try:
+            ticker = self._safe_request('fetch_ticker', symbol=symbol)
+            return float(ticker['last'])
+        except Exception as e:
+            self.logger.error(f"Error fetching price for {symbol}: {e}")
+            return 0.0
+
     def get_available_symbols(self, quote_asset='USDT'):
         """
         Dynamically fetches tickers and filters by quote asset (e.g. USDT, USDC).

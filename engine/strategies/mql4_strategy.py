@@ -63,6 +63,21 @@ class MQL4Strategy(BaseStrategy):
         self.stoch_tf = self.params.get('stoch_tf', None)
         self.macd_tf = self.params.get('macd_tf', None)
 
+        # Advanced Blessing 3 Features
+        self.use_atr_grid = self.params.get('UseATRGrid', False)
+        self.atr_grid_factor = self.params.get('ATRGridFactor', 1.0)
+        self.atr_period = self.params.get('ATRPeriods', 21)
+        
+        self.use_hedge = self.params.get('UseHedge', False)
+        self.hedge_start = self.params.get('HedgeStart', 20.0)
+        self.lot_mult_hedge = self.params.get('LotMultHedge', 0.8)
+
+        # MTF Confluence & Trigger Logic (New)
+        self.use_mtf_confluence = self.params.get('UseMTFConfluence', False)
+        self.mtf_tf = self.params.get('MTF_Timeframe', '1h') # The higher TF to check
+        self.trigger_candles = self.params.get('TriggerCandles', 1) # Consecutive candles needed
+        self.candle_counter = 0 # volatile state usually handled by checking back scan
+
     def _resample(self, data: pd.DataFrame, timeframe: str) -> pd.DataFrame:
         """
         Resamples micro-timeframe data (e.g. 1m) to target timeframe (e.g. 1h).
@@ -72,7 +87,7 @@ class MQL4Strategy(BaseStrategy):
             return data
             
         # Map string tf to pandas alias
-        tf_map = {'1m': '1T', '5m': '5T', '15m': '15T', '30m': '30T', '1h': '1H', '4h': '4H', '1d': '1D'}
+        tf_map = {'1m': '1min', '5m': '5min', '15m': '15min', '30m': '30min', '1h': '1h', '4h': '4h', '1d': '1D'}
         pd_tf = tf_map.get(timeframe, '1H')
         
         try:
@@ -99,115 +114,169 @@ class MQL4Strategy(BaseStrategy):
 
     def check_signals(self, market_data: pd.DataFrame) -> tuple[bool, bool]:
         """
-        Mimics the specific MQL4 signal aggregation logic.
+        Refined 8-Trigger Confluence logic.
+        Validates 4 indicators + 4 patterns. ALL enabled triggers must pass.
         """
-        buy_me = False
-        sell_me = False
-        ind_entry_count = 0
+        # Directional allow flags
+        buy_allow = True
+        sell_allow = True
+        triggers_active = 0
         
-        # --- CCI ---
-        if self.cci_entry > 0:
-            # Resample if needed
-            df_cci = self._resample(market_data, self.cci_tf)
-            
-            if 'high' in df_cci and 'low' in df_cci:
-                cci_val = iCCI(df_cci['high'], df_cci['low'], df_cci['close'], self.cci_period)
-            else:
-                cci_val = iCCI(df_cci['close'], df_cci['close'], df_cci['close'], self.cci_period)
-            
-            is_uptrend = cci_val > 0 
-            is_downtrend = cci_val < 0
-            
-            buy_signal = False
-            sell_signal = False
-            
-            if is_uptrend:
-                if self.cci_entry == 1: buy_signal = True
-                elif self.cci_entry == 2: sell_signal = True 
-            elif is_downtrend:
-                if self.cci_entry == 1: sell_signal = True
-                elif self.cci_entry == 2: buy_signal = True
-                
-            buy_me, sell_me, ind_entry_count = self._aggregate_signal(buy_me, sell_me, buy_signal, sell_signal, ind_entry_count)
+        # --- 1. Indicator Triggers (1-4) ---
+        # CCI
+        mode_cci = self.params.get('mode_cci', 0) # 0=Off, 1=Above, 2=Below
+        if mode_cci > 0:
+            triggers_active += 1
+            df_cci = self._resample(market_data, self.params.get('cci_tf'))
+            val = iCCI(df_cci['high'], df_cci['low'], df_cci['close'], self.params.get('cci_period', 14))
+            lvl = self.params.get('cci_level', 100)
+            if mode_cci == 1: # Above
+                if val < lvl: buy_allow = sell_allow = False
+            else: # Below
+                if val > -lvl: buy_allow = sell_allow = False
 
-        # --- Bollinger ---
-        if self.bollinger_entry > 0:
-            df_bb = self._resample(market_data, self.boll_tf)
-            upper, mid, lower = iBands(df_bb['close'], self.boll_period, self.boll_deviation)
-            
-            ask = market_data['close'].iloc[-1] # Current Price always executes on CURRENT execution TF
-            bid = market_data['close'].iloc[-1] 
-            
-            # Logic: Check if Current Price broke bands calculated on HIGHER TF? 
-            # OR check if Higher TF Close broke Higher TF Bands?
-            # Standard MTF: Current price relative to MTF Bands.
-            
-            # NOTE: Comparing realtime tick (execution TF) vs 1H Band.
-            
-            buy_signal = ask < (lower - (self.boll_distance * 0.0001)) 
-            sell_signal = bid > (upper + (self.boll_distance * 0.0001))
-            
-            final_buy = False
-            final_sell = False
-            
-            if buy_signal:
-                if self.bollinger_entry == 1: final_buy = True
-                elif self.bollinger_entry == 2: final_sell = True
-            elif sell_signal:
-                if self.bollinger_entry == 1: final_sell = True
-                elif self.bollinger_entry == 2: final_buy = True
-                
-            buy_me, sell_me, ind_entry_count = self._aggregate_signal(buy_me, sell_me, final_buy, final_sell, ind_entry_count)
+        # Bollinger
+        mode_boll = self.params.get('mode_boll', 0) # 0=Off, 1=Outside Lower (Buy-ish), 2=Outside Upper (Sell-ish)
+        if mode_boll > 0:
+            triggers_active += 1
+            df_bb = self._resample(market_data, self.params.get('boll_tf'))
+            upper, mid, lower = iBands(df_bb['close'], self.params.get('boll_period', 20), self.params.get('boll_deviation', 2.0))
+            price = market_data['close'].iloc[-1]
+            if mode_boll == 1: # Price < Lower (Buy entry)
+                if price >= lower: buy_allow = False
+            else: # Price > Upper (Sell entry)
+                if price <= upper: sell_allow = False
 
-        # --- Stochastic ---
-        if self.stoch_entry > 0:
-            df_st = self._resample(market_data, self.stoch_tf)
-            if 'high' in df_st and 'low' in df_st:
-                k, d = iStochastic(df_st['high'], df_st['low'], df_st['close'], self.stoch_k, self.stoch_d, self.stoch_slowing)
-            else:
-                k, d = iStochastic(df_st['close'], df_st['close'], df_st['close'], self.stoch_k, self.stoch_d, self.stoch_slowing)
-                
-            is_oversold = (k < self.stoch_lvl_dn) and (d < self.stoch_lvl_dn)
-            is_overbought = (k > self.stoch_lvl_up) and (d > self.stoch_lvl_up)
-            
-            buy_signal = is_oversold 
-            sell_signal = is_overbought
-            
-            final_buy = False; final_sell = False
-            if buy_signal:
-                if self.stoch_entry == 1: final_buy = True
-                elif self.stoch_entry == 2: final_sell = True
-            elif sell_signal:
-                if self.stoch_entry == 1: final_sell = True
-                elif self.stoch_entry == 2: final_buy = True
-                
-            buy_me, sell_me, ind_entry_count = self._aggregate_signal(buy_me, sell_me, final_buy, final_sell, ind_entry_count)
+        # Stochastic
+        mode_stoch = self.params.get('mode_stoch', 0) # 0=Off, 1=Below DN (Oversold), 2=Above UP (Overbought)
+        if mode_stoch > 0:
+            triggers_active += 1
+            df_st = self._resample(market_data, self.params.get('stoch_tf'))
+            k, d = iStochastic(df_st['high'], df_st['low'], df_st['close'], self.params.get('stoch_k', 5), self.params.get('stoch_d', 3), self.params.get('stoch_slowing', 3))
+            if mode_stoch == 1: # K & D < LVL_DN
+                if k >= self.params.get('stoch_lvl_dn', 20) or d >= self.params.get('stoch_lvl_dn', 20): buy_allow = False
+            else: # K & D > LVL_UP
+                if k <= self.params.get('stoch_lvl_up', 80) or d <= self.params.get('stoch_lvl_up', 80): sell_allow = False
 
-        # --- MACD ---
-        if self.macd_entry > 0:
-            df_macd = self._resample(market_data, self.macd_tf)
-            main, sig = iMACD(df_macd['close'], self.macd_fast, self.macd_slow, self.macd_sig)
+        # RSI (New/Refined)
+        mode_rsi = self.params.get('mode_rsi', 0) # 0=Off, 1=Below, 2=Above
+        if mode_rsi > 0:
+            triggers_active += 1
+            df_rsi = self._resample(market_data, self.params.get('rsi_tf'))
+            val = iRSI(df_rsi['close'], self.params.get('rsi_period', 14))
+            lvl = self.params.get('rsi_level', 30 if mode_rsi==1 else 70)
+            if mode_rsi == 1: # Below
+                if val >= lvl: buy_allow = False
+            else: # Above
+                if val <= lvl: sell_allow = False
 
-            
-            buy_signal = main > sig
-            sell_signal = main < sig
-            
-            final_buy = False; final_sell = False
-            if buy_signal:
-                if self.macd_entry == 1: final_buy = True
-                elif self.macd_entry == 2: final_sell = True
-            elif sell_signal:
-                if self.macd_entry == 1: final_sell = True
-                elif self.macd_entry == 2: final_buy = True
+        # --- 2. Pattern Triggers (5-8) ---
+        for p_idx in range(1, 5):
+            p_mode = self.params.get(f'pat_{p_idx}_mode', 0) # 0=Off, 1=Consecutive Up, 2=Consecutive Down
+            if p_mode > 0:
+                triggers_active += 1
+                p_tf = self.params.get(f'pat_{p_idx}_tf')
+                df_p = self._resample(market_data, p_tf)
+                count = self.params.get(f'pat_{p_idx}_count', 3)
+                if len(df_p) < count:
+                    buy_allow = sell_allow = False
+                    continue
                 
-            buy_me, sell_me, ind_entry_count = self._aggregate_signal(buy_me, sell_me, final_buy, final_sell, ind_entry_count)
+                last_closes = df_p['close'].iloc[-count:]
+                is_up = all(last_closes.iloc[i] > last_closes.iloc[i-1] for i in range(1, len(last_closes)))
+                is_down = all(last_closes.iloc[i] < last_closes.iloc[i-1] for i in range(1, len(last_closes)))
+                
+                if p_mode == 1: # Consecutive Up
+                    if not is_up: buy_allow = sell_allow = False
+                else: # Consecutive Down
+                    if not is_down: buy_allow = sell_allow = False
 
+        # Final Confluence: All enabled must be true. 
+        # For a Buy signal, buy_allow must be True and triggers_active > 0
+        if triggers_active == 0:
+            return False, False
+            
+        return buy_allow, sell_allow
+
+    def calculate_lot_size(self, current_step: int, account_balance: float) -> float:
+        """
+        Calculates the order size ($USDC) for the next Martingale level.
+        Based on Blessing 3 Multiplier or LotAdd logic.
+        """
+        base_size = self.params.get('base_size', 10.0)
+        multiplier = self.params.get('martingale_multiplier', 1.5)
         
-        # Fallback
-        if ind_entry_count == 0 and self.force_market_cond == 3:
-            pass
+        if current_step == 0:
+            return base_size
             
-        return buy_me, sell_me
+        # Standard Multiplier scaling
+        return base_size * (multiplier ** current_step)
+
+    def calculate_projections(self, steps=10) -> list:
+        """
+        Generates a list of dictionaries representing the risk/investment at each step.
+        """
+        projections = []
+        total_invested = 0
+        base_size = self.params.get('base_size', 10.0)
+        multiplier = self.params.get('martingale_multiplier', 1.5)
+        hedge_step = self.params.get('HedgeStartStep', 7) # Example param
+
+        fee_rate = self.params.get('fee_rate', 0.001) # 0.1%
+        slippage_rate = self.params.get('slippage_rate', 0.0005) # 0.05%
+        cost_factor = 1.0 + fee_rate + slippage_rate
+
+        for i in range(steps):
+            step_size = base_size * (multiplier ** i)
+            # Add trading costs to the invested amount
+            total_invested += (step_size * cost_factor)
+            
+            is_hedge = i + 1 >= hedge_step if self.params.get('UseHedge') else False
+            hedge_size = round(total_invested, 2) if is_hedge else 0.0
+
+            # Simplified projection logic
+            projection = {
+                'step': i + 1,
+                'order_size_usdc': round(step_size, 2),
+                'total_invested_usdc': round(total_invested, 2),
+                'hedge_size_usdc': hedge_size
+            }
+            projections.append(projection)
+            
+        return projections
+
+    def calculate_grid_distance(self, current_step: int, market_data: pd.DataFrame) -> float:
+        """
+        Calculates the distance in pips for the next grid order.
+        If UseATRGrid is true, uses ATR-based dynamic spacing.
+        """
+        base_grid = self.params.get('base_grid', 25.0) # Default 25 pips
+        
+        if self.use_atr_grid:
+            # Assume Ta-Lib or custom ATR available
+            atr_series = ta_custom.atr(market_data['high'], market_data['low'], market_data['close'], period=self.atr_period)
+            if atr_series is not None and not atr_series.empty:
+                current_atr = atr_series.iloc[-1]
+                # Blessing 3 logic: Grid = ATR * GAF
+                return current_atr * self.atr_grid_factor
+                
+        return base_grid
+
+    def calculate_next_grid_price(self, direction: str, current_price: float, avg_entry: float, current_step: int, market_data: pd.DataFrame) -> float:
+        """
+        Calculates the exact price level for the next grid order.
+        """
+        grid_dist = self.calculate_grid_distance(current_step, market_data)
+        
+        # In crypto, we use absolute price distance (simplified pips/points logic)
+        # Assuming grid_dist is in same units as price or percentage if configured.
+        # For simplicity, if step 0, we use current_price. If step > 0, we use avg_entry.
+        ref_price = avg_entry if (current_step > 0 and avg_entry > 0) else current_price
+        
+        if direction.upper() == 'LONG':
+            return ref_price - grid_dist
+        else:
+            return ref_price + grid_dist
 
     def _aggregate_signal(self, current_buy, current_sell, new_buy, new_sell, count):
         if self.use_any_entry:

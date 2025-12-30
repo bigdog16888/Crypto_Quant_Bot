@@ -86,30 +86,71 @@ with st.sidebar:
                 return False, None
         return False, None
 
-    running, pid = is_engine_running()
+    engine_running, pid = is_engine_running()
     
-    if running:
-        st.success(f"Running (PID: {pid})")
-        if st.button("Stop Engine", type="primary"):
-            try:
-                # Force kill on Windows using taskkill
-                subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True)
-                if os.path.exists(PID_FILE): os.remove(PID_FILE)
-                st.rerun()
-            except Exception as e:
-                st.error(f"Stop failed: {e}")
+    if not engine_running:
+        if st.button("🚀 Start Monitoring", use_container_width=True):
+            # Start engine logic...
+            CREATE_NEW_CONSOLE = 0x00000010 # For Windows to run detached
+            process = subprocess.Popen([sys.executable, "engine/runner.py"], creationflags=CREATE_NEW_CONSOLE)
+            with open("engine.pid", "w") as f:
+                f.write(str(process.pid))
+            st.success("Monitoring service started.")
+            st.rerun()
     else:
-        st.warning("Engine Stopped")
-        if st.button("Start Engine"):
+        st.success(f"Monitoring Running (PID: {pid})")
+        if st.button("🛑 Stop Monitoring", use_container_width=True):
+            with open("engine.stop", "w") as f:
+                f.write("stop")
+            st.warning("Stop signal sent. Waiting for graceful shutdown...")
+            st.rerun()
+        
+        if st.button("🔥 Force Kill Monitoring", use_container_width=True, type="secondary"):
+            # Attempt to kill by PID first
             try:
-                # Launch independent process with NEW_CONSOLE to avoid killing Streamlit on stop
-                CREATE_NEW_CONSOLE = 0x00000010
-                process = subprocess.Popen([sys.executable, "engine/runner.py"], creationflags=CREATE_NEW_CONSOLE)
-                with open(PID_FILE, "w") as f:
-                    f.write(str(process.pid))
+                os.kill(pid, 9) # SIGKILL
+            except OSError:
+                pass # Process might already be dead
+            
+            # Fallback for Windows or if PID kill fails
+            if sys.platform == "win32":
+                subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True)
+            else:
+                subprocess.run(["kill", "-9", str(pid)], capture_output=True)
+
+            if os.path.exists("engine.pid"): os.remove("engine.pid")
+            if os.path.exists("engine.stop"): os.remove("engine.stop")
+            st.error("Engine force-killed.")
+            st.rerun()
+
+    st.divider()
+    
+    # Emergency Close All
+    if 'show_emergency_confirm' not in st.session_state:
+        st.session_state['show_emergency_confirm'] = False
+
+    if st.button("🚨 EMERGENCY: CLOSE ALL", use_container_width=True, type="primary"):
+        st.session_state['show_emergency_confirm'] = True
+
+    if st.session_state.get('show_emergency_confirm'):
+        st.error("!!! WARNING !!! This will MARKET CLOSE all positions and CANCEL all orders immediately.")
+        st.warning("Type **'liquidate'** below to enable the button.")
+        conf_input = st.text_input("Confirmation", placeholder="liquidate", key="sidebar_liquidation_conf")
+        
+        col_c1, col_c2 = st.columns(2)
+        with col_c1:
+            confirm_disabled = (conf_input.lower().strip() != "liquidate")
+            if st.button("✅ YES, CLOSE EVERYTHING", use_container_width=True, disabled=confirm_disabled):
+                # Trigger Emergency Signal
+                with open("engine.emergency", "w") as f:
+                    f.write("emergency")
+                st.session_state['show_emergency_confirm'] = False
+                st.error("🚨 Emergency Liquidation Signal Sent! 🚨")
                 st.rerun()
-            except Exception as e:
-                st.error(f"Start failed: {e}")
+        with col_c2:
+            if st.button("❌ CANCEL", use_container_width=True):
+                st.session_state['show_emergency_confirm'] = False
+                st.rerun()
 
 # Main Area - Tabs
 st.title("🤖 Multi-Bot Crypto Trading System")

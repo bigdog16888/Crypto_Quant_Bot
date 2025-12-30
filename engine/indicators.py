@@ -75,3 +75,16 @@ def macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
     signal_line = macd_line.ewm(span=signal, adjust=False).mean()
     
     return macd_line.fillna(0), signal_line.fillna(0)
+
+def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    """
+    Average True Range (ATR)
+    """
+    tr1 = high - low
+    tr2 = (high - close.shift()).abs()
+    tr3 = (low - close.shift()).abs()
+    
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr_val = tr.rolling(window=period).mean() # Simple Moving Average of TR
+    
+    return atr_val.fillna(tr.mean())

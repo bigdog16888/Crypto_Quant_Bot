@@ -1,4 +1,5 @@
 import streamlit as st
+import pandas as pd
 import sys
 import os
 
@@ -45,51 +46,65 @@ def render_bot_creator_view():
             timeframe = st.selectbox("Execution Timeframe", ["1m", "5m", "15m", "1h", "4h", "1d"], index=1)
         
         with col2:
-            base_size = st.number_input("Base Size (USDT/USDC)", min_value=10.0, step=10.0, value=10.0)
+            base_size = st.number_input("Base Order Size ($USDC)", min_value=1.0, step=10.0, value=10.0)
             martingale_multiplier = st.number_input("Martingale Multiplier", min_value=1.0, step=0.1, value=1.5)
+            # Projection Table for Sizing
+            from engine.strategies.mql4_strategy import MQL4Strategy
+            temp_strat = MQL4Strategy(params={'base_size': base_size, 'martingale_multiplier': martingale_multiplier})
+            projections = temp_strat.calculate_projections(steps=10)
+            
+            with st.expander("🔍 Risk Projection ($USDC)", expanded=False):
+                st.caption("Martingale Growth & Total Investment")
+                proj_df = pd.DataFrame(projections)
+                proj_df.columns = ["Step", "Order Size ($)", "Total Invested ($)", "Hedge Req ($)"]
+                st.table(proj_df)
+
             rsi_limit = st.slider("RSI Limit (for Classic)", 0, 100, 30)
 
         st.divider()
         config = {}
 
-        with st.expander("Strategy Settings (Indicators)", expanded=True):
-            st.subheader("Entry Logic Switch")
-            st.caption("0=Off, 1=Standard (Trend/Level), 2=Reverse (Counter-Trend)")
+        with st.expander("Entry Triggers (Multi-Switch Confluence)", expanded=True):
+            st.caption("ALL enabled switches below must align for an entry. Each works on its own timeframe.")
             
-            c1, c2, c3, c4 = st.columns(4)
-            with c1: config['cci_entry'] = st.selectbox("CCI Entry", [0, 1, 2], index=0)
-            with c2: config['bollinger_entry'] = st.selectbox("Boll Entry", [0, 1, 2], index=0)
-            with c3: config['stoch_entry'] = st.selectbox("Stoch Entry", [0, 1, 2], index=0)
-            with c4: config['macd_entry'] = st.selectbox("MACD Entry", [0, 1, 2], index=0)
+            st.markdown("### 1. Indicators")
+            i_col1, i_col2, i_col3, i_col4 = st.columns(4)
+            with i_col1: 
+                config['mode_cci'] = st.selectbox("CCI Switch", [0, 1, 2], index=0, format_func=lambda x: {0: "OFF", 1: "Above Level", 2: "Below Level"}[x], key="create_mode_cci")
+                config['cci_level'] = st.number_input("CCI Level", value=100, key="create_cci_lvl")
+                config['cci_tf'] = st.selectbox("CCI TF", ["1m","5m","15m","1h","4h","1d"], index=2, key="create_cci_tf")
+            with i_col2: 
+                config['mode_boll'] = st.selectbox("Boll Switch", [0, 1, 2], index=0, format_func=lambda x: {0: "OFF", 1: "Outside Lower", 2: "Outside Upper"}[x], key="create_mode_boll")
+                config['boll_tf'] = st.selectbox("Boll TF", ["1m","5m","15m","1h","4h","1d"], index=2, key="create_bb_tf")
+            with i_col3: 
+                config['mode_stoch'] = st.selectbox("Stoch Switch", [0, 1, 2], index=0, format_func=lambda x: {0: "OFF", 1: "Oversold (DN)", 2: "Overbought (UP)"}[x], key="create_mode_stoch")
+                config['stoch_tf'] = st.selectbox("Stoch TF", ["1m","5m","15m","1h","4h","1d"], index=2, key="create_stoch_tf")
+            with i_col4: 
+                config['mode_rsi'] = st.selectbox("RSI Switch", [0, 1, 2], index=0, format_func=lambda x: {0: "OFF", 1: "Below Level", 2: "Above Level"}[x], key="create_mode_rsi")
+                config['rsi_level'] = st.number_input("RSI Level", value=30, key="create_rsi_lvl")
+                config['rsi_tf'] = st.selectbox("RSI TF", ["1m","15m","1h"], index=1, key="create_rsi_tf")
+
+            st.divider()
+            st.markdown("### 2. Consecutive Pattern Slots")
+            st.caption("Entries will wait for X consecutive green/red candles on specified TFs.")
+            
+            for p_idx in range(1, 4, 2): # 2 rows of 2
+                pc1, pc2 = st.columns(2)
+                for i, col in enumerate([pc1, pc2]):
+                    idx = p_idx + i
+                    with col:
+                        st.markdown(f"**Slot {idx}**")
+                        c_p1, c_p2, c_p3 = st.columns(3)
+                        config[f'pat_{idx}_mode'] = c_p1.selectbox(f"Type ##{idx}", [0, 1, 2], index=0, format_func=lambda x: {0: "OFF", 1: "Consec. Up", 2: "Consec. Down"}[x], key=f"create_p_mode_{idx}")
+                        config[f'pat_{idx}_tf'] = c_p2.selectbox(f"TF ##{idx}", ["1m","5m","15m","1h","4h","1d"], index=1, key=f"create_p_tf_{idx}")
+                        config[f'pat_{idx}_count'] = c_p3.number_input(f"Count ##{idx}", min_value=1, value=3, key=f"create_p_count_{idx}")
+            
+            # Use current config for refined projection
+            temp_strat.params.update(config)
+            projections = temp_strat.calculate_projections(steps=10)
             
             st.divider()
-            st.subheader("Indicator Parameters")
-            
-            # CCI
-            c_cci1, c_cci2 = st.columns(2)
-            with c_cci1: config['cci_period'] = st.number_input("CCI Period", value=14)
-            with c_cci2: config['cci_tf'] = st.selectbox("CCI Timeframe", ["1m","5m","15m","1h","4h","1d"], index=2, key="cci_tf")
-            
-            # Boll
-            c_bb1, c_bb2, c_bb3, c_bb4 = st.columns(4)
-            with c_bb1: config['boll_period'] = st.number_input("BB Period", value=20)
-            with c_bb2: config['boll_deviation'] = st.number_input("BB Dev", value=2.0)
-            with c_bb3: config['boll_distance'] = st.number_input("BB Dist", value=10)
-            with c_bb4: config['boll_tf'] = st.selectbox("BB Timeframe", ["1m","5m","15m","1h","4h","1d"], index=2, key="bb_tf")
-            
-            # Stoch (Phase 3)
-            c_st1, c_st2, c_st3, c_st4 = st.columns(4)
-            with c_st1: config['stoch_k'] = st.number_input("Stoch K", value=5)
-            with c_st2: config['stoch_d'] = st.number_input("Stoch D", value=3)
-            with c_st3: config['stoch_slowing'] = st.number_input("Stoch Slow", value=3)
-            with c_st4: config['stoch_tf'] = st.selectbox("Stoch Timeframe", ["1m","5m","15m","1h","4h","1d"], index=2, key="stoch_tf")
-            
-            # MACD (Phase 3)
-            c_mac1, c_mac2, c_mac3, c_mac4 = st.columns(4)
-            with c_mac1: config['macd_fast'] = st.number_input("MACD Fast", value=12)
-            with c_mac2: config['macd_slow'] = st.number_input("MACD Slow", value=26)
-            with c_mac3: config['macd_sig'] = st.number_input("MACD Sig", value=9)
-            with c_mac4: config['macd_tf'] = st.selectbox("MACD Timeframe", ["1m","5m","15m","1h","4h","1d"], index=3, key="macd_tf")
+            # Legacy Indicator Parameters removed in favor of 8-trigger system
 
 
         with st.expander("Risk Management (Martingale & Grid)", expanded=False):
@@ -98,18 +113,22 @@ def render_bot_creator_view():
             config['ATRGridFactor'] = st.number_input("ATR Grid Factor", value=1.0)
             
         with st.expander("Trade Management (Exit & Hedge)", expanded=False):
-            st.subheader("Early Exit (Smart Decay)")
-            config['UseEarlyExit'] = st.checkbox("Use Early Exit", value=True)
-            config['EEHoursPC'] = st.number_input("Decay % Per Hour", value=0.5)
-            config['EEStartHours'] = st.number_input("Start Decay After (Hours)", value=2.0)
+            st.subheader("Accelerated Early Exit (Smart Decay)")
+            config['UseEarlyExit'] = st.checkbox("Enable Early Exit", value=True, help="Moves TP target closer to Break Even over time to exit stale trades safely.")
+            col_ee1, col_ee2 = st.columns(2)
+            with col_ee1:
+                config['DecayIntervalMins'] = st.number_input("Decay Interval (Mins)", value=15.0, help="How often (in minutes) the profit target is reduced.")
+            with col_ee2:
+                config['DecayPercentPerInterval'] = st.number_input("Reduction (%) per Interval", value=30.0, help="What percentage of the current profit target to cut per interval.")
             
             st.subheader("Moving Profit")
             config['MaximizeProfit'] = st.checkbox("Use Moving Profit Target", value=False)
             config['ProfitSet'] = st.slider("Profit Set % (Lock in)", 0.1, 0.9, 0.5)
             
             st.subheader("Hedging")
-            config['UseHedge'] = st.checkbox("Use Hedging", value=False)
-            config['HedgeStart'] = st.number_input("Hedge Start (DD%)", value=20.0)
+            config['UseHedge'] = st.checkbox("Use Hedging", value=False, help="Locks drawdown by opening an opposite trade of equal size when grid depth is reached.")
+            config['HedgeStartStep'] = st.number_input("Hedge Start Step (1-10)", min_value=1, max_value=10, value=7, help="Which Martingale step triggers the hedge trade.")
+            config['HedgeStart'] = st.number_input("Hedge Start (DD%)", value=20.0, help="Alternative trigger: Drawdown percentage to start hedging.")
 
         submitted = st.form_submit_button("Deploy Bot", type="primary")
     

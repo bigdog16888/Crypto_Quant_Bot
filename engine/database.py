@@ -88,6 +88,41 @@ def add_bot(name, pair, direction, rsi_limit, martingale_multiplier, base_size, 
     finally:
         conn.close()
 
+def get_bot_params(bot_id):
+    """Fetches all configuration parameters for a specific bot."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT name, pair, direction, rsi_limit, martingale_multiplier, base_size, strategy_type, config FROM bots WHERE id = ?', (bot_id,))
+    result = cursor.fetchone()
+    conn.close()
+    return result
+
+def update_bot(bot_id, name, pair, direction, rsi_limit, martingale_multiplier, base_size, strategy_type, config_dict):
+    """Updates an existing bot configuration."""
+    import json
+    config_json = json.dumps(config_dict)
+    
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute('''
+            UPDATE bots 
+            SET name = ?, pair = ?, direction = ?, rsi_limit = ?, 
+                martingale_multiplier = ?, base_size = ?, 
+                strategy_type = ?, config = ?
+            WHERE id = ?
+        ''', (name, pair, direction.upper(), rsi_limit, martingale_multiplier, base_size, strategy_type, config_json, bot_id))
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        print(f"Error: Bot name '{name}' already exists.")
+        return False
+    except Exception as e:
+        print(f"Error updating bot {bot_id}: {e}")
+        return False
+    finally:
+        conn.close()
+
 def update_martingale_step(bot_id, next_step, added_investment, new_avg_price, new_tp_price):
     """Updates the active position stats when a new Martingale step is triggered."""
     conn = get_connection()
