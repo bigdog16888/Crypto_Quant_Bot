@@ -3,11 +3,32 @@ import pandas as pd
 import engine.indicators as ta_custom
 
 # Helper functions for MQL4-style indicators (kept local or could be moved to utils)
+def iATR(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> float:
+    atr_series = ta_custom.atr(high, low, close, period=period)
+    if atr_series is None or atr_series.empty:
+        return 0.0
+    return atr_series.iloc[-1]
+
+def iATRPercentile(high: pd.Series, low: pd.Series, close: pd.Series, period_atr: int, period_lookback: int) -> float:
+    return ta_custom.atr_percentile(high, low, close, period_atr=period_atr, period_lookback=period_lookback)
+
+def iATRExpansion(open_p: float, current_p: float, high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> float:
+    """Calculates move from open as a percentage of ATR."""
+    atr_val = iATR(high, low, close, period)
+    if atr_val == 0: return 0.0
+    return (current_p - open_p) / atr_val * 100.0
+
 def iRSI(data: pd.Series, period: int) -> float:
     rsi_series = ta_custom.rsi(data, period=period)
     if rsi_series is None or rsi_series.empty:
         return 50.0
     return rsi_series.iloc[-1]
+
+def iCCI(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> float:
+    cci_series = ta_custom.cci(high, low, close, period=period)
+    if cci_series is None or cci_series.empty:
+        return 0.0
+    return cci_series.iloc[-1]
 
 def iCCI(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> float:
     cci_series = ta_custom.cci(high, low, close, period=period)
@@ -177,19 +198,72 @@ class MQL4Strategy(BaseStrategy):
                 triggers_active += 1
                 p_tf = self.params.get(f'pat_{p_idx}_tf')
                 df_p = self._resample(market_data, p_tf)
+                # Indicator Awareness: watch_indicator param (e.g. 'Price', 'RSI', 'CCI')
+                watch = self.params.get(f'pat_{p_idx}_source', 'Price')
                 count = self.params.get(f'pat_{p_idx}_count', 3)
-                if len(df_p) < count:
+                
+                if watch == 'RSI':
+                    series = ta_custom.rsi(df_p['close'], period=self.params.get('rsi_period', 14))
+                elif watch == 'CCI':
+                    series = ta_custom.cci(df_p['high'], df_p['low'], df_p['close'], period=self.params.get('cci_period', 14))
+                else:
+                    series = df_p['close']
+
+                if series is None or len(series) < count:
                     buy_allow = sell_allow = False
                     continue
                 
-                last_closes = df_p['close'].iloc[-count:]
-                is_up = all(last_closes.iloc[i] > last_closes.iloc[i-1] for i in range(1, len(last_closes)))
-                is_down = all(last_closes.iloc[i] < last_closes.iloc[i-1] for i in range(1, len(last_closes)))
+                last_vals = series.iloc[-count:]
+                is_up = all(last_vals.iloc[i] > last_vals.iloc[i-1] for i in range(1, len(last_vals)))
+                is_down = all(last_vals.iloc[i] < last_vals.iloc[i-1] for i in range(1, len(last_vals)))
                 
                 if p_mode == 1: # Consecutive Up
                     if not is_up: buy_allow = sell_allow = False
                 else: # Consecutive Down
                     if not is_down: buy_allow = sell_allow = False
+
+        # --- 3. Price Threshold Trigger (Trigger 9) ---
+        mode_price = self.params.get('mode_price', 0) # 0=Off, 1=Above, 2=Below
+        if mode_price > 0:
+            triggers_active += 1
+            current_price = market_data['close'].iloc[-1]
+            threshold = self.params.get('price_threshold', 0.0)
+            if mode_price == 1: # Above
+                if current_price <= threshold: buy_allow = sell_allow = False
+            else: # Below
+                if current_price >= threshold: buy_allow = sell_allow = False
+
+        # --- 4. ATR Percentile Trigger (Trigger 10) ---
+        mode_atrp = self.params.get('mode_atrp', 0) # 0=Off, 1=Below Level (Low Vol), 2=Above Level (High Vol)
+        if mode_atrp > 0:
+            triggers_active += 1
+            atrp_tf = self.params.get('atrp_tf', '1h')
+            df_atrp = self._resample(market_data, atrp_tf)
+            val = iATRPercentile(df_atrp['high'], df_atrp['low'], df_atrp['close'], 
+                                self.params.get('atrp_period', 14), 
+                                self.params.get('atrp_lookback', 100))
+            lvl = self.params.get('atrp_level', 50.0)
+            if mode_atrp == 1: # Below (Low Volatility filter)
+                if val > lvl: buy_allow = sell_allow = False
+            else: # Above (High Volatility filter)
+                if val < lvl: buy_allow = sell_allow = False
+
+        # --- 5. ATR Expansion Trigger (Trigger 11) ---
+        mode_atre = self.params.get('mode_atre', 0) # 0=Off, 1=Move Up >= X%, 2=Move Down >= X%
+        if mode_atre > 0:
+            triggers_active += 1
+            atre_tf = self.params.get('atre_tf', '1h')
+            df_atre = self._resample(market_data, atre_tf)
+            if not df_atre.empty:
+                open_p = df_atre['open'].iloc[-1]
+                curr_p = market_data['close'].iloc[-1]
+                expansion = iATRExpansion(open_p, curr_p, df_atre['high'], df_atre['low'], df_atre['close'], self.params.get('atre_period', 14))
+                target = self.params.get('atre_level', 100.0)
+                
+                if mode_atre == 1: # Move Up (Long trigger or Sell block)
+                    if expansion < target: buy_allow = False
+                else: # Move Down (Short trigger or Buy block)
+                    if expansion > -target: sell_allow = False
 
         # Final Confluence: All enabled must be true. 
         # For a Buy signal, buy_allow must be True and triggers_active > 0
@@ -212,34 +286,62 @@ class MQL4Strategy(BaseStrategy):
         # Standard Multiplier scaling
         return base_size * (multiplier ** current_step)
 
-    def calculate_projections(self, steps=10) -> list:
+    def calculate_projections(self, base_price: float, current_atr: float = None) -> list:
         """
         Generates a list of dictionaries representing the risk/investment at each step.
+        Includes absolute price levels for grid, TP, and hedging.
         """
         projections = []
         total_invested = 0
+        total_qty = 0
+        total_cost_basis = 0
+        
         base_size = self.params.get('base_size', 10.0)
         multiplier = self.params.get('martingale_multiplier', 1.5)
-        hedge_step = self.params.get('HedgeStartStep', 7) # Example param
-
-        fee_rate = self.params.get('fee_rate', 0.001) # 0.1%
-        slippage_rate = self.params.get('slippage_rate', 0.0005) # 0.05%
+        hedge_step = self.params.get('HedgeStartStep', 7)
+        tp_target_usd = self.params.get('TakeProfitBase', 10.0)
+        
+        # Grid Distance math
+        grid_pips = self.params.get('base_grid', 25.0)
+        if self.use_atr_grid and current_atr:
+            grid_pips = current_atr * self.params.get('atr_grid_factor', 1.0)
+        
+        direction = 1 if self.params.get('direction', 'LONG').upper() == 'LONG' else -1
+        fee_rate = self.params.get('fee_rate', 0.001)
+        slippage_rate = self.params.get('slippage_rate', 0.0005)
         cost_factor = 1.0 + fee_rate + slippage_rate
 
-        for i in range(steps):
+        for i in range(self.params.get('max_steps', 10)):
             step_size = base_size * (multiplier ** i)
-            # Add trading costs to the invested amount
             total_invested += (step_size * cost_factor)
+            
+            # Absolute Price math
+            # Step 0 is entry, Step 1 is grid 1
+            order_price = base_price - (i * grid_pips * direction)
+            if order_price <= 0: order_price = 0.01 # Safety
+            
+            qty = step_size / order_price
+            total_qty += qty
+            total_cost_basis += (qty * order_price)
+            
+            avg_price = total_cost_basis / total_qty
+            
+            # TP Price: Break-even + (target_usd / total_qty)
+            # For LONG: tp = avg + (target / total_qty)
+            # For SHORT: tp = avg - (target / total_qty)
+            tp_price = avg_price + (tp_target_usd / total_qty * direction)
             
             is_hedge = i + 1 >= hedge_step if self.params.get('UseHedge') else False
             hedge_size = round(total_invested, 2) if is_hedge else 0.0
 
-            # Simplified projection logic
             projection = {
                 'step': i + 1,
+                'price': round(order_price, 2),
                 'order_size_usdc': round(step_size, 2),
                 'total_invested_usdc': round(total_invested, 2),
-                'hedge_size_usdc': hedge_size
+                'tp_price': round(tp_price, 2),
+                'hedge_size_usdc': hedge_size,
+                'is_hedge': is_hedge
             }
             projections.append(projection)
             
@@ -277,6 +379,32 @@ class MQL4Strategy(BaseStrategy):
             return ref_price - grid_dist
         else:
             return ref_price + grid_dist
+
+    def get_atr_foundation(self, market_data: pd.DataFrame):
+        """
+        Fetches ATR and Percentile for planning (4H, 1D, 3D, 5D).
+        """
+        results = {}
+        for tf in ['4h', '1d', '3d', '5d']:
+            try:
+                df = self._resample(market_data, tf)
+                if df.empty: continue
+                
+                atr_val = iATR(df['high'], df['low'], df['close'], 14)
+                open_p = df['open'].iloc[-1]
+                curr_p = market_data['close'].iloc[-1]
+                
+                # Move as % of ATR
+                if atr_val > 0:
+                    move_pct = (curr_p - open_p) / atr_val * 100.0
+                else:
+                    move_pct = 0.0
+                
+                perc = iATRPercentile(df['high'], df['low'], df['close'], 14, 100)
+                results[tf] = {'atr': atr_val, 'move_pct': move_pct, 'percentile': perc}
+            except Exception as e:
+                results[tf] = {'atr': 0, 'move_pct': 0, 'percentile': 0, 'error': str(e)}
+        return results
 
     def _aggregate_signal(self, current_buy, current_sell, new_buy, new_sell, count):
         if self.use_any_entry:

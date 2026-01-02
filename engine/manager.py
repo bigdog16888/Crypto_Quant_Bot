@@ -146,7 +146,7 @@ def manage_trade(bot_id, bot_name, pair, direction, settings, trade_data, curren
         logger.info(f"💰 Bot {bot_name} Profit Target Hit! Closing at {current_price}")
         # In real execution, we would market close here
         # For now, we reset the bot state
-        reset_bot_after_tp(bot_id)
+        reset_bot_after_tp(bot_id, exit_price=current_price)
         return {'action': 'tp_hit'}
 
     # 2. Check Next Martingale Grid Order

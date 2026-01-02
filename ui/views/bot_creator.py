@@ -33,6 +33,31 @@ def render_bot_creator_view():
 
         pair = st.selectbox("Trading Pair", available_pairs)
 
+    # --- ATR Planning Foundation (Foundation of Parameters) ---
+    with st.expander("📊 ATR Planning Foundation", expanded=True):
+        st.write("Use these values to baseline your Grid Range and First Entry Price.")
+        try:
+            from engine.strategies.mql4_strategy import MQL4Strategy
+            # Fetch 1D data to get enough history for various TFs
+            ohlcv_f = exchange.fetch_ohlcv(pair, timeframe='1h', limit=500)
+            df_f = pd.DataFrame(ohlcv_f, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df_f['timestamp'] = pd.to_datetime(df_f['timestamp'], unit='ms')
+            
+            temp_strat_f = MQL4Strategy()
+            atr_data = temp_strat_f.get_atr_foundation(df_f)
+            
+            # Display metrics
+            m_cols = st.columns(4)
+            for i, tf in enumerate(['4h', '1d', '3d', '5d']):
+                with m_cols[i]:
+                    st.metric(f"ATR ({tf})", f"{atr_data[tf]['atr']:.4f}")
+                    move_p = atr_data[tf]['move_pct']
+                    color = "normal" if abs(move_p) < 100 else "inverse"
+                    st.caption(f"Range Pos: **{move_p:+.1f}%**")
+                    st.caption(f"Vol %-tile: {atr_data[tf]['percentile']:.0f}%")
+        except Exception as e:
+            st.warning(f"Could not load ATR Foundation: {e}")
+
     # --- Configuration Sections ---
     # Wrap everything in a form to fix StreamlitAPIException and allow clean submission
     with st.form("deploy_bot_form"):
@@ -41,25 +66,42 @@ def render_bot_creator_view():
         with col1:
             name = st.text_input("Bot Name", placeholder="e.g., Scalper_USDC_01")
             direction = st.selectbox("Direction", ["LONG", "SHORT"])
-            strategy_type = st.selectbox("Strategy Logic", ["Classic (RSI/CCI/Boll)", "Market Maker (Spread)"])
+            strategy_type = st.selectbox("Strategy Logic", ["MQL4", "Classic"], help="MQL4: Uses the 11-trigger confluence system below. Classic: Simple RSI/CCI thresholds.")
             # Global/Base Timeframe (Execution speed)
-            timeframe = st.selectbox("Execution Timeframe", ["1m", "5m", "15m", "1h", "4h", "1d"], index=1)
+            timeframe = st.selectbox("Execution Timeframe", ["1m", "5m", "15m", "1h", "4h", "1d"], index=1, help="Scanning frequency. 1m scans for entries every minute.")
         
         with col2:
             base_size = st.number_input("Base Order Size ($USDC)", min_value=1.0, step=10.0, value=10.0)
             martingale_multiplier = st.number_input("Martingale Multiplier", min_value=1.0, step=0.1, value=1.5)
             # Projection Table for Sizing
             from engine.strategies.mql4_strategy import MQL4Strategy
-            temp_strat = MQL4Strategy(params={'base_size': base_size, 'martingale_multiplier': martingale_multiplier})
-            projections = temp_strat.calculate_projections(steps=10)
+            temp_strat = MQL4Strategy(params={'base_size': base_size, 'martingale_multiplier': martingale_multiplier, 'direction': direction})
             
-            with st.expander("🔍 Risk Projection ($USDC)", expanded=False):
-                st.caption("Martingale Growth & Total Investment")
-                proj_df = pd.DataFrame(projections)
-                proj_df.columns = ["Step", "Order Size ($)", "Total Invested ($)", "Hedge Req ($)"]
-                st.table(proj_df)
+            try:
+                current_price = df_f['close'].iloc[-1]
+                # Try to get ATR for visual projection if available
+                p_atr = atr_data.get(timeframe, {}).get('atr', 10.0)
+                projections = temp_strat.calculate_projections(base_price=current_price, current_atr=p_atr)
+                
+                with st.expander("🔍 Risk Projection & Math Summary ($USDC)", expanded=False):
+                    st.caption(f"Simulated Martingale Grid based on current price: **{current_price:,.2f}**")
+                    proj_df = pd.DataFrame(projections)
+                    
+                    # Update display columns for clarity
+                    proj_df.columns = ["Step", "Grid Price", "Order ($)", "Total Inv. ($)", "TP Price", "Hedge Size", "Is Hedge"]
+                    st.table(proj_df)
+                    
+                    # Hedge Summary Instruction
+                    hedge_steps = [p for p in projections if p['is_hedge']]
+                    if hedge_steps:
+                        h1 = hedge_steps[0]
+                        st.info(f"🛡️ **Hedge Summary**: At Step {h1['step']} (Price: {h1['price']}), a hedge of **${h1['hedge_size_usdc']}** activates.")
+                    else:
+                        st.warning("⚠️ No Hedge configured.")
+            except Exception as e:
+                st.error(f"Projection Error: {e}")
 
-            rsi_limit = st.slider("RSI Limit (for Classic)", 0, 100, 30)
+            rsi_limit = st.slider("RSI Limit (for Classic)", 0, 100, 30, help="Only used if Strategy Logic is 'Classic'.")
 
         st.divider()
         config = {}
@@ -88,16 +130,42 @@ def render_bot_creator_view():
             st.markdown("### 2. Consecutive Pattern Slots")
             st.caption("Entries will wait for X consecutive green/red candles on specified TFs.")
             
-            for p_idx in range(1, 4, 2): # 2 rows of 2
+            for p_idx in range(1, 5, 2): # 2 cols x 2 rows
                 pc1, pc2 = st.columns(2)
                 for i, col in enumerate([pc1, pc2]):
                     idx = p_idx + i
+                    if idx > 4: continue
                     with col:
-                        st.markdown(f"**Slot {idx}**")
-                        c_p1, c_p2, c_p3 = st.columns(3)
-                        config[f'pat_{idx}_mode'] = c_p1.selectbox(f"Type ##{idx}", [0, 1, 2], index=0, format_func=lambda x: {0: "OFF", 1: "Consec. Up", 2: "Consec. Down"}[x], key=f"create_p_mode_{idx}")
-                        config[f'pat_{idx}_tf'] = c_p2.selectbox(f"TF ##{idx}", ["1m","5m","15m","1h","4h","1d"], index=1, key=f"create_p_tf_{idx}")
-                        config[f'pat_{idx}_count'] = c_p3.number_input(f"Count ##{idx}", min_value=1, value=3, key=f"create_p_count_{idx}")
+                        st.markdown(f"**Pattern Slot {idx}**")
+                        c_p1, c_p2, c_p3, c_p4 = st.columns(4)
+                        config[f'pat_{idx}_mode'] = c_p1.selectbox(f"Type ##{idx}", [0, 1, 2], index=0, format_func=lambda x: {0: "OFF", 1: "Up", 2: "Down"}[x], key=f"create_p_mode_{idx}")
+                        config[f'pat_{idx}_source'] = c_p2.selectbox(f"Source ##{idx}", ["Price", "RSI", "CCI"], index=0, key=f"create_p_src_{idx}")
+                        config[f'pat_{idx}_tf'] = c_p3.selectbox(f"TF ##{idx}", ["1m","5m","15m","1h","4h","1d"], index=1, key=f"create_p_tf_{idx}")
+                        config[f'pat_{idx}_count'] = c_p4.number_input(f"Count ##{idx}", min_value=1, value=3, key=f"create_p_count_{idx}")
+
+            st.divider()
+            st.markdown("### 3. Price & Volatility Triggers")
+            v_col1, v_col2 = st.columns(2)
+            with v_col1:
+                st.markdown("**Trigger 9: Price Threshold**")
+                config['mode_price'] = st.selectbox("Price Switch", [0, 1, 2], index=0, format_func=lambda x: {0: "OFF", 1: "Above", 2: "Below"}[x], key="create_mode_price")
+                config['price_threshold'] = st.number_input("Threshold Price", value=0.0, key="create_price_threshold")
+            with v_col2:
+                st.markdown("**Trigger 10: Volatility Relative Percentile**")
+                config['mode_atrp'] = st.selectbox("Market State", [0, 1, 2], index=0, format_func=lambda x: {0: "OFF", 1: "Below (Quiet)", 2: "Above (Extreme)"}[x], help="Compares current ATR to the last 100 candles. 0-20% is very quiet; 80-100% is high-vol spike.", key="create_mode_atrp")
+                a_col1, a_col2 = st.columns(2)
+                config['atrp_level'] = a_col1.number_input("Lookback Level %", value=50.0, key="create_atrp_level")
+                config['atrp_tf'] = a_col2.selectbox("ATR TF (T10)", ["15m","1h","4h","1d"], index=1, key="create_atrp_tf")
+
+            st.divider()
+            st.markdown("**Trigger 11: ATR Expansion (Current Move vs Range)**")
+            e_col1, e_col2, e_col3 = st.columns(3)
+            with e_col1:
+                config['mode_atre'] = st.selectbox("Expansion Move", [0, 1, 2], index=0, format_func=lambda x: {0: "OFF", 1: "Move Up >= X%", 2: "Move Down >= X%"}[x], help="Checks if high/low has moved X% of the ATR from the open of THIS candle.", key="create_mode_atre")
+            with e_col2:
+                config['atre_level'] = st.number_input("Target % of ATR", value=100.0, key="create_atre_level")
+            with e_col3:
+                config['atre_tf'] = st.selectbox("TF to Watch (T11)", ["1h","4h","1d"], index=0, key="create_atre_tf")
             
             # Use current config for refined projection
             temp_strat.params.update(config)
@@ -125,6 +193,17 @@ def render_bot_creator_view():
             config['MaximizeProfit'] = st.checkbox("Use Moving Profit Target", value=False)
             config['ProfitSet'] = st.slider("Profit Set % (Lock in)", 0.1, 0.9, 0.5)
             
+            st.divider()
+            st.subheader("Advanced Re-entry & Cooldown")
+            st.caption("Post-Exit behavior. Distance or Time based re-engagement.")
+            r1, r2, r3 = st.columns(3)
+            with r1:
+                config['reentry_cooldown_mins'] = st.number_input("Cooldown (Mins)", value=0.0, help="Wait X minutes after exit before entering again.")
+            with r2:
+                config['reentry_distance_pct'] = st.number_input("Re-entry Dist (%)", value=0.0, help="Price must move X% away from exit price before re-entering.")
+            with r3:
+                config['post_exit_stop'] = st.checkbox("Stop After Cycle", value=False, help="Automatically stops the bot after one successful Take Profit.")
+
             st.subheader("Hedging")
             config['UseHedge'] = st.checkbox("Use Hedging", value=False, help="Locks drawdown by opening an opposite trade of equal size when grid depth is reached.")
             config['HedgeStartStep'] = st.number_input("Hedge Start Step (1-10)", min_value=1, max_value=10, value=7, help="Which Martingale step triggers the hedge trade.")

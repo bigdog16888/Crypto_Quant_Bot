@@ -51,9 +51,19 @@ def init_db():
             total_invested REAL DEFAULT 0,
             avg_entry_price REAL DEFAULT 0,
             target_tp_price REAL DEFAULT 0,
+            last_exit_price REAL DEFAULT 0,
+            last_exit_time INTEGER DEFAULT 0,
             FOREIGN KEY (bot_id) REFERENCES bots (id)
         )
     ''')
+    
+    # Migrations for new columns
+    try:
+        cursor.execute('SELECT last_exit_price FROM trades LIMIT 1')
+    except sqlite3.OperationalError:
+        cursor.execute('ALTER TABLE trades ADD COLUMN last_exit_price REAL DEFAULT 0')
+        cursor.execute('ALTER TABLE trades ADD COLUMN last_exit_time INTEGER DEFAULT 0')
+        conn.commit()
     
     conn.commit()
     conn.close()
@@ -138,8 +148,9 @@ def update_martingale_step(bot_id, next_step, added_investment, new_avg_price, n
     conn.commit()
     conn.close()
 
-def reset_bot_after_tp(bot_id):
-    """Resets the trade stats after a Take Profit (TP) hit."""
+def reset_bot_after_tp(bot_id, exit_price=0):
+    """Resets the trade stats after a Take Profit (TP) hit, saving exit metadata."""
+    import time
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute('''
@@ -147,9 +158,11 @@ def reset_bot_after_tp(bot_id):
         SET current_step = 0, 
             total_invested = 0, 
             avg_entry_price = 0, 
-            target_tp_price = 0
+            target_tp_price = 0,
+            last_exit_price = ?,
+            last_exit_time = ?
         WHERE bot_id = ?
-    ''', (bot_id,))
+    ''', (exit_price, int(time.time()), bot_id))
     conn.commit()
     conn.close()
 
@@ -158,7 +171,7 @@ def get_bot_status(bot_id):
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute('''
-        SELECT b.name, b.pair, t.current_step, t.total_invested, t.avg_entry_price, t.target_tp_price 
+        SELECT b.name, b.pair, t.current_step, t.total_invested, t.avg_entry_price, t.target_tp_price, t.last_exit_price, t.last_exit_time
         FROM bots b 
         JOIN trades t ON b.id = t.bot_id 
         WHERE b.id = ?

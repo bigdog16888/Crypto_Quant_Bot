@@ -55,7 +55,9 @@ class BotRunner:
         Main logic for a single bot instance.
         bot_data: tuple (id, name, pair, direction, strat_type, config_json, base_size, mm, rsi_limit, is_active)
         """
-        bot_id, name, pair, direction, strat_type, config_json, base_size, mm, rsi_limit, is_active = bot_data
+        # Unpack bot data; handle missing is_active (default True)
+        bot_id, name, pair, direction, strat_type, config_json, base_size, mm, rsi_limit, *optional = bot_data
+        is_active = optional[0] if optional else True
         
         try:
             # Cleanup Logic for Deactivated Bots
@@ -107,14 +109,39 @@ class BotRunner:
             is_in_trade = trade_data[3] > 0 if trade_data else False
 
             if not is_in_trade:
-                # --- Entry Logic ---
-                buy_signal, sell_signal = strategy.check_signals(df)
-                logger.debug(f"Bot {name} - Signal Check: Buy={buy_signal}, Sell={sell_signal}")
+                # --- Re-entry Logic & Cooldowns ---
+                last_exit_price = trade_data[6]
+                last_exit_time = trade_data[7]
+                current_price = df['close'].iloc[-1]
                 
-                if direction == 'LONG' and buy_signal:
-                    self.execute_entry(bot_id, name, pair, 'buy', base_size)
-                elif direction == 'SHORT' and sell_signal:
-                    self.execute_entry(bot_id, name, pair, 'sell', base_size)
+                can_enter = True
+                
+                # Check Time Cooldown
+                reentry_mins = params.get('reentry_cooldown_mins', 0)
+                if last_exit_time > 0 and reentry_mins > 0:
+                    import time
+                    elapsed_mins = (time.time() - last_exit_time) / 60
+                    if elapsed_mins < reentry_mins:
+                        can_enter = False
+                        logger.debug(f"Bot {name} in time cooldown ({elapsed_mins:.1f}/{reentry_mins} min)")
+                
+                # Check Distance Cooldown
+                reentry_dist_pct = params.get('reentry_distance_pct', 0.0)
+                if last_exit_price > 0 and reentry_dist_pct > 0:
+                    dist_pc = abs(current_price - last_exit_price) / last_exit_price * 100
+                    if dist_pc < reentry_dist_pct:
+                        can_enter = False
+                        logger.debug(f"Bot {name} in distance cooldown ({dist_pc:.2f}/{reentry_dist_pct}%)")
+
+                if can_enter:
+                    # --- Entry Logic ---
+                    buy_signal, sell_signal = strategy.check_signals(df)
+                    logger.debug(f"Bot {name} - Signal Check: Buy={buy_signal}, Sell={sell_signal}")
+                    
+                    if direction == 'LONG' and buy_signal:
+                        self.execute_entry(bot_id, name, pair, 'buy', base_size)
+                    elif direction == 'SHORT' and sell_signal:
+                        self.execute_entry(bot_id, name, pair, 'sell', base_size)
             else:
                 # --- Trade Management Logic ---
                 # Pass market data to strategy for grid calculations
@@ -124,8 +151,9 @@ class BotRunner:
                 # manager.manage_trade handles TP, Grid Steps, and Hedging
                 result = manage_trade(bot_id, name, pair, direction, params, trade_data, current_price, strategy, self.exchange)
                 
-                if result.get('action') != 'none':
-                    logger.info(f"Bot {name} Management Action: {result}")
+                if result.get('action') == 'tp_hit':
+                    # Log the clear exit
+                    logger.info(f"Bot {name} - Cycle Complete. Entering potential cooldown/re-entry phase.")
 
         except Exception as e:
             logger.error(f"Error processing bot {name}: {e}")

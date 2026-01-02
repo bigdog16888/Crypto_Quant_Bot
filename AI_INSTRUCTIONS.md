@@ -9,36 +9,41 @@
     - Use `edit_*_{bot_id}` as a prefix for all keys in `ui/views/bot_manager.py`'s `render_edit_form`.
     - Always pass a unique `key` to common widgets like `cci_tf`, `rsi_level`, etc.
 
-### 2. The 8-Trigger Confluence System
+### 2. The 11-Trigger Confluence System
 - **Location**: `engine/strategies/mql4_strategy.py` -> `check_signals`.
 - **Logic**:
-    - **Triggers 1-4**: Indicators (CCI, Boll, Stoch, RSI). Support `0=Off`, `1=Above/DN`, `2=Below/UP`.
-    - **Triggers 5-8**: Pattern Slots (`pat_1` to `pat_4`). Independent Count and Timeframe.
-    - **Strict Confluence**: A signal is only returned if `triggers_active > 0` and **ALL** enabled triggers are concurrently `True`.
+    - **Triggers 1-4**: Indicators (CCI, Boll, Stoch, RSI).
+    - **Triggers 5-8**: **Indicator-Aware Patterns**. Mode 1=Up, 2=Down. Can watch `Price`, `RSI`, or `CCI` over X candles.
+    - **Trigger 9**: Price Threshold. Hard filter for specific price levels.
+    - **Trigger 10**: Volatility Relative Percentile. Uses historical lookback to determine if market is Quiet or Extreme.
+    - **Trigger 11**: ATR Expansion. Distance from candle open as % of ATR range.
+- **Strict Confluence**: A signal is only returned if `triggers_active > 0` and **ALL** enabled triggers are concurrently `True`.
 
-### 3. Risk Projections & Fees
-- **Logic**: `MQL4Strategy.calculate_projections`
-- **Simulation**: Uses a `cost_factor` (1.0 + 0.001 fee + 0.0005 slippage = 1.0015).
-- **Output**: Returns `total_invested_usdc` which includes cumulative trading costs.
+### 3. Risk Projections & Math transparency
+- **Logic**: `MQL4Strategy.calculate_projections(base_price, current_atr)`
+- **Projections**: Detailed absolute prices for grid entries and TP targets.
+- **Costs**: Includes 0.1% fee + 0.05% slippage simulation.
+- **TP Price**: Calculated as `Breakeven + (Target Profit USD / Total Position Qty)`.
 
 ### 4. Automated Hedging & Runner State
 - **Runner**: `engine/runner.py` branches between:
-    - `is_in_trade == False`: Hunting for signals using `check_signals`.
-    - `is_in_trade == True`: Managing active trade using `manage_trade`.
-- **Manager**: `engine/manager.py` -> `manage_trade` handles:
-    - Real-time TP monitoring.
-    - Automated Grid Step execution.
-    - **Automated Hedge Executor**: Triggers based on `check_hedge_entry` (Step or DD% threshold).
+    - Signal Hunting (`check_signals`).
+    - Active Management (`manage_trade`).
+- **Manager**: `engine/manager.py` handles TP, Martingale Grids, and the **Automated Hedge Executor**.
+- **Re-entry**: Supports post-exit cooldown (time) and distance-based re-entry.
 
 ### 5. Database Schema
-- `bots`: stores static config.
-- `trades`: stores live position data (`current_step`, `total_invested`, `avg_entry_price`, `target_tp_price`).
-- `bot_id` in `trades` is a primary key linking to `bots.id`.
+- `bots`: Static configuration.
+- `trades`: Active position tracking.
+- `last_exit_price` & `last_exit_time`: Tracked in `trades` for re-entry logic.
 
-## 📌 Pending Tasks
-- [ ] Connect `exchange.create_order` (currently DRY_RUN logs only).
-- [ ] Implement actual position fetching from exchange in `emergency_close_all`.
-- [ ] Add more granular "Market Maker" logic variants.
+## 📌 Development Roadmap
+- [x] Phase 10: 8-Trigger Entry System
+- [x] Phase 11: Real-World Risk (Fees, Hedging)
+- [x] Phase 12: Advanced Entry (9-11 Triggers, Re-entry logic)
+- [x] Phase 13: UI Transparency (Absolute Price Projections, Indicator-Aware Patterns)
+- [ ] Phase 14: Live Exchange Integration (CCXT Live Orders)
+- [ ] Phase 15: Market Maker Logic Refinement
 
 ---
 *End of Protocol.*

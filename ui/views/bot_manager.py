@@ -139,17 +139,34 @@ def render_edit_form(bot_id):
         col5, col6, col7 = st.columns(3)
         new_base = col5.number_input("Order Size ($USDC)", value=float(base_size), key=f"edit_base_{bot_id}")
         new_mm = col6.number_input("Martingale Multiplier", value=float(martingale_multiplier), key=f"edit_mm_{bot_id}")
-        new_rsi = col7.number_input("RSI Limit", value=float(rsi_limit), key=f"edit_rsi_{bot_id}")
+        new_rsi = col7.number_input("RSI Limit (Classic)", value=float(rsi_limit), help="Only for Classic logic.", key=f"edit_rsi_{bot_id}")
 
-        # Risk Projection in Edit Mode
-        temp_strat = MQL4Strategy(params={'base_size': new_base, 'martingale_multiplier': new_mm})
-        temp_strat.params.update(config_dict)
-        projections = temp_strat.calculate_projections(steps=10)
-        with st.expander("🔍 Risk Projection ($USDC)", expanded=False):
-            st.caption("Investment Growth & Hedging Thresholds")
-            proj_df = pd.DataFrame(projections)
-            proj_df.columns = ["Step", "Order Size ($)", "Total Invested ($)", "Hedge Req ($)"]
-            st.table(proj_df)
+        # Math Projection in Editor
+        try:
+            from engine.exchange_interface import ExchangeInterface
+            temp_strat = MQL4Strategy(params={'base_size': new_base, 'martingale_multiplier': new_mm, 'direction': new_direction})
+            temp_strat.params.update(config_dict)
+            
+            # Fetch current price for projection
+            exchange = ExchangeInterface()
+            # ticker = exchange.exchange.fetch_ticker(pair) # Pair might be modified in input, use current pair for realism
+            ohlcv = exchange.fetch_ohlcv(pair if pair else "BTC/USDT", timeframe='1m', limit=1)
+            curr_p = ohlcv[0][4] if ohlcv else 40000.0
+            
+            projections = temp_strat.calculate_projections(base_price=curr_p)
+            with st.expander("🔍 Editor Risk Projection & Math Summary", expanded=False):
+                st.caption(f"Simulated levels starting at: **{curr_p:,.2f}**")
+                proj_df = pd.DataFrame(projections)
+                proj_df.columns = ["Step", "Grid Price", "Order ($)", "Total Inv. ($)", "TP Price", "Hedge Size", "Is Hedge"]
+                st.table(proj_df)
+                
+                # Hedge Summary
+                hedge_steps = [p for p in projections if p['is_hedge']]
+                if hedge_steps:
+                    h1 = hedge_steps[0]
+                    st.info(f"🛡️ **Hedge Summary**: At Step {h1['step']} (Price: {h1['price']}), a hedge of **${h1['hedge_size_usdc']}** activates.")
+        except Exception as e:
+            st.warning(f"Projection skip: {e}")
 
         st.markdown("#### Entry Triggers (8-Switch Confluence)")
         t_col1, t_col2, t_col3, t_col4 = st.columns(4)
@@ -164,16 +181,38 @@ def render_edit_form(bot_id):
             config_dict['mode_rsi'] = st.selectbox("RSI Switch", [0, 1, 2], index=int(config_dict.get('mode_rsi', 0)), format_func=lambda x: {0: "OFF", 1: "Below", 2: "Above"}[x], key=f"edit_mode_rsi_{bot_id}")
             config_dict['rsi_level'] = st.number_input("RSI Level", value=float(config_dict.get('rsi_level', 30)), key=f"edit_rsi_lvl_{bot_id}")
 
+        st.markdown("#### Price & Volatility Triggers (9 & 10)")
+        pv_col1, pv_col2 = st.columns(2)
+        with pv_col1:
+            config_dict['mode_price'] = st.selectbox("Price Switch", [0, 1, 2], index=int(config_dict.get('mode_price', 0)), format_func=lambda x: {0: "OFF", 1: "Above", 2: "Below"}[x], key=f"edit_mode_price_{bot_id}")
+            config_dict['price_threshold'] = st.number_input("Threshold Price", value=float(config_dict.get('price_threshold', 0.0)), key=f"edit_price_threshold_{bot_id}")
+        with pv_col2:
+            st.markdown("**Trigger 10: Market State**")
+            config_dict['mode_atrp'] = st.selectbox("Volatility Context", [0, 1, 2], index=int(config_dict.get('mode_atrp', 0)), format_func=lambda x: {0: "OFF", 1: "Below (Quiet)", 2: "Above (Extreme)"}[x], help="Compares current volatility to historical levels.", key=f"edit_mode_atrp_{bot_id}")
+            pa1, pa2 = st.columns(2)
+            config_dict['atrp_level'] = pa1.number_input("Lookback Level %", value=float(config_dict.get('atrp_level', 50.0)), key=f"edit_atrp_level_{bot_id}")
+            config_dict['atrp_tf'] = pa2.selectbox("ATR TF", ["15m","1h","4h","1d"], index=1, key=f"edit_atrp_tf_{bot_id}")
+
+        st.markdown("#### Trigger 11: ATR Expansion (Current Move vs Range)")
+        e_col1, e_col2, e_col3 = st.columns(3)
+        with e_col1:
+            config_dict['mode_atre'] = st.selectbox("Expansion Move", [0, 1, 2], index=int(config_dict.get('mode_atre', 0)), format_func=lambda x: {0: "OFF", 1: "Move Up >= X%", 2: "Move Down >= X%"}[x], help="Move from open as % of ATR.", key=f"edit_mode_atre_{bot_id}")
+        with e_col2:
+            config_dict['atre_level'] = st.number_input("Target % of ATR", value=float(config_dict.get('atre_level', 100.0)), key=f"edit_atre_level_{bot_id}")
+        with e_col3:
+            config_dict['atre_tf'] = st.selectbox("TF to Watch (T11)", ["1h","4h","1d"], index=0, key=f"edit_atre_tf_{bot_id}")
+
         st.markdown("#### Pattern Slots")
         for p_idx in range(1, 4, 2):
             pc1, pc2 = st.columns(2)
             for i, col in enumerate([pc1, pc2]):
                 idx = p_idx + i
                 with col:
-                    c_p1, c_p2, c_p3 = st.columns(3)
-                    config_dict[f'pat_{idx}_mode'] = c_p1.selectbox(f"Type ##{idx}", [0, 1, 2], index=int(config_dict.get(f'pat_{idx}_mode', 0)), format_func=lambda x: {0: "OFF", 1: "Consec. Up", 2: "Consec. Down"}[x], key=f"edit_p_mode_{idx}")
-                    config_dict[f'pat_{idx}_tf'] = c_p2.selectbox(f"TF ##{idx}", ["1m","5m","15m","1h","4h","1d"], index=1, key=f"edit_p_tf_{idx}")
-                    config_dict[f'pat_{idx}_count'] = c_p3.number_input(f"Count ##{idx}", min_value=1, value=int(config_dict.get(f'pat_{idx}_count', 3)), key=f"edit_p_count_{idx}")
+                    c_p1, c_p2, c_p3, c_p4 = st.columns(4)
+                    config_dict[f'pat_{idx}_mode'] = c_p1.selectbox(f"Type ##{idx}", [0, 1, 2], index=int(config_dict.get(f'pat_{idx}_mode', 0)), format_func=lambda x: {0: "OFF", 1: "Up", 2: "Down"}[x], key=f"edit_p_mode_{idx}_{bot_id}")
+                    config_dict[f'pat_{idx}_source'] = c_p2.selectbox(f"Source ##{idx}", ["Price", "RSI", "CCI"], index=["Price", "RSI", "CCI"].index(config_dict.get(f'pat_{idx}_source', "Price")), key=f"edit_p_src_{idx}_{bot_id}")
+                    config_dict[f'pat_{idx}_tf'] = c_p3.selectbox(f"TF ##{idx}", ["1m","5m","15m","1h","4h","1d"], index=["1m","5m","15m","1h","4h","1d"].index(config_dict.get(f'pat_{idx}_tf', "5m")), key=f"edit_p_tf_{idx}_{bot_id}")
+                    config_dict[f'pat_{idx}_count'] = c_p4.number_input(f"Count ##{idx}", min_value=1, value=int(config_dict.get(f'pat_{idx}_count', 3)), key=f"edit_p_count_{idx}_{bot_id}")
 
         st.markdown("#### Advanced Exit & Hedge Settings")
         col_ee1, col_ee2, col_ee3, col_ee4 = st.columns(4)
@@ -186,12 +225,22 @@ def render_edit_form(bot_id):
         with col_ee4:
             hedge_step = st.number_input("Hedge Step", min_value=1, max_value=10, value=int(config_dict.get('HedgeStartStep', 7)), help="Which Martingale step triggers the hedge trade.", key=f"edit_hedge_step_{bot_id}")
         
-        config_dict['UseEarlyExit'] = use_ee
-        
+        st.markdown("#### Post-Exit Re-entry & Cooldown")
+        re1, re2, re3 = st.columns(3)
+        with re1:
+            reentry_mins = st.number_input("Cooldown (Mins)", value=float(config_dict.get('reentry_cooldown_mins', 0.0)), key=f"edit_reentry_mins_{bot_id}")
+        with re2:
+            reentry_dist = st.number_input("Re-entry Dist (%)", value=float(config_dict.get('reentry_distance_pct', 0.0)), key=f"edit_reentry_dist_{bot_id}")
+        with re3:
+            post_stop = st.checkbox("Stop After Cycle", value=bool(config_dict.get('post_exit_stop', False)), key=f"edit_post_stop_{bot_id}")
+
         config_dict['UseEarlyExit'] = use_ee
         config_dict['DecayIntervalMins'] = decay_interval
         config_dict['DecayPercentPerInterval'] = decay_pct
         config_dict['HedgeStartStep'] = hedge_step
+        config_dict['reentry_cooldown_mins'] = reentry_mins
+        config_dict['reentry_distance_pct'] = reentry_dist
+        config_dict['post_exit_stop'] = post_stop
 
         st.markdown("#### Strategy Parameters (JSON View)")
         new_config_str = st.text_area("JSON View", value=json.dumps(config_dict, indent=4), height=150)

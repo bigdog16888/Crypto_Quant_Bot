@@ -88,3 +88,18 @@ def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> 
     atr_val = tr.rolling(window=period).mean() # Simple Moving Average of TR
     
     return atr_val.fillna(tr.mean())
+
+def atr_percentile(high: pd.Series, low: pd.Series, close: pd.Series, period_atr: int = 14, period_lookback: int = 100) -> float:
+    """
+    Calculates where the current ATR sits relative to the last X periods (0-100).
+    """
+    atr_val = atr(high, low, close, period=period_atr)
+    if atr_val is None or len(atr_val) < period_lookback:
+        return 50.0
+    
+    current_atr = atr_val.iloc[-1]
+    history = atr_val.iloc[-period_lookback:]
+    
+    # Percentile calculation: (count of values < current) / total
+    percentile = (history < current_atr).sum() / len(history) * 100
+    return float(percentile)

@@ -15,14 +15,16 @@ def test_projections():
         'HedgeStartStep': 5
     }
     strat = MQL4Strategy(params=params)
-    projections = strat.calculate_projections(steps=6)
+    projections = strat.calculate_projections(base_price=40000.0)
     
     for p in projections:
-        print(f"Step {p['step']}: Size ${p['order_size_usdc']}, Total ${p['total_invested_usdc']}, Hedge: {p['is_hedge']}")
+        print(f"Step {p['step']}: Price {p['price']}, Size ${p['order_size_usdc']}, TP: {p['tp_price']}, Hedge: {p['is_hedge']}")
         
     # Validation
     assert projections[0]['order_size_usdc'] == 100.0
     assert projections[1]['order_size_usdc'] == 200.0
+    assert 'price' in projections[0]
+    assert 'tp_price' in projections[0]
     assert projections[4]['is_hedge'] == True # Step 5
     assert projections[3]['is_hedge'] == False # Step 4
     
