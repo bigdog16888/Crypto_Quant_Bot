@@ -2,10 +2,6 @@
 
 - [ ] Project Assessment & Planning
     - [x] Explore current file structure and verify modularity <!-- id: 0 -->
-        - [x] List root directory
-        - [x] List engine and ui directories
-        - [x] Locate database schema definitions
-        - [x] Analyze UI component separation
     - [x] Review existing Streamlit entry point and UI layout <!-- id: 1 -->
     - [x] Verify SQLite schema design and integration <!-- id: 2 -->
     - [x] Create Implementation Plan for structural/UI improvements <!-- id: 3 -->
@@ -78,9 +74,17 @@
     - [x] Monitor Bot Execution in Logs <!-- id: 60 -->
     - [x] Visualize Active Bot Levels on Chart <!-- id: 61 -->
 
-- [ ] Phase 6: Advanced Bot Management & Configuration <!-- id: 62 -->
+- [x] Phase 6: Advanced Bot Management & Configuration <!-- id: 62 -->
     - [x] Create `ui/views/bot_manager.py` (List/Delete/Toggle) <!-- id: 63 -->
     - [x] Integrate Bot Manager into `app.py` <!-- id: 64 -->
-    - [ ] Audit `mql4_strategy.py` for Hedging/DollarTP logic <!-- id: 65 -->
-    - [ ] Update `bot_creator.py` with Advanced Settings (Hedging, Dollar TP) <!-- id: 66 -->
-    - [ ] Verify Advanced Settings Persistence <!-- id: 67 -->
+    - [x] Audit `mql4_strategy.py` for Hedging/DollarTP logic <!-- id: 65 -->
+    - [x] Update `bot_creator.py` with Advanced Settings (Hedging, Dollar TP) <!-- id: 66 -->
+    - [x] Verify Advanced Settings Persistence <!-- id: 67 -->
+    - [x] Upgrade `runner.py` with TP/Grid/Hedge execution logic <!-- id: 68 -->
+
+- [x] Phase 7: Advanced Confluence & Risk (Latest)
+    - [x] Implement 11-Trigger System in `mql4_strategy.py`
+    - [x] Implement "Emergency Stop" file logic in `runner.py`
+    - [x] Implement "Accelerated Early Exit" in `manager.py`
+    - [x] Update UI with "JSON View" and Advanced Triggers
+    - [x] Verify Advanced Logic (`tests/test_advanced_logic.py`)

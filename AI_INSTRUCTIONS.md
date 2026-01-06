@@ -1,49 +1,53 @@
-# AI Handover Instructions: Crypto Quant Bot
+# AI Handover Instructions: Crypto Quant Bot v0.4 (Robust Live)
 
-## 🛠️ Architecture & Conventions
+## 🛠️ Architecture & Roles
 
-### 1. UI Keys & State Isolation (CRITICAL)
-- **Constraint**: Streamlit tabs maintain all widgets in the global DOM. Duplicate labels/keys cause crashes.
-- **Convention**: 
-    - Use `create_*` prefix for all keys in `ui/views/bot_creator.py`.
-    - Use `edit_*_{bot_id}` as a prefix for all keys in `ui/views/bot_manager.py`'s `render_edit_form`.
-    - Always pass a unique `key` to common widgets like `cci_tf`, `rsi_level`, etc.
+### 1. Agent Roles
+- **Lead Architect**: Responsible for `ui/views`, user experience, and config validation (e.g. `bot_creator.py` integrity).
+- **Senior Backend Engineer**: Owns `engine/runner.py`, `engine/sync.py`, and `engine/database.py`. Focuses on reliability, state consistency, and crash recovery.
+- **Security Specialist**: Owns `engine/exchange_interface.py` and `config/settings.py`. Enforces `validate_order`, circuit breakers, and secret sanitization.
+- **Quant Analyst**: Owns `engine/strategies/mql4_strategy.py`, `engine/risk.py`, and `engine/manager.py`. Focuses on math correctness (fees, slippage, indicators).
 
-### 2. The 11-Trigger Confluence System
-- **Location**: `engine/strategies/mql4_strategy.py` -> `check_signals`.
-- **Logic**:
-    - **Triggers 1-4**: Indicators (CCI, Boll, Stoch, RSI).
-    - **Triggers 5-8**: **Indicator-Aware Patterns**. Mode 1=Up, 2=Down. Can watch `Price`, `RSI`, or `CCI` over X candles.
-    - **Trigger 9**: Price Threshold. Hard filter for specific price levels.
-    - **Trigger 10**: Volatility Relative Percentile. Uses historical lookback to determine if market is Quiet or Extreme.
-    - **Trigger 11**: ATR Expansion. Distance from candle open as % of ATR range.
-- **Strict Confluence**: A signal is only returned if `triggers_active > 0` and **ALL** enabled triggers are concurrently `True`.
+### 2. Core Systems (v0.4 Status)
 
-### 3. Risk Projections & Math transparency
-- **Logic**: `MQL4Strategy.calculate_projections(base_price, current_atr)`
-- **Projections**: Detailed absolute prices for grid entries and TP targets.
-- **Costs**: Includes 0.1% fee + 0.05% slippage simulation.
-- **TP Price**: Calculated as `Breakeven + (Target Profit USD / Total Position Qty)`.
+#### A. The Safety Layer (Security Specialist)
+- **Validation**: `ExchangeInterface.validate_order` PRE-CHECKS MinNotional, MinQty, and Precision before any API call.
+- **Circuit Breaker**: `BotRunner.check_circuit_breaker` monitors Global Equity. If drawdown > 50%, it trips `engine.emergency` and locks the system.
+- **Retry Logic**: Network errors use exponential backoff. Logic errors (insufficient funds) fail fast.
 
-### 4. Automated Hedging & Runner State
-- **Runner**: `engine/runner.py` branches between:
-    - Signal Hunting (`check_signals`).
-    - Active Management (`manage_trade`).
-- **Manager**: `engine/manager.py` handles TP, Martingale Grids, and the **Automated Hedge Executor**.
-- **Re-entry**: Supports post-exit cooldown (time) and distance-based re-entry.
+#### B. The Resilience Layer (Backend Engineer)
+- **Startup Sync**: `BotRunner.sync_all_bots` calls `engine/sync.py`.
+    - **Orphan Handler**: Cancels orders if DB says "Idle" but Exchange has orders.
+    - **Ghost Handler**: Closes trade in DB if DB says "In Trade" but Exchange has no orders (TP hit offline).
+- **Emergency System**: `handle_emergency_liquidation` supports cancelling orders AND market-closing positions.
 
-### 5. Database Schema
-- `bots`: Static configuration.
-- `trades`: Active position tracking.
-- `last_exit_price` & `last_exit_time`: Tracked in `trades` for re-entry logic.
+#### C. The Strategy Layer (Quant Analyst)
+- **11-Trigger Confluence**:
+    - Triggers 1-4: Indicators (CCI, Boll, Stoch, RSI).
+    - Triggers 5-8: Pattern Slots (Indicator-Aware).
+    - Triggers 9-11: Price Threshold, Volatility Percentile, ATR Expansion.
+- **Risk Math**: Includes 0.1% Fee + 0.05% Slippage in projections.
+- **Manager**: Handles `manage_trade` loop (TP, Grid, Hedge, Decay).
 
-## 📌 Development Roadmap
-- [x] Phase 10: 8-Trigger Entry System
-- [x] Phase 11: Real-World Risk (Fees, Hedging)
-- [x] Phase 12: Advanced Entry (9-11 Triggers, Re-entry logic)
-- [x] Phase 13: UI Transparency (Absolute Price Projections, Indicator-Aware Patterns)
-- [ ] Phase 14: Live Exchange Integration (CCXT Live Orders)
-- [ ] Phase 15: Market Maker Logic Refinement
+#### D. The Interface Layer (Architect)
+- **Keys**: Strict `create_*` vs `edit_*_{id}` isolation.
+- **ATR Foundation**: Pre-calculates market context (Vol Percentile) for user planning.
+
+### 3. Database Schema
+- `bots`: Config, Strategy Type, Limits.
+- `trades`: Active state (`current_step`, `total_invested`, `avg_entry_price`, `target_tp_price`).
+- `trades` (v0.3+): Added `last_exit_price`, `last_exit_time` for cooldown logic.
+
+## 📌 Development Roadmap (v0.4 -> v1.0)
+
+### Phase 10: Production Release (v1.0 Candidate)
+- [ ] **Testnet Burn-in**: Run on Binance Testnet for 48h.
+- [ ] **Performance Logging**: Export `trades` to CSV for PnL analysis.
+- [ ] **Final Deployment**: Validate `.env` secrets and remove `DRY_RUN` flag.
+
+### Future (v1.1+)
+- [ ] **Websocket Integration**: Replace polling with `ccxt.pro` for sub-second reaction.
+- [ ] **Market Maker Logic**: Refine `market_maker.py` for spread capture.
 
 ---
-*End of Protocol.*
+*Follow strict "Read-Before-Write" and "Safe Request" protocols.*

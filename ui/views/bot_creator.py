@@ -30,31 +30,37 @@ def render_bot_creator_view():
         except Exception as e:
             st.error(f"Error fetching symbols: {e}")
             available_pairs = [f"BTC/{quote_asset}"]
+            exchange = None # Initialize to avoid UnboundLocalError
 
         pair = st.selectbox("Trading Pair", available_pairs)
 
     # --- ATR Planning Foundation (Foundation of Parameters) ---
+    df_f = None
+    atr_data = {}
+    
     with st.expander("📊 ATR Planning Foundation", expanded=True):
         st.write("Use these values to baseline your Grid Range and First Entry Price.")
         try:
-            from engine.strategies.mql4_strategy import MQL4Strategy
-            # Fetch 1D data to get enough history for various TFs
-            ohlcv_f = exchange.fetch_ohlcv(pair, timeframe='1h', limit=500)
-            df_f = pd.DataFrame(ohlcv_f, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df_f['timestamp'] = pd.to_datetime(df_f['timestamp'], unit='ms')
-            
-            temp_strat_f = MQL4Strategy()
-            atr_data = temp_strat_f.get_atr_foundation(df_f)
-            
-            # Display metrics
-            m_cols = st.columns(4)
-            for i, tf in enumerate(['4h', '1d', '3d', '5d']):
-                with m_cols[i]:
-                    st.metric(f"ATR ({tf})", f"{atr_data[tf]['atr']:.4f}")
-                    move_p = atr_data[tf]['move_pct']
-                    color = "normal" if abs(move_p) < 100 else "inverse"
-                    st.caption(f"Range Pos: **{move_p:+.1f}%**")
-                    st.caption(f"Vol %-tile: {atr_data[tf]['percentile']:.0f}%")
+            if exchange:
+                from engine.strategies.mql4_strategy import MQL4Strategy
+                # Fetch 1D data to get enough history for various TFs
+                ohlcv_f = exchange.fetch_ohlcv(pair, timeframe='1h', limit=500)
+                if ohlcv_f:
+                    df_f = pd.DataFrame(ohlcv_f, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                    df_f['timestamp'] = pd.to_datetime(df_f['timestamp'], unit='ms')
+                    
+                    temp_strat_f = MQL4Strategy()
+                    atr_data = temp_strat_f.get_atr_foundation(df_f)
+                    
+                    # Display metrics
+                    m_cols = st.columns(4)
+                    for i, tf in enumerate(['4h', '1d', '3d', '5d']):
+                        with m_cols[i]:
+                            if tf in atr_data:
+                                st.metric(f"ATR ({tf})", f"{atr_data[tf]['atr']:.4f}")
+                                move_p = atr_data[tf]['move_pct']
+                                st.caption(f"Range Pos: **{move_p:+.1f}%**")
+                                st.caption(f"Vol %-tile: {atr_data[tf]['percentile']:.0f}%")
         except Exception as e:
             st.warning(f"Could not load ATR Foundation: {e}")
 
@@ -78,26 +84,29 @@ def render_bot_creator_view():
             temp_strat = MQL4Strategy(params={'base_size': base_size, 'martingale_multiplier': martingale_multiplier, 'direction': direction})
             
             try:
-                current_price = df_f['close'].iloc[-1]
-                # Try to get ATR for visual projection if available
-                p_atr = atr_data.get(timeframe, {}).get('atr', 10.0)
-                projections = temp_strat.calculate_projections(base_price=current_price, current_atr=p_atr)
-                
-                with st.expander("🔍 Risk Projection & Math Summary ($USDC)", expanded=False):
-                    st.caption(f"Simulated Martingale Grid based on current price: **{current_price:,.2f}**")
-                    proj_df = pd.DataFrame(projections)
+                if df_f is not None and not df_f.empty:
+                    current_price = df_f['close'].iloc[-1]
+                    # Try to get ATR for visual projection if available
+                    p_atr = atr_data.get(timeframe, {}).get('atr', 10.0)
+                    projections = temp_strat.calculate_projections(base_price=current_price, current_atr=p_atr)
                     
-                    # Update display columns for clarity
-                    proj_df.columns = ["Step", "Grid Price", "Order ($)", "Total Inv. ($)", "TP Price", "Hedge Size", "Is Hedge"]
-                    st.table(proj_df)
-                    
-                    # Hedge Summary Instruction
-                    hedge_steps = [p for p in projections if p['is_hedge']]
-                    if hedge_steps:
-                        h1 = hedge_steps[0]
-                        st.info(f"🛡️ **Hedge Summary**: At Step {h1['step']} (Price: {h1['price']}), a hedge of **${h1['hedge_size_usdc']}** activates.")
-                    else:
-                        st.warning("⚠️ No Hedge configured.")
+                    with st.expander("🔍 Risk Projection & Math Summary ($USDC)", expanded=False):
+                        st.caption(f"Simulated Martingale Grid based on current price: **{current_price:,.2f}**")
+                        proj_df = pd.DataFrame(projections)
+                        
+                        # Update display columns for clarity
+                        proj_df.columns = ["Step", "Grid Price", "Order ($)", "Total Inv. ($)", "TP Price", "Hedge Size", "Is Hedge"]
+                        st.table(proj_df)
+                        
+                        # Hedge Summary Instruction
+                        hedge_steps = [p for p in projections if p['is_hedge']]
+                        if hedge_steps:
+                            h1 = hedge_steps[0]
+                            st.info(f"🛡️ **Hedge Summary**: At Step {h1['step']} (Price: {h1['price']}), a hedge of **${h1['hedge_size_usdc']}** activates.")
+                        else:
+                            st.warning("⚠️ No Hedge configured.")
+                else:
+                    st.info("Market data unavailable for projection.")
             except Exception as e:
                 st.error(f"Projection Error: {e}")
 
@@ -169,7 +178,13 @@ def render_bot_creator_view():
             
             # Use current config for refined projection
             temp_strat.params.update(config)
-            projections = temp_strat.calculate_projections(steps=10)
+            # Fix: calculate_projections might not take 'steps' arg if using legacy signature
+            # Checking mql4_strategy.py: calculate_projections(self, base_price: float, current_atr: float = None) -> list
+            # It uses self.params.get('max_steps', 10) internally.
+            # So passing 'steps' as arg would fail. Fixed call below.
+            # Also ensure base_price is passed.
+            if df_f is not None and not df_f.empty:
+               projections = temp_strat.calculate_projections(base_price=current_price, current_atr=p_atr)
             
             st.divider()
             # Legacy Indicator Parameters removed in favor of 8-trigger system
@@ -227,4 +242,3 @@ def render_bot_creator_view():
                 st.info(f"Deployed on {market_type} - {pair} using {strategy_type} ({timeframe})")
             else:
                 st.error(f"Failed to deploy bot. Name '{name}' might already exist.")
-

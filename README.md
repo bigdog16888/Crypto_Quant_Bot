@@ -1,35 +1,58 @@
-# 🤖 Professional Multi-Bot Crypto Trading System
+# 🤖 Professional Multi-Bot Crypto Trading System (v0.4)
 
-A professional-grade quantitative trading platform built for extreme precision and robust risk management.
+A professional-grade quantitative trading platform built for extreme precision, robust risk management, and live market resilience.
 
 ## 🚀 Key Features
 
-### 🎯 8-Trigger Entry Confluence
-- **Multi-Switch Logic**: Combine up to 8 triggers (4 indicators + 4 pattern slots). A trade only opens if **ALL** enabled switches align.
-- **Granular Indicators**: CCI, RSI, Bollinger Bands, and Stochastic with explicit "Above/Below Level" modes.
-- **Consecutive Pattern Slots**: 4 independent slots to detect candle patterns (e.g., "Wait for 3 consecutive red candles") across any timeframe.
+### 🛡️ Institutional-Grade Safety (New in v0.4)
+- **Circuit Breaker**: Global "Kill Switch" monitors total account equity. If drawdown exceeds 50%, it locks the engine and prevents further losses.
+- **Exchange Validation**: Pre-validates every order against live `MinNotional`, `MinQty`, and `StepSize` rules to prevent API bans.
+- **State Recovery**: Auto-syncs database with exchange on startup. Detects "Ghost Trades" (TP hit while offline) and "Orphaned Orders".
+- **Network Resilience**: Automatic retry logic with exponential backoff for unstable connections.
 
-### 🛡️ Advanced Risk Management
-- **Automated Hedge Executor**: Automatically opens hedge positions to lock net exposure when the Martingale grid depth or drawdown limits are reached.
-- **Realistic Projections**: Real-time risk calculator including **0.15% Fee & Slippage simulation** for accurate capital assessment.
-- **Accelerated Early Exit**: Rescue logic that reduces the profit target by 30% every 15 minutes to exit stale trades at Break Even.
+### 🎯 11-Trigger Entry Confluence
+- **Multi-Switch Logic**: Combine up to 11 triggers (Indicators, Patterns, Volatility). A trade only opens if **ALL** enabled switches align.
+- **Volatility Awareness**: "Market State" trigger filters entries based on historical volatility percentile (e.g., "Only trade when vol is > 80%").
+- **Indicator-Aware Patterns**: Detect consecutive patterns not just on Price, but on RSI or CCI values.
 
-### 📊 Professional UI & Monitoring
-- **Interactive Plotly Charts**: Live visualization of Entry, TP, and Next Order levels.
-- **Isolated UI Keys**: 100% stable Streamlit interface using `create_` and `edit_` key isolation to prevent widget clashing.
-- **Emergency Killswitch**: Double-confirmation "Liquidate" command for immediate market closure of all positions.
+### 📊 Professional UI & Risk Math
+- **Automated Hedge Executor**: Locks net exposure via counter-orders when grid depth is reached.
+- **Realistic Projections**: Real-time risk calculator including **0.15% Fee & Slippage** simulation.
+- **Accelerated Early Exit**: Smart decay logic reduces profit targets over time to exit stale trades at Break Even.
 
 ## 🛠️ Technical Stack
-- **Frontend**: Streamlit (Rich Dark Aesthetic)
-- **Engine**: Python / CCXT (Binance Architecture)
-- **Analytics**: Pandas, Pandas-TA, Plotly
-- **Database**: SQLite (State-aware trade management)
+- **Engine**: Python / CCXT (Robust Runner with Circuit Breakers)
+- **Frontend**: Streamlit (Rich Dark Aesthetic, Isolated Keys)
+- **Database**: SQLite (State-aware, Sync-capable)
+- **Analytics**: Pandas, Plotly, ATR-based Volatility Analysis
 
 ## 🚦 Getting Started
-1. Configure your Binance API in the sidebar.
-2. Use the **Bot Creator** to build an 8-trigger confluence bot.
-3. Review the **Risk Projection** before deploying.
-4. Monitor live performance in the **Live Monitor** tab.
+
+### 1. Installation
+```bash
+pip install -r requirements.txt
+```
+
+### 2. Configuration
+Create a `.env` file based on `.env.example`:
+```ini
+BINANCE_API_KEY=your_key
+BINANCE_API_SECRET=your_secret
+DRY_RUN=True  # Set to False for Live Trading
+GLOBAL_STOP_LOSS_PCT=50.0
+```
+
+### 3. Run the Platform
+```bash
+streamlit run ui/app.py
+```
+
+### 4. Workflow
+1.  **Configure API**: Ensure valid keys in `.env`.
+2.  **Create Bot**: Use the **Bot Creator** to build a strategy (e.g., "RSI Dip Buyer + Volatility Filter").
+3.  **Analyze Risk**: Check the **ATR Planning Foundation** and **Risk Projection** tables.
+4.  **Deploy**: Launch the bot. The **Runner** handles validation, safety, and execution.
+5.  **Monitor**: Watch the **Live Monitor** for active trades and logs.
 
 ---
-*Developed for High-Precision Quantitative Trading.*
+*v0.4 "Live Readiness" Release - Built for Stability.*

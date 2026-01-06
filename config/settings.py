@@ -12,6 +12,11 @@ class Config:
     
     ALLOWED_SYMBOLS = os.getenv("ALLOWED_SYMBOLS", "BTC/USDT,ETH/USDT").split(",")
     MAX_ORDER_USD = float(os.getenv("MAX_ORDER_USD", 100))
+    
+    # Circuit Breaker / Safety
+    GLOBAL_STOP_LOSS_PCT = float(os.getenv("GLOBAL_STOP_LOSS_PCT", 50.0)) # Stop if account drops 50%
+    MAX_RETRIES = int(os.getenv("MAX_RETRIES", 3))
+    RETRY_DELAY = int(os.getenv("RETRY_DELAY", 2))
 
 config = Config()
 
@@ -39,4 +44,3 @@ def get_settings():
         "EEStartHours": 2.0,  # Start decay after X hours
         "EEStartLevel": 1     # Minimum grid level to activate EE
     }
-
