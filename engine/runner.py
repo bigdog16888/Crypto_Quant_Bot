@@ -29,7 +29,7 @@ logger = logging.getLogger("BotRunner")
 class BotRunner:
     def __init__(self):
         self.running = False
-        self.exchange = ExchangeInterface(market_type='spot') # Defaulting to spot for now, can be dynamic per bot
+        self.exchange = ExchangeInterface(market_type=config.MARKET_TYPE) # Use config for market type
         self.strategies = {} # Cache strategy instances: {bot_id: strategy_instance}
         
         # Safety / Circuit Breaker State
@@ -198,6 +198,9 @@ class BotRunner:
             if bot_id not in self.strategies:
                 if strat_type == 'MQL4':
                     self.strategies[bot_id] = MQL4Strategy(name=name, params=params)
+                elif strat_type == 'MarketMaker':
+                    from engine.strategies.market_maker import MarketMakerStrategy
+                    self.strategies[bot_id] = MarketMakerStrategy(name=name, params=params)
                 else:
                     logger.warning(f"Unknown strategy type {strat_type} for bot {name}. Skipping.")
                     return
@@ -213,6 +216,11 @@ class BotRunner:
 
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+
+            # --- SPECIAL: Market Maker Logic ---
+            if strat_type == 'MarketMaker':
+                self.process_market_maker(bot_id, name, pair, strategy, df)
+                return
 
             # --- State Selection ---
             trade_data = get_bot_status(bot_id)
@@ -269,7 +277,62 @@ class BotRunner:
         except Exception as e:
             logger.error(f"Error processing bot {name}: {e}")
 
-    def execute_entry(self, bot_id, name, pair, side, amount):
+    def process_market_maker(self, bot_id, name, pair, strategy, df):
+        """
+        Executes the specific loop for Market Making bots.
+        """
+        try:
+            current_price = df['close'].iloc[-1]
+            
+            # 1. Get Inventory
+            # In a real scenario, fetch from Exchange. For v0.4, use DB state or mock.
+            # Here we assume 'total_invested' in DB reflects net position (signed).
+            trade_data = get_bot_status(bot_id)
+            # trade_data: (name, pair, current_step, total_invested, avg_price, tp_price)
+            current_inventory = trade_data[3] if trade_data else 0.0
+            
+            # 2. Calculate Quotes
+            ideal_bid, ideal_ask = strategy.calculate_quotes(current_price, current_inventory)
+            
+            # 3. Reconcile (Update Orders)
+            # Fetch open orders
+            open_orders = self.exchange.fetch_open_orders(pair)
+            
+            # Separate Bid/Ask
+            current_bids = [o for o in open_orders if o['side'] == 'buy']
+            current_asks = [o for o in open_orders if o['side'] == 'sell']
+            
+            # --- Bid Logic ---
+            if not current_bids:
+                self.execute_entry(bot_id, name, pair, 'buy', strategy.order_size, price=ideal_bid, params={'postOnly': True})
+            else:
+                best_bid = max(current_bids, key=lambda x: x['price'])
+                bid_price = float(best_bid['price'])
+                
+                # Check deviation
+                diff = abs(bid_price - ideal_bid) / ideal_bid
+                if diff > strategy.reprice_threshold:
+                    logger.info(f"MM {name}: Repricing Bid. Old: {bid_price}, New: {ideal_bid}")
+                    self.exchange.cancel_all_orders(pair) # Simple cancel all for now
+                    self.execute_entry(bot_id, name, pair, 'buy', strategy.order_size, price=ideal_bid, params={'postOnly': True})
+
+            # --- Ask Logic ---
+            if not current_asks:
+                self.execute_entry(bot_id, name, pair, 'sell', strategy.order_size, price=ideal_ask, params={'postOnly': True})
+            else:
+                best_ask = min(current_asks, key=lambda x: x['price'])
+                ask_price = float(best_ask['price'])
+                
+                diff = abs(ask_price - ideal_ask) / ideal_ask
+                if diff > strategy.reprice_threshold:
+                    logger.info(f"MM {name}: Repricing Ask. Old: {ask_price}, New: {ideal_ask}")
+                    self.exchange.cancel_all_orders(pair)
+                    self.execute_entry(bot_id, name, pair, 'sell', strategy.order_size, price=ideal_ask, params={'postOnly': True})
+
+        except Exception as e:
+            logger.error(f"MM Loop failed for {name}: {e}")
+
+    def execute_entry(self, bot_id, name, pair, side, amount, price=None, params={}):
         """
         Place the first order and initialize the trade in DB.
         """
@@ -277,7 +340,9 @@ class BotRunner:
         
         # Validated Create Order
         # Fetch current price for limit order safety
-        price = self.exchange.get_last_price(pair)
+        if price is None:
+            price = self.exchange.get_last_price(pair)
+        
         if price == 0:
             logger.error(f"Could not fetch price for {pair}, aborting entry.")
             return
@@ -293,7 +358,7 @@ class BotRunner:
             # Real Order
             try:
                 # Use create_order which now has validation and retries
-                order = self.exchange.create_order(pair, 'limit', side, amount, price)
+                order = self.exchange.create_order(pair, 'limit', side, amount, price, params=params)
                 if order:
                     logger.info(f"Order placed: {order.get('id')}")
                     # Update DB only if successful

@@ -5,12 +5,13 @@ import streamlit as st
 import os
 import sys
 import subprocess
-from dotenv import load_dotenv
+from dotenv import load_dotenv, set_key, find_dotenv
 
 # Add root to sys.path to ensure module resolution
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from engine.database import init_db
+from config.settings import config
 from ui.views.monitor import render_monitor_view
 from ui.views.bot_creator import render_bot_creator_view
 from ui.views.bot_manager import render_bot_manager_view
@@ -61,16 +62,45 @@ with st.sidebar:
     st.divider()
     
     st.subheader("API Configuration")
+    
+    # Locate .env file robustly
+    dotenv_path = find_dotenv()
+    if not dotenv_path:
+        dotenv_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env')
+
     api_key = st.text_input("Binance API Key", value=os.getenv("BINANCE_API_KEY", ""), type="password")
     api_secret = st.text_input("Binance API Secret", value=os.getenv("BINANCE_API_SECRET", ""), type="password")
     
     st.divider()
     
     if st.button("Apply Settings", use_container_width=True):
-        st.success("Settings saved locally for this session.")
+        if api_key and api_secret:
+            try:
+                # 1. Update .env file on disk
+                set_key(dotenv_path, "BINANCE_API_KEY", api_key)
+                set_key(dotenv_path, "BINANCE_API_SECRET", api_secret)
+                
+                # 2. Update current process environment
+                os.environ["BINANCE_API_KEY"] = api_key
+                os.environ["BINANCE_API_SECRET"] = api_secret
+                
+                # 3. Update global config object immediately (for UI components)
+                config.API_KEY = api_key
+                config.API_SECRET = api_secret
+                
+                st.success("✅ Credentials Saved!")
+                
+                # 4. Check if engine is running and warn
+                if os.path.exists("engine.pid"):
+                    st.warning("⚠️ Engine is running! Please RESTART Monitoring below to apply changes.")
+                    
+            except Exception as e:
+                st.error(f"Failed to save settings: {e}")
+        else:
+            st.error("❌ Key and Secret required.")
 
     st.divider()
-    st.header("🚀 Engine Control")
+    st.header("🛠️ Engine Control")
     
     PID_FILE = "engine.pid"
     
@@ -89,7 +119,7 @@ with st.sidebar:
     engine_running, pid = is_engine_running()
     
     if not engine_running:
-        if st.button("🚀 Start Monitoring", use_container_width=True):
+        if st.button("▶️ Start Monitoring", use_container_width=True):
             # Start engine logic...
             CREATE_NEW_CONSOLE = 0x00000010 # For Windows to run detached
             process = subprocess.Popen([sys.executable, "engine/runner.py"], creationflags=CREATE_NEW_CONSOLE)
@@ -105,7 +135,7 @@ with st.sidebar:
             st.warning("Stop signal sent. Waiting for graceful shutdown...")
             st.rerun()
         
-        if st.button("🔥 Force Kill Monitoring", use_container_width=True, type="secondary"):
+        if st.button("💀 Force Kill Monitoring", use_container_width=True, type="secondary"):
             # Attempt to kill by PID first
             try:
                 os.kill(pid, 9) # SIGKILL
@@ -140,7 +170,7 @@ with st.sidebar:
         col_c1, col_c2 = st.columns(2)
         with col_c1:
             confirm_disabled = (conf_input.lower().strip() != "liquidate")
-            if st.button("✅ YES, CLOSE EVERYTHING", use_container_width=True, disabled=confirm_disabled):
+            if st.button("🔥YES, CLOSE EVERYTHING", use_container_width=True, disabled=confirm_disabled):
                 # Trigger Emergency Signal
                 with open("engine.emergency", "w") as f:
                     f.write("emergency")
@@ -148,14 +178,14 @@ with st.sidebar:
                 st.error("🚨 Emergency Liquidation Signal Sent! 🚨")
                 st.rerun()
         with col_c2:
-            if st.button("❌ CANCEL", use_container_width=True):
+            if st.button("🔙CANCEL", use_container_width=True):
                 st.session_state['show_emergency_confirm'] = False
                 st.rerun()
 
 # Main Area - Tabs
 st.title("🤖 Multi-Bot Crypto Trading System")
 
-tab1, tab2, tab3 = st.tabs(["📊 Live Monitor", "🛠️ Bot Creator", "⚙️ Bot Manager"])
+tab1, tab2, tab3 = st.tabs(["📊 Live Monitor", "🏗️ Bot Creator", "🛠️ Bot Manager"])
 
 with tab1:
     render_monitor_view()

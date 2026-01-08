@@ -1,52 +1,76 @@
 import streamlit as st
 import time
+import pandas as pd
+import plotly.graph_objects as go
+import ccxt
+from engine.exchange_interface import ExchangeInterface
+from engine.database import get_connection
 
 def render_monitor_view():
-    st.header("Live Market Monitor")
+    st.header("📊 Live Market Monitor")
     
-    # Simple control bar
-    col1, col2 = st.columns([1, 3])
+    # --- Control Bar ---
+    col1, col2, col3 = st.columns([2, 1, 1])
     with col1:
-        # Fetch symbols from exchange if possible, else hardcode
         symbol = st.selectbox("Select Symbol", ["BTC/USDT", "ETH/USDT", "SOL/USDT", "DOGE/USDT"], key="monitor_symbol")
     with col2:
+        timeframe = st.selectbox("Timeframe", ["1m", "5m", "15m", "30m", "1h", "4h", "1d"], index=4, key="monitor_tf")
+    with col3:
         st.write("") # Spacer
-        if st.button("Refresh Data", use_container_width=False):
+        if st.button("🔄 Refresh", use_container_width=True):
             st.session_state.last_refresh = time.time()
     
-    # Fetch Data
+    # --- Fetch Data ---
     try:
-        from engine.exchange_interface import ExchangeInterface
-        import pandas as pd
-        import plotly.graph_objects as go
-        
         # Initialize exchange (defaulting to spot for monitor for now)
-        exchange = ExchangeInterface() 
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=100)
+        try:
+            exchange = ExchangeInterface() 
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=100)
+        except (ccxt.AuthenticationError, ccxt.ExchangeError) as e:
+            st.error(f"🔌 **API Connection Failed**: {e}")
+            st.warning("Please check your API keys in the `.env` file.")
+            ohlcv = []
+        except Exception as e:
+            st.error(f"Exchange Error: {e}")
+            ohlcv = []
         
         if ohlcv and len(ohlcv) > 0:
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             
-            # Create Plotly Candlestick Chart
-            fig = go.Figure(data=[go.Candlestick(
+            # Technical Indicator: 20-period SMA
+            df['sma_20'] = df['close'].rolling(window=20).mean()
+            
+            # --- Create Interactive Plotly Chart ---
+            fig = go.Figure()
+            
+            # Candlestick Trace
+            fig.add_trace(go.Candlestick(
                 x=df['timestamp'],
                 open=df['open'],
                 high=df['high'],
                 low=df['low'],
                 close=df['close'],
                 name=symbol
-            )])
+            ))
+            
+            # SMA Trace
+            fig.add_trace(go.Scatter(
+                x=df['timestamp'], 
+                y=df['sma_20'], 
+                name='SMA 20', 
+                line=dict(color='orange', width=1.5),
+                opacity=0.7
+            ))
             
             # --- Visual Overlays for Active Bot ---
-            # Fetch active bot for this symbol
-            from engine.database import get_connection
+            active_bot_data = None
             try:
                 conn = get_connection()
                 cur = conn.cursor()
-                # Get bot + trade info
+                # Enhanced query to get investment info for PnL
                 query = """
-                    SELECT b.name, t.avg_entry_price, t.target_tp_price, t.current_step, b.direction
+                    SELECT b.name, t.avg_entry_price, t.target_tp_price, t.current_step, b.direction, t.total_invested
                     FROM bots b
                     JOIN trades t ON b.id = t.bot_id
                     WHERE b.pair = ? AND b.is_active = 1
@@ -54,48 +78,83 @@ def render_monitor_view():
                     LIMIT 1
                 """
                 cur.execute(query, (symbol,))
-                active_bot = cur.fetchone()
+                active_bot_data = cur.fetchone()
                 conn.close()
                 
-                if active_bot:
-                    bot_name, entry, tp, step, direction = active_bot
+                if active_bot_data:
+                    bot_name, entry, tp, step, direction, invested = active_bot_data
                     
                     if entry > 0:
                         color_entry = "blue"
                         color_tp = "green" if direction == "LONG" else "red"
                         
                         fig.add_hline(y=entry, line_dash="solid", line_color=color_entry, annotation_text=f"Entry ({bot_name})")
-                        
                         if tp > 0:
                              fig.add_hline(y=tp, line_dash="dash", line_color=color_tp, annotation_text="Take Profit")
                         
-                        st.info(f"Bot '{bot_name}' active. Step: {step} | Entry: {entry} | TP: {tp}")
+                        st.info(f"🤖 **Bot '{bot_name}' active**. Step: {step} | Entry: ${entry:,.2f} | TP: ${tp:,.2f}")
                 
             except Exception as e:
                 st.warning(f"Could not load bot levels: {e}")
 
+            # Layout Improvements
             fig.update_layout(
-                title=f"{symbol} - 1H Chart",
-                yaxis_title="Price",
+                title=f"{symbol} - {timeframe.upper()} Live Chart",
+                yaxis_title="Price (USDT)",
                 xaxis_title="Time",
                 template="plotly_dark",
                 height=600,
-                xaxis_rangeslider_visible=False
+                xaxis_rangeslider_visible=True, # Interactive Zoom
+                margin=dict(l=10, r=10, t=40, b=10)
+            )
+            
+            # Range Selector Buttons
+            fig.update_xaxes(
+                rangeselector=dict(
+                    buttons=list([
+                        dict(count=1, label="1h", step="hour", stepmode="backward"),
+                        dict(count=6, label="6h", step="hour", stepmode="backward"),
+                        dict(count=1, label="1d", step="day", stepmode="backward"),
+                        dict(step="all")
+                    ])
+                )
             )
             
             st.plotly_chart(fig, use_container_width=True)
             
-            # Display latest price stats
+            # --- PnL and Stats Area ---
             latest = df.iloc[-1]
-            c1, c2, c3 = st.columns(3)
-            with c1: st.metric("Latest Price", f"{latest['close']:.2f}", f"{latest['close'] - df.iloc[-2]['close']:.2f}")
-            with c2: st.metric("24h Vol", f"{latest['volume']:.0f}")
-            with c3: st.caption("Active Bot Levels will appear here when running.")
+            prev_close = df.iloc[-2]['close'] if len(df) > 1 else latest['close']
             
+            st.subheader("📊 Performance & Metrics")
+            c1, c2, c3, c4 = st.columns(4)
+            
+            with c1: 
+                st.metric("Latest Price", f"{latest['close']:,.2f}", f"{latest['close'] - prev_close:,.2f}")
+            
+            with c2: 
+                st.metric("24h Volume", f"{latest['volume']:,.0f}")
+            
+            # PnL Calculation
+            with c3:
+                if active_bot_data and active_bot_data[1] > 0:
+                    bot_name, entry, tp, step, direction, invested = active_bot_data
+                    price_diff = latest['close'] - entry if direction == "LONG" else entry - latest['close']
+                    pnl_pct = (price_diff / entry) * 100
+                    pnl_usd = (invested * pnl_pct / 100) if invested > 0 else 0.0
+                    
+                    st.metric("Unrealized PnL", f"${pnl_usd:,.2f}", f"{pnl_pct:.2f}%")
+                else:
+                    st.metric("Unrealized PnL", "$0.00 (Mock)", "0.00%", delta_color="off")
+            
+            with c4:
+                invested_val = active_bot_data[5] if active_bot_data else 0.0
+                st.metric("Total Invested", f"${invested_val:,.2f}")
+
         else:
-            st.warning("No data received from exchange.")
+            st.warning("No data received from exchange. Check your API connection or symbol.")
             
     except Exception as e:
-        st.error(f"Error loading chart: {e}")
+        st.error(f"Error loading monitor: {e}")
 
-    st.info(f"Visualizing live data for **{symbol}**.")
+    st.caption(f"Visualizing live data for **{symbol}** via CCXT.")

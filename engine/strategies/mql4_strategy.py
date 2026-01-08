@@ -133,6 +133,25 @@ class MQL4Strategy(BaseStrategy):
 
 
 
+    def check_pattern(self, series: pd.Series, mode: int, count: int) -> bool:
+        """
+        Generic pattern checker for any indicator series.
+        mode: 1 (Consecutive Up), 2 (Consecutive Down)
+        count: number of consecutive candles
+        """
+        if series is None or len(series) < count:
+            return False
+            
+        last_vals = series.iloc[-count:]
+        
+        if mode == 1: # Consecutive Up
+            # Check if each value is greater than the previous
+            return all(last_vals.iloc[i] > last_vals.iloc[i-1] for i in range(1, len(last_vals)))
+        elif mode == 2: # Consecutive Down
+            return all(last_vals.iloc[i] < last_vals.iloc[i-1] for i in range(1, len(last_vals)))
+            
+        return False
+
     def check_signals(self, market_data: pd.DataFrame) -> tuple[bool, bool]:
         """
         Refined 8-Trigger Confluence logic.
@@ -191,36 +210,29 @@ class MQL4Strategy(BaseStrategy):
             else: # Above
                 if val <= lvl: sell_allow = False
 
-        # --- 2. Pattern Triggers (5-8) ---
+        # --- 2. Pattern Triggers (5-8) (Refined) ---
         for p_idx in range(1, 5):
             p_mode = self.params.get(f'pat_{p_idx}_mode', 0) # 0=Off, 1=Consecutive Up, 2=Consecutive Down
             if p_mode > 0:
                 triggers_active += 1
                 p_tf = self.params.get(f'pat_{p_idx}_tf')
                 df_p = self._resample(market_data, p_tf)
+                
                 # Indicator Awareness: watch_indicator param (e.g. 'Price', 'RSI', 'CCI')
                 watch = self.params.get(f'pat_{p_idx}_source', 'Price')
                 count = self.params.get(f'pat_{p_idx}_count', 3)
                 
+                series = None
                 if watch == 'RSI':
                     series = ta_custom.rsi(df_p['close'], period=self.params.get('rsi_period', 14))
                 elif watch == 'CCI':
                     series = ta_custom.cci(df_p['high'], df_p['low'], df_p['close'], period=self.params.get('cci_period', 14))
-                else:
+                else: # Default to Price
                     series = df_p['close']
-
-                if series is None or len(series) < count:
+                
+                # Use helper method
+                if not self.check_pattern(series, p_mode, count):
                     buy_allow = sell_allow = False
-                    continue
-                
-                last_vals = series.iloc[-count:]
-                is_up = all(last_vals.iloc[i] > last_vals.iloc[i-1] for i in range(1, len(last_vals)))
-                is_down = all(last_vals.iloc[i] < last_vals.iloc[i-1] for i in range(1, len(last_vals)))
-                
-                if p_mode == 1: # Consecutive Up
-                    if not is_up: buy_allow = sell_allow = False
-                else: # Consecutive Down
-                    if not is_down: buy_allow = sell_allow = False
 
         # --- 3. Price Threshold Trigger (Trigger 9) ---
         mode_price = self.params.get('mode_price', 0) # 0=Off, 1=Above, 2=Below

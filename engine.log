@@ -794,3 +794,123 @@
 2026-01-01 12:48:57,525 - BotRunner - INFO - Cycle complete.
 2026-01-01 12:49:07,528 - BotRunner - INFO - Stop signal detected. Exiting gracefully...
 2026-01-01 12:49:07,529 - BotRunner - INFO - Bot Service Permanently Stopped.
+2026-01-08 20:52:24,493 - BotRunner - INFO - Bot Service Started.
+2026-01-08 20:52:24,642 - engine.exchange_interface - ERROR - Logic/Exchange error on fetch_balance: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 20:52:24,642 - BotRunner - ERROR - Failed to initialize safety baseline: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 20:52:24,642 - BotRunner - INFO - Starting global state synchronization...
+2026-01-08 20:52:24,720 - engine.exchange_interface - ERROR - Logic/Exchange error on fetch_open_orders: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 20:52:24,720 - StateSync - ERROR - Failed to fetch open orders for RSI_Scalper_01: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 20:52:24,783 - engine.exchange_interface - ERROR - Logic/Exchange error on fetch_open_orders: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 20:52:24,783 - StateSync - ERROR - Failed to fetch open orders for 00: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 20:52:24,845 - engine.exchange_interface - ERROR - Logic/Exchange error on fetch_open_orders: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 20:52:24,845 - StateSync - ERROR - Failed to fetch open orders for PaperTestBot: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 20:52:24,845 - BotRunner - INFO - Global state synchronization complete.
+2026-01-08 20:52:24,845 - BotRunner - INFO - Starting run cycle...
+2026-01-08 20:52:24,845 - BotRunner - INFO - Found 3 active bots.
+2026-01-08 20:52:24,908 - engine.exchange_interface - ERROR - Logic/Exchange error on fetch_ohlcv: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 20:52:24,908 - BotRunner - ERROR - Error processing bot RSI_Scalper_01: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 20:52:24,970 - engine.exchange_interface - ERROR - Logic/Exchange error on fetch_ohlcv: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 20:52:24,970 - BotRunner - ERROR - Error processing bot 00: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 20:52:25,033 - engine.exchange_interface - ERROR - Logic/Exchange error on fetch_ohlcv: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 20:52:25,033 - BotRunner - ERROR - Error processing bot PaperTestBot: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 20:52:25,033 - BotRunner - INFO - Cycle complete.
+2026-01-08 20:52:35,042 - BotRunner - INFO - Stop signal detected. Exiting gracefully...
+2026-01-08 20:52:35,042 - BotRunner - INFO - Bot Service Permanently Stopped.
+2026-01-08 20:53:00,761 - BotRunner - INFO - Bot Service Started.
+2026-01-08 20:53:00,888 - engine.exchange_interface - ERROR - Logic/Exchange error on fetch_balance: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 20:53:00,888 - BotRunner - ERROR - Failed to initialize safety baseline: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 20:53:00,888 - BotRunner - INFO - Starting global state synchronization...
+2026-01-08 20:53:00,950 - engine.exchange_interface - ERROR - Logic/Exchange error on fetch_open_orders: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 20:53:00,950 - StateSync - ERROR - Failed to fetch open orders for RSI_Scalper_01: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 20:53:01,012 - engine.exchange_interface - ERROR - Logic/Exchange error on fetch_open_orders: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 20:53:01,012 - StateSync - ERROR - Failed to fetch open orders for 00: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 20:53:01,075 - engine.exchange_interface - ERROR - Logic/Exchange error on fetch_open_orders: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 20:53:01,075 - StateSync - ERROR - Failed to fetch open orders for PaperTestBot: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 20:53:01,075 - BotRunner - INFO - Global state synchronization complete.
+2026-01-08 20:53:01,075 - BotRunner - INFO - Starting run cycle...
+2026-01-08 20:53:01,075 - BotRunner - INFO - Found 3 active bots.
+2026-01-08 20:53:01,145 - engine.exchange_interface - ERROR - Logic/Exchange error on fetch_ohlcv: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 20:53:01,145 - BotRunner - ERROR - Error processing bot RSI_Scalper_01: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 20:53:01,195 - engine.exchange_interface - ERROR - Logic/Exchange error on fetch_ohlcv: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 20:53:01,195 - BotRunner - ERROR - Error processing bot 00: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 20:53:01,246 - engine.exchange_interface - ERROR - Logic/Exchange error on fetch_ohlcv: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 20:53:01,246 - BotRunner - ERROR - Error processing bot PaperTestBot: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 20:53:01,246 - BotRunner - INFO - Cycle complete.
+2026-01-08 22:16:17,095 - BotRunner - INFO - Bot Service Started.
+2026-01-08 22:16:17,239 - engine.exchange_interface - ERROR - Logic/Exchange error on fetch_balance: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 22:16:17,239 - BotRunner - ERROR - Failed to initialize safety baseline: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 22:16:17,239 - BotRunner - INFO - Starting global state synchronization...
+2026-01-08 22:16:17,286 - engine.exchange_interface - ERROR - Logic/Exchange error on fetch_open_orders: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 22:16:17,286 - StateSync - ERROR - Failed to fetch open orders for RSI_Scalper_01: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 22:16:17,348 - engine.exchange_interface - ERROR - Logic/Exchange error on fetch_open_orders: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 22:16:17,348 - StateSync - ERROR - Failed to fetch open orders for 00: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 22:16:17,411 - engine.exchange_interface - ERROR - Logic/Exchange error on fetch_open_orders: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 22:16:17,411 - StateSync - ERROR - Failed to fetch open orders for PaperTestBot: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 22:16:17,411 - BotRunner - INFO - Global state synchronization complete.
+2026-01-08 22:16:17,411 - BotRunner - INFO - Starting run cycle...
+2026-01-08 22:16:17,411 - BotRunner - INFO - Found 3 active bots.
+2026-01-08 22:16:17,484 - engine.exchange_interface - ERROR - Logic/Exchange error on fetch_ohlcv: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 22:16:17,484 - BotRunner - ERROR - Error processing bot RSI_Scalper_01: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 22:16:17,539 - engine.exchange_interface - ERROR - Logic/Exchange error on fetch_ohlcv: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 22:16:17,539 - BotRunner - ERROR - Error processing bot 00: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 22:16:17,591 - engine.exchange_interface - ERROR - Logic/Exchange error on fetch_ohlcv: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 22:16:17,591 - BotRunner - ERROR - Error processing bot PaperTestBot: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 22:16:17,591 - BotRunner - INFO - Cycle complete.
+2026-01-08 22:18:11,998 - BotRunner - INFO - Bot Service Started.
+2026-01-08 22:18:12,123 - engine.exchange_interface - ERROR - Logic/Exchange error on fetch_balance: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 22:18:12,123 - BotRunner - ERROR - Failed to initialize safety baseline: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 22:18:12,123 - BotRunner - INFO - Starting global state synchronization...
+2026-01-08 22:18:12,185 - engine.exchange_interface - ERROR - Logic/Exchange error on fetch_open_orders: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 22:18:12,185 - StateSync - ERROR - Failed to fetch open orders for RSI_Scalper_01: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 22:18:12,232 - engine.exchange_interface - ERROR - Logic/Exchange error on fetch_open_orders: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 22:18:12,232 - StateSync - ERROR - Failed to fetch open orders for 00: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 22:18:12,294 - engine.exchange_interface - ERROR - Logic/Exchange error on fetch_open_orders: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 22:18:12,294 - StateSync - ERROR - Failed to fetch open orders for PaperTestBot: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 22:18:12,294 - BotRunner - INFO - Global state synchronization complete.
+2026-01-08 22:18:12,294 - BotRunner - INFO - Starting run cycle...
+2026-01-08 22:18:12,294 - BotRunner - INFO - Found 3 active bots.
+2026-01-08 22:18:12,357 - engine.exchange_interface - ERROR - Logic/Exchange error on fetch_ohlcv: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 22:18:12,357 - BotRunner - ERROR - Error processing bot RSI_Scalper_01: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 22:18:12,435 - engine.exchange_interface - ERROR - Logic/Exchange error on fetch_ohlcv: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 22:18:12,435 - BotRunner - ERROR - Error processing bot 00: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 22:18:12,482 - engine.exchange_interface - ERROR - Logic/Exchange error on fetch_ohlcv: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 22:18:12,482 - BotRunner - ERROR - Error processing bot PaperTestBot: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 22:18:12,482 - BotRunner - INFO - Cycle complete.
+2026-01-08 22:18:22,490 - BotRunner - INFO - Starting run cycle...
+2026-01-08 22:18:22,490 - BotRunner - INFO - Found 3 active bots.
+2026-01-08 22:18:22,537 - engine.exchange_interface - ERROR - Logic/Exchange error on fetch_ohlcv: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 22:18:22,537 - BotRunner - ERROR - Error processing bot RSI_Scalper_01: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 22:18:22,600 - engine.exchange_interface - ERROR - Logic/Exchange error on fetch_ohlcv: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 22:18:22,600 - BotRunner - ERROR - Error processing bot 00: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 22:18:22,662 - engine.exchange_interface - ERROR - Logic/Exchange error on fetch_ohlcv: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 22:18:22,662 - BotRunner - ERROR - Error processing bot PaperTestBot: binance {"code":-2008,"msg":"Invalid Api-Key ID."}
+2026-01-08 22:18:22,662 - BotRunner - INFO - Cycle complete.
+2026-01-08 22:37:43,206 - BotRunner - INFO - Bot Service Started.
+2026-01-08 22:37:43,315 - engine.exchange_interface - ERROR - Logic/Exchange error on fetch_balance: binance {"code":-5000,"msg":"Path /fapi/v1/capital/config/getall, Method GET is invalid"}
+2026-01-08 22:37:43,315 - BotRunner - ERROR - Failed to initialize safety baseline: binance {"code":-5000,"msg":"Path /fapi/v1/capital/config/getall, Method GET is invalid"}
+2026-01-08 22:37:43,315 - BotRunner - INFO - Starting global state synchronization...
+2026-01-08 22:37:43,362 - engine.exchange_interface - ERROR - Logic/Exchange error on fetch_open_orders: binance {"code":-5000,"msg":"Path /fapi/v1/capital/config/getall, Method GET is invalid"}
+2026-01-08 22:37:43,362 - StateSync - ERROR - Failed to fetch open orders for RSI_Scalper_01: binance {"code":-5000,"msg":"Path /fapi/v1/capital/config/getall, Method GET is invalid"}
+2026-01-08 22:37:43,425 - engine.exchange_interface - ERROR - Logic/Exchange error on fetch_open_orders: binance {"code":-5000,"msg":"Path /fapi/v1/capital/config/getall, Method GET is invalid"}
+2026-01-08 22:37:43,425 - StateSync - ERROR - Failed to fetch open orders for 00: binance {"code":-5000,"msg":"Path /fapi/v1/capital/config/getall, Method GET is invalid"}
+2026-01-08 22:37:43,550 - engine.exchange_interface - ERROR - Logic/Exchange error on fetch_open_orders: binance {"code":-5000,"msg":"Path /fapi/v1/capital/config/getall, Method GET is invalid"}
+2026-01-08 22:37:43,550 - StateSync - ERROR - Failed to fetch open orders for PaperTestBot: binance {"code":-5000,"msg":"Path /fapi/v1/capital/config/getall, Method GET is invalid"}
+2026-01-08 22:37:43,550 - BotRunner - INFO - Global state synchronization complete.
+2026-01-08 22:37:43,550 - BotRunner - INFO - Starting run cycle...
+2026-01-08 22:37:43,550 - BotRunner - INFO - Found 3 active bots.
+2026-01-08 22:37:43,597 - engine.exchange_interface - ERROR - Logic/Exchange error on fetch_ohlcv: binance {"code":-5000,"msg":"Path /fapi/v1/capital/config/getall, Method GET is invalid"}
+2026-01-08 22:37:43,597 - BotRunner - ERROR - Error processing bot RSI_Scalper_01: binance {"code":-5000,"msg":"Path /fapi/v1/capital/config/getall, Method GET is invalid"}
+2026-01-08 22:37:43,659 - engine.exchange_interface - ERROR - Logic/Exchange error on fetch_ohlcv: binance {"code":-5000,"msg":"Path /fapi/v1/capital/config/getall, Method GET is invalid"}
+2026-01-08 22:37:43,659 - BotRunner - ERROR - Error processing bot 00: binance {"code":-5000,"msg":"Path /fapi/v1/capital/config/getall, Method GET is invalid"}
+2026-01-08 22:37:43,784 - engine.exchange_interface - ERROR - Logic/Exchange error on fetch_ohlcv: binance {"code":-5000,"msg":"Path /fapi/v1/capital/config/getall, Method GET is invalid"}
+2026-01-08 22:37:43,784 - BotRunner - ERROR - Error processing bot PaperTestBot: binance {"code":-5000,"msg":"Path /fapi/v1/capital/config/getall, Method GET is invalid"}
+2026-01-08 22:37:43,784 - BotRunner - INFO - Cycle complete.
+2026-01-08 22:37:53,787 - BotRunner - INFO - Starting run cycle...
+2026-01-08 22:37:53,787 - BotRunner - INFO - Found 3 active bots.
+2026-01-08 22:37:53,834 - engine.exchange_interface - ERROR - Logic/Exchange error on fetch_ohlcv: binance {"code":-5000,"msg":"Path /fapi/v1/capital/config/getall, Method GET is invalid"}
+2026-01-08 22:37:53,834 - BotRunner - ERROR - Error processing bot RSI_Scalper_01: binance {"code":-5000,"msg":"Path /fapi/v1/capital/config/getall, Method GET is invalid"}
+2026-01-08 22:37:53,897 - engine.exchange_interface - ERROR - Logic/Exchange error on fetch_ohlcv: binance {"code":-5000,"msg":"Path /fapi/v1/capital/config/getall, Method GET is invalid"}
+2026-01-08 22:37:53,897 - BotRunner - ERROR - Error processing bot 00: binance {"code":-5000,"msg":"Path /fapi/v1/capital/config/getall, Method GET is invalid"}
+2026-01-08 22:37:53,959 - engine.exchange_interface - ERROR - Logic/Exchange error on fetch_ohlcv: binance {"code":-5000,"msg":"Path /fapi/v1/capital/config/getall, Method GET is invalid"}
+2026-01-08 22:37:53,959 - BotRunner - ERROR - Error processing bot PaperTestBot: binance {"code":-5000,"msg":"Path /fapi/v1/capital/config/getall, Method GET is invalid"}
+2026-01-08 22:37:53,959 - BotRunner - INFO - Cycle complete.

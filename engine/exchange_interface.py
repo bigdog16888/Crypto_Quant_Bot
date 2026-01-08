@@ -17,8 +17,37 @@ class ExchangeInterface:
             'options': options,
             'timeout': 10000 # 10s timeout
         })
-        self.logger = logging.getLogger(__name__)
         
+        # Testnet Override
+        if config.TESTNET:
+            # Special handling for Futures: set_sandbox_mode is deprecated/broken in some CCXT versions
+            # So we manually override URLs and SKIP set_sandbox_mode for futures
+            if market_type in ['future', 'delivery', 'swap']:
+                testnet_base = 'https://testnet.binancefuture.com'
+                self.exchange.urls['api'].update({
+                    'fapiPublic': f'{testnet_base}/fapi/v1',
+                    'fapiPublicV2': f'{testnet_base}/fapi/v2',
+                    'fapiPublicV3': f'{testnet_base}/fapi/v3',
+                    'fapiPrivate': f'{testnet_base}/fapi/v1',
+                    'fapiPrivateV2': f'{testnet_base}/fapi/v2',
+                    'fapiPrivateV3': f'{testnet_base}/fapi/v3',
+                    'dapiPublic': f'{testnet_base}/dapi/v1',
+                    'dapiPrivate': f'{testnet_base}/dapi/v1',
+                    'dapiPrivateV2': f'{testnet_base}/dapi/v2',
+                    # Nuclear Option: Route EVERYTHING to Testnet
+                    # This prevents ANY accidental Mainnet connection if CCXT falls back to 'sapi' or 'spot'
+                    'sapi': f'{testnet_base}/fapi/v1',
+                    'spot': f'{testnet_base}/fapi/v1',
+                })
+            else:
+                # For Spot, standard sandbox mode still works fine
+                self.exchange.set_sandbox_mode(True)
+            
+            self.logger = logging.getLogger(__name__)
+            self.logger.warning("⚠️ USING TESTNET (SANDBOX) MODE ⚠️")
+        else:
+            self.logger = logging.getLogger(__name__)
+            
         # Cache for market info (minNotional, filters)
         self.markets_loaded = False
 
@@ -154,7 +183,7 @@ class ExchangeInterface:
     def fetch_ohlcv(self, symbol, timeframe='1h', limit=100):
         return self._safe_request('fetch_ohlcv', symbol=symbol, timeframe=timeframe, limit=limit)
 
-    def create_order(self, symbol, type, side, amount, price=None):
+    def create_order(self, symbol, type, side, amount, price=None, params={}):
         """
         Creates an order with pre-validation logic.
         """
@@ -174,10 +203,15 @@ class ExchangeInterface:
             amount = s_amt
             price = s_price
 
-        return self._safe_request('create_order', symbol=symbol, type=type, side=side, amount=amount, price=price)
+        # Merge extra params (e.g., postOnly)
+        return self._safe_request('create_order', symbol=symbol, type=type, side=side, amount=amount, price=price, params=params)
 
     def fetch_balance(self):
-        return self._safe_request('fetch_balance')
+        params = {}
+        # Ensure we target the correct wallet in Futures mode to avoid 'sapi' Mainnet leaks
+        if self.exchange.options.get('defaultType') == 'future':
+            params['type'] = 'future'
+        return self._safe_request('fetch_balance', params=params)
 
     def fetch_open_orders(self, symbol):
         """Fetches open orders for a specific symbol."""
