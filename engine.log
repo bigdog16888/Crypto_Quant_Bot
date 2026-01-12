@@ -914,3 +914,8 @@
 2026-01-08 22:37:53,959 - engine.exchange_interface - ERROR - Logic/Exchange error on fetch_ohlcv: binance {"code":-5000,"msg":"Path /fapi/v1/capital/config/getall, Method GET is invalid"}
 2026-01-08 22:37:53,959 - BotRunner - ERROR - Error processing bot PaperTestBot: binance {"code":-5000,"msg":"Path /fapi/v1/capital/config/getall, Method GET is invalid"}
 2026-01-08 22:37:53,959 - BotRunner - INFO - Cycle complete.
+System check write test.
+System check write test.
+System check write test.
+System check write test.
+System check write test.

@@ -4,6 +4,17 @@ from dotenv import load_dotenv
 load_dotenv()
 
 class Config:
+    # --- Path Configuration (Universal) ---
+    ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    
+    PATHS = {
+        "PID_FILE": os.path.join(ROOT_DIR, "engine.pid"),
+        "STOP_FILE": os.path.join(ROOT_DIR, "engine.stop"),
+        "EMERGENCY_FILE": os.path.join(ROOT_DIR, "engine.emergency"),
+        "LOG_FILE": os.path.join(ROOT_DIR, "engine.log"),
+        "DB_FILE": os.path.join(ROOT_DIR, "crypto_bot.db"),
+    }
+
     API_KEY = os.getenv("BINANCE_API_KEY")
     API_SECRET = os.getenv("BINANCE_API_SECRET")
     
@@ -11,7 +22,7 @@ class Config:
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
     TESTNET = os.getenv("TESTNET", "True").lower() == "true"
     
-    ALLOWED_SYMBOLS = os.getenv("ALLOWED_SYMBOLS", "BTC/USDT,ETH/USDT").split(",")
+    ALLOWED_SYMBOLS = os.getenv("ALLOWED_SYMBOLS", "BTC/USDT,ETH/USDT,SOL/USDT,BNB/USDT,XRP/USDT,BTC/USDC,ETH/USDC,SOL/USDC").split(",")
     MARKET_TYPE = os.getenv("MARKET_TYPE", "future").lower() # 'spot' or 'future' (USDT-M) or 'swap'
     MAX_ORDER_USD = float(os.getenv("MAX_ORDER_USD", 100))
     

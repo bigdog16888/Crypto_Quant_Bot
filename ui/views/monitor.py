@@ -6,18 +6,21 @@ import ccxt
 from engine.exchange_interface import ExchangeInterface
 from engine.database import get_connection
 
+from config.settings import config
+
 def render_monitor_view():
     st.header("📊 Live Market Monitor")
     
     # --- Control Bar ---
     col1, col2, col3 = st.columns([2, 1, 1])
     with col1:
-        symbol = st.selectbox("Select Symbol", ["BTC/USDT", "ETH/USDT", "SOL/USDT", "DOGE/USDT"], key="monitor_symbol")
+        # Use config for symbols
+        symbol = st.selectbox("Select Symbol", config.ALLOWED_SYMBOLS, key="monitor_symbol")
     with col2:
         timeframe = st.selectbox("Timeframe", ["1m", "5m", "15m", "30m", "1h", "4h", "1d"], index=4, key="monitor_tf")
     with col3:
         st.write("") # Spacer
-        if st.button("🔄 Refresh", use_container_width=True):
+        if st.button("🔄 Refresh"):
             st.session_state.last_refresh = time.time()
     
     # --- Fetch Data ---
@@ -156,5 +159,44 @@ def render_monitor_view():
             
     except Exception as e:
         st.error(f"Error loading monitor: {e}")
+
+    st.divider()
+    
+    # --- 🆕 Portfolio Overview Section ---
+    st.subheader("📋 Active Positions (All Bots)")
+    try:
+        conn = get_connection()
+        # Fetch all active bots with trade info
+        query_all = """
+            SELECT b.name, b.pair, b.direction, t.current_step, t.total_invested, t.avg_entry_price, t.target_tp_price 
+            FROM bots b
+            LEFT JOIN trades t ON b.id = t.bot_id
+            WHERE b.is_active = 1
+        """
+        df_bots = pd.read_sql_query(query_all, conn)
+        conn.close()
+        
+        if not df_bots.empty:
+            # Format columns for display
+            df_bots['P/L'] = "Calculating..." # Placeholder for now, hard to calc for all without fetch_ticker for each
+            st.dataframe(
+                df_bots,
+                column_config={
+                    "name": "Bot Name",
+                    "pair": "Symbol",
+                    "direction": "Side",
+                    "current_step": "Step",
+                    "total_invested": st.column_config.NumberColumn("Invested ($)", format="$%.2f"),
+                    "avg_entry_price": st.column_config.NumberColumn("Entry Price", format="$%.2f"),
+                    "target_tp_price": st.column_config.NumberColumn("Target TP", format="$%.2f"),
+                },
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            st.info("No active bots running.")
+            
+    except Exception as e:
+        st.error(f"Could not load portfolio: {e}")
 
     st.caption(f"Visualizing live data for **{symbol}** via CCXT.")

@@ -111,7 +111,7 @@ def render_bot_manager_view():
         
         st.divider()
 
-    # Edit Form (Appears below or as a modal equivalent)
+        # Edit Form (Appears below or as a modal equivalent)
     if editing_bot_id:
         render_edit_form(editing_bot_id)
 
@@ -141,6 +141,23 @@ def render_edit_form(bot_id):
         new_mm = col6.number_input("Martingale Multiplier", value=float(martingale_multiplier), key=f"edit_mm_{bot_id}")
         new_rsi = col7.number_input("RSI Limit (Classic)", value=float(rsi_limit), help="Only for Classic logic.", key=f"edit_rsi_{bot_id}")
 
+        # --- NEW: Take Profit Editing ---
+        st.markdown("#### Take Profit Logic")
+        curr_tp_type = config_dict.get('TakeProfitType', 'USD')
+        # Map USD -> index 0, Percent -> index 1
+        tp_type_idx = 0 if curr_tp_type == 'USD' else 1
+        
+        new_tp_type = st.radio("TP Mode", ["Dollar Target ($)", "Percentage (%)"], index=tp_type_idx, horizontal=True, key=f"edit_tp_type_{bot_id}")
+        
+        if new_tp_type == "Dollar Target ($)":
+            new_tp_base = st.number_input("Take Profit Target ($USDC)", min_value=1.0, step=1.0, value=float(config_dict.get('TakeProfitBase', 10.0)), key=f"edit_tp_base_{bot_id}")
+            config_dict['TakeProfitType'] = 'USD'
+            config_dict['TakeProfitBase'] = new_tp_base
+        else:
+            new_tp_pct = st.number_input("Take Profit Target (%)", min_value=0.1, step=0.1, value=float(config_dict.get('TakeProfitPct', 1.0)), key=f"edit_tp_pct_{bot_id}")
+            config_dict['TakeProfitType'] = 'Percent'
+            config_dict['TakeProfitPct'] = new_tp_pct
+
         # Math Projection in Editor
         try:
             from engine.exchange_interface import ExchangeInterface
@@ -153,7 +170,12 @@ def render_edit_form(bot_id):
             ohlcv = exchange.fetch_ohlcv(pair if pair else "BTC/USDT", timeframe='1m', limit=1)
             curr_p = ohlcv[0][4] if ohlcv else 40000.0
             
-            projections = temp_strat.calculate_projections(base_price=curr_p)
+            # Pass ATR context for grid
+            # Assume 1h ATR for simplicity in editor projection or add dropdown
+            # For now, use a default ATR or calculate
+            p_atr = 20.0
+            
+            projections = temp_strat.calculate_projections(base_price=curr_p, current_atr=p_atr)
             with st.expander("🔍 Editor Risk Projection & Math Summary", expanded=False):
                 st.caption(f"Simulated levels starting at: **{curr_p:,.2f}**")
                 proj_df = pd.DataFrame(projections)
@@ -165,6 +187,12 @@ def render_edit_form(bot_id):
                 if hedge_steps:
                     h1 = hedge_steps[0]
                     st.info(f"🛡️ **Hedge Summary**: At Step {h1['step']} (Price: {h1['price']}), a hedge of **${h1['hedge_size_usdc']}** activates.")
+                else:
+                    if config_dict.get('UseHedge'):
+                        st.warning("⚠️ Hedge enabled but not triggered in max steps.")
+                    else:
+                        st.info("No Hedge Configured.")
+                        
         except Exception as e:
             st.warning(f"Projection skip: {e}")
 
@@ -213,6 +241,15 @@ def render_edit_form(bot_id):
                     config_dict[f'pat_{idx}_source'] = c_p2.selectbox(f"Source ##{idx}", ["Price", "RSI", "CCI"], index=["Price", "RSI", "CCI"].index(config_dict.get(f'pat_{idx}_source', "Price")), key=f"edit_p_src_{idx}_{bot_id}")
                     config_dict[f'pat_{idx}_tf'] = c_p3.selectbox(f"TF ##{idx}", ["1m","5m","15m","1h","4h","1d"], index=["1m","5m","15m","1h","4h","1d"].index(config_dict.get(f'pat_{idx}_tf', "5m")), key=f"edit_p_tf_{idx}_{bot_id}")
                     config_dict[f'pat_{idx}_count'] = c_p4.number_input(f"Count ##{idx}", min_value=1, value=int(config_dict.get(f'pat_{idx}_count', 3)), key=f"edit_p_count_{idx}_{bot_id}")
+
+        st.markdown("#### Risk Management")
+        rm1, rm2, rm3 = st.columns(3)
+        with rm1:
+            config_dict['UseATRGrid'] = st.checkbox("Use ATR Grid", value=config_dict.get('UseATRGrid', True), key=f"edit_atr_grid_{bot_id}")
+        with rm2:
+            config_dict['ATRGridFactor'] = st.number_input("ATR Factor", value=float(config_dict.get('ATRGridFactor', 1.0)), key=f"edit_atr_fac_{bot_id}")
+        with rm3:
+            config_dict['base_grid'] = st.number_input("Fixed Step", value=float(config_dict.get('base_grid', 100.0)), key=f"edit_base_grid_{bot_id}")
 
         st.markdown("#### Advanced Exit & Hedge Settings")
         col_ee1, col_ee2, col_ee3, col_ee4 = st.columns(4)

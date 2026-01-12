@@ -1,14 +1,15 @@
 # Streamlit Main App Entry Point
 # Updated for force reload
 import streamlit as st
-
+import time
 import os
 import sys
 import subprocess
 from dotenv import load_dotenv, set_key, find_dotenv
 
 # Add root to sys.path to ensure module resolution
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(ROOT_DIR)
 
 from engine.database import init_db
 from config.settings import config
@@ -67,13 +68,20 @@ with st.sidebar:
     dotenv_path = find_dotenv()
     if not dotenv_path:
         dotenv_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env')
+    
+    # Reload env to ensure fresh read
+    load_dotenv(dotenv_path, override=True)
 
-    api_key = st.text_input("Binance API Key", value=os.getenv("BINANCE_API_KEY", ""), type="password")
-    api_secret = st.text_input("Binance API Secret", value=os.getenv("BINANCE_API_SECRET", ""), type="password")
+    # Use config as primary, os.getenv as fallback
+    current_key = config.API_KEY if config.API_KEY else os.getenv("BINANCE_API_KEY", "")
+    current_secret = config.API_SECRET if config.API_SECRET else os.getenv("BINANCE_API_SECRET", "")
+
+    api_key = st.text_input("Binance API Key", value=current_key, type="password")
+    api_secret = st.text_input("Binance API Secret", value=current_secret, type="password")
     
     st.divider()
     
-    if st.button("Apply Settings", use_container_width=True):
+    if st.button("Apply Settings"):
         if api_key and api_secret:
             try:
                 # 1. Update .env file on disk
@@ -91,7 +99,7 @@ with st.sidebar:
                 st.success("✅ Credentials Saved!")
                 
                 # 4. Check if engine is running and warn
-                if os.path.exists("engine.pid"):
+                if os.path.exists(config.PATHS["PID_FILE"]):
                     st.warning("⚠️ Engine is running! Please RESTART Monitoring below to apply changes.")
                     
             except Exception as e:
@@ -102,7 +110,9 @@ with st.sidebar:
     st.divider()
     st.header("🛠️ Engine Control")
     
-    PID_FILE = "engine.pid"
+    PID_FILE = config.PATHS["PID_FILE"]
+    STOP_FILE = config.PATHS["STOP_FILE"]
+    EMERGENCY_FILE = config.PATHS["EMERGENCY_FILE"]
     
     def is_engine_running():
         if os.path.exists(PID_FILE):
@@ -119,23 +129,37 @@ with st.sidebar:
     engine_running, pid = is_engine_running()
     
     if not engine_running:
-        if st.button("▶️ Start Monitoring", use_container_width=True):
+        if st.button("▶️ Start Monitoring"):
             # Start engine logic...
             CREATE_NEW_CONSOLE = 0x00000010 # For Windows to run detached
-            process = subprocess.Popen([sys.executable, "engine/runner.py"], creationflags=CREATE_NEW_CONSOLE)
-            with open("engine.pid", "w") as f:
+            runner_path = os.path.join(ROOT_DIR, "engine", "runner.py")
+            process = subprocess.Popen([sys.executable, runner_path], creationflags=CREATE_NEW_CONSOLE)
+            with open(PID_FILE, "w") as f:
                 f.write(str(process.pid))
-            st.success("Monitoring service started.")
+            st.success("Monitoring service started. Refreshing page...")
+            time.sleep(2) # Give it a moment
             st.rerun()
     else:
         st.success(f"Monitoring Running (PID: {pid})")
-        if st.button("🛑 Stop Monitoring", use_container_width=True):
-            with open("engine.stop", "w") as f:
+        if st.button("🛑 Stop Monitoring"):
+            with open(STOP_FILE, "w") as f:
                 f.write("stop")
-            st.warning("Stop signal sent. Waiting for graceful shutdown...")
+            st.warning("Stop signal sent. Waiting for shutdown...")
+            
+            # Simple spin-wait for feedback
+            for _ in range(10):
+                if not os.path.exists(PID_FILE):
+                    break
+                time.sleep(1)
+                
+            st.success("Stopped!")
             st.rerun()
         
-        if st.button("💀 Force Kill Monitoring", use_container_width=True, type="secondary"):
+        if st.button("💀 Force Kill Monitoring", type="secondary"):
+            if pid is None:
+                st.error("Cannot kill: PID not found.")
+                st.rerun()
+                
             # Attempt to kill by PID first
             try:
                 os.kill(pid, 9) # SIGKILL
@@ -148,8 +172,8 @@ with st.sidebar:
             else:
                 subprocess.run(["kill", "-9", str(pid)], capture_output=True)
 
-            if os.path.exists("engine.pid"): os.remove("engine.pid")
-            if os.path.exists("engine.stop"): os.remove("engine.stop")
+            if os.path.exists(PID_FILE): os.remove(PID_FILE)
+            if os.path.exists(STOP_FILE): os.remove(STOP_FILE)
             st.error("Engine force-killed.")
             st.rerun()
 
@@ -159,7 +183,7 @@ with st.sidebar:
     if 'show_emergency_confirm' not in st.session_state:
         st.session_state['show_emergency_confirm'] = False
 
-    if st.button("🚨 EMERGENCY: CLOSE ALL", use_container_width=True, type="primary"):
+    if st.button("🚨 EMERGENCY: CLOSE ALL", type="primary"):
         st.session_state['show_emergency_confirm'] = True
 
     if st.session_state.get('show_emergency_confirm'):
@@ -170,15 +194,15 @@ with st.sidebar:
         col_c1, col_c2 = st.columns(2)
         with col_c1:
             confirm_disabled = (conf_input.lower().strip() != "liquidate")
-            if st.button("🔥YES, CLOSE EVERYTHING", use_container_width=True, disabled=confirm_disabled):
+            if st.button("🔥YES, CLOSE EVERYTHING", disabled=confirm_disabled):
                 # Trigger Emergency Signal
-                with open("engine.emergency", "w") as f:
+                with open(EMERGENCY_FILE, "w") as f:
                     f.write("emergency")
                 st.session_state['show_emergency_confirm'] = False
                 st.error("🚨 Emergency Liquidation Signal Sent! 🚨")
                 st.rerun()
         with col_c2:
-            if st.button("🔙CANCEL", use_container_width=True):
+            if st.button("🔙CANCEL"):
                 st.session_state['show_emergency_confirm'] = False
                 st.rerun()
 

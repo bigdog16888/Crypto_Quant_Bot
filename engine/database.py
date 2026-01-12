@@ -1,7 +1,9 @@
 import sqlite3
 import os
 
-DB_PATH = "crypto_bot.db"
+# Use absolute path to ensure database is found regardless of working directory
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DB_PATH = os.path.join(BASE_DIR, "crypto_bot.db")
 
 def get_connection():
     """Returns a connection to the SQLite database."""

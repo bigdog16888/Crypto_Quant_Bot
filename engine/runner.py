@@ -20,7 +20,7 @@ logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL),
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("engine.log"),
+        logging.FileHandler(config.PATHS["LOG_FILE"]),
         logging.StreamHandler()
     ]
 )
@@ -62,7 +62,8 @@ class BotRunner:
                 raise ValueError("Failed to fetch balance on init")
                 
             # Assuming single-asset collateral (USDT) for simplicity in this version
-            usdt_bal = balance.get('USDT') or {}
+            usdt_bal = balance.get('USDT')
+            if not isinstance(usdt_bal, dict): usdt_bal = {}
             usdt_total = usdt_bal.get('total', 0.0)
             
             # Add estimated value of open positions (from DB)
@@ -97,10 +98,14 @@ class BotRunner:
             if not balance:
                 return # Skip check if API fail
                 
-            usdt_bal = balance.get('USDT') or {}
-            usdt_total = usdt_bal.get('total', 0.0)
+            # usdt_bal = balance.get('USDT') or {}
+            # usdt_total = usdt_bal.get('total', 0.0)
             
             # Approximate current equity
+            usdt_bal = balance.get('USDT')
+            if not isinstance(usdt_bal, dict): usdt_bal = {}
+            usdt_total = usdt_bal.get('total', 0.0)
+            
             # Note: This ignores PnL of open positions, looking only at "Cash + Invested Cost"
             # To be stricter, we should fetch live PnL, but that requires checking every ticker.
             # For v0.4, we monitor "Realized Losses" effectively. 
@@ -125,7 +130,16 @@ class BotRunner:
                     # For safety, we might just check "Realized Drawdown" (Cash + Cost).
                     current_pos_value += invested # Placeholder for Mark Value
             
-            current_equity = usdt_total + invested_cost 
+            # usdt_bal = balance.get('USDT')
+            # if not isinstance(usdt_bal, dict): usdt_bal = {}
+            # usdt_total = usdt_bal.get('total', 0.0)
+
+            # Recalculate or use initial values if refreshed
+            usdt_bal = balance.get('USDT')
+            if not isinstance(usdt_bal, dict): usdt_bal = {}
+            usdt_total = usdt_bal.get('total', 0.0)
+            
+            current_equity = usdt_total + invested_cost
             # Note: This creates a flaw where floating loss isn't caught until close. 
             # But it protects against "Series of Bad Trades" draining the account.
             
@@ -137,7 +151,7 @@ class BotRunner:
                 self.circuit_breaker_triggered = True
                 
                 # Create emergency file to trigger handler
-                with open("engine.emergency", "w") as f:
+                with open(config.PATHS["EMERGENCY_FILE"], "w") as f:
                     f.write("CIRCUIT_BREAKER")
                     
         except Exception as e:
@@ -299,15 +313,15 @@ class BotRunner:
             open_orders = self.exchange.fetch_open_orders(pair)
             
             # Separate Bid/Ask
-            current_bids = [o for o in open_orders if o['side'] == 'buy']
-            current_asks = [o for o in open_orders if o['side'] == 'sell']
+            current_bids = [o for o in open_orders if o.get('side') == 'buy'] if open_orders else []
+            current_asks = [o for o in open_orders if o.get('side') == 'sell'] if open_orders else []
             
             # --- Bid Logic ---
             if not current_bids:
                 self.execute_entry(bot_id, name, pair, 'buy', strategy.order_size, price=ideal_bid, params={'postOnly': True})
             else:
-                best_bid = max(current_bids, key=lambda x: x['price'])
-                bid_price = float(best_bid['price'])
+                best_bid = max(current_bids, key=lambda x: float(x.get('price', 0)))
+                bid_price = float(best_bid.get('price', 0))
                 
                 # Check deviation
                 diff = abs(bid_price - ideal_bid) / ideal_bid
@@ -320,9 +334,10 @@ class BotRunner:
             if not current_asks:
                 self.execute_entry(bot_id, name, pair, 'sell', strategy.order_size, price=ideal_ask, params={'postOnly': True})
             else:
-                best_ask = min(current_asks, key=lambda x: x['price'])
-                ask_price = float(best_ask['price'])
+                best_ask = min(current_asks, key=lambda x: float(x.get('price', 0)))
+                ask_price = float(best_ask.get('price', 0))
                 
+                # Check deviation
                 diff = abs(ask_price - ideal_ask) / ideal_ask
                 if diff > strategy.reprice_threshold:
                     logger.info(f"MM {name}: Repricing Ask. Old: {ask_price}, New: {ideal_ask}")
@@ -375,15 +390,15 @@ class BotRunner:
         self.check_circuit_breaker()
 
         # 1. Check for Emergency Signal (Higher Priority)
-        if os.path.exists("engine.emergency"):
+        if os.path.exists(config.PATHS["EMERGENCY_FILE"]):
             logger.critical("🚨 EMERGENCY SIGNAL DETECTED! LIQUIDATING ALL 🚨")
             self.handle_emergency_liquidation()
             self.running = False
-            if os.path.exists("engine.emergency"): os.remove("engine.emergency")
+            if os.path.exists(config.PATHS["EMERGENCY_FILE"]): os.remove(config.PATHS["EMERGENCY_FILE"])
             return False
 
         # 2. Check for standard stop signal
-        if os.path.exists("engine.stop"):
+        if os.path.exists(config.PATHS["STOP_FILE"]):
             logger.info("Stop signal detected. Exiting gracefully...")
             self.running = False
             return False
@@ -394,7 +409,7 @@ class BotRunner:
         
         for bot in bots:
             # Re-check signals inside loop
-            if os.path.exists("engine.emergency") or os.path.exists("engine.stop"):
+            if os.path.exists(config.PATHS["EMERGENCY_FILE"]) or os.path.exists(config.PATHS["STOP_FILE"]):
                 break
             self.process_bot(bot)
             
@@ -422,7 +437,11 @@ class BotRunner:
                     # Fetch position (assuming spot, we check balance of base asset)
                     base_currency = pair.split('/')[0]
                     balance = self.exchange.fetch_balance()
-                    qty = balance.get(base_currency, {}).get('free', 0.0)
+                    qty_dict = balance.get(base_currency)
+                    if isinstance(qty_dict, dict):
+                        qty = qty_dict.get('free', 0.0)
+                    else:
+                        qty = 0.0
                     
                     # Validate against MinQty to avoid error loop
                     # Simplified Market Sell
@@ -442,8 +461,8 @@ if __name__ == "__main__":
     runner = BotRunner()
     runner.running = True
     
-    STOP_FILE = "engine.stop"
-    PID_FILE = "engine.pid"
+    STOP_FILE = config.PATHS["STOP_FILE"]
+    PID_FILE = config.PATHS["PID_FILE"]
 
     # Ensure stop file is gone at start
     if os.path.exists(STOP_FILE): os.remove(STOP_FILE)

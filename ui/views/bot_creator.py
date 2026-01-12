@@ -80,6 +80,9 @@ def render_bot_creator_view():
             st.warning(f"Could not load ATR Foundation: {e}")
 
     # --- Configuration Sections ---
+    # Initialize config dictionary early to avoid UnboundLocalError
+    config = {}
+    
     with st.form("deploy_bot_form"):
         st.subheader("General Settings")
         col1, col2 = st.columns(2)
@@ -89,43 +92,74 @@ def render_bot_creator_view():
             strategy_type = st.selectbox("Strategy Logic", ["MQL4", "Market Maker"], help="MQL4: 11-Trigger Confluence. MM: Spread-based Market Making.")
             timeframe = st.selectbox("Execution Timeframe", ["1m", "5m", "15m", "1h", "4h", "1d"], index=1, help="Scanning frequency.")
         
-        with col2:
-            base_size = st.number_input("Base Order Size ($USDC)", min_value=1.0, step=10.0, value=10.0)
-            martingale_multiplier = st.number_input("Martingale Multiplier", min_value=1.0, step=0.1, value=1.5)
-            
-            # Projection Table for Sizing
-            from engine.strategies.mql4_strategy import MQL4Strategy
-            temp_strat = MQL4Strategy(params={'base_size': base_size, 'martingale_multiplier': martingale_multiplier, 'direction': direction})
-            
-            try:
-                if df_f is not None and not df_f.empty:
-                    current_price = df_f['close'].iloc[-1]
-                    p_atr = atr_data.get(timeframe, {}).get('atr', 10.0)
-                    projections = temp_strat.calculate_projections(base_price=current_price, current_atr=p_atr)
-                    
-                    with st.expander("🔍 Risk Projection & Math Summary ($USDC)", expanded=False):
-                        st.caption(f"Simulated Martingale Grid based on current price: **{current_price:,.2f}**")
-                        proj_df = pd.DataFrame(projections)
-                        
-                        if not proj_df.empty:
-                            proj_df.columns = ["Step", "Grid Price", "Order ($)", "Total Inv. ($)", "TP Price", "Hedge Size", "Is Hedge"]
-                            st.table(proj_df)
-                        
-                        hedge_steps = [p for p in projections if p['is_hedge']]
-                        if hedge_steps:
-                            h1 = hedge_steps[0]
-                            st.info(f"🛡️ **Hedge Summary**: At Step {h1['step']} (Price: {h1['price']}), a hedge of **${h1['hedge_size_usdc']}** activates.")
-                        else:
-                            st.warning("⚠️ No Hedge configured.")
+            with col2:
+                base_size = st.number_input("Base Order Size ($USDC)", min_value=1.0, step=10.0, value=10.0)
+                martingale_multiplier = st.number_input("Martingale Multiplier", min_value=1.0, step=0.1, value=1.5)
+                
+                # --- NEW: Take Profit Input with Selection ---
+                st.markdown("**Take Profit Logic**")
+                tp_type = st.radio("TP Mode", ["Dollar Target ($)", "Percentage (%)"], index=0, horizontal=True)
+                
+                if tp_type == "Dollar Target ($)":
+                    take_profit_base = st.number_input("Take Profit Target ($USDC)", min_value=1.0, step=1.0, value=10.0, help="Dollar Profit Target per Cycle")
+                    config['TakeProfitBase'] = take_profit_base
+                    config['TakeProfitType'] = 'USD'
+                    # Explicitly define for scope safety
+                    take_profit_pct = 0.0 
                 else:
-                    st.info("Market data unavailable for projection.")
-            except Exception as e:
-                st.error(f"Projection Error: {e}")
+                    take_profit_pct = st.number_input("Take Profit Target (%)", min_value=0.1, step=0.1, value=1.0, help="Percentage Profit Target per Cycle")
+                    config['TakeProfitPct'] = take_profit_pct
+                    config['TakeProfitType'] = 'Percent'
+                    # Explicitly define for scope safety
+                    take_profit_base = 0.0
 
-            rsi_limit = st.slider("RSI Limit (for Classic)", 0, 100, 30, help="Only used if Strategy Logic is 'Classic'.")
+                # Projection Table for Sizing
+                from engine.strategies.mql4_strategy import MQL4Strategy
+                
+                # Pass params for projection
+                proj_params = {
+                    'base_size': base_size, 
+                    'martingale_multiplier': martingale_multiplier, 
+                    'direction': direction,
+                    'UseHedge': False # Will update below
+                }
+                
+                if tp_type == "Dollar Target ($)":
+                    proj_params['TakeProfitBase'] = take_profit_base
+                else:
+                    proj_params['TakeProfitPct'] = take_profit_pct
+                    
+                temp_strat = MQL4Strategy(params=proj_params)
+        
+        try:
+            if df_f is not None and not df_f.empty:
+                current_price = df_f['close'].iloc[-1]
+                p_atr = atr_data.get(timeframe, {}).get('atr', 10.0)
+                projections = temp_strat.calculate_projections(base_price=current_price, current_atr=p_atr)
+                
+                with st.expander("🔍 Risk Projection & Math Summary ($USDC)", expanded=False):
+                    st.caption(f"Simulated Martingale Grid based on current price: **{current_price:,.2f}**")
+                    proj_df = pd.DataFrame(projections)
+                    
+                    if not proj_df.empty:
+                        proj_df.columns = ["Step", "Grid Price", "Order ($)", "Total Inv. ($)", "TP Price", "Hedge Size", "Is Hedge"]
+                        st.table(proj_df)
+                    
+                    hedge_steps = [p for p in projections if p['is_hedge']]
+                    if hedge_steps:
+                        h1 = hedge_steps[0]
+                        st.info(f"🛡️ **Hedge Summary**: At Step {h1['step']} (Price: {h1['price']}), a hedge of **${h1['hedge_size_usdc']}** activates.")
+                    else:
+                        st.warning("⚠️ No Hedge configured.")
+            else:
+                st.info("Market data unavailable for projection.")
+        except Exception as e:
+            st.error(f"Projection Error: {e}")
+
+        rsi_limit = st.slider("RSI Limit (for Classic)", 0, 100, 30, help="Only used if Strategy Logic is 'Classic'.")
 
         st.divider()
-        config = {}
+        # config = {} # REMOVED: Re-initialization cleared previous values
 
         if strategy_type == "Market Maker":
             with st.expander("Market Maker Configuration", expanded=True):
@@ -206,9 +240,14 @@ def render_bot_creator_view():
             st.divider()
 
         with st.expander("Risk Management (Martingale & Grid)", expanded=False):
-            st.subheader("Dynamic Grid (ATR)")
-            config['UseATRGrid'] = st.checkbox("Use ATR Dynamic Grid", value=True)
-            config['ATRGridFactor'] = st.number_input("ATR Grid Factor", value=1.0)
+            st.subheader("Grid Logic")
+            config['UseATRGrid'] = st.checkbox("Use ATR Dynamic Grid", value=True, help="If OFF, uses fixed 'Base Grid' distance.")
+            
+            g_col1, g_col2 = st.columns(2)
+            with g_col1:
+                config['ATRGridFactor'] = st.number_input("ATR Grid Factor", value=1.0, step=0.1, help="Multiplier for ATR. < 1.0 = tighter grid.")
+            with g_col2:
+                config['base_grid'] = st.number_input("Fixed Grid Step (Price)", value=100.0, step=10.0, help="Used if ATR Grid is OFF. Absolute price change.")
             
         with st.expander("Trade Management (Exit & Hedge)", expanded=False):
             st.subheader("Accelerated Early Exit (Smart Decay)")
@@ -234,9 +273,18 @@ def render_bot_creator_view():
                 config['post_exit_stop'] = st.checkbox("Stop After Cycle", value=False)
 
             st.subheader("Hedging")
-            config['UseHedge'] = st.checkbox("Use Hedging", value=False)
+            use_hedge = st.checkbox("Use Hedging", value=False)
+            config['UseHedge'] = use_hedge
             config['HedgeStartStep'] = st.number_input("Hedge Start Step (1-10)", min_value=1, max_value=10, value=7)
             config['HedgeStart'] = st.number_input("Hedge Start (DD%)", value=20.0)
+
+            # Update Temp Strat for Projection if Hedging is toggled
+            if use_hedge:
+                 temp_strat.params['UseHedge'] = True
+                 temp_strat.params['HedgeStartStep'] = config['HedgeStartStep']
+                 # Re-run projection to show hedge
+                 if df_f is not None and not df_f.empty and current_price > 0:
+                     projections = temp_strat.calculate_projections(base_price=current_price, current_atr=p_atr)
 
         submitted = st.form_submit_button("Deploy Bot", type="primary")
     

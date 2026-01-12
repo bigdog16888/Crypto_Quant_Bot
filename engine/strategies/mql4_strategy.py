@@ -109,7 +109,7 @@ class MQL4Strategy(BaseStrategy):
             
         # Map string tf to pandas alias
         tf_map = {'1m': '1min', '5m': '5min', '15m': '15min', '30m': '30min', '1h': '1h', '4h': '4h', '1d': '1D'}
-        pd_tf = tf_map.get(timeframe, '1H')
+        pd_tf = tf_map.get(timeframe, '1h')
         
         try:
             # Ensure index is datetime
@@ -315,8 +315,17 @@ class MQL4Strategy(BaseStrategy):
         
         # Grid Distance math
         grid_pips = self.params.get('base_grid', 25.0)
-        if self.use_atr_grid and current_atr:
-            grid_pips = current_atr * self.params.get('atr_grid_factor', 1.0)
+        
+        if self.use_atr_grid:
+            # Use ATR from params if provided (for projection), else default
+            current_atr = current_atr if current_atr is not None else 20.0
+            grid_pips = current_atr * self.params.get('ATRGridFactor', 1.0)
+        
+        # Ensure grid_pips is reasonable for crypto prices
+        # If ATR is "Huge" (daily), and we use it directly, grid steps might be massive.
+        # User concern: "Huge ATR".
+        # Logic: If price ~40k, ATR ~1000. Grid step 1000 is 2.5%.
+        # If user wants smaller steps, they should reduce ATRGridFactor (e.g. 0.1) OR use fixed pips.
         
         direction = 1 if self.params.get('direction', 'LONG').upper() == 'LONG' else -1
         fee_rate = self.params.get('fee_rate', 0.001)
@@ -338,10 +347,20 @@ class MQL4Strategy(BaseStrategy):
             
             avg_price = total_cost_basis / total_qty
             
-            # TP Price: Break-even + (target_usd / total_qty)
-            # For LONG: tp = avg + (target / total_qty)
-            # For SHORT: tp = avg - (target / total_qty)
-            tp_price = avg_price + (tp_target_usd / total_qty * direction)
+            # TP Price Calculation (Dollar vs Percent)
+            tp_type = self.params.get('TakeProfitType', 'USD') # Default USD for backward compat
+            
+            if tp_type == 'Percent':
+                # TP = AvgPrice * (1 + pct)
+                tp_pct = self.params.get('TakeProfitPct', 1.0) / 100.0
+                if direction == 1: # LONG
+                    tp_price = avg_price * (1 + tp_pct)
+                else: # SHORT
+                    tp_price = avg_price * (1 - tp_pct)
+            else:
+                # Dollar TP: Break-even + (target_usd / total_qty)
+                tp_target_usd = self.params.get('TakeProfitBase', 10.0)
+                tp_price = avg_price + (tp_target_usd / total_qty * direction)
             
             is_hedge = i + 1 >= hedge_step if self.params.get('UseHedge') else False
             hedge_size = round(total_invested, 2) if is_hedge else 0.0

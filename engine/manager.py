@@ -176,8 +176,26 @@ def manage_trade(bot_id, bot_name, pair, direction, settings, trade_data, curren
             # Avg Price = Price1*S1 + Price2*S2 / (S1+S2)
             new_avg = (avg_entry_price * total_invested + current_price * added_investment) / new_total
             
-            # Simple TP logic (e.g. 1% profit) - in real scenario, strategy would provide this
-            new_tp = new_avg * (1.01 if direction == 'LONG' else 0.99) 
+            # Recalculate TP based on settings (support both USD and Pct)
+            tp_type = settings.get('TakeProfitType', 'USD')
+            new_tp = 0.0
+            
+            # Estimate total qty (approx for USD calculation)
+            # Crypto is Base/Quote. Investment is Quote. Qty is Base.
+            # Qty = Investment / Price
+            # This is an approximation since we don't have exact Qty in trade_data tuple passed here
+            # But for updating the DB, we need a valid target.
+            
+            if tp_type == 'Percent':
+                tp_pct = settings.get('TakeProfitPct', 1.0) / 100.0
+                new_tp = new_avg * (1.0 + tp_pct) if direction == 'LONG' else new_avg * (1.0 - tp_pct)
+            else:
+                # Dollar TP
+                target_usd = settings.get('TakeProfitBase', 10.0)
+                # We need estimated qty to calc price distance
+                est_qty = new_total / new_avg
+                dist = target_usd / est_qty
+                new_tp = new_avg + dist if direction == 'LONG' else new_avg - dist
             
             update_martingale_step(bot_id, next_step, added_investment, new_avg, new_tp)
             return {'action': 'grid_step', 'step': next_step}
