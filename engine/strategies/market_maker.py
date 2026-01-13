@@ -54,7 +54,21 @@ class MarketMakerStrategy(BaseStrategy):
             
         return ideal_bid, ideal_ask
 
-    def check_signals(self, df):
+    def calculate_lot_size(self, current_step: int, account_balance: float) -> float:
+        """
+        Returns the order size for market making.
+        Market makers typically use fixed size, not martingale.
+        """
+        return self.order_size
+    
+    def calculate_grid_distance(self, current_step: int, market_data) -> float:
+        """
+        Market makers don't use traditional grid.
+        Returns spread as the effective "distance".
+        """
+        return self.spread_pct
+
+    def check_signals(self, market_data):
         """
         Market Makers don't use 'signals' like directional bots.
         They run a continuous loop. This method is kept for compatibility

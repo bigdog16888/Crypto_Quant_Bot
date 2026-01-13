@@ -209,6 +209,15 @@ with st.sidebar:
 # Main Area - Tabs
 st.title("🤖 Multi-Bot Crypto Trading System")
 
+# ========== TESTNET/SAFETY WARNING BANNER ==========
+if config.TESTNET:
+    st.warning("⚠️ **TESTNET MODE ACTIVE** - Trading on Binance Futures Testnet. No real funds at risk.")
+elif config.DRY_RUN:
+    st.info("🧪 **DRY RUN MODE** - Orders are simulated, not sent to exchange.")
+else:
+    st.error("🔴 **LIVE TRADING MODE** - Real funds at risk! Be careful.")
+# ===================================================
+
 tab1, tab2, tab3 = st.tabs(["📊 Live Monitor", "🏗️ Bot Creator", "🛠️ Bot Manager"])
 
 with tab1:

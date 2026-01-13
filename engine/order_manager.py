@@ -14,12 +14,17 @@ class OrderManager:
         """
         self.logger.info(f"Starting limit chase for {side} {amount} {symbol}")
         
-        # Get current ticker
-        ticker = self.exchange.exchange.fetch_ticker(symbol)
-        price = ticker['ask'] if side == 'buy' else ticker['bid']
+        # Get current ticker using safe wrapper
+        price = self.exchange.get_last_price(symbol)
+        if price == 0:
+            self.logger.error(f"Could not get price for {symbol}")
+            return None
         
         order = self.exchange.create_order(symbol, 'limit', side, amount, price)
         
+        if not order:
+            return None
+            
         if order.get('status') == 'dry_run':
             return order
 
@@ -27,20 +32,28 @@ class OrderManager:
         while retries < max_retries:
             time.sleep(5) # Wait for fill
             
-            order_status = self.exchange.exchange.fetch_order(order['id'], symbol)
-            if order_status['status'] == 'closed':
-                self.logger.info("Order filled completely.")
-                return order_status
+            try:
+                order_status = self.exchange.fetch_order(order['id'], symbol)
+                if order_status and order_status.get('status') == 'closed':
+                    self.logger.info("Order filled completely.")
+                    return order_status
+            except Exception as e:
+                self.logger.warning(f"Error fetching order status: {e}")
             
             # Not filled, cancel and move
             self.logger.info(f"Order not filled. Retry {retries + 1}/{max_retries}. Chasing...")
-            self.exchange.exchange.cancel_order(order['id'], symbol)
+            try:
+                self.exchange.cancel_all_orders(symbol)
+            except Exception:
+                pass
             
-            ticker = self.exchange.exchange.fetch_ticker(symbol)
-            price = ticker['ask'] if side == 'buy' else ticker['bid']
+            price = self.exchange.get_last_price(symbol)
+            if price == 0:
+                break
             
-            # Apply offset if needed or just track spread
             order = self.exchange.create_order(symbol, 'limit', side, amount, price)
+            if not order:
+                break
             retries += 1
             
         return order

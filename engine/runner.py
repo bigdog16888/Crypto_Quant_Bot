@@ -8,7 +8,7 @@ import pandas as pd
 # Add root to sys.path to ensure module resolution
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from engine.database import get_connection, init_db, get_bot_status, update_martingale_step
+from engine.database import get_connection, init_db, get_bot_status, update_martingale_step, log_trade
 from engine.exchange_interface import ExchangeInterface
 from engine.strategies.mql4_strategy import MQL4Strategy
 from engine.manager import manage_trade
@@ -35,10 +35,23 @@ class BotRunner:
         # Safety / Circuit Breaker State
         self.initial_equity = 0.0
         self.circuit_breaker_triggered = False
+        
+        # ========== RUNAWAY ORDER PROTECTION ==========
+        # Prevents bugs from placing unlimited orders
+        self.orders_this_cycle = 0
+        self.orders_today = {}  # {bot_id: count}
+        self.last_order_reset = time.time()
+        self.MAX_ORDERS_PER_CYCLE = 10  # Hard cap per 10s cycle
+        self.MAX_ORDERS_PER_BOT_DAILY = 100  # Per-bot daily cap
+        # ===============================================
+        
         self._initialize_safety_baseline()
         
-        # State Synchronization (Phase 9)
-        self.sync_all_bots()
+        # State Synchronization (Phase 9) - wrapped in try/except for crash safety
+        try:
+            self.sync_all_bots()
+        except Exception as e:
+            logger.error(f"Failed to sync bots on startup (non-fatal): {e}")
 
     def sync_all_bots(self):
         """
@@ -61,10 +74,12 @@ class BotRunner:
             if not balance:
                 raise ValueError("Failed to fetch balance on init")
                 
-            # Assuming single-asset collateral (USDT) for simplicity in this version
-            usdt_bal = balance.get('USDT')
-            if not isinstance(usdt_bal, dict): usdt_bal = {}
-            usdt_total = usdt_bal.get('total', 0.0)
+            # Support both USDT and USDC (futures testnet uses USDC)
+            total_stablecoin = 0.0
+            for currency in ['USDT', 'USDC']:
+                curr_bal = balance.get(currency)
+                if isinstance(curr_bal, dict):
+                    total_stablecoin += float(curr_bal.get('total', 0.0))
             
             # Add estimated value of open positions (from DB)
             # This handles restarts where we already have positions
@@ -74,13 +89,12 @@ class BotRunner:
                 # bot: id, name, ..., strategy, config, base, mm, rsi, is_active
                 # We need trade data
                 t_data = get_bot_status(bot[0])
-                if t_data:
-                    invested_sum += t_data[3] # total_invested
+                if t_data and len(t_data) > 3:
+                    invested_sum += float(t_data[3]) # total_invested
             
             # Equity ≈ Cash + Cost Basis of Positions (Simplified)
-            # Ideal would be Mark Value, but Cost Basis is safe baseline
-            self.initial_equity = usdt_total + invested_sum
-            logger.info(f"🛡️ Safety Baseline Initialized. Equity: ${self.initial_equity:.2f} (Cash: {usdt_total:.2f} + Pos: {invested_sum:.2f})")
+            self.initial_equity = total_stablecoin + invested_sum
+            logger.info(f"🛡️ Safety Baseline Initialized. Equity: ${self.initial_equity:.2f} (Cash: {total_stablecoin:.2f} + Pos: {invested_sum:.2f})")
             
         except Exception as e:
             logger.error(f"Failed to initialize safety baseline: {e}")
@@ -90,64 +104,51 @@ class BotRunner:
         """
         Global Circuit Breaker: Checks if account equity has dropped below safe limits.
         """
-        if self.circuit_breaker_triggered or self.initial_equity <= 0:
+        if self.circuit_breaker_triggered:
+            return  # Already triggered, don't check again
+            
+        if self.initial_equity <= 0:
+            logger.warning("Circuit breaker skipped: initial_equity not set (API may have failed on startup)")
             return
 
         try:
             balance = self.exchange.fetch_balance()
             if not balance:
+                logger.warning("Circuit breaker skipped: Could not fetch balance")
                 return # Skip check if API fail
                 
-            # usdt_bal = balance.get('USDT') or {}
-            # usdt_total = usdt_bal.get('total', 0.0)
+            # Support both USDT and USDC (futures testnet uses USDC)
+            total_stablecoin = 0.0
+            for currency in ['USDT', 'USDC']:
+                curr_bal = balance.get(currency)
+                if isinstance(curr_bal, dict):
+                    total_stablecoin += float(curr_bal.get('total', 0.0))
             
-            # Approximate current equity
-            usdt_bal = balance.get('USDT')
-            if not isinstance(usdt_bal, dict): usdt_bal = {}
-            usdt_total = usdt_bal.get('total', 0.0)
-            
-            # Note: This ignores PnL of open positions, looking only at "Cash + Invested Cost"
-            # To be stricter, we should fetch live PnL, but that requires checking every ticker.
-            # For v0.4, we monitor "Realized Losses" effectively. 
-            # If we lose money, USDT drops. total_invested stays same (until closed).
-            # So (Cash + Invested) will drop if we close losers.
-            
-            # We also want to protect against massive floating loss.
-            # Let's sum up current position values.
+            # Sum up invested costs from all bots
             active_bots = self.get_active_bots()
-            current_pos_value = 0.0
             invested_cost = 0.0
             
             for bot in active_bots:
                 bot_id = bot[0]
                 t_data = get_bot_status(bot_id)
-                if t_data and t_data[3] > 0:
-                    invested = t_data[3]
-                    invested_cost += invested
-                    # Estimate current value: need price
-                    # This API call overhead might be high for many bots. 
-                    # Optimization: Use price from process_bot loop? 
-                    # For safety, we might just check "Realized Drawdown" (Cash + Cost).
-                    current_pos_value += invested # Placeholder for Mark Value
+                if t_data and len(t_data) > 3 and t_data[3] > 0:
+                    invested_cost += t_data[3]
             
-            # usdt_bal = balance.get('USDT')
-            # if not isinstance(usdt_bal, dict): usdt_bal = {}
-            # usdt_total = usdt_bal.get('total', 0.0)
-
-            # Recalculate or use initial values if refreshed
-            usdt_bal = balance.get('USDT')
-            if not isinstance(usdt_bal, dict): usdt_bal = {}
-            usdt_total = usdt_bal.get('total', 0.0)
+            current_equity = total_stablecoin + invested_cost
             
-            current_equity = usdt_total + invested_cost
-            # Note: This creates a flaw where floating loss isn't caught until close. 
-            # But it protects against "Series of Bad Trades" draining the account.
-            
+            # Prevent division by zero
+            if self.initial_equity <= 0:
+                logger.error("Circuit breaker: initial_equity is zero or negative")
+                return
+                
             drawdown_pct = (self.initial_equity - current_equity) / self.initial_equity * 100
+            
+            # Log current state periodically (every check)
+            logger.debug(f"Circuit Breaker Check: Equity ${current_equity:.2f} (Initial: ${self.initial_equity:.2f}) | Drawdown: {drawdown_pct:.2f}%")
             
             if drawdown_pct > config.GLOBAL_STOP_LOSS_PCT:
                 logger.critical(f"🚨 CIRCUIT BREAKER TRIPPED! Drawdown: {drawdown_pct:.2f}% > {config.GLOBAL_STOP_LOSS_PCT}%")
-                logger.critical(f"Initial: {self.initial_equity}, Current: {current_equity}")
+                logger.critical(f"Initial: ${self.initial_equity:.2f}, Current: ${current_equity:.2f}")
                 self.circuit_breaker_triggered = True
                 
                 # Create emergency file to trigger handler
@@ -184,6 +185,8 @@ class BotRunner:
         bot_id, name, pair, direction, strat_type, config_json, base_size, mm, rsi_limit, *optional = bot_data
         is_active = optional[0] if optional else True
         
+        # Per-bot isolation: wrap entire bot processing in try/except
+        # One bot crashing should NOT affect others
         try:
             # Cleanup Logic for Deactivated Bots
             if not is_active:
@@ -238,13 +241,23 @@ class BotRunner:
 
             # --- State Selection ---
             trade_data = get_bot_status(bot_id)
-            # trade_data: (name, pair, current_step, total_invested, avg_price, tp_price)
-            is_in_trade = trade_data[3] > 0 if trade_data else False
+            # trade_data: (name, pair, current_step, total_invested, avg_price, tp_price, last_exit_price, last_exit_time)
+            # SAFETY: Validate tuple before accessing indices to prevent IndexError crashes
+            if not trade_data or len(trade_data) < 8:
+                logger.warning(f"Bot {name}: Invalid trade_data (None or incomplete). Skipping cycle.")
+                return
+            
+            is_in_trade = trade_data[3] > 0
 
             if not is_in_trade:
                 # --- Re-entry Logic & Cooldowns ---
-                last_exit_price = trade_data[6]
-                last_exit_time = trade_data[7]
+                last_exit_price = trade_data[6] if len(trade_data) > 6 else 0.0
+                last_exit_time = trade_data[7] if len(trade_data) > 7 else 0
+                
+                # SAFETY: Validate DataFrame before accessing iloc
+                if df.empty:
+                    logger.warning(f"Bot {name}: Empty DataFrame. Skipping cycle.")
+                    return
                 current_price = df['close'].iloc[-1]
                 
                 can_enter = True
@@ -277,6 +290,11 @@ class BotRunner:
                         self.execute_entry(bot_id, name, pair, 'sell', base_size)
             else:
                 # --- Trade Management Logic ---
+                # SAFETY: Validate DataFrame before accessing iloc
+                if df.empty:
+                    logger.warning(f"Bot {name}: Empty DataFrame in trade management. Skipping.")
+                    return
+                    
                 # Pass market data to strategy for grid calculations
                 strategy.last_market_data = df
                 current_price = df['close'].iloc[-1]
@@ -284,7 +302,7 @@ class BotRunner:
                 # manager.manage_trade handles TP, Grid Steps, and Hedging
                 result = manage_trade(bot_id, name, pair, direction, params, trade_data, current_price, strategy, self.exchange)
                 
-                if result.get('action') == 'tp_hit':
+                if result and result.get('action') == 'tp_hit':
                     # Log the clear exit
                     logger.info(f"Bot {name} - Cycle Complete. Entering potential cooldown/re-entry phase.")
 
@@ -347,11 +365,53 @@ class BotRunner:
         except Exception as e:
             logger.error(f"MM Loop failed for {name}: {e}")
 
+    def _check_order_limits(self, bot_id, name):
+        """
+        RUNAWAY PROTECTION: Checks if order limits are exceeded.
+        Returns (can_order: bool, reason: str)
+        """
+        # Reset daily counter at midnight
+        current_day = time.strftime("%Y-%m-%d")
+        if not hasattr(self, '_last_reset_day') or self._last_reset_day != current_day:
+            self.orders_today = {}
+            self._last_reset_day = current_day
+            logger.info(f"🔄 Daily order counters reset for {current_day}")
+        
+        # Check per-cycle limit
+        if self.orders_this_cycle >= self.MAX_ORDERS_PER_CYCLE:
+            return False, f"Cycle limit reached ({self.orders_this_cycle}/{self.MAX_ORDERS_PER_CYCLE})"
+        
+        # Check per-bot daily limit
+        bot_count = self.orders_today.get(bot_id, 0)
+        if bot_count >= self.MAX_ORDERS_PER_BOT_DAILY:
+            return False, f"Daily limit for bot {name} reached ({bot_count}/{self.MAX_ORDERS_PER_BOT_DAILY})"
+        
+        return True, ""
+    
+    def _record_order(self, bot_id):
+        """Records an order for rate limiting."""
+        self.orders_this_cycle += 1
+        self.orders_today[bot_id] = self.orders_today.get(bot_id, 0) + 1
+
     def execute_entry(self, bot_id, name, pair, side, amount, price=None, params={}):
         """
         Place the first order and initialize the trade in DB.
         """
+        # ========== RUNAWAY ORDER PROTECTION ==========
+        can_order, reason = self._check_order_limits(bot_id, name)
+        if not can_order:
+            logger.critical(f"🚨 ORDER BLOCKED for {name}: {reason}")
+            return
+        # ===============================================
+        
         logger.info(f"🚀 [ENTRY] Bot: {name} | Side: {side} | Amount: ${amount}")
+        
+        # ========== MINIMUM ORDER VALIDATION ==========
+        MIN_ORDER_USD = 5.0  # Binance futures min is ~5 USDC
+        if amount < MIN_ORDER_USD:
+            logger.error(f"Order amount ${amount} below minimum ${MIN_ORDER_USD}, aborting.")
+            return
+        # ===============================================
         
         # Validated Create Order
         # Fetch current price for limit order safety
@@ -369,16 +429,46 @@ class BotRunner:
             logger.info(f"[DRY RUN] Simulating entry for {name} at {price}")
             tp_price = price * (1.01 if side == 'buy' else 0.99)
             update_martingale_step(bot_id, 0, amount, price, tp_price)
+            self._record_order(bot_id)  # Count dry run orders too for testing
         else:
             # Real Order
             try:
                 # Use create_order which now has validation and retries
                 order = self.exchange.create_order(pair, 'limit', side, amount, price, params=params)
                 if order:
-                    logger.info(f"Order placed: {order.get('id')}")
-                    # Update DB only if successful
-                    tp_price = price * (1.01 if side == 'buy' else 0.99) # Initial TP assumption
-                    update_martingale_step(bot_id, 0, amount, price, tp_price)
+                    order_id = order.get('id')
+                    logger.info(f"Order placed: {order_id}")
+                    
+                    # Wait for fill confirmation (with timeout)
+                    filled, final_order = self.exchange.wait_for_fill(order_id, pair, timeout_seconds=30)
+                    
+                    if filled:
+                        # Use actual fill price if available
+                        fill_price = final_order.get('average', price) if final_order else price
+                        tp_price = fill_price * (1.01 if side == 'buy' else 0.99)
+                        update_martingale_step(bot_id, 0, amount, fill_price, tp_price)
+                        self._record_order(bot_id)
+                        logger.info(f"✅ Order {order_id} confirmed filled at {fill_price}")
+                        
+                        # Log trade to history for post-mortem analysis
+                        log_trade(
+                            bot_id=bot_id,
+                            action='BUY' if side == 'buy' else 'SELL',
+                            symbol=pair,
+                            price=fill_price,
+                            amount=amount,
+                            cost_usdc=amount,
+                            order_id=order_id,
+                            step=0,
+                            notes=f"Entry order for {name}"
+                        )
+                    else:
+                        # Order didn't fill, cancel it
+                        logger.warning(f"Order {order_id} not filled, cancelling...")
+                        try:
+                            self.exchange.cancel_all_orders(pair)
+                        except Exception:
+                            pass
             except Exception as e:
                 logger.error(f"Entry failed for {name}: {e}")
 
@@ -386,6 +476,10 @@ class BotRunner:
         """
         Single iteration of the bot loop.
         """
+        # ========== RESET CYCLE ORDER COUNTER ==========
+        self.orders_this_cycle = 0
+        # ===============================================
+        
         # 0. Circuit Breaker Check
         self.check_circuit_breaker()
 
@@ -427,7 +521,7 @@ class BotRunner:
             logger.warning(f"Emergency cleanup for {name} ({pair})")
             try:
                 # 1. Cancel Open Orders
-                self.exchange.exchange.cancel_all_orders(pair)
+                self.exchange.cancel_all_orders(pair)
                 logger.info(f"Orders canceled for {pair}")
                 
                 # 2. Close Positions (Market Sell/Buy)
@@ -458,7 +552,14 @@ class BotRunner:
 if __name__ == "__main__":
     init_db() # Ensure schema is up to date
     logger.info("Bot Service Started.")
-    runner = BotRunner()
+    
+    # CRASH RECOVERY: Wrap BotRunner init in try/except
+    try:
+        runner = BotRunner()
+    except Exception as e:
+        logger.critical(f"FATAL: Failed to initialize BotRunner: {e}")
+        sys.exit(1)
+    
     runner.running = True
     
     STOP_FILE = config.PATHS["STOP_FILE"]
@@ -466,16 +567,41 @@ if __name__ == "__main__":
 
     # Ensure stop file is gone at start
     if os.path.exists(STOP_FILE): os.remove(STOP_FILE)
+    
+    # Write PID file for process management
+    try:
+        with open(PID_FILE, "w") as f:
+            f.write(str(os.getpid()))
+    except Exception as e:
+        logger.error(f"Failed to write PID file: {e}")
+
+    consecutive_failures = 0
+    MAX_CONSECUTIVE_FAILURES = 5
 
     try:
         while runner.running:
-            if not runner.run_cycle():
-                break
+            try:
+                if not runner.run_cycle():
+                    break
+                consecutive_failures = 0  # Reset on success
+            except Exception as cycle_err:
+                # PER-CYCLE CRASH RECOVERY: Log and continue, don't kill entire service
+                consecutive_failures += 1
+                logger.error(f"Cycle failed ({consecutive_failures}/{MAX_CONSECUTIVE_FAILURES}): {cycle_err}")
+                
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                    logger.critical(f"🚨 {MAX_CONSECUTIVE_FAILURES} consecutive failures. Shutting down for safety.")
+                    break
+                    
             time.sleep(10) # 10 second polling
+            
     except KeyboardInterrupt:
         logger.info("Bot Service Stopped by User (Ctrl+C).")
-    except Exception as e:
-        logger.critical(f"Bot Service Crashed: {e}")
+    except SystemExit:
+        logger.info("Bot Service received exit signal.")
+    except BaseException as e:
+        # Catch EVERYTHING including SystemExit, KeyboardInterrupt variants
+        logger.critical(f"Bot Service Crashed (BaseException): {e}")
     finally:
         # Cleanup
         if os.path.exists(PID_FILE): os.remove(PID_FILE)

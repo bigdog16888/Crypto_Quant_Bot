@@ -12,9 +12,10 @@ def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     avg_gain = gain.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
 
-    rs = avg_gain / avg_loss
+    # Prevent division by zero
+    rs = np.where(avg_loss != 0, avg_gain / avg_loss, 100.0)
     rsi_val = 100 - (100 / (1 + rs))
-    return rsi_val.fillna(50)
+    return pd.Series(rsi_val, index=series.index).fillna(50)
 
 def cci(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
     """

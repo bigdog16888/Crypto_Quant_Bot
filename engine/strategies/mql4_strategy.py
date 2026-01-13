@@ -30,12 +30,6 @@ def iCCI(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> floa
         return 0.0
     return cci_series.iloc[-1]
 
-def iCCI(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> float:
-    cci_series = ta_custom.cci(high, low, close, period=period)
-    if cci_series is None or cci_series.empty:
-        return 0.0
-    return cci_series.iloc[-1]
-
 def iBands(close: pd.Series, period: int, deviation: float):
     upper_s, mid_s, lower_s = ta_custom.bollinger_bands(close, period=period, deviation=deviation)
     if upper_s is None or upper_s.empty:

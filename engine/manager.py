@@ -130,7 +130,7 @@ def manage_trade(bot_id, bot_name, pair, direction, settings, trade_data, curren
     Returns: dict with actions taken (e.g. {'action': 'tp_hit'})
     """
     import logging
-    from engine.database import update_martingale_step, reset_bot_after_tp
+    from engine.database import update_martingale_step, reset_bot_after_tp, log_trade
     logger = logging.getLogger("TradeManager")
     
     _, current_step, total_invested, avg_entry_price, target_tp_price = trade_data
@@ -144,10 +144,30 @@ def manage_trade(bot_id, bot_name, pair, direction, settings, trade_data, curren
         
     if tp_hit:
         logger.info(f"💰 Bot {bot_name} Profit Target Hit! Closing at {current_price}")
+        # Calculate PnL before resetting
+        est_qty = total_invested / avg_entry_price if avg_entry_price > 0 else 0
+        if direction == 'LONG':
+            pnl = (current_price - avg_entry_price) * est_qty
+        else:
+            pnl = (avg_entry_price - current_price) * est_qty
+        
+        # Log the TP hit trade
+        log_trade(
+            bot_id=bot_id,
+            action='TP_HIT',
+            symbol=pair,
+            price=current_price,
+            amount=est_qty,
+            cost_usdc=total_invested,
+            step=current_step,
+            pnl=pnl,
+            notes=f"TP hit at step {current_step}, avg entry {avg_entry_price:.4f}"
+        )
+        
         # In real execution, we would market close here
         # For now, we reset the bot state
         reset_bot_after_tp(bot_id, exit_price=current_price)
-        return {'action': 'tp_hit'}
+        return {'action': 'tp_hit', 'pnl': pnl}
 
     # 2. Check Next Martingale Grid Order
     # Calculate next order price based on strategy
@@ -198,6 +218,19 @@ def manage_trade(bot_id, bot_name, pair, direction, settings, trade_data, curren
                 new_tp = new_avg + dist if direction == 'LONG' else new_avg - dist
             
             update_martingale_step(bot_id, next_step, added_investment, new_avg, new_tp)
+            
+            # Log the grid step trade
+            log_trade(
+                bot_id=bot_id,
+                action='BUY' if direction == 'LONG' else 'SELL',
+                symbol=pair,
+                price=current_price,
+                amount=added_investment / current_price if current_price > 0 else 0,
+                cost_usdc=added_investment,
+                step=next_step,
+                notes=f"Grid step {next_step}, new avg {new_avg:.4f}"
+            )
+            
             return {'action': 'grid_step', 'step': next_step}
             
     except Exception as e:
@@ -217,6 +250,19 @@ def manage_trade(bot_id, bot_name, pair, direction, settings, trade_data, curren
         # EXECUTE HEDGE
         hedge_size = total_invested * hedge_trigger.get('size_mult', 1.0)
         logger.warning(f"🛡️ Bot {bot_name} AUTOMATED HEDGE TRIGGERED! Size: {hedge_size} at {current_price}")
+        
+        # Log the hedge trade
+        log_trade(
+            bot_id=bot_id,
+            action='HEDGE_OPEN',
+            symbol=pair,
+            price=current_price,
+            amount=hedge_size / current_price if current_price > 0 else 0,
+            cost_usdc=hedge_size,
+            step=current_step,
+            notes=f"Hedge triggered at {drawdown_pc:.1f}% drawdown"
+        )
+        
         # In real execution: exchange_interface.create_order(...)
         return {'action': 'hedge_opened', 'size': hedge_size}
 

@@ -1,17 +1,55 @@
 import sqlite3
 import os
+import threading
 
 # Use absolute path to ensure database is found regardless of working directory
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.path.join(BASE_DIR, "crypto_bot.db")
 
+# Thread-local storage for SQLite connections
+# SQLite connections should not be shared across threads
+_local = threading.local()
+
 def get_connection():
-    """Returns a connection to the SQLite database."""
-    return sqlite3.connect(DB_PATH)
+    """
+    Returns a thread-safe connection to the SQLite database.
+    Each thread gets its own connection to prevent 'database is locked' errors.
+    """
+    # Check if we have a connection and if it's still valid
+    need_new_connection = False
+    
+    if not hasattr(_local, 'connection') or _local.connection is None:
+        need_new_connection = True
+    else:
+        # Test if the connection is still usable
+        try:
+            _local.connection.execute("SELECT 1")
+        except (sqlite3.ProgrammingError, sqlite3.OperationalError):
+            # Connection was closed or is broken
+            need_new_connection = True
+    
+    if need_new_connection:
+        _local.connection = sqlite3.connect(DB_PATH, timeout=30.0)
+        # Enable WAL mode for better concurrent read/write performance
+        _local.connection.execute("PRAGMA journal_mode=WAL")
+        _local.connection.execute("PRAGMA busy_timeout=30000")
+    
+    return _local.connection
+
+def close_connection():
+    """Explicitly closes the thread-local connection."""
+    if hasattr(_local, 'connection') and _local.connection:
+        try:
+            _local.connection.close()
+        except Exception:
+            pass
+        _local.connection = None
 
 def init_db():
     """Initializes the database and creates tables if they don't exist."""
-    conn = get_connection()
+    # Use a fresh connection for init (not thread-local) since this runs once at startup
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    conn.execute("PRAGMA journal_mode=WAL")
     cursor = conn.cursor()
     
     # Bots table: Stores configuration for each bot
@@ -67,6 +105,29 @@ def init_db():
         cursor.execute('ALTER TABLE trades ADD COLUMN last_exit_time INTEGER DEFAULT 0')
         conn.commit()
     
+    # Trade history table: Permanent log of all trades for post-mortem analysis
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS trade_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            bot_id INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            price REAL NOT NULL,
+            amount REAL NOT NULL,
+            cost_usdc REAL DEFAULT 0,
+            order_id TEXT,
+            step INTEGER DEFAULT 0,
+            pnl REAL DEFAULT 0,
+            timestamp INTEGER NOT NULL,
+            notes TEXT,
+            FOREIGN KEY (bot_id) REFERENCES bots (id)
+        )
+    ''')
+    
+    # Index for faster queries by bot and time
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_trade_history_bot ON trade_history(bot_id)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_trade_history_time ON trade_history(timestamp)')
+    
     conn.commit()
     conn.close()
     print(f"Database initialized at {DB_PATH}")
@@ -97,8 +158,7 @@ def add_bot(name, pair, direction, rsi_limit, martingale_multiplier, base_size, 
     except sqlite3.IntegrityError:
         print(f"Error: Bot name '{name}' already exists.")
         return None
-    finally:
-        conn.close()
+    # Note: No conn.close() - using thread-local connection
 
 def get_bot_params(bot_id):
     """Fetches all configuration parameters for a specific bot."""
@@ -106,7 +166,7 @@ def get_bot_params(bot_id):
     cursor = conn.cursor()
     cursor.execute('SELECT name, pair, direction, rsi_limit, martingale_multiplier, base_size, strategy_type, config FROM bots WHERE id = ?', (bot_id,))
     result = cursor.fetchone()
-    conn.close()
+    # Note: No conn.close() - using thread-local connection
     return result
 
 def update_bot(bot_id, name, pair, direction, rsi_limit, martingale_multiplier, base_size, strategy_type, config_dict):
@@ -132,8 +192,7 @@ def update_bot(bot_id, name, pair, direction, rsi_limit, martingale_multiplier, 
     except Exception as e:
         print(f"Error updating bot {bot_id}: {e}")
         return False
-    finally:
-        conn.close()
+    # Note: No conn.close() - using thread-local connection
 
 def update_martingale_step(bot_id, next_step, added_investment, new_avg_price, new_tp_price):
     """Updates the active position stats when a new Martingale step is triggered."""
@@ -148,7 +207,7 @@ def update_martingale_step(bot_id, next_step, added_investment, new_avg_price, n
         WHERE bot_id = ?
     ''', (next_step, added_investment, new_avg_price, new_tp_price, bot_id))
     conn.commit()
-    conn.close()
+    # Note: No conn.close() - using thread-local connection
 
 def reset_bot_after_tp(bot_id, exit_price=0):
     """Resets the trade stats after a Take Profit (TP) hit, saving exit metadata."""
@@ -166,7 +225,7 @@ def reset_bot_after_tp(bot_id, exit_price=0):
         WHERE bot_id = ?
     ''', (exit_price, int(time.time()), bot_id))
     conn.commit()
-    conn.close()
+    # Note: No conn.close() - using thread-local connection
 
 def get_bot_status(bot_id):
     """Fetches full status joining bot settings and trade data."""
@@ -179,7 +238,7 @@ def get_bot_status(bot_id):
         WHERE b.id = ?
     ''', (bot_id,))
     result = cursor.fetchone()
-    conn.close()
+    # Note: No conn.close() - using thread-local connection
     return result
 
 def get_all_bots():
@@ -193,7 +252,7 @@ def get_all_bots():
         LEFT JOIN trades t ON b.id = t.bot_id
     ''')
     results = cursor.fetchall()
-    conn.close()
+    # Note: No conn.close() - using thread-local connection
     return results
 
 def toggle_bot_active(bot_id, new_status):
@@ -204,14 +263,16 @@ def toggle_bot_active(bot_id, new_status):
     status_int = 1 if new_status else 0
     cursor.execute('UPDATE bots SET is_active = ? WHERE id = ?', (status_int, bot_id))
     conn.commit()
-    conn.close()
+    # Note: No conn.close() - using thread-local connection
 
 def delete_bot(bot_id):
     """Deletes a bot and its trade history."""
     conn = get_connection()
     cursor = conn.cursor()
     try:
-        # Delete from trades first (FK)
+        # Delete from trade_history first (FK)
+        cursor.execute('DELETE FROM trade_history WHERE bot_id = ?', (bot_id,))
+        # Delete from trades (FK)
         cursor.execute('DELETE FROM trades WHERE bot_id = ?', (bot_id,))
         # Delete from bots
         cursor.execute('DELETE FROM bots WHERE id = ?', (bot_id,))
@@ -220,8 +281,101 @@ def delete_bot(bot_id):
     except Exception as e:
         print(f"Error deleting bot {bot_id}: {e}")
         return False
-    finally:
-        conn.close()
+    # Note: No conn.close() - using thread-local connection
+
+def log_trade(bot_id, action, symbol, price, amount, cost_usdc=0, order_id=None, step=0, pnl=0, notes=None):
+    """
+    Logs a trade to the permanent trade_history table for post-mortem analysis.
+    
+    Args:
+        bot_id: The bot that executed this trade
+        action: 'BUY', 'SELL', 'TP_HIT', 'HEDGE_OPEN', 'HEDGE_CLOSE', 'STOP_LOSS'
+        symbol: Trading pair (e.g., 'BTC/USDC')
+        price: Execution price
+        amount: Position size in base currency
+        cost_usdc: Total cost in USDC
+        order_id: Exchange order ID (optional)
+        step: Martingale step number
+        pnl: Realized PnL for closing trades
+        notes: Additional context (optional)
+    """
+    import time
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute('''
+            INSERT INTO trade_history 
+            (bot_id, action, symbol, price, amount, cost_usdc, order_id, step, pnl, timestamp, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (bot_id, action, symbol, price, amount, cost_usdc, order_id, step, pnl, int(time.time()), notes))
+        conn.commit()
+        return cursor.lastrowid
+    except Exception as e:
+        print(f"Error logging trade for bot {bot_id}: {e}")
+        return None
+    # Note: No conn.close() - using thread-local connection
+
+def get_trade_history(bot_id=None, limit=100):
+    """
+    Fetches trade history for analysis.
+    
+    Args:
+        bot_id: Filter by bot (None = all bots)
+        limit: Max records to return
+    
+    Returns:
+        List of trade records
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    if bot_id:
+        cursor.execute('''
+            SELECT th.id, th.bot_id, b.name, th.action, th.symbol, th.price, 
+                   th.amount, th.cost_usdc, th.step, th.pnl, th.timestamp, th.notes
+            FROM trade_history th
+            LEFT JOIN bots b ON th.bot_id = b.id
+            WHERE th.bot_id = ?
+            ORDER BY th.timestamp DESC
+            LIMIT ?
+        ''', (bot_id, limit))
+    else:
+        cursor.execute('''
+            SELECT th.id, th.bot_id, b.name, th.action, th.symbol, th.price, 
+                   th.amount, th.cost_usdc, th.step, th.pnl, th.timestamp, th.notes
+            FROM trade_history th
+            LEFT JOIN bots b ON th.bot_id = b.id
+            ORDER BY th.timestamp DESC
+            LIMIT ?
+        ''', (limit,))
+    return cursor.fetchall()
+    # Note: No conn.close() - using thread-local connection
+
+def get_bot_pnl_summary(bot_id):
+    """
+    Calculates total PnL for a bot from trade history.
+    
+    Returns:
+        Dict with total_pnl, trade_count, win_count, loss_count
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT 
+            COALESCE(SUM(pnl), 0) as total_pnl,
+            COUNT(*) as trade_count,
+            SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as win_count,
+            SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END) as loss_count
+        FROM trade_history
+        WHERE bot_id = ? AND action IN ('TP_HIT', 'SELL', 'HEDGE_CLOSE', 'STOP_LOSS')
+    ''', (bot_id,))
+    result = cursor.fetchone()
+    return {
+        'total_pnl': result[0] or 0,
+        'trade_count': result[1] or 0,
+        'win_count': result[2] or 0,
+        'loss_count': result[3] or 0
+    }
+    # Note: No conn.close() - using thread-local connection
 
 if __name__ == "__main__":
     # Self-test block

@@ -223,3 +223,43 @@ class ExchangeInterface:
         # generic cancel_all_orders might not be supported by all exchanges in ccxt base, 
         # but binance supports it. Safe request handles errors.
         return self._safe_request('cancel_all_orders', symbol=symbol)
+
+    def fetch_order(self, order_id, symbol):
+        """Fetches a specific order by ID to check fill status."""
+        return self._safe_request('fetch_order', id=order_id, symbol=symbol)
+    
+    def wait_for_fill(self, order_id, symbol, timeout_seconds=30, poll_interval=2):
+        """
+        Waits for an order to fill, with timeout.
+        Returns: (filled: bool, order_status: dict or None)
+        """
+        import time
+        start_time = time.time()
+        
+        while time.time() - start_time < timeout_seconds:
+            try:
+                order = self.fetch_order(order_id, symbol)
+                if order is None:
+                    return False, None
+                    
+                status = order.get('status', 'unknown')
+                
+                if status == 'closed':
+                    self.logger.info(f"Order {order_id} filled completely")
+                    return True, order
+                elif status == 'canceled' or status == 'cancelled':
+                    self.logger.warning(f"Order {order_id} was cancelled")
+                    return False, order
+                elif status == 'expired':
+                    self.logger.warning(f"Order {order_id} expired")
+                    return False, order
+                    
+                # Still open, wait and poll again
+                time.sleep(poll_interval)
+                
+            except Exception as e:
+                self.logger.error(f"Error checking order {order_id}: {e}")
+                time.sleep(poll_interval)
+        
+        self.logger.warning(f"Order {order_id} did not fill within {timeout_seconds}s")
+        return False, None

@@ -15,6 +15,16 @@ def render_bot_manager_view():
     st.header("Bot Manager")
     st.caption("Manage existing bots: Toggle Status or Delete.")
     
+    # Cache exchange instance to avoid creating new one per bot row
+    @st.cache_resource
+    def get_shared_exchange():
+        try:
+            return ExchangeInterface(market_type='spot')
+        except Exception:
+            return None
+    
+    shared_exchange = get_shared_exchange()
+    
     # Fetch Data
     bots = get_all_bots()
     
@@ -62,8 +72,9 @@ def render_bot_manager_view():
                 
                 # Fetch current price for Next Order calc
                 try:
-                    exchange = ExchangeInterface(market_type='spot') # Dynamic type preferred in future
-                    curr_price = exchange.get_last_price(pair)
+                    curr_price = 0.0
+                    if shared_exchange:
+                        curr_price = shared_exchange.get_last_price(pair)
                     
                     # Get config for grid logic
                     raw_params = get_bot_params(b_id)
@@ -72,8 +83,8 @@ def render_bot_manager_view():
                     
                     # Fetch minimal OHLCV for ATR grid if needed
                     market_data = pd.DataFrame() # Placeholder, ATR needs data
-                    if params.get('UseATRGrid'):
-                        ohlcv = exchange.fetch_ohlcv(pair, timeframe='1h', limit=50)
+                    if params.get('UseATRGrid') and shared_exchange:
+                        ohlcv = shared_exchange.fetch_ohlcv(pair, timeframe='1h', limit=50)
                         market_data = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                     
                     next_order = strat.calculate_next_grid_price(raw_params[2], curr_price, be, step, market_data)
