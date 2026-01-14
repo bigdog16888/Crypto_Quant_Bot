@@ -12,8 +12,10 @@ import pandas as pd
 import json
 
 def render_bot_manager_view():
-    st.header("Bot Manager")
-    st.caption("Manage existing bots: Toggle Status or Delete.")
+    st.header("🤖 Bot Manager")
+    st.caption("📊 Manage existing bots: Toggle Status, Edit Settings, or Delete.")
+
+    st.divider()
     
     # Cache exchange instance to avoid creating new one per bot row
     @st.cache_resource
@@ -32,18 +34,18 @@ def render_bot_manager_view():
         st.info("No bots found. Go to 'Bot Creator' to deploy one.")
         return
         
-    st.markdown("### Active Inventory")
-    
+    st.markdown("### 📈 Active Inventory")
+
     # Header Row
     cols = st.columns([0.5, 1.5, 1.5, 1.5, 2, 2, 2, 2])
-    cols[0].markdown("**ID**")
-    cols[1].markdown("**Name**")
-    cols[2].markdown("**Pair**")
-    cols[3].markdown("**Strat**")
-    cols[4].markdown("**Invested**")
-    cols[5].markdown("**Targets (BE/TP/Next)**")
-    cols[6].markdown("**Status**")
-    cols[7].markdown("**Action**")
+    cols[0].markdown("**🆔 ID**")
+    cols[1].markdown("**🏷️ Name**")
+    cols[2].markdown("**💰 Pair**")
+    cols[3].markdown("**⚙️ Strat**")
+    cols[4].markdown("**💵 Invested**")
+    cols[5].markdown("**🎯 Targets (BE/TP/Next)**")
+    cols[6].markdown("**📊 Status**")
+    cols[7].markdown("**🔧 Action**")
     
     st.divider()
 
@@ -70,14 +72,45 @@ def render_bot_manager_view():
                 be = status_data[4]
                 tp = status_data[5]
                 
-                # Fetch current price for Next Order calc
+                # Fetch current price for Next Order calc and PnL Badge
                 try:
                     curr_price = 0.0
                     if shared_exchange:
                         curr_price = shared_exchange.get_last_price(pair)
                     
+                    # PnL Badge Logic
+                    if be > 0 and curr_price > 0:
+                        is_long = True # Default
+                        # Need to fetch direction from bot tuple again or assume logic
+                        # bot tuple: b_id, name, pair, is_active, strat_type, total_invested, step
+                        # We don't have direction here easily without fetching.
+                        # Let's just show raw price distance for now or fetch direction.
+                        pass
+
                     # Get config for grid logic
                     raw_params = get_bot_params(b_id)
+                    # raw_params: name, pair, direction, rsi_limit, mm, base, strat, config_json
+                    direction_str = raw_params[2]
+                    
+                    # PnL Calculation
+                    pnl_pct = 0.0
+                    if be > 0:
+                        if direction_str == "LONG":
+                            pnl_pct = (curr_price - be) / be * 100
+                        else:
+                            pnl_pct = (be - curr_price) / be * 100
+                    
+                    # Badge Color
+                    badge_color = "green" if pnl_pct >= 0 else "red"
+                    badge_bg = "#dafbe1" if pnl_pct >= 0 else "#ffebe9"
+                    badge_text = "#1a7f37" if pnl_pct >= 0 else "#cf222e"
+                    
+                    # Render Badge
+                    st.markdown(
+                        f"""<span style='background-color: {badge_bg}; color: {badge_text}; padding: 2px 6px; border-radius: 4px; font-weight: bold; font-size: 0.8em;'>{pnl_pct:+.2f}%</span>""", 
+                        unsafe_allow_html=True
+                    )
+                    
                     params = json.loads(raw_params[7]) if raw_params[7] else {}
                     strat = MQL4Strategy(name=name, params=params)
                     
@@ -89,9 +122,9 @@ def render_bot_manager_view():
                     
                     next_order = strat.calculate_next_grid_price(raw_params[2], curr_price, be, step, market_data)
                     
-                    row_cols[5].caption(f"**BE:** {be:.2f}")
-                    row_cols[5].caption(f"**TP:** {tp:.2f}")
-                    row_cols[5].caption(f"**NO:** {next_order:.2f}")
+                    row_cols[5].caption(f"**BE:** {be:,.2f}")
+                    row_cols[5].caption(f"**TP:** {tp:,.2f}")
+                    row_cols[5].caption(f"**NO:** {next_order:,.2f}")
                     if params.get('UseEarlyExit'):
                         row_cols[5].caption("📉 *Decay Active*")
                 except Exception as e:
@@ -103,21 +136,46 @@ def render_bot_manager_view():
 
         # Toggle Status
         with row_cols[6]:
-            status_label = "Running" if is_active else "Stopped"
-            if st.toggle(status_label, value=bool(is_active), key=f"toggle_{b_id}") != bool(is_active):
+            # Status Pulse Logic
+            pulse_color = "#3fb950" if is_active else "#d29922" # Green vs Yellow (Stopped)
+            pulse_anim = """
+            <style>
+            .blob {
+                background: """ + pulse_color + """;
+                border-radius: 50%;
+                margin: 5px;
+                height: 10px;
+                width: 10px;
+                box-shadow: 0 0 0 0 """ + pulse_color + """;
+                transform: scale(1);
+                animation: pulse-green 2s infinite;
+                display: inline-block;
+            }
+            @keyframes pulse-green {
+                0% { transform: scale(0.95); box-shadow: 0 0 0 0 """ + pulse_color + """70; }
+                70% { transform: scale(1); box-shadow: 0 0 0 10px """ + pulse_color + """00; }
+                100% { transform: scale(0.95); box-shadow: 0 0 0 0 """ + pulse_color + """00; }
+            }
+            </style>
+            """
+            st.markdown(pulse_anim + f"<div style='display:flex;align-items:center;'><div class='blob'></div> {'Active' if is_active else 'Paused'}</div>", unsafe_allow_html=True)
+            
+            # Simple toggle below visual status
+            if st.button("⏯️ Toggle", key=f"btn_toggle_{b_id}", help="Start/Stop Bot"):
                 toggle_bot_active(b_id, not bool(is_active))
+                st.success(f"✅ Bot {name} status updated!")
                 st.rerun()
-        
+
         # Actions
-        with row_cols[6]:
+        with row_cols[7]:
             col1, col2 = st.columns(2)
-            if col1.button("✏️", key=f"edit_{b_id}", help=f"Edit {name}"):
+            if col1.button("✏️ Edit", key=f"edit_{b_id}", help=f"Edit {name} settings"):
                 st.session_state['editing_bot_id'] = b_id
                 st.rerun()
-                
-            if col2.button("🗑️", key=f"del_{b_id}", help=f"Delete {name}"):
+
+            if col2.button("🗑️ Delete", key=f"del_{b_id}", help=f"Delete {name}"):
                 if delete_bot(b_id):
-                    st.success(f"Deleted {name}")
+                    st.success(f"✅ Deleted {name} successfully!")
                     st.rerun()
         
         st.divider()
@@ -129,6 +187,9 @@ def render_bot_manager_view():
 def render_edit_form(bot_id):
     st.markdown("---")
     st.subheader(f"🛠️ Editing Bot #{bot_id}")
+    st.caption("⚙️ Modify bot settings and parameters")
+
+    st.divider()
     
     params = get_bot_params(bot_id)
     if not params:
@@ -161,11 +222,11 @@ def render_edit_form(bot_id):
         new_tp_type = st.radio("TP Mode", ["Dollar Target ($)", "Percentage (%)"], index=tp_type_idx, horizontal=True, key=f"edit_tp_type_{bot_id}")
         
         if new_tp_type == "Dollar Target ($)":
-            new_tp_base = st.number_input("Take Profit Target ($USDC)", min_value=1.0, step=1.0, value=float(config_dict.get('TakeProfitBase', 10.0)), key=f"edit_tp_base_{bot_id}")
+            new_tp_base = st.number_input("Take Profit Target ($USDC)", min_value=0.1, step=0.1, value=float(config_dict.get('TakeProfitBase', 10.0)), key=f"edit_tp_base_v2_{bot_id}")
             config_dict['TakeProfitType'] = 'USD'
             config_dict['TakeProfitBase'] = new_tp_base
         else:
-            new_tp_pct = st.number_input("Take Profit Target (%)", min_value=0.1, step=0.1, value=float(config_dict.get('TakeProfitPct', 1.0)), key=f"edit_tp_pct_{bot_id}")
+            new_tp_pct = st.number_input("Take Profit Target (%)", min_value=0.01, step=0.01, value=float(config_dict.get('TakeProfitPct', 1.0)), format="%.2f", key=f"edit_tp_pct_v2_{bot_id}")
             config_dict['TakeProfitType'] = 'Percent'
             config_dict['TakeProfitPct'] = new_tp_pct
 
@@ -184,10 +245,43 @@ def render_edit_form(bot_id):
             # Pass ATR context for grid
             # Assume 1h ATR for simplicity in editor projection or add dropdown
             # For now, use a default ATR or calculate
+            # Use 'ATR_Timeframe' from config if present
+            atr_tf = config_dict.get('ATR_Timeframe', '1h')
             p_atr = 20.0
             
             projections = temp_strat.calculate_projections(base_price=curr_p, current_atr=p_atr)
             with st.expander("🔍 Editor Risk Projection & Math Summary", expanded=False):
+                # --- DYNAMIC GRID VISUALIZER ---
+                if projections:
+                    import plotly.graph_objects as go
+                    
+                    proj_df = pd.DataFrame(projections)
+                    steps = proj_df['step']
+                    prices = proj_df['price']
+                    tps = proj_df['tp_price']
+                    
+                    fig = go.Figure()
+                    
+                    # Grid Levels
+                    fig.add_trace(go.Scatter(x=steps, y=prices, mode='lines+markers', name='Grid Orders', line=dict(color='#58a6ff')))
+                    
+                    # TP Levels
+                    fig.add_trace(go.Scatter(x=steps, y=tps, mode='lines+markers', name='Take Profit', line=dict(color='#3fb950', dash='dash')))
+                    
+                    # Current Price Line
+                    fig.add_hline(y=curr_p, line_dash="solid", line_color="white", annotation_text="Entry")
+                    
+                    fig.update_layout(
+                        title="Grid Visualizer",
+                        xaxis_title="Martingale Step",
+                        yaxis_title="Price ($)",
+                        template="plotly_dark",
+                        height=300,
+                        margin=dict(l=10, r=10, t=30, b=10)
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                # -------------------------------
+
                 st.caption(f"Simulated levels starting at: **{curr_p:,.2f}**")
                 proj_df = pd.DataFrame(projections)
                 proj_df.columns = ["Step", "Grid Price", "Order ($)", "Total Inv. ($)", "TP Price", "Hedge Size", "Is Hedge"]
@@ -202,7 +296,7 @@ def render_edit_form(bot_id):
                     if config_dict.get('UseHedge'):
                         st.warning("⚠️ Hedge enabled but not triggered in max steps.")
                     else:
-                        st.info("No Hedge Configured.")
+                        st.info("ℹ️ No Hedge Configured.")
                         
         except Exception as e:
             st.warning(f"Projection skip: {e}")
@@ -212,13 +306,17 @@ def render_edit_form(bot_id):
         with t_col1:
             config_dict['mode_cci'] = st.selectbox("CCI Switch", [0, 1, 2], index=int(config_dict.get('mode_cci', 0)), format_func=lambda x: {0: "OFF", 1: "Above", 2: "Below"}[x], key=f"edit_mode_cci_{bot_id}")
             config_dict['cci_level'] = st.number_input("CCI Level", value=float(config_dict.get('cci_level', 100)), key=f"edit_cci_lvl_{bot_id}")
+            config_dict['cci_tf'] = st.selectbox("CCI TF", ["1m","5m","15m","1h","4h","1d"], index=["1m","5m","15m","1h","4h","1d"].index(config_dict.get('cci_tf', "15m")), key=f"edit_cci_tf_{bot_id}")
         with t_col2:
             config_dict['mode_boll'] = st.selectbox("Boll Switch", [0, 1, 2], index=int(config_dict.get('mode_boll', 0)), format_func=lambda x: {0: "OFF", 1: "Outside Lower", 2: "Outside Upper"}[x], key=f"edit_mode_boll_{bot_id}")
+            config_dict['boll_tf'] = st.selectbox("Boll TF", ["1m","5m","15m","1h","4h","1d"], index=["1m","5m","15m","1h","4h","1d"].index(config_dict.get('boll_tf', "15m")), key=f"edit_boll_tf_{bot_id}")
         with t_col3:
             config_dict['mode_stoch'] = st.selectbox("Stoch Switch", [0, 1, 2], index=int(config_dict.get('mode_stoch', 0)), format_func=lambda x: {0: "OFF", 1: "Oversold", 2: "Overbought"}[x], key=f"edit_mode_stoch_{bot_id}")
+            config_dict['stoch_tf'] = st.selectbox("Stoch TF", ["1m","5m","15m","1h","4h","1d"], index=["1m","5m","15m","1h","4h","1d"].index(config_dict.get('stoch_tf', "15m")), key=f"edit_stoch_tf_{bot_id}")
         with t_col4:
             config_dict['mode_rsi'] = st.selectbox("RSI Switch", [0, 1, 2], index=int(config_dict.get('mode_rsi', 0)), format_func=lambda x: {0: "OFF", 1: "Below", 2: "Above"}[x], key=f"edit_mode_rsi_{bot_id}")
             config_dict['rsi_level'] = st.number_input("RSI Level", value=float(config_dict.get('rsi_level', 30)), key=f"edit_rsi_lvl_{bot_id}")
+            config_dict['rsi_tf'] = st.selectbox("RSI TF", ["1m","15m","1h"], index=["1m","15m","1h"].index(config_dict.get('rsi_tf', "15m")), key=f"edit_rsi_tf_{bot_id}")
 
         st.markdown("#### Price & Volatility Triggers (9 & 10)")
         pv_col1, pv_col2 = st.columns(2)
@@ -257,6 +355,8 @@ def render_edit_form(bot_id):
         rm1, rm2, rm3 = st.columns(3)
         with rm1:
             config_dict['UseATRGrid'] = st.checkbox("Use ATR Grid", value=config_dict.get('UseATRGrid', True), key=f"edit_atr_grid_{bot_id}")
+            if config_dict['UseATRGrid']:
+                config_dict['ATR_Timeframe'] = st.selectbox("ATR TF", ["1m", "5m", "15m", "1h", "4h", "1d"], index=["1m", "5m", "15m", "1h", "4h", "1d"].index(config_dict.get('ATR_Timeframe', '1h')), key=f"edit_atr_tf_{bot_id}")
         with rm2:
             config_dict['ATRGridFactor'] = st.number_input("ATR Factor", value=float(config_dict.get('ATRGridFactor', 1.0)), key=f"edit_atr_fac_{bot_id}")
         with rm3:
@@ -298,13 +398,13 @@ def render_edit_form(bot_id):
             try:
                 new_config = json.loads(new_config_str)
                 if update_bot(bot_id, new_name, new_pair, new_direction, new_rsi, new_mm, new_base, new_strat, new_config):
-                    st.success("Bot updated successfully!")
+                    st.success("✅ Bot updated successfully!")
                     st.session_state['editing_bot_id'] = None
                     st.rerun()
                 else:
-                    st.error("Failed to update bot.")
+                    st.error("❌ Failed to update bot.")
             except Exception as e:
-                st.error(f"Invalid JSON in config: {e}")
+                st.error(f"❌ Invalid JSON in config: {e}")
 
         if submit_cols[1].form_submit_button("❌ Cancel"):
             st.session_state['editing_bot_id'] = None

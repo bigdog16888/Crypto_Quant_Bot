@@ -50,11 +50,17 @@ class ExchangeInterface:
             
         # Cache for market info (minNotional, filters)
         self.markets_loaded = False
-
+        
+        # Optimization: Do NOT auto-load markets on init
+        # CCXT by default might try to load markets if you call methods that need them,
+        # but explicit loading is better controlled via _ensure_markets()
+        
     def _ensure_markets(self):
         """Ensures markets are loaded for validation."""
         if not self.markets_loaded:
             try:
+                # OPTIMIZATION: Only load if absolutely necessary for the validation logic
+                # For pure ticker fetching, we might not need this if we don't care about precision
                 self.exchange.load_markets()
                 self.markets_loaded = True
             except Exception as e:
@@ -212,6 +218,29 @@ class ExchangeInterface:
         if self.exchange.options.get('defaultType') == 'future':
             params['type'] = 'future'
         return self._safe_request('fetch_balance', params=params)
+
+    def fetch_funding_rate(self, symbol):
+        """Fetches the current funding rate for a symbol (Futures only)."""
+        try:
+            # Check if exchange supports funding rates
+            if not self.exchange.has.get('fetchFundingRate'):
+                self.logger.warning(f"Exchange does not support fetchFundingRate")
+                return None
+            return self._safe_request('fetch_funding_rate', symbol=symbol)
+        except Exception as e:
+            self.logger.error(f"Error fetching funding rate for {symbol}: {e}")
+            return None
+
+    def fetch_open_interest(self, symbol):
+        """Fetches open interest for a symbol (Futures only)."""
+        try:
+            if not self.exchange.has.get('fetchOpenInterest'):
+                self.logger.warning(f"Exchange does not support fetchOpenInterest")
+                return None
+            return self._safe_request('fetch_open_interest', symbol=symbol)
+        except Exception as e:
+            self.logger.error(f"Error fetching open interest for {symbol}: {e}")
+            return None
 
     def fetch_open_orders(self, symbol):
         """Fetches open orders for a specific symbol."""

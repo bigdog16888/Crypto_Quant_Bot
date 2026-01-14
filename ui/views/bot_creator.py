@@ -1,6 +1,5 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
 import sys
 import os
 
@@ -12,9 +11,12 @@ from engine.exchange_interface import ExchangeInterface
 
 def render_bot_creator_view():
     st.header("🏗️ Strategy & Bot Creator")
-    st.write("Configure and launch new trading bots here.")
+    st.caption("Configure and launch new trading bots with advanced martingale and confluence logic.")
+    
+    st.divider()
     
     # Dynamic Market Selection
+    st.subheader("🌐 Market Configuration")
     col_m1, col_m2, col_m3 = st.columns(3)
     with col_m1:
         market_type = st.selectbox("Market Type", ["Spot", "Futures (Swap)"], index=0)
@@ -51,8 +53,8 @@ def render_bot_creator_view():
     current_price = 0.0 
     p_atr = 10.0        
     
-    with st.expander("📊 ATR Planning Foundation", expanded=True):
-        st.write("Use these values to baseline your Grid Range and First Entry Price.")
+    with st.expander("📊 ATR Planning Foundation (Market Context)", expanded=True):
+        st.info("💡 Use these live values to baseline your Grid Range and First Entry Price.")
         try:
             if exchange:
                 from engine.strategies.mql4_strategy import MQL4Strategy
@@ -83,17 +85,79 @@ def render_bot_creator_view():
     # Initialize config dictionary early to avoid UnboundLocalError
     config = {}
     
+    st.divider()
+    
     with st.form("deploy_bot_form"):
-        st.subheader("General Settings")
+        st.subheader("⚙️ General Settings")
+        
+        # --- Visual Strategy Selector (Cards) ---
+        st.markdown("### 🧠 Select Strategy Logic")
+        
+        # Custom CSS for Strategy Cards
+        st.markdown("""
+        <style>
+        .strat-card {
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            padding: 15px;
+            background-color: #161b22;
+            height: 100%;
+            text-align: center;
+        }
+        .strat-icon { font-size: 2em; margin-bottom: 10px; }
+        .strat-title { font-weight: bold; font-size: 1.1em; color: #58a6ff; margin-bottom: 5px; }
+        .strat-desc { font-size: 0.9em; color: #8b949e; }
+        </style>
+        """, unsafe_allow_html=True)
+        
+        strat_col1, strat_col2, strat_col3 = st.columns(3)
+        
+        # This is a visual trick; the actual selection is via radio button below, but we format it nicely
+        with strat_col1:
+            st.markdown("""
+            <div class="strat-card">
+                <div class="strat-icon">🛡️</div>
+                <div class="strat-title">MQL4 Classic</div>
+                <div class="strat-desc">Confluence of RSI, CCI, Bollinger. Best for conservative entries.</div>
+            </div>
+            """, unsafe_allow_html=True)
+            
+        with strat_col2:
+            st.markdown("""
+            <div class="strat-card">
+                <div class="strat-icon">📈</div>
+                <div class="strat-title">Market Maker</div>
+                <div class="strat-desc">High-frequency spread capturing. Best for ranging markets.</div>
+            </div>
+            """, unsafe_allow_html=True)
+            
+        with strat_col3:
+            st.markdown("""
+            <div class="strat-card">
+                <div class="strat-icon">🕰️</div>
+                <div class="strat-title">Magic Hour</div>
+                <div class="strat-desc">Session breakout & mean reversion. Time-based statistical edge.</div>
+            </div>
+            """, unsafe_allow_html=True)
+            
+        strategy_type = st.radio(
+            "Select Strategy Logic",
+            ["MQL4", "Market Maker", "Magic Hour"],
+            label_visibility="collapsed",
+            horizontal=True
+        )
+        
+        st.divider()
+        
         col1, col2 = st.columns(2)
         with col1:
             name = st.text_input("Bot Name", placeholder="e.g., Scalper_USDC_01")
             direction = st.selectbox("Direction", ["LONG", "SHORT"])
-            strategy_type = st.selectbox("Strategy Logic", ["MQL4", "Market Maker"], help="MQL4: 11-Trigger Confluence. MM: Spread-based Market Making.")
-            timeframe = st.selectbox("Execution Timeframe", ["1m", "5m", "15m", "1h", "4h", "1d"], index=1, help="Scanning frequency.")
+            # strategy_type removed from here, moved up
+            timeframe = st.selectbox("Execution Timeframe", ["1m", "5m", "15m", "1h", "4h", "1d"], index=0, help="Scanning frequency.")
         
             with col2:
-                base_size = st.number_input("Base Order Size ($USDC)", min_value=1.0, step=10.0, value=10.0)
+                base_size = st.number_input("Base Order Size ($USDC)", min_value=0.1, step=1.0, value=10.0)
                 martingale_multiplier = st.number_input("Martingale Multiplier", min_value=1.0, step=0.1, value=1.5)
                 
                 # --- NEW: Take Profit Input with Selection ---
@@ -101,13 +165,14 @@ def render_bot_creator_view():
                 tp_type = st.radio("TP Mode", ["Dollar Target ($)", "Percentage (%)"], index=0, horizontal=True)
                 
                 if tp_type == "Dollar Target ($)":
-                    take_profit_base = st.number_input("Take Profit Target ($USDC)", min_value=1.0, step=1.0, value=10.0, help="Dollar Profit Target per Cycle")
+                    take_profit_base = st.number_input("Take Profit Target ($USDC)", min_value=0.1, step=0.1, value=0.1, help="Dollar Profit Target per Cycle. Note: $10 profit on a $10 trade = 100% gain!")
                     config['TakeProfitBase'] = take_profit_base
                     config['TakeProfitType'] = 'USD'
                     # Explicitly define for scope safety
                     take_profit_pct = 0.0 
                 else:
-                    take_profit_pct = st.number_input("Take Profit Target (%)", min_value=0.1, step=0.1, value=1.0, help="Percentage Profit Target per Cycle")
+                    st.caption("✅ Low percentage values (e.g. 0.1%) are allowed.")
+                    take_profit_pct = st.number_input("Take Profit Target (%) 🎯", min_value=0.01, step=0.01, value=0.5, format="%.2f", key="tp_pct_fixed_v5", help="Percentage Profit Target per Cycle")
                     config['TakeProfitPct'] = take_profit_pct
                     config['TakeProfitType'] = 'Percent'
                     # Explicitly define for scope safety
@@ -131,30 +196,8 @@ def render_bot_creator_view():
                     
                 temp_strat = MQL4Strategy(params=proj_params)
         
-        try:
-            if df_f is not None and not df_f.empty:
-                current_price = df_f['close'].iloc[-1]
-                p_atr = atr_data.get(timeframe, {}).get('atr', 10.0)
-                projections = temp_strat.calculate_projections(base_price=current_price, current_atr=p_atr)
-                
-                with st.expander("🔍 Risk Projection & Math Summary ($USDC)", expanded=False):
-                    st.caption(f"Simulated Martingale Grid based on current price: **{current_price:,.2f}**")
-                    proj_df = pd.DataFrame(projections)
-                    
-                    if not proj_df.empty:
-                        proj_df.columns = ["Step", "Grid Price", "Order ($)", "Total Inv. ($)", "TP Price", "Hedge Size", "Is Hedge"]
-                        st.table(proj_df)
-                    
-                    hedge_steps = [p for p in projections if p['is_hedge']]
-                    if hedge_steps:
-                        h1 = hedge_steps[0]
-                        st.info(f"🛡️ **Hedge Summary**: At Step {h1['step']} (Price: {h1['price']}), a hedge of **${h1['hedge_size_usdc']}** activates.")
-                    else:
-                        st.warning("⚠️ No Hedge configured.")
-            else:
-                st.info("Market data unavailable for projection.")
-        except Exception as e:
-            st.error(f"Projection Error: {e}")
+            # Projection Logic Moved to Bottom to capture all configs
+
 
         rsi_limit = st.slider("RSI Limit (for Classic)", 0, 100, 30, help="Only used if Strategy Logic is 'Classic'.")
 
@@ -162,7 +205,7 @@ def render_bot_creator_view():
         # config = {} # REMOVED: Re-initialization cleared previous values
 
         if strategy_type == "Market Maker":
-            with st.expander("Market Maker Configuration", expanded=True):
+            with st.expander("📈 Market Maker Configuration", expanded=True):
                 mm_c1, mm_c2 = st.columns(2)
                 with mm_c1:
                     config['spread_pct'] = st.number_input("Target Spread (%)", value=0.2, step=0.01)
@@ -171,6 +214,23 @@ def render_bot_creator_view():
                     config['order_size'] = base_size 
                     config['max_inventory'] = st.number_input("Max Inventory (Units)", value=1.0)
                     config['reprice_threshold'] = st.number_input("Reprice Threshold (%)", value=0.1)
+
+        elif strategy_type == "Magic Hour":
+            with st.expander("🕰️ Magic Hour Configuration", expanded=True):
+                st.info("🎯 **Strategy Goal:** Capture mean reversion after breakout from a specific hourly range.")
+                
+                # Timezone Selector
+                common_tzs = ["Asia/Taipei", "America/New_York", "Europe/London", "Asia/Tokyo", "UTC"]
+                selected_tz = st.selectbox("🌍 Strategy Timezone", common_tzs, index=0)
+                config['timezone'] = selected_tz
+                
+                mh1, mh2 = st.columns(2)
+                with mh1:
+                    config['magic_hour'] = st.slider(f"🕒 Magic Hour ({selected_tz} 0-23)", 0, 23, 9, help=f"The specific hour that defines the trading range (e.g. 9 = 09:00-10:00 {selected_tz}).")
+                    config['analysis_duration'] = st.slider("⏳ Analysis Window (Hours)", 1, 6, 3, help="Duration to monitor for breakouts after the Magic Hour closes.")
+                with mh2:
+                    config['stop_loss_ext'] = st.number_input("🛑 Max Extension (Fade Zone)", value=1.0, step=0.1, help="Allowed deviation multiplier. If Price > High + (Range * Extension), we assume strong trend and STOP fading.")
+                    st.success(f"✅ Target is fixed at **50% Mean Reversion** (Range Midpoint).")
 
         elif strategy_type == "MQL4":
             with st.expander("Entry Triggers (Multi-Switch Confluence)", expanded=True):
@@ -193,8 +253,8 @@ def render_bot_creator_view():
                 config['rsi_tf'] = st.selectbox("RSI TF", ["1m","15m","1h"], index=1, key="create_rsi_tf")
 
             st.divider()
-            st.markdown("### 2. Consecutive Pattern Slots")
-            st.caption("Entries will wait for X consecutive green/red candles on specified TFs.")
+            st.markdown("### 📊 2. Consecutive Pattern Slots")
+            st.caption("📈 Entries will wait for X consecutive green/red candles on specified TFs.")
             
             for p_idx in range(1, 5, 2): 
                 pc1, pc2 = st.columns(2)
@@ -249,6 +309,11 @@ def render_bot_creator_view():
             with g_col2:
                 config['base_grid'] = st.number_input("Fixed Grid Step (Price)", value=100.0, step=10.0, help="Used if ATR Grid is OFF. Absolute price change.")
             
+            # --- New ATR Timeframe Selector ---
+            if config['UseATRGrid']:
+                config['ATR_Timeframe'] = st.selectbox("ATR Timeframe for Grid", ["1m", "5m", "15m", "1h", "4h", "1d"], index=3, help="Timeframe used to calculate ATR for grid spacing. Lower timeframe = tighter grid.")
+            # ----------------------------------
+            
         with st.expander("Trade Management (Exit & Hedge)", expanded=False):
             st.subheader("Accelerated Early Exit (Smart Decay)")
             config['UseEarlyExit'] = st.checkbox("Enable Early Exit", value=True)
@@ -283,17 +348,99 @@ def render_bot_creator_view():
                  temp_strat.params['UseHedge'] = True
                  temp_strat.params['HedgeStartStep'] = config['HedgeStartStep']
                  # Re-run projection to show hedge
-                 if df_f is not None and not df_f.empty and current_price > 0:
-                     projections = temp_strat.calculate_projections(base_price=current_price, current_atr=p_atr)
+                 # if df_f is not None and not df_f.empty and current_price > 0:
+                 #     projections = temp_strat.calculate_projections(base_price=current_price, current_atr=p_atr)
+
+        st.divider()
+
+        # --- MOVED PROJECTION LOGIC ---
+        try:
+            if df_f is not None and not df_f.empty:
+                current_price = df_f['close'].iloc[-1]
+                
+                # Determine correct ATR for projection
+                proj_tf = timeframe
+                if config.get('UseATRGrid'):
+                    proj_tf = config.get('ATR_Timeframe', timeframe)
+                    # Validation Warning
+                    tf_minutes = {'1m': 1, '5m': 5, '15m': 15, '1h': 60, '4h': 240, '1d': 1440}
+                    if tf_minutes.get(proj_tf, 0) < tf_minutes.get(timeframe, 0):
+                        st.warning(f"⚠️ ATR Timeframe ({proj_tf}) is lower than Execution Timeframe ({timeframe}). This may cause grid calculation errors. Recommended: ATR TF >= Execution TF.")
+                
+                # Use data from Foundation if available, else default
+                p_atr = atr_data.get(proj_tf, {}).get('atr', 10.0)
+                
+                # Update strat params with full config before calculating
+                temp_strat.params.update(config)
+                
+                projections = temp_strat.calculate_projections(base_price=current_price, current_atr=p_atr)
+                
+                with st.expander("🔍 Risk Projection & Math Summary ($USDC)", expanded=True):
+                    
+                    # --- DYNAMIC GRID PREVIEW CHART ---
+                    if projections:
+                        import plotly.graph_objects as go
+                        
+                        proj_df = pd.DataFrame(projections)
+                        steps = proj_df['step']
+                        prices = proj_df['price']
+                        tps = proj_df['tp_price']
+                        
+                        fig = go.Figure()
+                        
+                        # Grid Levels
+                        fig.add_trace(go.Scatter(x=steps, y=prices, mode='lines+markers', name='Grid Orders', line=dict(color='#58a6ff')))
+                        
+                        # TP Levels
+                        fig.add_trace(go.Scatter(x=steps, y=tps, mode='lines+markers', name='Take Profit', line=dict(color='#3fb950', dash='dash')))
+                        
+                        # Current Price Line
+                        fig.add_hline(y=current_price, line_dash="solid", line_color="white", annotation_text="Current Price")
+                        
+                        fig.update_layout(
+                            title=f"Grid Visualizer (ATR TF: {proj_tf})",
+                            xaxis_title="Martingale Step",
+                            yaxis_title="Price ($)",
+                            template="plotly_dark",
+                            height=300,
+                            margin=dict(l=10, r=10, t=30, b=10)
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                    # ----------------------------------
+
+                    st.success(f"📈 Simulated Martingale Grid based on current price: **{current_price:,.2f}**")
+                    proj_df = pd.DataFrame(projections)
+                    
+                    if not proj_df.empty:
+                        proj_df.columns = ["Step", "Grid Price", "Order ($)", "Total Inv. ($)", "TP Price", "Hedge Size", "Is Hedge"]
+                        st.table(proj_df)
+                    
+                    hedge_steps = [p for p in projections if p['is_hedge']]
+                    if hedge_steps:
+                        h1 = hedge_steps[0]
+                        st.info(f"🛡️ **Hedge Summary**: At Step {h1['step']} (Price: {h1['price']}), a hedge of **${h1['hedge_size_usdc']}** activates.")
+                    else:
+                        st.warning("⚠️ No Hedge configured.")
+            else:
+                st.info("Market data unavailable for projection.")
+        except Exception as e:
+            st.error(f"Projection Error: {e}")
+        # ------------------------------
 
         submitted = st.form_submit_button("Deploy Bot", type="primary")
     
     if submitted:
         if not name:
-            st.error("Bot Name is required.")
+            st.error("🚨 Bot Name is required.")
         else:
             config['timeframe'] = timeframe
-            strat_id = "MarketMaker" if strategy_type == "Market Maker" else "MQL4"
+            
+            strat_id = "MQL4" # Default
+            if strategy_type == "Market Maker":
+                strat_id = "MarketMaker"
+            elif strategy_type == "Magic Hour":
+                strat_id = "MagicHour"
+                
             config['market_type'] = 'spot' if mode_id == 'spot' else 'futures'
             
             # Explicitly mapping all required positional arguments as keywords

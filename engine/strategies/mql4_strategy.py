@@ -82,6 +82,7 @@ class MQL4Strategy(BaseStrategy):
         self.use_atr_grid = self.params.get('UseATRGrid', False)
         self.atr_grid_factor = self.params.get('ATRGridFactor', 1.0)
         self.atr_period = self.params.get('ATRPeriods', 21)
+        self.atr_tf = self.params.get('ATR_Timeframe', None) # New: Specific TF for Grid ATR
         
         self.use_hedge = self.params.get('UseHedge', False)
         self.hedge_start = self.params.get('HedgeStart', 20.0)
@@ -353,8 +354,22 @@ class MQL4Strategy(BaseStrategy):
                     tp_price = avg_price * (1 - tp_pct)
             else:
                 # Dollar TP: Break-even + (target_usd / total_qty)
+                # Logic: We want to make $10 total profit on the entire position.
+                # Total Value at TP = Total Cost + Target Profit
+                # Price * Qty = Cost + Target
+                # Price = (Cost + Target) / Qty
                 tp_target_usd = self.params.get('TakeProfitBase', 10.0)
-                tp_price = avg_price + (tp_target_usd / total_qty * direction)
+                tp_price = (total_invested + tp_target_usd) / total_qty
+                
+                # Verify direction logic if using distance adder instead
+                # If SHORT, Cost is handled differently? 
+                # For Short: Entry 100, Qty 1. Cost $100.
+                # Target Profit $10. We want equity $110? No, in Short, profit is (Entry - Exit) * Qty.
+                # Profit = (AvgPrice - ExitPrice) * Qty
+                # 10 = (Avg - Exit) * Qty -> 10/Qty = Avg - Exit -> Exit = Avg - (10/Qty)
+                
+                if direction == -1: # SHORT
+                     tp_price = avg_price - (tp_target_usd / total_qty)
             
             is_hedge = i + 1 >= hedge_step if self.params.get('UseHedge') else False
             hedge_size = round(total_invested, 2) if is_hedge else 0.0
@@ -380,8 +395,16 @@ class MQL4Strategy(BaseStrategy):
         base_grid = self.params.get('base_grid', 25.0) # Default 25 pips
         
         if self.use_atr_grid:
+            # Determine which dataframe to use
+            df_calc = market_data
+            if self.atr_tf:
+                 # Attempt resample (only works if atr_tf >= market_data tf)
+                 # If atr_tf < market_data tf, resampling will yield bad data (flat candles -> ATR=0), 
+                 # but we rely on UI validation to prevent that config.
+                 df_calc = self._resample(market_data, self.atr_tf)
+
             # Assume Ta-Lib or custom ATR available
-            atr_series = ta_custom.atr(market_data['high'], market_data['low'], market_data['close'], period=self.atr_period)
+            atr_series = ta_custom.atr(df_calc['high'], df_calc['low'], df_calc['close'], period=self.atr_period)
             if atr_series is not None and not atr_series.empty:
                 current_atr = atr_series.iloc[-1]
                 # Blessing 3 logic: Grid = ATR * GAF

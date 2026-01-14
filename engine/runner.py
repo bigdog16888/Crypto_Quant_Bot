@@ -14,6 +14,15 @@ from engine.strategies.mql4_strategy import MQL4Strategy
 from engine.manager import manage_trade
 from engine.sync import sync_bot_state
 from config.settings import config
+from config.constants import (
+    MIN_ORDER_USD,
+    MAX_ORDERS_PER_CYCLE,
+    MAX_ORDERS_PER_BOT_DAILY,
+    POLL_INTERVAL_SECONDS,
+    ORDER_FILL_TIMEOUT_SECONDS,
+    MAX_CONSECUTIVE_FAILURES,
+    STABLECOINS
+)
 
 # Configure logging
 logging.basicConfig(
@@ -41,8 +50,7 @@ class BotRunner:
         self.orders_this_cycle = 0
         self.orders_today = {}  # {bot_id: count}
         self.last_order_reset = time.time()
-        self.MAX_ORDERS_PER_CYCLE = 10  # Hard cap per 10s cycle
-        self.MAX_ORDERS_PER_BOT_DAILY = 100  # Per-bot daily cap
+        # Using constants from config/constants.py
         # ===============================================
         
         self._initialize_safety_baseline()
@@ -52,6 +60,15 @@ class BotRunner:
             self.sync_all_bots()
         except Exception as e:
             logger.error(f"Failed to sync bots on startup (non-fatal): {e}")
+
+    def _calculate_stablecoin_balance(self, balance: dict) -> float:
+        """Calculate total balance across USDT and USDC stablecoins."""
+        total = 0.0
+        for currency in STABLECOINS:
+            curr_bal = balance.get(currency)
+            if isinstance(curr_bal, dict):
+                total += float(curr_bal.get('total', 0.0))
+        return total
 
     def sync_all_bots(self):
         """
@@ -74,12 +91,8 @@ class BotRunner:
             if not balance:
                 raise ValueError("Failed to fetch balance on init")
                 
-            # Support both USDT and USDC (futures testnet uses USDC)
-            total_stablecoin = 0.0
-            for currency in ['USDT', 'USDC']:
-                curr_bal = balance.get(currency)
-                if isinstance(curr_bal, dict):
-                    total_stablecoin += float(curr_bal.get('total', 0.0))
+            # Use helper for stablecoin calculation
+            total_stablecoin = self._calculate_stablecoin_balance(balance)
             
             # Add estimated value of open positions (from DB)
             # This handles restarts where we already have positions
@@ -117,12 +130,8 @@ class BotRunner:
                 logger.warning("Circuit breaker skipped: Could not fetch balance")
                 return # Skip check if API fail
                 
-            # Support both USDT and USDC (futures testnet uses USDC)
-            total_stablecoin = 0.0
-            for currency in ['USDT', 'USDC']:
-                curr_bal = balance.get(currency)
-                if isinstance(curr_bal, dict):
-                    total_stablecoin += float(curr_bal.get('total', 0.0))
+            # Use helper for stablecoin calculation
+            total_stablecoin = self._calculate_stablecoin_balance(balance)
             
             # Sum up invested costs from all bots
             active_bots = self.get_active_bots()
@@ -163,7 +172,7 @@ class BotRunner:
         conn = get_connection()
         cursor = conn.cursor()
         try:
-            # Fetch all bots to handle sowohl active als auch recently deactivated ones
+            # Fetch all bots to handle both active and recently deactivated ones
             cursor.execute('''
                 SELECT id, name, pair, direction, strategy_type, config, base_size, martingale_multiplier, rsi_limit, is_active
                 FROM bots 
@@ -218,6 +227,9 @@ class BotRunner:
                 elif strat_type == 'MarketMaker':
                     from engine.strategies.market_maker import MarketMakerStrategy
                     self.strategies[bot_id] = MarketMakerStrategy(name=name, params=params)
+                elif strat_type == 'MagicHour':
+                    from engine.strategies.magic_hour_strategy import MagicHourStrategy
+                    self.strategies[bot_id] = MagicHourStrategy(name=name, params=params)
                 else:
                     logger.warning(f"Unknown strategy type {strat_type} for bot {name}. Skipping.")
                     return
@@ -265,7 +277,6 @@ class BotRunner:
                 # Check Time Cooldown
                 reentry_mins = params.get('reentry_cooldown_mins', 0)
                 if last_exit_time > 0 and reentry_mins > 0:
-                    import time
                     elapsed_mins = (time.time() - last_exit_time) / 60
                     if elapsed_mins < reentry_mins:
                         can_enter = False
@@ -378,13 +389,13 @@ class BotRunner:
             logger.info(f"🔄 Daily order counters reset for {current_day}")
         
         # Check per-cycle limit
-        if self.orders_this_cycle >= self.MAX_ORDERS_PER_CYCLE:
-            return False, f"Cycle limit reached ({self.orders_this_cycle}/{self.MAX_ORDERS_PER_CYCLE})"
+        if self.orders_this_cycle >= MAX_ORDERS_PER_CYCLE:
+            return False, f"Cycle limit reached ({self.orders_this_cycle}/{MAX_ORDERS_PER_CYCLE})"
         
         # Check per-bot daily limit
         bot_count = self.orders_today.get(bot_id, 0)
-        if bot_count >= self.MAX_ORDERS_PER_BOT_DAILY:
-            return False, f"Daily limit for bot {name} reached ({bot_count}/{self.MAX_ORDERS_PER_BOT_DAILY})"
+        if bot_count >= MAX_ORDERS_PER_BOT_DAILY:
+            return False, f"Daily limit for bot {name} reached ({bot_count}/{MAX_ORDERS_PER_BOT_DAILY})"
         
         return True, ""
     
@@ -407,7 +418,6 @@ class BotRunner:
         logger.info(f"🚀 [ENTRY] Bot: {name} | Side: {side} | Amount: ${amount}")
         
         # ========== MINIMUM ORDER VALIDATION ==========
-        MIN_ORDER_USD = 5.0  # Binance futures min is ~5 USDC
         if amount < MIN_ORDER_USD:
             logger.error(f"Order amount ${amount} below minimum ${MIN_ORDER_USD}, aborting.")
             return
@@ -440,7 +450,7 @@ class BotRunner:
                     logger.info(f"Order placed: {order_id}")
                     
                     # Wait for fill confirmation (with timeout)
-                    filled, final_order = self.exchange.wait_for_fill(order_id, pair, timeout_seconds=30)
+                    filled, final_order = self.exchange.wait_for_fill(order_id, pair, timeout_seconds=ORDER_FILL_TIMEOUT_SECONDS)
                     
                     if filled:
                         # Use actual fill price if available
@@ -576,7 +586,6 @@ if __name__ == "__main__":
         logger.error(f"Failed to write PID file: {e}")
 
     consecutive_failures = 0
-    MAX_CONSECUTIVE_FAILURES = 5
 
     try:
         while runner.running:
@@ -593,7 +602,7 @@ if __name__ == "__main__":
                     logger.critical(f"🚨 {MAX_CONSECUTIVE_FAILURES} consecutive failures. Shutting down for safety.")
                     break
                     
-            time.sleep(10) # 10 second polling
+            time.sleep(POLL_INTERVAL_SECONDS)
             
     except KeyboardInterrupt:
         logger.info("Bot Service Stopped by User (Ctrl+C).")
