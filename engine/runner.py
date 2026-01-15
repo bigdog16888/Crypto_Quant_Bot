@@ -8,7 +8,7 @@ import pandas as pd
 # Add root to sys.path to ensure module resolution
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from engine.database import get_connection, init_db, get_bot_status, update_martingale_step, log_trade
+from engine.database import get_connection, init_db, get_bot_status, update_martingale_step, log_trade, reset_bot_after_tp
 from engine.exchange_interface import ExchangeInterface
 from engine.strategies.mql4_strategy import MQL4Strategy
 from engine.manager import manage_trade
@@ -301,24 +301,144 @@ class BotRunner:
                         self.execute_entry(bot_id, name, pair, 'sell', base_size)
             else:
                 # --- Trade Management Logic ---
-                # SAFETY: Validate DataFrame before accessing iloc
                 if df.empty:
                     logger.warning(f"Bot {name}: Empty DataFrame in trade management. Skipping.")
                     return
                     
-                # Pass market data to strategy for grid calculations
                 strategy.last_market_data = df
                 current_price = df['close'].iloc[-1]
                 
-                # manager.manage_trade handles TP, Grid Steps, and Hedging
-                result = manage_trade(bot_id, name, pair, direction, params, trade_data, current_price, strategy, self.exchange)
+                # Decision Phase (Oracle)
+                mission = manage_trade(bot_id, name, pair, direction, params, trade_data, current_price, strategy, self.exchange)
                 
-                if result and result.get('action') == 'tp_hit':
-                    # Log the clear exit
-                    logger.info(f"Bot {name} - Cycle Complete. Entering potential cooldown/re-entry phase.")
+                # Execution Phase
+                if mission and mission.get('action') != 'none':
+                    self.execute_mission(mission)
 
         except Exception as e:
             logger.error(f"Error processing bot {name}: {e}")
+
+    def execute_mission(self, mission):
+        """
+        Executes a trade mission from the manager.
+        """
+        try:
+            action = mission.get('action')
+            bot_id = mission.get('bot_id')
+            bot_name = mission.get('bot_name')
+            pair = mission.get('pair')
+            direction = mission.get('direction')
+            
+            if action == 'tp_hit':
+                exit_price = mission.get('exit_price')
+                qty = mission.get('qty')
+                
+                logger.info(f"💰 [TP MISSION] Closing {bot_name} at {exit_price}")
+                
+                if config.DRY_RUN:
+                    reset_bot_after_tp(bot_id, exit_price=exit_price)
+                    logger.info(f"[DRY RUN] TP Reset Complete for {bot_name}")
+                else:
+                    side = 'sell' if direction == 'LONG' else 'buy'
+                    try:
+                        order = self.exchange.create_order(pair, 'market', side, qty)
+                        if order:
+                            reset_bot_after_tp(bot_id, exit_price=exit_price)
+                            logger.info(f"✅ TP Market Order Filled for {bot_name}")
+                    except Exception as e:
+                        logger.error(f"Failed to execute TP for {bot_name}: {e}")
+
+            elif action == 'grid_step':
+                price = mission.get('price')
+                qty = mission.get('qty')
+                amount_usd = mission.get('amount_usd')
+                new_step = mission.get('new_step')
+                new_avg = mission.get('new_avg')
+                new_tp = mission.get('new_tp')
+                
+                side = 'buy' if direction == 'LONG' else 'sell'
+                
+                logger.info(f"📥 [GRID MISSION] Step {new_step} for {bot_name} at {price}")
+                
+                if config.DRY_RUN:
+                    update_martingale_step(bot_id, new_step, amount_usd, new_avg, new_tp)
+                    log_trade(
+                        bot_id=bot_id,
+                        action='DRY_BUY' if side == 'buy' else 'DRY_SELL',
+                        symbol=pair,
+                        price=price,
+                        amount=qty,
+                        cost_usdc=amount_usd,
+                        order_id="DRY_GRID",
+                        step=new_step,
+                        notes=f"[DRY RUN] Grid Step {new_step}"
+                    )
+                    logger.info(f"[DRY RUN] Grid Update Complete for {bot_name}")
+                else:
+                    try:
+                        order = self.exchange.create_order(pair, 'limit', side, qty, price)
+                        if order:
+                            update_martingale_step(bot_id, new_step, amount_usd, new_avg, new_tp)
+                            log_trade(
+                                bot_id=bot_id,
+                                action='BUY' if side == 'buy' else 'SELL',
+                                symbol=pair,
+                                price=price,
+                                amount=qty,
+                                cost_usdc=amount_usd,
+                                order_id=order.get('id'),
+                                step=new_step,
+                                notes=f"Grid Step {new_step}"
+                            )
+                            logger.info(f"✅ Grid Order {new_step} Placed for {bot_name}")
+                    except Exception as e:
+                        logger.error(f"Failed to execute Grid Step {new_step} for {bot_name}: {e}")
+            
+            elif action == 'hedge_open':
+                price = mission.get('price')
+                qty = mission.get('qty')
+                amount_usd = mission.get('amount_usd')
+                step = mission.get('step')
+                
+                # Hedge side is usually same as initial? No, hedge is opposite.
+                # If bot is LONG, entry was buy. Hedge is sell?
+                # Actually Martingale bots hedge by opening an opposite position.
+                side = 'sell' if direction == 'LONG' else 'buy'
+                
+                logger.info(f"🛡️ [HEDGE MISSION] Opening Hedge for {bot_name} at {price}")
+                
+                if config.DRY_RUN:
+                    log_trade(
+                        bot_id=bot_id,
+                        action='HEDGE_OPEN',
+                        symbol=pair,
+                        price=price,
+                        amount=qty,
+                        cost_usdc=amount_usd,
+                        order_id="DRY_HEDGE",
+                        step=step,
+                        notes=f"[DRY RUN] Hedge Opened"
+                    )
+                else:
+                    try:
+                        order = self.exchange.create_order(pair, 'market', side, qty)
+                        if order:
+                            log_trade(
+                                bot_id=bot_id,
+                                action='HEDGE_OPEN',
+                                symbol=pair,
+                                price=price,
+                                amount=qty,
+                                cost_usdc=amount_usd,
+                                order_id=order.get('id'),
+                                step=step,
+                                notes="Hedge Opened"
+                            )
+                    except Exception as e:
+                        logger.error(f"Failed to execute Hedge for {bot_name}: {e}")
+
+        except Exception as e:
+            logger.error(f"Error executing mission for bot {mission.get('bot_name')}: {e}")
 
     def process_market_maker(self, bot_id, name, pair, strategy, df):
         """
@@ -432,19 +552,37 @@ class BotRunner:
             logger.error(f"Could not fetch price for {pair}, aborting entry.")
             return
 
+        # CRITICAL FIX: Convert dollar amount to coin quantity
+        # Exchange expects 'amount' as quantity of base asset (e.g. 0.001 BTC)
+        qty = amount / price
+
         # Sanity check direction vs side
         # side is 'buy' or 'sell'
         
         if config.DRY_RUN:
-            logger.info(f"[DRY RUN] Simulating entry for {name} at {price}")
+            logger.info(f"[DRY RUN] Simulating entry for {name} at {price} (Qty: {qty:.6f})")
             tp_price = price * (1.01 if side == 'buy' else 0.99)
             update_martingale_step(bot_id, 0, amount, price, tp_price)
             self._record_order(bot_id)  # Count dry run orders too for testing
+            
+            # Log dry run trade to history for visibility
+            log_trade(
+                bot_id=bot_id,
+                action='DRY_BUY' if side == 'buy' else 'DRY_SELL',
+                symbol=pair,
+                price=price,
+                amount=qty,
+                cost_usdc=amount,
+                order_id="DRY_RUN",
+                step=0,
+                notes=f"[DRY RUN] Entry order for {name}"
+            )
         else:
             # Real Order
             try:
                 # Use create_order which now has validation and retries
-                order = self.exchange.create_order(pair, 'limit', side, amount, price, params=params)
+                # Pass 'qty' as the amount parameter
+                order = self.exchange.create_order(pair, 'limit', side, qty, price, params=params)
                 if order:
                     order_id = order.get('id')
                     logger.info(f"Order placed: {order_id}")

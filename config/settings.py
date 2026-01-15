@@ -15,15 +15,22 @@ class Config:
         "DB_FILE": os.path.join(ROOT_DIR, "crypto_bot.db"),
     }
 
-    API_KEY = os.getenv("BINANCE_API_KEY")
-    API_SECRET = os.getenv("BINANCE_API_SECRET")
-    
-    DRY_RUN = os.getenv("DRY_RUN", "True").lower() == "true"
-    LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+    # Use testnet keys when TESTNET is True
     TESTNET = os.getenv("TESTNET", "True").lower() == "true"
-    
+    if TESTNET:
+        API_KEY = os.getenv("BINANCE_TESTNET_API_KEY", os.getenv("BINANCE_API_KEY", ""))
+        API_SECRET = os.getenv("BINANCE_TESTNET_API_SECRET", os.getenv("BINANCE_API_SECRET", ""))
+    else:
+        API_KEY = os.getenv("BINANCE_API_KEY", "")
+        API_SECRET = os.getenv("BINANCE_API_SECRET", "")
+
+    DRY_RUN = os.getenv("DRY_RUN", "False").lower() == "true"
+    LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+
+    # Support both SPOT (for USDC pairs) and FUTURES (for USDT pairs)
+    # Users select via UI dropdown in Bot Creator/Manager
     ALLOWED_SYMBOLS = os.getenv("ALLOWED_SYMBOLS", "BTC/USDT,ETH/USDT,SOL/USDT,BNB/USDT,XRP/USDT,BTC/USDC,ETH/USDC,SOL/USDC").split(",")
-    MARKET_TYPE = os.getenv("MARKET_TYPE", "future").lower() # 'spot' or 'future' (USDT-M) or 'swap'
+    MARKET_TYPE = os.getenv("MARKET_TYPE", "future").lower() # 'spot' or 'future' (USDT-M) or 'swap' - DEFAULT: FUTURES
     MAX_ORDER_USD = float(os.getenv("MAX_ORDER_USD", 100))
     
     # Circuit Breaker / Safety

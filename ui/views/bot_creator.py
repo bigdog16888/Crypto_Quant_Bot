@@ -19,14 +19,22 @@ def render_bot_creator_view():
     st.subheader("🌐 Market Configuration")
     col_m1, col_m2, col_m3 = st.columns(3)
     with col_m1:
-        market_type = st.selectbox("Market Type", ["Spot", "Futures (Swap)"], index=0)
-        mode_id = 'spot' if market_type == "Spot" else 'future'
-        
-        # Testnet Toggle
         from config.settings import config as global_config
+        market_type = st.selectbox(
+            "Market Type",
+            ["Spot", "Futures (Swap)"],
+            index=0 if global_config.MARKET_TYPE == 'spot' else 1,
+            help="Choose Spot (for USDC pairs) or Futures (for USDT pairs)"
+        )
+        mode_id = 'spot' if market_type == "Spot" else 'future'
+
+        # Store in session for consistency with bot_manager
+        st.session_state['market_type'] = market_type
+
+        # Testnet Toggle
         is_testnet = st.checkbox("Use Testnet", value=global_config.TESTNET)
         if is_testnet:
-             st.caption("⚠️ TESTNET MODE ACTIVE")
+            st.caption("⚠️ TESTNET MODE ACTIVE")
              
     with col_m2:
         quote_asset = st.selectbox("Quote Asset", ["USDT", "USDC"])
@@ -36,6 +44,9 @@ def render_bot_creator_view():
             exchange = ExchangeInterface(market_type=mode_id)
             # Ensure markets are loaded before querying symbols
             exchange.exchange.load_markets()
+
+            # Store market type in session for bot_manager consistency
+            st.session_state['market_type'] = mode_id
             available_pairs = exchange.get_available_symbols(quote_asset=quote_asset)
             if not available_pairs:
                 st.warning("No pairs found. Check connection or API keys.")
@@ -405,7 +416,7 @@ def render_bot_creator_view():
                             height=300,
                             margin=dict(l=10, r=10, t=30, b=10)
                         )
-                        st.plotly_chart(fig, use_container_width=True)
+                        st.plotly_chart(fig, width='stretch')
                     # ----------------------------------
 
                     st.success(f"📈 Simulated Martingale Grid based on current price: **{current_price:,.2f}**")

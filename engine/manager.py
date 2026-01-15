@@ -126,14 +126,13 @@ def calculate_hedge_lot(main_basket_lots: float, settings: dict) -> float:
 def manage_trade(bot_id, bot_name, pair, direction, settings, trade_data, current_price, strategy, exchange_interface):
     """
     Core trade management logic called by the runner.
-    trade_data: (bot_id, current_step, total_invested, avg_entry_price, target_tp_price)
-    Returns: dict with actions taken (e.g. {'action': 'tp_hit'})
+    trade_data: (name, pair, current_step, total_invested, avg_entry_price, target_tp_price, last_exit_price, last_exit_time)
+    Returns: dict with missions for the runner to execute (e.g. {'action': 'TP', 'price': ...})
     """
     import logging
-    from engine.database import update_martingale_step, reset_bot_after_tp, log_trade
     logger = logging.getLogger("TradeManager")
-    
-    _, current_step, total_invested, avg_entry_price, target_tp_price = trade_data
+
+    _, _, current_step, total_invested, avg_entry_price, target_tp_price, _, _ = trade_data
     
     # 1. Check Take Profit
     tp_hit = False
@@ -143,40 +142,30 @@ def manage_trade(bot_id, bot_name, pair, direction, settings, trade_data, curren
         if current_price <= target_tp_price: tp_hit = True
         
     if tp_hit:
-        logger.info(f"💰 Bot {bot_name} Profit Target Hit! Closing at {current_price}")
-        # Calculate PnL before resetting
+        logger.info(f"💰 Bot {bot_name} Profit Target Hit! Signal to close at {current_price}")
         est_qty = total_invested / avg_entry_price if avg_entry_price > 0 else 0
         if direction == 'LONG':
             pnl = (current_price - avg_entry_price) * est_qty
         else:
             pnl = (avg_entry_price - current_price) * est_qty
         
-        # Log the TP hit trade
-        log_trade(
-            bot_id=bot_id,
-            action='TP_HIT',
-            symbol=pair,
-            price=current_price,
-            amount=est_qty,
-            cost_usdc=total_invested,
-            step=current_step,
-            pnl=pnl,
-            notes=f"TP hit at step {current_step}, avg entry {avg_entry_price:.4f}"
-        )
-        
-        # In real execution, we would market close here
-        # For now, we reset the bot state
-        reset_bot_after_tp(bot_id, exit_price=current_price)
-        return {'action': 'tp_hit', 'pnl': pnl}
+        # MISSION: CLOSE POSITION
+        return {
+            'action': 'tp_hit',
+            'bot_id': bot_id,
+            'bot_name': bot_name,
+            'pair': pair,
+            'direction': direction,
+            'exit_price': current_price,
+            'qty': est_qty,
+            'pnl': pnl,
+            'current_step': current_step,
+            'avg_entry_price': avg_entry_price,
+            'total_invested': total_invested
+        }
 
     # 2. Check Next Martingale Grid Order
-    # Calculate next order price based on strategy
-    # Note: strategy.calculate_next_grid_price() logic handles direction
     try:
-        # We need market data for ATR grid if enabled
-        # This is passed from the runner to the strategy usually
-        # For now, we assume strategy has access or we pass simplified context
-        # In runner, we'll ensure strategy.last_market_data is set
         next_order_price = strategy.calculate_next_grid_price(direction, current_price, avg_entry_price, current_step, strategy.last_market_data if hasattr(strategy, 'last_market_data') else None)
         
         grid_trigger = False
@@ -187,57 +176,43 @@ def manage_trade(bot_id, bot_name, pair, direction, settings, trade_data, curren
             
         if grid_trigger:
             next_step = current_step + 1
-            added_investment = strategy.calculate_lot_size(next_step, 0) # Account balance currently unused
+            added_investment = strategy.calculate_lot_size(next_step, 0)
             
-            logger.info(f"📥 Bot {bot_name} Triggering Grid Step {next_step} at {current_price} (Order Size: {added_investment})")
+            logger.info(f"📥 Bot {bot_name} - Grid Step {next_step} triggered at {current_price} (Order Size: ${added_investment})")
             
-            # Update DB (Calculated new avg price and tp is simplified here)
+            # Recalculate values for mission
             new_total = total_invested + added_investment
-            # Avg Price = Price1*S1 + Price2*S2 / (S1+S2)
             new_avg = (avg_entry_price * total_invested + current_price * added_investment) / new_total
             
-            # Recalculate TP based on settings (support both USD and Pct)
             tp_type = settings.get('TakeProfitType', 'USD')
-            new_tp = 0.0
-            
-            # Estimate total qty (approx for USD calculation)
-            # Crypto is Base/Quote. Investment is Quote. Qty is Base.
-            # Qty = Investment / Price
-            # This is an approximation since we don't have exact Qty in trade_data tuple passed here
-            # But for updating the DB, we need a valid target.
-            
             if tp_type == 'Percent':
                 tp_pct = settings.get('TakeProfitPct', 1.0) / 100.0
                 new_tp = new_avg * (1.0 + tp_pct) if direction == 'LONG' else new_avg * (1.0 - tp_pct)
             else:
-                # Dollar TP
                 target_usd = settings.get('TakeProfitBase', 10.0)
-                # We need estimated qty to calc price distance
                 est_qty = new_total / new_avg
                 dist = target_usd / est_qty
                 new_tp = new_avg + dist if direction == 'LONG' else new_avg - dist
             
-            update_martingale_step(bot_id, next_step, added_investment, new_avg, new_tp)
-            
-            # Log the grid step trade
-            log_trade(
-                bot_id=bot_id,
-                action='BUY' if direction == 'LONG' else 'SELL',
-                symbol=pair,
-                price=current_price,
-                amount=added_investment / current_price if current_price > 0 else 0,
-                cost_usdc=added_investment,
-                step=next_step,
-                notes=f"Grid step {next_step}, new avg {new_avg:.4f}"
-            )
-            
-            return {'action': 'grid_step', 'step': next_step}
+            # MISSION: PLACE GRID ORDER
+            return {
+                'action': 'grid_step',
+                'bot_id': bot_id,
+                'bot_name': bot_name,
+                'pair': pair,
+                'direction': direction,
+                'price': current_price,
+                'amount_usd': added_investment,
+                'qty': added_investment / current_price if current_price > 0 else 0,
+                'new_step': next_step,
+                'new_avg': new_avg,
+                'new_tp': new_tp
+            }
             
     except Exception as e:
         logger.error(f"Error checking grid for {bot_name}: {e}")
 
-    # 3. Check Hedge (Automated Hedge Executor)
-    # Drawdown Calculation (approximate)
+    # 3. Check Hedge
     drawdown_pc = 0.0
     if avg_entry_price > 0:
         if direction == 'LONG':
@@ -247,24 +222,22 @@ def manage_trade(bot_id, bot_name, pair, direction, settings, trade_data, curren
 
     hedge_trigger = check_hedge_entry(drawdown_pc, current_step, settings)
     if hedge_trigger:
-        # EXECUTE HEDGE
         hedge_size = total_invested * hedge_trigger.get('size_mult', 1.0)
-        logger.warning(f"🛡️ Bot {bot_name} AUTOMATED HEDGE TRIGGERED! Size: {hedge_size} at {current_price}")
+        logger.warning(f"🛡️ Bot {bot_name} - HEDGE TRIGGERED! Size: ${hedge_size} at {current_price}")
         
-        # Log the hedge trade
-        log_trade(
-            bot_id=bot_id,
-            action='HEDGE_OPEN',
-            symbol=pair,
-            price=current_price,
-            amount=hedge_size / current_price if current_price > 0 else 0,
-            cost_usdc=hedge_size,
-            step=current_step,
-            notes=f"Hedge triggered at {drawdown_pc:.1f}% drawdown"
-        )
-        
-        # In real execution: exchange_interface.create_order(...)
-        return {'action': 'hedge_opened', 'size': hedge_size}
+        # MISSION: OPEN HEDGE
+        return {
+            'action': 'hedge_open',
+            'bot_id': bot_id,
+            'bot_name': bot_name,
+            'pair': pair,
+            'direction': direction,
+            'price': current_price,
+            'amount_usd': hedge_size,
+            'qty': hedge_size / current_price if current_price > 0 else 0,
+            'step': current_step,
+            'drawdown_pct': drawdown_pc
+        }
 
     return {'action': 'none'}
 

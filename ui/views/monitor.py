@@ -53,7 +53,8 @@ def render_monitor_view():
         price_map = {}
         if active_symbols:
             try:
-                ex_global = ExchangeInterface()
+                # Use market type from config (spot vs future)
+                ex_global = ExchangeInterface(market_type=config.MARKET_TYPE)
                 # Optimized fetch
                 for sym in active_symbols:
                     ticker = ex_global.exchange.fetch_ticker(sym)
@@ -72,51 +73,132 @@ def render_monitor_view():
                     pnl = (entry - curr) / entry * inv
                 global_pnl_usd += pnl
 
-        # 4. Fetch Wallet Balance
-        wallet_balance = 0.0
+        # 4. Fetch Multi-Asset Balances (Spot + Futures)
+        futures_balance = 0.0
+        spot_balance = 0.0
         total_equity = 0.0
+        assets_breakdown = []
+        balance_debug_msg = []
+
+        # --- A. Fetch Futures Balance ---
         try:
-            ex_bal = ExchangeInterface()
-            bal_data = ex_bal.fetch_balance()
-            # Assuming USDT/USDC quoted
-            # total = free + used
-            # For simplicity, getting 'total' of the main quote asset (USDT or USDC)
-            # Or usually 'total' in USDT equivalent if exchange provides it
-            if 'USDT' in bal_data['total']:
-                wallet_balance = float(bal_data['total']['USDT'])
-            elif 'USDC' in bal_data['total']:
-                wallet_balance = float(bal_data['total']['USDC'])
-            else:
-                # Fallback to total free + used if total dict not standard
-                wallet_balance = 0.0 
+            ex_future = ExchangeInterface(market_type='future')
+            fut_data = ex_future.fetch_balance()
             
-            total_equity = wallet_balance + global_pnl_usd # Balance usually includes realized, PnL is unrealized
-        except Exception:
-            wallet_balance = 0.0
-            total_equity = 0.0
-        
+            if fut_data and 'info' in fut_data:
+                info = fut_data['info']
+                # Try standard Total Wallet Balance (Binance specific)
+                if 'totalWalletBalance' in info:
+                    futures_balance = float(info['totalWalletBalance'])
+                # Fallback to USDT total if specific key missing
+                elif 'USDT' in fut_data:
+                    futures_balance = float(fut_data['USDT'].get('total', 0))
+                
+                # Extract assets for breakdown
+                if 'assets' in info:
+                    for asset in info['assets']:
+                        wb = float(asset.get('walletBalance', 0))
+                        u_pnl = float(asset.get('unrealizedProfit', 0))
+                        if wb > 0 or u_pnl != 0:
+                            assets_breakdown.append({
+                                'Type': 'Futures',
+                                'Asset': asset.get('asset'),
+                                'Balance': wb,
+                                'Unrealized PnL': u_pnl,
+                                'Equity': wb + u_pnl
+                            })
+            
+            balance_debug_msg.append(f"Fut: ${futures_balance:.2f}")
+        except Exception as e:
+            balance_debug_msg.append(f"Fut Err: {str(e)[:20]}")
+
+        # --- B. Fetch Spot Balance ---
+        try:
+            # Only try spot if not exclusively futures restricted (optional check)
+            ex_spot = ExchangeInterface(market_type='spot')
+            # Check if we can fetch (might fail if keys are futures-only)
+            spot_data = ex_spot.fetch_balance()
+            
+            if spot_data:
+                # Calculate total spot value in USDT (simplified)
+                # We iterate over non-zero balances
+                if 'total' in spot_data:
+                    for asset, amount in spot_data['total'].items():
+                        if amount > 0:
+                            # Estimate value in USDT (mock or fetch price?)
+                            # For now, just count USDT/USDC directly as 1:1
+                            val = 0.0
+                            if asset in ['USDT', 'USDC', 'DAI', 'BUSD']:
+                                val = amount
+                            else:
+                                # Try to get price? Too slow for now.
+                                # Just log the asset
+                                pass 
+                            
+                            if val > 0:
+                                spot_balance += val
+                            
+                            assets_breakdown.append({
+                                'Type': 'Spot',
+                                'Asset': asset,
+                                'Balance': amount,
+                                'Unrealized PnL': 0.0,
+                                'Equity': val # Approximate
+                            })
+            
+            balance_debug_msg.append(f"Spot: ${spot_balance:.2f}")
+        except Exception as e:
+            # Likely auth error if using futures keys
+            balance_debug_msg.append("Spot: N/A (Auth)")
+
+        # Total Calculation
+        total_equity = futures_balance + spot_balance + global_pnl_usd # Global PnL is active trade PnL from DB logic
+
         conn.close()
-    except Exception:
+    except Exception as outer_e:
         active_count = 0
         total_invested_db = 0.0
         global_pnl_usd = 0.0
-        wallet_balance = 0.0
+        futures_balance = 0.0
+        spot_balance = 0.0
         total_equity = 0.0
+        balance_debug_msg = [f"Critical Error: {str(outer_e)}"]
+        assets_breakdown = []
 
+    # DEBUG: Show balance debug info (temporary - remove after fixing)
+    if balance_debug_msg:
+        st.caption(f"🔧 Portfolio Debug: {' | '.join(balance_debug_msg)}")
+    
     # Display Metrics Grid (Top Command Center)
     m1, m2, m3, m4 = st.columns(4)
     with m1:
-        st.markdown(f"""<div class="metric-card"><div class="metric-label">Wallet Balance</div><div class="metric-value">${wallet_balance:,.2f}</div></div>""", unsafe_allow_html=True)
+        st.markdown(f"""<div class="metric-card"><div class="metric-label">Total Equity</div><div class="metric-value">${total_equity:,.2f}</div></div>""", unsafe_allow_html=True)
     with m2:
-        st.markdown(f"""<div class="metric-card"><div class="metric-label">Active Exposure</div><div class="metric-value">${total_invested_db:,.2f}</div></div>""", unsafe_allow_html=True)
+        st.markdown(f"""<div class="metric-card"><div class="metric-label">Futures Balance</div><div class="metric-value">${futures_balance:,.2f}</div></div>""", unsafe_allow_html=True)
     with m3:
         # Global PnL
         color = "#3fb950" if global_pnl_usd >= 0 else "#f85149"
         sign = "+" if global_pnl_usd >= 0 else ""
-        st.markdown(f"""<div class="metric-card"><div class="metric-label">Global PnL (Unrealized)</div><div class="metric-value" style="color:{color}">{sign}${global_pnl_usd:,.2f}</div></div>""", unsafe_allow_html=True)
+        st.markdown(f"""<div class="metric-card"><div class="metric-label">Active PnL (Unrealized)</div><div class="metric-value" style="color:{color}">{sign}${global_pnl_usd:,.2f}</div></div>""", unsafe_allow_html=True)
     with m4:
-        # Equity
-        st.markdown(f"""<div class="metric-card"><div class="metric-label">Est. Total Equity</div><div class="metric-value">${total_equity:,.2f}</div></div>""", unsafe_allow_html=True)
+        # Spot or Invested
+        st.markdown(f"""<div class="metric-card"><div class="metric-label">Active Exposure</div><div class="metric-value">${total_invested_db:,.2f}</div></div>""", unsafe_allow_html=True)
+
+    # Asset Breakdown Expander
+    if assets_breakdown:
+        with st.expander("💰 Detailed Asset Breakdown"):
+            df_assets = pd.DataFrame(assets_breakdown)
+            st.dataframe(
+                df_assets, 
+                column_config={
+                    "Balance": st.column_config.NumberColumn(format="%.4f"),
+                    "Unrealized PnL": st.column_config.NumberColumn(format="$%.2f"),
+                    "Equity": st.column_config.NumberColumn(format="$%.2f"),
+                },
+                width='stretch',
+                hide_index=True
+            )
+
 
     st.divider()
     
@@ -156,9 +238,9 @@ def render_monitor_view():
     
     # --- Fetch Data ---
     try:
-        # Initialize exchange (defaulting to spot for monitor for now)
+        # Initialize exchange with correct market type from config
         try:
-            exchange = ExchangeInterface() 
+            exchange = ExchangeInterface(market_type=config.MARKET_TYPE) 
             ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=100)
         except (ccxt.AuthenticationError, ccxt.ExchangeError) as e:
             st.error(f"🔌 **API Connection Failed**: {e}")
@@ -317,17 +399,41 @@ def render_monitor_view():
             unique_symbols = list(set([r[2] for r in rows if r[2]]))
             
             # 2. Fetch all tickers in one go (or efficient loop)
+            # Group symbols by market type from bot config to avoid 'spot' errors on futures keys
             current_prices = {}
-            if unique_symbols:
+            symbols_by_market = {'spot': set(), 'future': set()}
+            
+            for r in rows:
+                # r: id, name, pair, direction, strat, config, step, invested, entry, tp
+                # Parse config to get market type
                 try:
-                    # Use shared exchange instance if possible, or new one
-                    ex = ExchangeInterface()
-                    ex.exchange.load_markets()
-                    for sym in unique_symbols:
-                        ticker = ex.exchange.fetch_ticker(sym)
-                        current_prices[sym] = ticker['last']
+                    c = json.loads(r[5]) if r[5] else {}
+                    m_type = c.get('market_type', config.MARKET_TYPE)
+                except:
+                    m_type = config.MARKET_TYPE
+                
+                # Normalize
+                if m_type not in ['spot', 'future']: m_type = 'future'
+                
+                if r[2]: # pair
+                    symbols_by_market[m_type].add(r[2])
+
+            # Fetch for each market type
+            for m_type, syms in symbols_by_market.items():
+                if not syms: continue
+                try:
+                    ex = ExchangeInterface(market_type=m_type)
+                    # ex.exchange.load_markets() # Handled by init
+                    for sym in syms:
+                        try:
+                            # Use safe fetch
+                            ticker = ex.get_last_price(sym)
+                            current_prices[sym] = ticker # Store by symbol
+                        except Exception:
+                            current_prices[sym] = 0.0
                 except Exception as e:
-                    st.warning(f"Price fetch warning: {e}")
+                    # Log error but don't crash UI
+                    st.warning(f"Price fetch warning ({m_type}): {e}")
 
             # 3. Build DataFrame with calculated P/L
             processed_data = []
@@ -422,7 +528,7 @@ def render_monitor_view():
                     "Target TP": st.column_config.NumberColumn(format="$%.4f"),
                     "Current Price": st.column_config.NumberColumn(format="$%.4f"),
                 },
-                use_container_width=True,
+                width='stretch',
                 hide_index=True
             )
         else:
@@ -430,5 +536,112 @@ def render_monitor_view():
             
     except Exception as e:
         st.error(f"Could not load portfolio: {e}")
+
+    st.divider()
+    
+    # --- 🆕 Open Orders Section ---
+    st.subheader("📋 Open Orders (Exchange)")
+    try:
+        ex_orders = ExchangeInterface(market_type=config.MARKET_TYPE)
+        
+        # Get unique symbols from active bots to check for open orders
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT DISTINCT pair FROM bots WHERE is_active = 1")
+        active_pairs = [row[0] for row in cursor.fetchall()]
+        conn.close()
+        
+        all_open_orders = []
+        for pair in active_pairs:
+            try:
+                orders = ex_orders.fetch_open_orders(pair)
+                if orders:
+                    for o in orders:
+                        all_open_orders.append({
+                            "Symbol": o.get('symbol', pair),
+                            "Side": o.get('side', '').upper(),
+                            "Type": o.get('type', '').upper(),
+                            "Price": o.get('price', 0),
+                            "Amount": o.get('amount', 0),
+                            "Filled": o.get('filled', 0),
+                            "Status": o.get('status', 'unknown'),
+                            "Order ID": o.get('id', '')[:12] + '...' if o.get('id') else '-'
+                        })
+            except Exception:
+                pass
+        
+        if all_open_orders:
+            df_orders = pd.DataFrame(all_open_orders)
+            st.dataframe(
+                df_orders, 
+                column_config={
+                    "Price": st.column_config.NumberColumn(format="$%.4f"),
+                    "Amount": st.column_config.NumberColumn(format="%.6f"),
+                    "Filled": st.column_config.NumberColumn(format="%.6f"),
+                },
+                width='stretch',
+                hide_index=True
+            )
+        else:
+            st.info("No open orders on exchange.")
+            
+    except Exception as e:
+        st.warning(f"Could not fetch open orders: {e}")
+
+    st.divider()
+    
+    # --- 🆕 Trade History Section ---
+    st.subheader("📜 Trade History (Recent)")
+    try:
+        from engine.database import get_trade_history
+        from datetime import datetime
+        
+        history = get_trade_history(limit=20)
+        
+        if history:
+            history_data = []
+            for h in history:
+                # h: id, bot_id, bot_name, action, symbol, price, amount, cost_usdc, step, pnl, timestamp, notes
+                h_id, bot_id, bot_name, action, symbol, price, amount, cost_usdc, step, pnl, ts, notes = h
+                
+                # Format timestamp
+                try:
+                    dt = datetime.fromtimestamp(ts)
+                    time_str = dt.strftime("%m/%d %H:%M")
+                except:
+                    time_str = str(ts)
+                
+                # Format PnL with color indicator
+                pnl_str = f"${pnl:+.2f}" if pnl != 0 else "-"
+                
+                history_data.append({
+                    "Time": time_str,
+                    "Bot": bot_name or f"Bot #{bot_id}",
+                    "Action": action,
+                    "Symbol": symbol,
+                    "Price": price,
+                    "Amount": amount,
+                    "Cost ($)": cost_usdc,
+                    "Step": step,
+                    "PnL": pnl_str,
+                    "Notes": notes or ""
+                })
+            
+            df_history = pd.DataFrame(history_data)
+            st.dataframe(
+                df_history,
+                column_config={
+                    "Price": st.column_config.NumberColumn(format="$%.4f"),
+                    "Amount": st.column_config.NumberColumn(format="%.6f"),
+                    "Cost ($)": st.column_config.NumberColumn(format="$%.2f"),
+                },
+                width='stretch',
+                hide_index=True
+            )
+        else:
+            st.info("No trade history yet. Trades will appear here once bots start executing.")
+            
+    except Exception as e:
+        st.warning(f"Could not load trade history: {e}")
 
     st.caption(f"Visualizing live data for **{symbol}** via CCXT.")

@@ -17,15 +17,8 @@ def render_bot_manager_view():
 
     st.divider()
     
-    # Cache exchange instance to avoid creating new one per bot row
-    @st.cache_resource
-    def get_shared_exchange():
-        try:
-            return ExchangeInterface(market_type='spot')
-        except Exception:
-            return None
-    
-    shared_exchange = get_shared_exchange()
+    # Import config for default market type
+    from config.settings import config
     
     # Fetch Data
     bots = get_all_bots()
@@ -74,27 +67,21 @@ def render_bot_manager_view():
                 
                 # Fetch current price for Next Order calc and PnL Badge
                 try:
-                    curr_price = 0.0
-                    if shared_exchange:
-                        curr_price = shared_exchange.get_last_price(pair)
-                    
-                    # PnL Badge Logic
-                    if be > 0 and curr_price > 0:
-                        is_long = True # Default
-                        # Need to fetch direction from bot tuple again or assume logic
-                        # bot tuple: b_id, name, pair, is_active, strat_type, total_invested, step
-                        # We don't have direction here easily without fetching.
-                        # Let's just show raw price distance for now or fetch direction.
-                        pass
-
-                    # Get config for grid logic
+                    # Get bot's market_type from its config
                     raw_params = get_bot_params(b_id)
+                    params_config = json.loads(raw_params[7]) if raw_params[7] else {}
+                    bot_market_type = params_config.get('market_type', config.MARKET_TYPE)
+                    
+                    # Create exchange with bot's market type
+                    bot_exchange = ExchangeInterface(market_type=bot_market_type)
+                    curr_price = bot_exchange.get_last_price(pair)
+                    
                     # raw_params: name, pair, direction, rsi_limit, mm, base, strat, config_json
                     direction_str = raw_params[2]
                     
                     # PnL Calculation
                     pnl_pct = 0.0
-                    if be > 0:
+                    if be > 0 and curr_price > 0:
                         if direction_str == "LONG":
                             pnl_pct = (curr_price - be) / be * 100
                         else:
@@ -116,9 +103,10 @@ def render_bot_manager_view():
                     
                     # Fetch minimal OHLCV for ATR grid if needed
                     market_data = pd.DataFrame() # Placeholder, ATR needs data
-                    if params.get('UseATRGrid') and shared_exchange:
-                        ohlcv = shared_exchange.fetch_ohlcv(pair, timeframe='1h', limit=50)
-                        market_data = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                    if params.get('UseATRGrid'):
+                        ohlcv = bot_exchange.fetch_ohlcv(pair, timeframe='1h', limit=50)
+                        if ohlcv:
+                            market_data = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                     
                     next_order = strat.calculate_next_grid_price(raw_params[2], curr_price, be, step, market_data)
                     
@@ -185,6 +173,8 @@ def render_bot_manager_view():
         render_edit_form(editing_bot_id)
 
 def render_edit_form(bot_id):
+    from config.settings import config  # Import config for this function
+    
     st.markdown("---")
     st.subheader(f"🛠️ Editing Bot #{bot_id}")
     st.caption("⚙️ Modify bot settings and parameters")
@@ -198,15 +188,79 @@ def render_edit_form(bot_id):
 
     name, pair, direction, rsi_limit, martingale_multiplier, base_size, strategy_type, config_json = params
     config_dict = json.loads(config_json) if config_json else {}
+    
+    # Get current bot's market type from config (default to config.MARKET_TYPE)
+    current_market_type = config_dict.get('market_type', config.MARKET_TYPE)
+    
+    # Parse current pair to get quote asset
+    current_quote = 'USDT'
+    if pair and '/' in pair:
+        current_quote = pair.split('/')[1]
 
     with st.form(key="edit_bot_form"):
+        # --- Market Configuration (Per-Bot) ---
+        st.markdown("#### 🌐 Market Configuration")
+        mcol1, mcol2, mcol3 = st.columns(3)
+        
+        with mcol1:
+            market_options = ["Spot", "Futures (Swap)"]
+            market_idx = 0 if current_market_type == 'spot' else 1
+            new_market_type_display = st.selectbox(
+                "Market Type", 
+                market_options, 
+                index=market_idx,
+                key=f"edit_market_type_{bot_id}"
+            )
+            new_market_type = 'spot' if new_market_type_display == "Spot" else 'future'
+        
+        with mcol2:
+            quote_options = ["USDT", "USDC"]
+            quote_idx = quote_options.index(current_quote) if current_quote in quote_options else 0
+            new_quote = st.selectbox(
+                "Quote Asset",
+                quote_options,
+                index=quote_idx,
+                key=f"edit_quote_{bot_id}"
+            )
+        
+        with mcol3:
+            # Fetch available pairs dynamically
+            try:
+                edit_exchange = ExchangeInterface(market_type=new_market_type)
+                available_pairs = edit_exchange.get_available_symbols(quote_asset=new_quote)
+                if not available_pairs:
+                    available_pairs = [f"BTC/{new_quote}", f"ETH/{new_quote}"]
+            except Exception:
+                available_pairs = [f"BTC/{new_quote}", f"ETH/{new_quote}", f"SOL/{new_quote}"]
+            
+            # Find current pair in list
+            pair_idx = 0
+            if pair in available_pairs:
+                pair_idx = available_pairs.index(pair)
+            
+            new_pair = st.selectbox(
+                "Trading Pair",
+                available_pairs,
+                index=pair_idx,
+                key=f"edit_pair_{bot_id}"
+            )
+        
+        # Store market_type in config_dict for saving
+        config_dict['market_type'] = new_market_type
+        
+        st.divider()
+        
         col1, col2 = st.columns(2)
         new_name = col1.text_input("Bot Name", value=name, key=f"edit_name_{bot_id}")
-        new_pair = col2.text_input("Trading Pair (e.g. BTC/USDT)", value=pair, key=f"edit_pair_{bot_id}")
+        new_direction = col2.selectbox("Direction", ["LONG", "SHORT"], index=0 if direction == "LONG" else 1, key=f"edit_dir_{bot_id}")
         
         col3, col4 = st.columns(2)
-        new_direction = col3.selectbox("Direction", ["LONG", "SHORT"], index=0 if direction == "LONG" else 1, key=f"edit_dir_{bot_id}")
-        new_strat = col4.selectbox("Strategy Type", ["MQL4", "RSI_ONLY"], index=0 if strategy_type == "MQL4" else 1, key=f"edit_strat_type_{bot_id}")
+        # Strategy type options matching bot_creator
+        strat_options = ["MQL4", "MarketMaker", "MagicHour"]
+        strat_index = 0
+        if strategy_type in strat_options:
+            strat_index = strat_options.index(strategy_type)
+        new_strat = col3.selectbox("Strategy Type", strat_options, index=strat_index, key=f"edit_strat_type_{bot_id}")
         
         col5, col6, col7 = st.columns(3)
         new_base = col5.number_input("Order Size ($USDC)", value=float(base_size), key=f"edit_base_{bot_id}")
@@ -236,11 +290,11 @@ def render_edit_form(bot_id):
             temp_strat = MQL4Strategy(params={'base_size': new_base, 'martingale_multiplier': new_mm, 'direction': new_direction})
             temp_strat.params.update(config_dict)
             
-            # Fetch current price for projection
-            exchange = ExchangeInterface()
-            # ticker = exchange.exchange.fetch_ticker(pair) # Pair might be modified in input, use current pair for realism
-            ohlcv = exchange.fetch_ohlcv(pair if pair else "BTC/USDT", timeframe='1m', limit=1)
-            curr_p = ohlcv[0][4] if ohlcv else 40000.0
+            # Fetch current price for projection using the bot's market type
+            exchange = ExchangeInterface(market_type=new_market_type)
+            # Use new_pair which is the selected pair from the dropdown
+            ohlcv = exchange.fetch_ohlcv(new_pair if new_pair else "BTC/USDT", timeframe='1m', limit=1)
+            curr_p = float(ohlcv[0][4]) if ohlcv else 40000.0
             
             # Pass ATR context for grid
             # Assume 1h ATR for simplicity in editor projection or add dropdown
@@ -279,7 +333,7 @@ def render_edit_form(bot_id):
                         height=300,
                         margin=dict(l=10, r=10, t=30, b=10)
                     )
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width='stretch')
                 # -------------------------------
 
                 st.caption(f"Simulated levels starting at: **{curr_p:,.2f}**")
@@ -301,55 +355,126 @@ def render_edit_form(bot_id):
         except Exception as e:
             st.warning(f"Projection skip: {e}")
 
-        st.markdown("#### Entry Triggers (8-Switch Confluence)")
-        t_col1, t_col2, t_col3, t_col4 = st.columns(4)
-        with t_col1:
-            config_dict['mode_cci'] = st.selectbox("CCI Switch", [0, 1, 2], index=int(config_dict.get('mode_cci', 0)), format_func=lambda x: {0: "OFF", 1: "Above", 2: "Below"}[x], key=f"edit_mode_cci_{bot_id}")
-            config_dict['cci_level'] = st.number_input("CCI Level", value=float(config_dict.get('cci_level', 100)), key=f"edit_cci_lvl_{bot_id}")
-            config_dict['cci_tf'] = st.selectbox("CCI TF", ["1m","5m","15m","1h","4h","1d"], index=["1m","5m","15m","1h","4h","1d"].index(config_dict.get('cci_tf', "15m")), key=f"edit_cci_tf_{bot_id}")
-        with t_col2:
-            config_dict['mode_boll'] = st.selectbox("Boll Switch", [0, 1, 2], index=int(config_dict.get('mode_boll', 0)), format_func=lambda x: {0: "OFF", 1: "Outside Lower", 2: "Outside Upper"}[x], key=f"edit_mode_boll_{bot_id}")
-            config_dict['boll_tf'] = st.selectbox("Boll TF", ["1m","5m","15m","1h","4h","1d"], index=["1m","5m","15m","1h","4h","1d"].index(config_dict.get('boll_tf', "15m")), key=f"edit_boll_tf_{bot_id}")
-        with t_col3:
-            config_dict['mode_stoch'] = st.selectbox("Stoch Switch", [0, 1, 2], index=int(config_dict.get('mode_stoch', 0)), format_func=lambda x: {0: "OFF", 1: "Oversold", 2: "Overbought"}[x], key=f"edit_mode_stoch_{bot_id}")
-            config_dict['stoch_tf'] = st.selectbox("Stoch TF", ["1m","5m","15m","1h","4h","1d"], index=["1m","5m","15m","1h","4h","1d"].index(config_dict.get('stoch_tf', "15m")), key=f"edit_stoch_tf_{bot_id}")
-        with t_col4:
-            config_dict['mode_rsi'] = st.selectbox("RSI Switch", [0, 1, 2], index=int(config_dict.get('mode_rsi', 0)), format_func=lambda x: {0: "OFF", 1: "Below", 2: "Above"}[x], key=f"edit_mode_rsi_{bot_id}")
-            config_dict['rsi_level'] = st.number_input("RSI Level", value=float(config_dict.get('rsi_level', 30)), key=f"edit_rsi_lvl_{bot_id}")
-            config_dict['rsi_tf'] = st.selectbox("RSI TF", ["1m","15m","1h"], index=["1m","15m","1h"].index(config_dict.get('rsi_tf', "15m")), key=f"edit_rsi_tf_{bot_id}")
+        # --- Strategy-Specific Configuration Sections ---
+        if new_strat == "MagicHour":
+            st.markdown("#### 🕰️ Magic Hour Configuration")
+            st.info("🎯 **Strategy Goal:** Capture mean reversion after breakout from a specific hourly range.")
+            
+            # Timezone Selector
+            common_tzs = ["Asia/Taipei", "America/New_York", "Europe/London", "Asia/Tokyo", "UTC"]
+            curr_tz = config_dict.get('timezone', 'America/New_York')
+            tz_idx = common_tzs.index(curr_tz) if curr_tz in common_tzs else 0
+            selected_tz = st.selectbox("🌍 Strategy Timezone", common_tzs, index=tz_idx, key=f"edit_tz_{bot_id}")
+            config_dict['timezone'] = selected_tz
+            
+            mh1, mh2 = st.columns(2)
+            with mh1:
+                config_dict['magic_hour'] = st.slider(
+                    f"🕒 Magic Hour ({selected_tz} 0-23)", 
+                    0, 23, 
+                    int(config_dict.get('magic_hour', 9)), 
+                    help=f"The specific hour that defines the trading range (e.g. 9 = 09:00-10:00 {selected_tz}).",
+                    key=f"edit_magic_hour_{bot_id}"
+                )
+                config_dict['analysis_duration'] = st.slider(
+                    "⏳ Analysis Window (Hours)", 
+                    1, 6, 
+                    int(config_dict.get('analysis_duration', 3)), 
+                    help="Duration to monitor for breakouts after the Magic Hour closes.",
+                    key=f"edit_analysis_dur_{bot_id}"
+                )
+            with mh2:
+                config_dict['stop_loss_ext'] = st.number_input(
+                    "🛑 Max Extension (Fade Zone)", 
+                    value=float(config_dict.get('stop_loss_ext', 1.0)), 
+                    step=0.1, 
+                    help="Allowed deviation multiplier. If Price > High + (Range * Extension), we assume strong trend and STOP fading.",
+                    key=f"edit_sl_ext_{bot_id}"
+                )
+                st.success("✅ Target is fixed at **50% Mean Reversion** (Range Midpoint).")
+        
+        elif new_strat == "MarketMaker":
+            st.markdown("#### 📈 Market Maker Configuration")
+            st.info("🎯 **Strategy Goal:** High-frequency spread capturing in ranging markets.")
+            
+            mm_c1, mm_c2 = st.columns(2)
+            with mm_c1:
+                config_dict['spread_pct'] = st.number_input(
+                    "Target Spread (%)", 
+                    value=float(config_dict.get('spread_pct', 0.2)), 
+                    step=0.01,
+                    key=f"edit_spread_{bot_id}"
+                )
+                config_dict['skew_factor'] = st.number_input(
+                    "Inventory Skew Factor", 
+                    value=float(config_dict.get('skew_factor', 0.0)), 
+                    step=1.0, 
+                    help="Shift price per unit of inventory.",
+                    key=f"edit_skew_{bot_id}"
+                )
+            with mm_c2:
+                config_dict['max_inventory'] = st.number_input(
+                    "Max Inventory (Units)", 
+                    value=float(config_dict.get('max_inventory', 1.0)),
+                    key=f"edit_max_inv_{bot_id}"
+                )
+                config_dict['reprice_threshold'] = st.number_input(
+                    "Reprice Threshold (%)", 
+                    value=float(config_dict.get('reprice_threshold', 0.1)),
+                    key=f"edit_reprice_{bot_id}"
+                )
+        
+        # MQL4-specific triggers (only show for MQL4 strategy)
+        if new_strat == "MQL4":
+            st.markdown("#### Entry Triggers (8-Switch Confluence)")
+            t_col1, t_col2, t_col3, t_col4 = st.columns(4)
+            with t_col1:
+                config_dict['mode_cci'] = st.selectbox("CCI Switch", [0, 1, 2], index=int(config_dict.get('mode_cci', 0)), format_func=lambda x: {0: "OFF", 1: "Above", 2: "Below"}[x], key=f"edit_mode_cci_{bot_id}")
+                config_dict['cci_level'] = st.number_input("CCI Level", value=float(config_dict.get('cci_level', 100)), key=f"edit_cci_lvl_{bot_id}")
+                config_dict['cci_tf'] = st.selectbox("CCI TF", ["1m","5m","15m","1h","4h","1d"], index=["1m","5m","15m","1h","4h","1d"].index(config_dict.get('cci_tf', "15m")), key=f"edit_cci_tf_{bot_id}")
+            with t_col2:
+                config_dict['mode_boll'] = st.selectbox("Boll Switch", [0, 1, 2], index=int(config_dict.get('mode_boll', 0)), format_func=lambda x: {0: "OFF", 1: "Outside Lower", 2: "Outside Upper"}[x], key=f"edit_mode_boll_{bot_id}")
+                config_dict['boll_tf'] = st.selectbox("Boll TF", ["1m","5m","15m","1h","4h","1d"], index=["1m","5m","15m","1h","4h","1d"].index(config_dict.get('boll_tf', "15m")), key=f"edit_boll_tf_{bot_id}")
+            with t_col3:
+                config_dict['mode_stoch'] = st.selectbox("Stoch Switch", [0, 1, 2], index=int(config_dict.get('mode_stoch', 0)), format_func=lambda x: {0: "OFF", 1: "Oversold", 2: "Overbought"}[x], key=f"edit_mode_stoch_{bot_id}")
+                config_dict['stoch_tf'] = st.selectbox("Stoch TF", ["1m","5m","15m","1h","4h","1d"], index=["1m","5m","15m","1h","4h","1d"].index(config_dict.get('stoch_tf', "15m")), key=f"edit_stoch_tf_{bot_id}")
+            with t_col4:
+                config_dict['mode_rsi'] = st.selectbox("RSI Switch", [0, 1, 2], index=int(config_dict.get('mode_rsi', 0)), format_func=lambda x: {0: "OFF", 1: "Below", 2: "Above"}[x], key=f"edit_mode_rsi_{bot_id}")
+                config_dict['rsi_level'] = st.number_input("RSI Level", value=float(config_dict.get('rsi_level', 30)), key=f"edit_rsi_lvl_{bot_id}")
+                config_dict['rsi_tf'] = st.selectbox("RSI TF", ["1m","15m","1h"], index=["1m","15m","1h"].index(config_dict.get('rsi_tf', "15m")), key=f"edit_rsi_tf_{bot_id}")
 
-        st.markdown("#### Price & Volatility Triggers (9 & 10)")
-        pv_col1, pv_col2 = st.columns(2)
-        with pv_col1:
-            config_dict['mode_price'] = st.selectbox("Price Switch", [0, 1, 2], index=int(config_dict.get('mode_price', 0)), format_func=lambda x: {0: "OFF", 1: "Above", 2: "Below"}[x], key=f"edit_mode_price_{bot_id}")
-            config_dict['price_threshold'] = st.number_input("Threshold Price", value=float(config_dict.get('price_threshold', 0.0)), key=f"edit_price_threshold_{bot_id}")
-        with pv_col2:
-            st.markdown("**Trigger 10: Market State**")
-            config_dict['mode_atrp'] = st.selectbox("Volatility Context", [0, 1, 2], index=int(config_dict.get('mode_atrp', 0)), format_func=lambda x: {0: "OFF", 1: "Below (Quiet)", 2: "Above (Extreme)"}[x], help="Compares current volatility to historical levels.", key=f"edit_mode_atrp_{bot_id}")
-            pa1, pa2 = st.columns(2)
-            config_dict['atrp_level'] = pa1.number_input("Lookback Level %", value=float(config_dict.get('atrp_level', 50.0)), key=f"edit_atrp_level_{bot_id}")
-            config_dict['atrp_tf'] = pa2.selectbox("ATR TF", ["15m","1h","4h","1d"], index=1, key=f"edit_atrp_tf_{bot_id}")
+            st.markdown("#### Price & Volatility Triggers (9 & 10)")
+            pv_col1, pv_col2 = st.columns(2)
+            with pv_col1:
+                config_dict['mode_price'] = st.selectbox("Price Switch", [0, 1, 2], index=int(config_dict.get('mode_price', 0)), format_func=lambda x: {0: "OFF", 1: "Above", 2: "Below"}[x], key=f"edit_mode_price_{bot_id}")
+                config_dict['price_threshold'] = st.number_input("Threshold Price", value=float(config_dict.get('price_threshold', 0.0)), key=f"edit_price_threshold_{bot_id}")
+            with pv_col2:
+                st.markdown("**Trigger 10: Market State**")
+                config_dict['mode_atrp'] = st.selectbox("Volatility Context", [0, 1, 2], index=int(config_dict.get('mode_atrp', 0)), format_func=lambda x: {0: "OFF", 1: "Below (Quiet)", 2: "Above (Extreme)"}[x], help="Compares current volatility to historical levels.", key=f"edit_mode_atrp_{bot_id}")
+                pa1, pa2 = st.columns(2)
+                config_dict['atrp_level'] = pa1.number_input("Lookback Level %", value=float(config_dict.get('atrp_level', 50.0)), key=f"edit_atrp_level_{bot_id}")
+                config_dict['atrp_tf'] = pa2.selectbox("ATR TF", ["15m","1h","4h","1d"], index=1, key=f"edit_atrp_tf_{bot_id}")
 
-        st.markdown("#### Trigger 11: ATR Expansion (Current Move vs Range)")
-        e_col1, e_col2, e_col3 = st.columns(3)
-        with e_col1:
-            config_dict['mode_atre'] = st.selectbox("Expansion Move", [0, 1, 2], index=int(config_dict.get('mode_atre', 0)), format_func=lambda x: {0: "OFF", 1: "Move Up >= X%", 2: "Move Down >= X%"}[x], help="Move from open as % of ATR.", key=f"edit_mode_atre_{bot_id}")
-        with e_col2:
-            config_dict['atre_level'] = st.number_input("Target % of ATR", value=float(config_dict.get('atre_level', 100.0)), key=f"edit_atre_level_{bot_id}")
-        with e_col3:
-            config_dict['atre_tf'] = st.selectbox("TF to Watch (T11)", ["1h","4h","1d"], index=0, key=f"edit_atre_tf_{bot_id}")
+            st.markdown("#### Trigger 11: ATR Expansion (Current Move vs Range)")
+            e_col1, e_col2, e_col3 = st.columns(3)
+            with e_col1:
+                config_dict['mode_atre'] = st.selectbox("Expansion Move", [0, 1, 2], index=int(config_dict.get('mode_atre', 0)), format_func=lambda x: {0: "OFF", 1: "Move Up >= X%", 2: "Move Down >= X%"}[x], help="Move from open as % of ATR.", key=f"edit_mode_atre_{bot_id}")
+            with e_col2:
+                config_dict['atre_level'] = st.number_input("Target % of ATR", value=float(config_dict.get('atre_level', 100.0)), key=f"edit_atre_level_{bot_id}")
+            with e_col3:
+                config_dict['atre_tf'] = st.selectbox("TF to Watch (T11)", ["1h","4h","1d"], index=0, key=f"edit_atre_tf_{bot_id}")
 
-        st.markdown("#### Pattern Slots")
-        for p_idx in range(1, 4, 2):
-            pc1, pc2 = st.columns(2)
-            for i, col in enumerate([pc1, pc2]):
-                idx = p_idx + i
-                with col:
-                    c_p1, c_p2, c_p3, c_p4 = st.columns(4)
-                    config_dict[f'pat_{idx}_mode'] = c_p1.selectbox(f"Type ##{idx}", [0, 1, 2], index=int(config_dict.get(f'pat_{idx}_mode', 0)), format_func=lambda x: {0: "OFF", 1: "Up", 2: "Down"}[x], key=f"edit_p_mode_{idx}_{bot_id}")
-                    config_dict[f'pat_{idx}_source'] = c_p2.selectbox(f"Source ##{idx}", ["Price", "RSI", "CCI"], index=["Price", "RSI", "CCI"].index(config_dict.get(f'pat_{idx}_source', "Price")), key=f"edit_p_src_{idx}_{bot_id}")
-                    config_dict[f'pat_{idx}_tf'] = c_p3.selectbox(f"TF ##{idx}", ["1m","5m","15m","1h","4h","1d"], index=["1m","5m","15m","1h","4h","1d"].index(config_dict.get(f'pat_{idx}_tf', "5m")), key=f"edit_p_tf_{idx}_{bot_id}")
-                    config_dict[f'pat_{idx}_count'] = c_p4.number_input(f"Count ##{idx}", min_value=1, value=int(config_dict.get(f'pat_{idx}_count', 3)), key=f"edit_p_count_{idx}_{bot_id}")
+            st.markdown("#### Pattern Slots")
+            for p_idx in range(1, 4, 2):
+                pc1, pc2 = st.columns(2)
+                for i, col in enumerate([pc1, pc2]):
+                    idx = p_idx + i
+                    with col:
+                        c_p1, c_p2, c_p3, c_p4 = st.columns(4)
+                        config_dict[f'pat_{idx}_mode'] = c_p1.selectbox(f"Type ##{idx}", [0, 1, 2], index=int(config_dict.get(f'pat_{idx}_mode', 0)), format_func=lambda x: {0: "OFF", 1: "Up", 2: "Down"}[x], key=f"edit_p_mode_{idx}_{bot_id}")
+                        config_dict[f'pat_{idx}_source'] = c_p2.selectbox(f"Source ##{idx}", ["Price", "RSI", "CCI"], index=["Price", "RSI", "CCI"].index(config_dict.get(f'pat_{idx}_source', "Price")), key=f"edit_p_src_{idx}_{bot_id}")
+                        config_dict[f'pat_{idx}_tf'] = c_p3.selectbox(f"TF ##{idx}", ["1m","5m","15m","1h","4h","1d"], index=["1m","5m","15m","1h","4h","1d"].index(config_dict.get(f'pat_{idx}_tf', "5m")), key=f"edit_p_tf_{idx}_{bot_id}")
+                        config_dict[f'pat_{idx}_count'] = c_p4.number_input(f"Count ##{idx}", min_value=1, value=int(config_dict.get(f'pat_{idx}_count', 3)), key=f"edit_p_count_{idx}_{bot_id}")
 
         st.markdown("#### Risk Management")
         rm1, rm2, rm3 = st.columns(3)
