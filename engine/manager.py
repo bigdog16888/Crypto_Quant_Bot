@@ -126,20 +126,53 @@ def calculate_hedge_lot(main_basket_lots: float, settings: dict) -> float:
 def manage_trade(bot_id, bot_name, pair, direction, settings, trade_data, current_price, strategy, exchange_interface):
     """
     Core trade management logic called by the runner.
-    trade_data: (name, pair, current_step, total_invested, avg_entry_price, target_tp_price, last_exit_price, last_exit_time)
+    trade_data: (name, pair, current_step, total_invested, avg_entry_price, target_tp_price, last_exit_price, last_exit_time, basket_start_time)
     Returns: dict with missions for the runner to execute (e.g. {'action': 'TP', 'price': ...})
     """
     import logging
     logger = logging.getLogger("TradeManager")
 
-    _, _, current_step, total_invested, avg_entry_price, target_tp_price, _, _ = trade_data
+    # Safety unpack (handle cases where tuple length varies during migration)
+    if len(trade_data) >= 8:
+        # Compatibility unpacking
+        # (name, pair, current_step, total_invested, avg_entry_price, target_tp_price, last_exit_price, last_exit_time, *basket_start)
+        _, _, current_step, total_invested, avg_entry_price, target_tp_price, _, _ = trade_data[:8]
+    else:
+        return {'action': 'none'}
     
     # 1. Check Take Profit
+    # Early Exit Logic Injection
+    # trade_data unpack: (name, pair, current_step, total_invested, avg_entry_price, target_tp_price, last_exit_price, last_exit_time, basket_start_time)
+    
+    effective_tp = target_tp_price
+    
+    if settings.get('UseEarlyExit', False) and len(trade_data) > 8:
+        basket_start_time = trade_data[8]
+        if basket_start_time > 0:
+            import time
+            from datetime import datetime
+            
+            start_dt = datetime.fromtimestamp(basket_start_time)
+            now_dt = datetime.fromtimestamp(time.time())
+            
+            effective_tp = calculate_early_exit_decay(
+                basket_start_time=start_dt,
+                current_time=now_dt,
+                total_orders=current_step + 1,
+                initial_tp=target_tp_price,
+                break_even=avg_entry_price,
+                settings=settings
+            )
+            
+            # Log decay if significant
+            if effective_tp < target_tp_price * 0.999:
+                logger.debug(f"EE: {bot_name} TP decayed from {target_tp_price} to {effective_tp}")
+
     tp_hit = False
     if direction == 'LONG':
-        if current_price >= target_tp_price: tp_hit = True
+        if current_price >= effective_tp: tp_hit = True
     else:
-        if current_price <= target_tp_price: tp_hit = True
+        if current_price <= effective_tp: tp_hit = True
         
     if tp_hit:
         logger.info(f"💰 Bot {bot_name} Profit Target Hit! Signal to close at {current_price}")
@@ -165,49 +198,75 @@ def manage_trade(bot_id, bot_name, pair, direction, settings, trade_data, curren
         }
 
     # 2. Check Next Martingale Grid Order
+    # Ensure this block runs even if max steps reached to MAINTAIN TP ORDER
+    max_steps = int(settings.get('max_steps', 10))
+    grid_mission_active = current_step < max_steps
+
     try:
-        next_order_price = strategy.calculate_next_grid_price(direction, current_price, avg_entry_price, current_step, strategy.last_market_data if hasattr(strategy, 'last_market_data') else None)
-        
-        grid_trigger = False
-        if direction == 'LONG':
-            if current_price <= next_order_price: grid_trigger = True
-        else:
-            if current_price >= next_order_price: grid_trigger = True
+        if grid_mission_active:
+            next_order_price = strategy.calculate_next_grid_price(direction, current_price, avg_entry_price, current_step, strategy.last_market_data if hasattr(strategy, 'last_market_data') else None)
             
-        if grid_trigger:
+            # Calculate Grid Order Specs
             next_step = current_step + 1
             added_investment = strategy.calculate_lot_size(next_step, 0)
             
-            logger.info(f"📥 Bot {bot_name} - Grid Step {next_step} triggered at {current_price} (Order Size: ${added_investment})")
-            
-            # Recalculate values for mission
+            # Recalculate Hypothetical Average & TP if this grid hits
             new_total = total_invested + added_investment
-            new_avg = (avg_entry_price * total_invested + current_price * added_investment) / new_total
+            new_avg = (avg_entry_price * total_invested + next_order_price * added_investment) / new_total
             
-            tp_type = settings.get('TakeProfitType', 'USD')
-            if tp_type == 'Percent':
-                tp_pct = settings.get('TakeProfitPct', 1.0) / 100.0
-                new_tp = new_avg * (1.0 + tp_pct) if direction == 'LONG' else new_avg * (1.0 - tp_pct)
-            else:
-                target_usd = settings.get('TakeProfitBase', 10.0)
-                est_qty = new_total / new_avg
+            # Pending Grid Order Data
+            grid_price = next_order_price
+            grid_qty = added_investment / next_order_price if next_order_price > 0 else 0
+            grid_step = next_step
+            grid_amount_usd = added_investment
+        else:
+            # Max steps reached, no grid order
+            next_order_price = 0
+            new_avg = avg_entry_price # No change
+            
+            # Empty Grid Data
+            grid_price = None
+            grid_qty = 0
+            grid_step = 0
+            grid_amount_usd = 0
+
+        # Calculate TP (Always needed)
+        tp_type = settings.get('TakeProfitType', 'USD')
+        if tp_type == 'Percent':
+            tp_pct = settings.get('TakeProfitPct', 1.0) / 100.0
+            new_tp = new_avg * (1.0 + tp_pct) if direction == 'LONG' else new_avg * (1.0 - tp_pct)
+        else:
+            target_usd = settings.get('TakeProfitBase', 10.0)
+            est_qty = total_invested / avg_entry_price if avg_entry_price > 0 else 0
+            if grid_mission_active:
+                 est_qty = new_total / new_avg # Use hypothetical qty if calculating future TP
+            
+            if est_qty > 0:
                 dist = target_usd / est_qty
                 new_tp = new_avg + dist if direction == 'LONG' else new_avg - dist
-            
-            # MISSION: PLACE GRID ORDER
-            return {
-                'action': 'grid_step',
-                'bot_id': bot_id,
-                'bot_name': bot_name,
-                'pair': pair,
-                'direction': direction,
-                'price': current_price,
-                'amount_usd': added_investment,
-                'qty': added_investment / current_price if current_price > 0 else 0,
-                'new_step': next_step,
-                'new_avg': new_avg,
-                'new_tp': new_tp
-            }
+            else:
+                new_tp = 0
+
+        # Return a "sync" mission that tells the runner to maintain these orders
+        return {
+            'action': 'maintain_orders',
+            'bot_id': bot_id,
+            'bot_name': bot_name,
+            'pair': pair,
+            'direction': direction,
+            'current_price': current_price,
+            # Pending Grid Order (None if max steps)
+            'grid_price': grid_price,
+            'grid_step': grid_step,
+            'grid_amount_usd': grid_amount_usd,
+            'grid_qty': grid_qty,
+            # Pending TP Order (Current TP for open position)
+            'tp_price': effective_tp, # Dynamic/Decayed TP
+            'tp_qty': total_invested / avg_entry_price if avg_entry_price > 0 else 0,
+            # Future Data (for DB update if grid hits)
+            'future_avg': new_avg,
+            'future_tp': new_tp
+        }
             
     except Exception as e:
         logger.error(f"Error checking grid for {bot_name}: {e}")

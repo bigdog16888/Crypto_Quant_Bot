@@ -36,12 +36,13 @@ def iBands(close: pd.Series, period: int, deviation: float):
         return 0.0, 0.0, 0.0
     return upper_s.iloc[-1], mid_s.iloc[-1], lower_s.iloc[-1]
 
-class MQL4Strategy(BaseStrategy):
+class MartingaleStrategy(BaseStrategy):
     """
-    Strategy porting the original MQL4 translation logic.
-    Focuses on CCI, Bollinger Bands, and other indicators defined in the original EA.
+    Martingale Grid DCA Strategy.
+    Uses confluence of indicators (CCI, Bollinger, RSI, etc.) for entry timing.
+    Originally ported from MQL4 EA logic.
     """
-    def __init__(self, name: str = "MQL4_Legacy", params: dict = None):
+    def __init__(self, name: str = "Martingale_Grid", params: dict = None):
         super().__init__(name, params)
         
         # Default MQL4 settings (can be overridden by params)
@@ -374,12 +375,18 @@ class MQL4Strategy(BaseStrategy):
             is_hedge = i + 1 >= hedge_step if self.params.get('UseHedge') else False
             hedge_size = round(total_invested, 2) if is_hedge else 0.0
 
+            # Determine precision based on price magnitude
+            # If price < 1, use 6 decimals. If < 1000, 4 decimals. Else 2.
+            prec = 2
+            if base_price < 1.0: prec = 6
+            elif base_price < 1000.0: prec = 4
+            
             projection = {
                 'step': i + 1,
-                'price': round(order_price, 2),
+                'price': round(order_price, prec),
                 'order_size_usdc': round(step_size, 2),
                 'total_invested_usdc': round(total_invested, 2),
-                'tp_price': round(tp_price, 2),
+                'tp_price': round(tp_price, prec),
                 'hedge_size_usdc': hedge_size,
                 'is_hedge': is_hedge
             }

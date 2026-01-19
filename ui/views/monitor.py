@@ -379,12 +379,12 @@ def render_monitor_view():
     st.subheader("📋 Active Positions (All Bots)")
     try:
         conn = get_connection()
-        # Fetch all active bots with trade info
+        # Fetch all bots (Active & Paused) with trade info
         query_all = """
-            SELECT b.id, b.name, b.pair, b.direction, b.strategy_type, b.config, t.current_step, t.total_invested, t.avg_entry_price, t.target_tp_price 
+            SELECT b.id, b.name, b.pair, b.direction, b.strategy_type, b.config, t.current_step, t.total_invested, t.avg_entry_price, t.target_tp_price, b.is_active
             FROM bots b
             LEFT JOIN trades t ON b.id = t.bot_id
-            WHERE b.is_active = 1
+            -- Show all bots so users can see paused/errored ones too
         """
         # Load into list of dicts for manual processing first
         cursor = conn.cursor()
@@ -438,8 +438,8 @@ def render_monitor_view():
             # 3. Build DataFrame with calculated P/L
             processed_data = []
             for r in rows:
-                # r: id, name, pair, direction, strat, config, step, invested, entry, tp
-                name, pair, direction, strat_type, config_json, step, invested, entry, tp = r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9]
+                # r: id, name, pair, direction, strat, config, step, invested, entry, tp, is_active
+                name, pair, direction, strat_type, config_json, step, invested, entry, tp, is_active = r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10]
                 
                 # --- PARSE STRATEGY SUMMARY ---
                 strat_summary = strat_type
@@ -447,7 +447,7 @@ def render_monitor_view():
                     c = json.loads(config_json) if config_json else {}
                     triggers = []
                     
-                    if strat_type == "MQL4":
+                    if strat_type == "Martingale":
                         if c.get('mode_rsi'): triggers.append(f"RSI({c.get('rsi_tf','?')})")
                         if c.get('mode_cci'): triggers.append(f"CCI({c.get('cci_tf','?')})")
                         if c.get('mode_boll'): triggers.append(f"BB({c.get('boll_tf','?')})")
@@ -464,7 +464,7 @@ def render_monitor_view():
                         if triggers:
                             strat_summary = f"{', '.join(triggers)}"
                         else:
-                            strat_summary = "MQL4 (No Triggers)"
+                            strat_summary = "Martingale (No Triggers)"
                             
                     elif strat_type == "Market Maker":
                         spread = c.get('spread_pct', '?')
@@ -480,31 +480,35 @@ def render_monitor_view():
 
                 curr_p = current_prices.get(pair, 0.0)
                 pnl_str = "-"
+                status_icon = "🟢" if is_active else "🔴"
                 
                 # Logic to handle "Scanning" vs "Active" state
-                if entry and entry > 0 and curr_p > 0 and invested > 0:
-                    # ACTIVE TRADE
-                    if direction == "LONG":
-                        pnl_raw = (curr_p - entry) / entry
-                    else: # SHORT
-                        pnl_raw = (entry - curr_p) / entry
-                    
-                    pnl_pct = pnl_raw * 100
-                    pnl_usd = invested * pnl_raw
-                    
-                    # Formatting
-                    icon = "🟢" if pnl_pct >= 0 else "🔴"
-                    pnl_str = f"{icon} {pnl_pct:+.2f}% (${pnl_usd:+.2f})"
-                    
-                    # Format numbers for display if needed, but st.dataframe handles floats well
+                if is_active:
+                    if entry and entry > 0 and curr_p > 0 and invested > 0:
+                        # ACTIVE TRADE
+                        if direction == "LONG":
+                            pnl_raw = (curr_p - entry) / entry
+                        else: # SHORT
+                            pnl_raw = (entry - curr_p) / entry
+                        
+                        pnl_pct = pnl_raw * 100
+                        pnl_usd = invested * pnl_raw
+                        
+                        # Formatting
+                        icon = "🟢" if pnl_pct >= 0 else "🔴"
+                        pnl_str = f"{icon} {pnl_pct:+.2f}% (${pnl_usd:+.2f})"
+                    else:
+                        # IDLE / SCANNING
+                        entry = None 
+                        tp = None
+                        invested = None
+                        pnl_str = "⏳ Scanning..."
                 else:
-                    # IDLE / SCANNING
-                    entry = None # Will display as empty/gray in dataframe or custom string if converted
-                    tp = None
-                    invested = None
-                    pnl_str = "⏳ Scanning..."
+                    # PAUSED / STOPPED
+                    pnl_str = "⛔ Stopped"
 
                 processed_data.append({
+                    "Status": "Running" if is_active else "Stopped",
                     "Bot Name": name,
                     "Strategy / Triggers": strat_summary,
                     "Symbol": pair,
@@ -522,6 +526,7 @@ def render_monitor_view():
             st.dataframe(
                 df_display,
                 column_config={
+                    "Status": st.column_config.TextColumn(width="small"),
                     "Strategy / Triggers": st.column_config.TextColumn(width="medium"),
                     "Invested": st.column_config.NumberColumn(format="$%.2f"),
                     "Entry": st.column_config.NumberColumn(format="$%.4f"),
@@ -589,6 +594,65 @@ def render_monitor_view():
         st.warning(f"Could not fetch open orders: {e}")
 
     st.divider()
+    
+    # --- 🆕 Open Positions Section (Futures) ---
+    if config.MARKET_TYPE in ['future', 'swap']:
+        st.subheader("📈 Open Positions (Exchange)")
+        try:
+            ex_positions = ExchangeInterface(market_type=config.MARKET_TYPE)
+            
+            # Fetch all positions from exchange
+            positions = ex_positions.exchange.fetch_positions()
+            
+            # Filter to only show positions with non-zero size
+            active_positions = []
+            for pos in positions:
+                contracts = float(pos.get('contracts', 0) or 0)
+                notional = float(pos.get('notional', 0) or 0)
+                
+                if contracts != 0 or notional != 0:
+                    side = pos.get('side', 'unknown')
+                    entry_price = float(pos.get('entryPrice', 0) or 0)
+                    mark_price = float(pos.get('markPrice', 0) or 0)
+                    unrealized_pnl = float(pos.get('unrealizedPnl', 0) or 0)
+                    leverage = pos.get('leverage', 1)
+                    liquidation = float(pos.get('liquidationPrice', 0) or 0)
+                    
+                    # Format PnL with color
+                    pnl_str = f"${unrealized_pnl:+.2f}"
+                    
+                    active_positions.append({
+                        "Symbol": pos.get('symbol', ''),
+                        "Side": side.upper() if side else 'UNKNOWN',
+                        "Size": abs(contracts),
+                        "Notional": f"${abs(notional):.2f}",
+                        "Entry": entry_price,
+                        "Mark": mark_price,
+                        "Liq. Price": liquidation if liquidation > 0 else None,
+                        "Leverage": f"{leverage}x",
+                        "Unrealized PnL": pnl_str
+                    })
+            
+            if active_positions:
+                df_positions = pd.DataFrame(active_positions)
+                st.dataframe(
+                    df_positions,
+                    column_config={
+                        "Size": st.column_config.NumberColumn(format="%.4f"),
+                        "Entry": st.column_config.NumberColumn(format="$%.4f"),
+                        "Mark": st.column_config.NumberColumn(format="$%.4f"),
+                        "Liq. Price": st.column_config.NumberColumn(format="$%.2f"),
+                    },
+                    width='stretch',
+                    hide_index=True
+                )
+            else:
+                st.info("No open positions on exchange.")
+                
+        except Exception as e:
+            st.warning(f"Could not fetch positions: {e}")
+
+        st.divider()
     
     # --- 🆕 Trade History Section ---
     st.subheader("📜 Trade History (Recent)")

@@ -93,6 +93,7 @@ def init_db():
             target_tp_price REAL DEFAULT 0,
             last_exit_price REAL DEFAULT 0,
             last_exit_time INTEGER DEFAULT 0,
+            basket_start_time INTEGER DEFAULT 0,
             FOREIGN KEY (bot_id) REFERENCES bots (id)
         )
     ''')
@@ -103,6 +104,20 @@ def init_db():
     except sqlite3.OperationalError:
         cursor.execute('ALTER TABLE trades ADD COLUMN last_exit_price REAL DEFAULT 0')
         cursor.execute('ALTER TABLE trades ADD COLUMN last_exit_time INTEGER DEFAULT 0')
+        conn.commit()
+
+    # Migration for basket_start_time
+    try:
+        cursor.execute('SELECT basket_start_time FROM trades LIMIT 1')
+    except sqlite3.OperationalError:
+        cursor.execute('ALTER TABLE trades ADD COLUMN basket_start_time INTEGER DEFAULT 0')
+        conn.commit()
+
+    # Migration for entry_confirmed
+    try:
+        cursor.execute('SELECT entry_confirmed FROM trades LIMIT 1')
+    except sqlite3.OperationalError:
+        cursor.execute('ALTER TABLE trades ADD COLUMN entry_confirmed BOOLEAN DEFAULT 0')
         conn.commit()
     
     # Trade history table: Permanent log of all trades for post-mortem analysis
@@ -132,7 +147,7 @@ def init_db():
     conn.close()
     print(f"Database initialized at {DB_PATH}")
 
-def add_bot(name, pair, direction, rsi_limit, martingale_multiplier, base_size, strategy_type="MQL4", config_dict=None):
+def add_bot(name, pair, direction, rsi_limit, martingale_multiplier, base_size, strategy_type="Martingale", config_dict=None):
     """Adds a new bot and initializes its trade state."""
     if config_dict is None:
         config_dict = {}
@@ -196,19 +211,68 @@ def update_bot(bot_id, name, pair, direction, rsi_limit, martingale_multiplier, 
 
 def update_martingale_step(bot_id, next_step, added_investment, new_avg_price, new_tp_price):
     """Updates the active position stats when a new Martingale step is triggered."""
+    import time
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute('''
-        UPDATE trades
-        SET current_step = ?,
-            total_invested = total_invested + ?,
-            avg_entry_price = ?,
-            target_tp_price = ?,
-            entry_confirmed = 1
-        WHERE bot_id = ?
-    ''', (next_step, added_investment, new_avg_price, new_tp_price, bot_id))
+    
+    # If step 0 (Entry), set start time if not set
+    current_time = int(time.time())
+    
+    if next_step == 0:
+        # Reset start time on fresh entry
+        cursor.execute('''
+            UPDATE trades
+            SET current_step = ?,
+                total_invested = total_invested + ?,
+                avg_entry_price = ?,
+                target_tp_price = ?,
+                entry_confirmed = 1,
+                basket_start_time = ?
+            WHERE bot_id = ?
+        ''', (next_step, added_investment, new_avg_price, new_tp_price, current_time, bot_id))
+    else:
+        # Standard update
+        cursor.execute('''
+            UPDATE trades
+            SET current_step = ?,
+                total_invested = total_invested + ?,
+                avg_entry_price = ?,
+                target_tp_price = ?,
+                entry_confirmed = 1
+            WHERE bot_id = ?
+        ''', (next_step, added_investment, new_avg_price, new_tp_price, bot_id))
+    
     conn.commit()
     # Note: No conn.close() - using thread-local connection
+
+def deactivate_bot(bot_id, reason="Unknown Error"):
+    """Deactivates a bot and logs the reason."""
+    try:
+        conn = get_connection()
+        c = conn.cursor()
+        c.execute('UPDATE bots SET is_active = 0 WHERE id = ?', (bot_id,))
+        
+        # Log this as a system event/trade with error action
+        # Using log_trade to ensure it appears in history
+        log_trade(
+            bot_id=bot_id,
+            action='ERROR_STOP',
+            symbol='SYSTEM',
+            price=0,
+            amount=0,
+            cost_usdc=0,
+            order_id="SYS_STOP",
+            step=0,
+            notes=f"Auto-Stopped: {reason}"
+        )
+        
+        conn.commit()
+        # Note: No conn.close() - using thread-local connection
+        print(f"Bot {bot_id} deactivated: {reason}")
+        return True
+    except Exception as e:
+        print(f"Failed to deactivate bot {bot_id}: {e}")
+        return False
 
 def reset_bot_after_tp(bot_id, exit_price=0):
     """Resets the trade stats after a Take Profit (TP) hit, saving exit metadata.
@@ -271,7 +335,8 @@ def reset_bot_after_tp(bot_id, exit_price=0):
                 avg_entry_price = 0,
                 target_tp_price = 0,
                 last_exit_price = ?,
-                last_exit_time = ?
+                last_exit_time = ?,
+                basket_start_time = 0
             WHERE bot_id = ?
         ''', (exit_price, int(time.time()), bot_id))
         conn.commit()
@@ -288,7 +353,7 @@ def get_bot_status(bot_id):
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute('''
-        SELECT b.name, b.pair, t.current_step, t.total_invested, t.avg_entry_price, t.target_tp_price, t.last_exit_price, t.last_exit_time
+        SELECT b.name, b.pair, t.current_step, t.total_invested, t.avg_entry_price, t.target_tp_price, t.last_exit_price, t.last_exit_time, t.basket_start_time
         FROM bots b 
         JOIN trades t ON b.id = t.bot_id 
         WHERE b.id = ?
@@ -318,6 +383,27 @@ def toggle_bot_active(bot_id, new_status):
     # Ensure status is integer 0 or 1
     status_int = 1 if new_status else 0
     cursor.execute('UPDATE bots SET is_active = ? WHERE id = ?', (status_int, bot_id))
+    
+    # If enabling, clear any error notes from recent history that might show in UI
+    # We don't delete history, but we can't easily "clear" the note from the last log entry without editing history.
+    # Instead, UI logic should check if bot is currently active to decide whether to show the error.
+    # The UI logic is: if not is_active, show last error.
+    # So simply setting is_active=1 clears the error *display*.
+    
+    # However, if user re-activates, we might want to log "User Resumed".
+    if status_int == 1:
+        log_trade(
+            bot_id=bot_id,
+            action='RESUME',
+            symbol='SYSTEM',
+            price=0,
+            amount=0,
+            cost_usdc=0,
+            order_id="SYS_RESUME",
+            step=0,
+            notes="User Manually Resumed Bot"
+        )
+    
     conn.commit()
     # Note: No conn.close() - using thread-local connection
 

@@ -47,20 +47,20 @@ def test_database():
 def test_strategy():
     """Test strategy functions."""
     print("\n2. Testing Strategy Functions...")
-    from engine.strategies.mql4_strategy import MQL4Strategy
+    from engine.strategies.martingale_strategy import MartingaleStrategy
     from engine.strategies.market_maker import MarketMakerStrategy
     
-    # Test MQL4 Strategy
-    strat = MQL4Strategy()
+    # Test Martingale Strategy
+    strat = MartingaleStrategy()
     
     # Test lot size calculation (positional args: current_step, account_balance)
     lot = strat.calculate_lot_size(0, 1000)
     assert lot > 0, "Lot size should be positive"
-    print(f"   MQL4 calculate_lot_size(step=0): ${lot}")
+    print(f"   Martingale calculate_lot_size(step=0): ${lot}")
     
     lot2 = strat.calculate_lot_size(3, 1000)
     assert lot2 > lot, "Martingale should increase lot size"
-    print(f"   MQL4 calculate_lot_size(step=3): ${lot2}")
+    print(f"   Martingale calculate_lot_size(step=3): ${lot2}")
     
     # Test Market Maker Strategy
     mm_strat = MarketMakerStrategy("test_mm", {'order_size': 10})

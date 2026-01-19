@@ -30,7 +30,7 @@ def create_test_bots(count=5):
             rsi_limit=30,
             martingale_multiplier=1.5,
             base_size=10.0,
-            strategy_type="MQL4",
+            strategy_type="Martingale",
             config_dict={'timeframe': '1h'}
         )
         if bot_id:

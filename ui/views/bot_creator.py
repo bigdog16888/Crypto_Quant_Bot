@@ -55,8 +55,27 @@ def render_bot_creator_view():
             st.error(f"Error fetching symbols: {e}")
             available_pairs = [f"BTC/{quote_asset}"]
             exchange = None # Initialize to avoid UnboundLocalError
+        
+        # Refresh Button for Pairs
+        if st.button("🔄 Refresh Pairs", help="Force reload of market pairs"):
+             try:
+                 temp_ex = ExchangeInterface(market_type=mode_id)
+                 temp_ex.exchange.load_markets(reload=True)
+                 st.success("Markets reloaded!")
+                 st.rerun()
+             except Exception as e:
+                 st.error(f"Reload failed: {e}")
 
         pair = st.selectbox("Trading Pair", available_pairs)
+
+        # Dynamic Min Order Calculation
+        min_order_usd = 5.0
+        if exchange and pair:
+            try:
+                min_order_usd = exchange.get_min_order_usd(pair)
+            except Exception as e:
+                pass # Fallback to default
+
 
     # --- ATR Planning Foundation (Foundation of Parameters) ---
     df_f = None
@@ -68,14 +87,14 @@ def render_bot_creator_view():
         st.info("💡 Use these live values to baseline your Grid Range and First Entry Price.")
         try:
             if exchange:
-                from engine.strategies.mql4_strategy import MQL4Strategy
+                from engine.strategies.martingale_strategy import MartingaleStrategy
                 # Fetch 1D data to get enough history for various TFs
                 ohlcv_f = exchange.fetch_ohlcv(pair, timeframe='1h', limit=500)
                 if ohlcv_f and isinstance(ohlcv_f, list):
                     df_f = pd.DataFrame(ohlcv_f, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                     df_f['timestamp'] = pd.to_datetime(df_f['timestamp'], unit='ms')
                     
-                    temp_strat_f = MQL4Strategy()
+                    temp_strat_f = MartingaleStrategy()
                     atr_data = temp_strat_f.get_atr_foundation(df_f)
                     
                     # Display metrics
@@ -128,7 +147,7 @@ def render_bot_creator_view():
             st.markdown("""
             <div class="strat-card">
                 <div class="strat-icon">🛡️</div>
-                <div class="strat-title">MQL4 Classic</div>
+                <div class="strat-title">Martingale Grid</div>
                 <div class="strat-desc">Confluence of RSI, CCI, Bollinger. Best for conservative entries.</div>
             </div>
             """, unsafe_allow_html=True)
@@ -153,7 +172,7 @@ def render_bot_creator_view():
             
         strategy_type = st.radio(
             "Select Strategy Logic",
-            ["MQL4", "Market Maker", "Magic Hour"],
+            ["Martingale", "Market Maker", "Magic Hour"],
             label_visibility="collapsed",
             horizontal=True
         )
@@ -167,51 +186,65 @@ def render_bot_creator_view():
             # strategy_type removed from here, moved up
             timeframe = st.selectbox("Execution Timeframe", ["1m", "5m", "15m", "1h", "4h", "1d"], index=0, help="Scanning frequency.")
         
-            with col2:
-                base_size = st.number_input("Base Order Size ($USDC)", min_value=0.1, step=1.0, value=10.0)
-                martingale_multiplier = st.number_input("Martingale Multiplier", min_value=1.0, step=0.1, value=1.5)
-                
-                # --- NEW: Take Profit Input with Selection ---
-                st.markdown("**Take Profit Logic**")
-                tp_type = st.radio("TP Mode", ["Dollar Target ($)", "Percentage (%)"], index=0, horizontal=True)
-                
-                if tp_type == "Dollar Target ($)":
-                    take_profit_base = st.number_input("Take Profit Target ($USDC)", min_value=0.1, step=0.1, value=0.1, help="Dollar Profit Target per Cycle. Note: $10 profit on a $10 trade = 100% gain!")
-                    config['TakeProfitBase'] = take_profit_base
-                    config['TakeProfitType'] = 'USD'
-                    # Explicitly define for scope safety
-                    take_profit_pct = 0.0 
-                else:
-                    st.caption("✅ Low percentage values (e.g. 0.1%) are allowed.")
-                    take_profit_pct = st.number_input("Take Profit Target (%) 🎯", min_value=0.01, step=0.01, value=0.5, format="%.2f", key="tp_pct_fixed_v5", help="Percentage Profit Target per Cycle")
-                    config['TakeProfitPct'] = take_profit_pct
-                    config['TakeProfitType'] = 'Percent'
-                    # Explicitly define for scope safety
-                    take_profit_base = 0.0
+            # Leverage Input (Only for Futures)
+            if mode_id == 'future':
+                leverage = st.slider("Leverage (x)", min_value=1, max_value=50, value=1, help="Leverage multiplier. Ensure your account allows this level.")
+                config['leverage'] = leverage
+            else:
+                config['leverage'] = 1 # Spot is always 1x
 
-                # Projection Table for Sizing
-                from engine.strategies.mql4_strategy import MQL4Strategy
+        with col2:
+            base_size = st.number_input(f"Base Order Size (Min: ${min_order_usd:.2f})", min_value=min_order_usd, step=1.0, value=max(10.0, min_order_usd))
+            if base_size < min_order_usd:
+                    st.warning(f"Order size below minimum ${min_order_usd:.2f}")
+
+            martingale_multiplier = st.number_input("Martingale Multiplier", min_value=1.0, step=0.1, value=1.5)
+            max_steps = st.number_input("Max Martingale Steps", min_value=1, max_value=20, value=10, help="Maximum number of safety orders (DCA layers).")
+            config['max_steps'] = max_steps
                 
-                # Pass params for projection
-                proj_params = {
-                    'base_size': base_size, 
-                    'martingale_multiplier': martingale_multiplier, 
-                    'direction': direction,
-                    'UseHedge': False # Will update below
-                }
+            # --- NEW: Take Profit Input with Selection ---
+            st.markdown("**Take Profit Logic**")
+            tp_type = st.radio("TP Mode", ["Dollar Target ($)", "Percentage (%)"], index=0, horizontal=True)
+            
+            if tp_type == "Dollar Target ($)":
+                take_profit_base = st.number_input("Take Profit Target ($USDC)", min_value=0.1, step=0.1, value=0.1, help="Dollar Profit Target per Cycle. Note: $10 profit on a $10 trade = 100% gain!")
+                config['TakeProfitBase'] = take_profit_base
+                config['TakeProfitType'] = 'USD'
+                # Explicitly define for scope safety
+                take_profit_pct = 0.0 
+            else:
+                st.caption("✅ Low percentage values (e.g. 0.1%) are allowed.")
+                take_profit_pct = st.number_input("Take Profit Target (%) 🎯", min_value=0.01, step=0.01, value=0.5, format="%.2f", key="tp_pct_fixed_v5", help="Percentage Profit Target per Cycle")
+                config['TakeProfitPct'] = take_profit_pct
+                config['TakeProfitType'] = 'Percent'
+                # Explicitly define for scope safety
+                take_profit_base = 0.0
+
+            # Projection Table for Sizing
+            from engine.strategies.martingale_strategy import MartingaleStrategy
+            
+            # Pass params for projection
+            proj_params = {
+                'base_size': base_size, 
+                'martingale_multiplier': martingale_multiplier, 
+                'max_steps': max_steps,
+                'direction': direction,
+                'UseHedge': False # Will update below
+            }
+            
+            if tp_type == "Dollar Target ($)":
+                proj_params['TakeProfitBase'] = take_profit_base
+            else:
+                proj_params['TakeProfitPct'] = take_profit_pct
                 
-                if tp_type == "Dollar Target ($)":
-                    proj_params['TakeProfitBase'] = take_profit_base
-                else:
-                    proj_params['TakeProfitPct'] = take_profit_pct
-                    
-                temp_strat = MQL4Strategy(params=proj_params)
+            temp_strat = MartingaleStrategy(params=proj_params)
         
             # Projection Logic Moved to Bottom to capture all configs
 
 
-        rsi_limit = st.slider("RSI Limit (for Classic)", 0, 100, 30, help="Only used if Strategy Logic is 'Classic'.")
-
+        # rsi_limit = st.slider("RSI Limit (for Classic)", 0, 100, 30, help="Only used if Strategy Logic is 'Classic'.")
+        rsi_limit = 30 # Default/Legacy value hidden from UI
+        
         st.divider()
         # config = {} # REMOVED: Re-initialization cleared previous values
 
@@ -243,7 +276,7 @@ def render_bot_creator_view():
                     config['stop_loss_ext'] = st.number_input("🛑 Max Extension (Fade Zone)", value=1.0, step=0.1, help="Allowed deviation multiplier. If Price > High + (Range * Extension), we assume strong trend and STOP fading.")
                     st.success(f"✅ Target is fixed at **50% Mean Reversion** (Range Midpoint).")
 
-        elif strategy_type == "MQL4":
+        elif strategy_type == "Martingale":
             with st.expander("Entry Triggers (Multi-Switch Confluence)", expanded=True):
                 st.caption("ALL enabled switches below must align for an entry. Each works on its own timeframe.")
                 st.markdown("### 1. Indicators")
@@ -318,7 +351,10 @@ def render_bot_creator_view():
             with g_col1:
                 config['ATRGridFactor'] = st.number_input("ATR Grid Factor", value=1.0, step=0.1, help="Multiplier for ATR. < 1.0 = tighter grid.")
             with g_col2:
-                config['base_grid'] = st.number_input("Fixed Grid Step (Price)", value=100.0, step=10.0, help="Used if ATR Grid is OFF. Absolute price change.")
+                if not config['UseATRGrid']:
+                     config['base_grid'] = st.number_input("Fixed Grid Step (Price)", value=100.0, step=10.0, help="Used if ATR Grid is OFF. Absolute price change.")
+                else:
+                     config['base_grid'] = 100.0 # Default hidden
             
             # --- New ATR Timeframe Selector ---
             if config['UseATRGrid']:
@@ -382,7 +418,12 @@ def render_bot_creator_view():
                 p_atr = atr_data.get(proj_tf, {}).get('atr', 10.0)
                 
                 # Update strat params with full config before calculating
-                temp_strat.params.update(config)
+                # temp_strat is already initialized, so we must recreate it or update its internal flags
+                # The Strategy class caches 'UseATRGrid' in __init__, so updating params dict is not enough.
+                # Re-initializing is safer.
+                final_proj_params = proj_params.copy()
+                final_proj_params.update(config)
+                temp_strat = MartingaleStrategy(params=final_proj_params)
                 
                 projections = temp_strat.calculate_projections(base_price=current_price, current_atr=p_atr)
                 
@@ -446,7 +487,7 @@ def render_bot_creator_view():
         else:
             config['timeframe'] = timeframe
             
-            strat_id = "MQL4" # Default
+            strat_id = "Martingale" # Default
             if strategy_type == "Market Maker":
                 strat_id = "MarketMaker"
             elif strategy_type == "Magic Hour":
