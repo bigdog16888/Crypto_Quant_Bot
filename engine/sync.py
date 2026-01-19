@@ -35,113 +35,72 @@ def sync_bot_state(bot_id, exchange, db_status=None):
     # Determine DB State
     is_in_trade = total_invested > 0
 
-    logger.info(f"🔄 Syncing state for Bot {name} ({pair})...")
+    logger.info(f"Syncing state for Bot {name} ({pair})...")
 
     try:
-        # Fetch Open Orders from Exchange
-        # In a real scenario, this hits the API. In DRY_RUN, it might return None or [] depending on mock.
-        # We wrap in try-except to prevent startup crashes if API is down.
+        # 1. Fetch Positions from Exchange (Futures only)
+        # This is the single source of truth for "In Trade"
+        has_exchange_position = False
+        exchange_side = None
+        
+        if exchange.market_type in ['future', 'swap']:
+            try:
+                positions = exchange.exchange.fetch_positions([pair])
+                for pos in positions:
+                    contracts = float(pos.get('contracts', 0) or 0)
+                    if contracts != 0:
+                        has_exchange_position = True
+                        exchange_side = pos.get('side')
+                        break
+            except Exception as e:
+                logger.error(f"Failed to fetch positions for {name}: {e}")
+        else:
+            # Spot logic: Check base asset balance
+            try:
+                base_asset = pair.split('/')[0]
+                balance = exchange.fetch_balance()
+                free = float(balance.get(base_asset, {}).get('free', 0))
+                if free > 0: # This is a bit naive for spot but better than nothing
+                    has_exchange_position = True
+            except Exception as e:
+                logger.error(f"Failed to fetch spot balance for {name}: {e}")
+
+        # 2. Fetch Open Orders
         try:
             open_orders = exchange.fetch_open_orders(pair)
         except Exception as e:
             logger.error(f"Failed to fetch open orders for {name}: {e}")
-            return # Cannot sync without exchange data
+            return
 
-        if open_orders is None:
-            open_orders = []
-
+        if open_orders is None: open_orders = []
         has_open_orders = len(open_orders) > 0
 
-        # Check if entry was confirmed (has trade_history entry)
-        import sqlite3
-        from engine.database import DB_PATH
-        try:
-            conn_sync = sqlite3.connect(DB_PATH, timeout=30.0)
-            cursor_sync = conn_sync.cursor()
-            cursor_sync.execute('''
-                SELECT COUNT(*) FROM trade_history
-                WHERE bot_id = ? AND action IN ('BUY', 'SELL')
-                ORDER BY timestamp DESC LIMIT 1
-            ''', (bot_id,))
-            entry_count = cursor_sync.fetchone()[0]
-            entry_confirmed = entry_count > 0
-            conn_sync.close()
-        except Exception as e:
-            logger.error(f"Failed to check entry confirmation: {e}")
-            entry_confirmed = False
+        # 3. Handle Mismatches
+        
+        # Scenario A: DB says IN TRADE, but Exchange has NO POSITION
+        if is_in_trade and not has_exchange_position:
+            logger.warning(f"State Mismatch for {name}: DB shows active position, but Exchange is EMPTY.")
+            logger.info("   -> Action: Resetting DB state to IDLE (Likely manually closed or TP hit).")
+            reset_bot_after_tp(bot_id, exit_price=0) # Reset to idle
+            return
 
-        # --- Synchronization Logic (IMPROVED) ---
+        # Scenario B: DB says IDLE, but Exchange HAS POSITION
+        if not is_in_trade and has_exchange_position:
+            logger.critical(f"CRITICAL Mismatch for {name}: DB says IDLE, but Exchange has ACTIVE POSITION!")
+            logger.info("   -> Action: Bot cannot automatically manage external positions. Please manually close or re-sync.")
+            # We don't auto-import positions for safety, just warn.
 
-        # Case 1: Orphaned Orders
-        # DB says "No Trade" (Idle), but Exchange has Open Orders.
-        # IMPROVEMENT: Check if these are unfilled entry orders (no entry_confirmed)
-        if not is_in_trade and has_open_orders:
-            if not entry_confirmed:
-                # These might be unfilled entry orders - warn but don't cancel
-                logger.warning(f"⚠️ State Mismatch for {name}: DB says IDLE, but Exchange has {len(open_orders)} OPEN ORDERS.")
-                logger.info("   -> Action: No entry confirmation in trade_history. These may be unfilled entry orders.")
-                logger.info(f"   -> Order IDs: {[o.get('id') for o in open_orders[:3]]}")
-                logger.info("   -> User should manually review: Cancel these OR re-attach to bot")
-            else:
-                # Confirmed entry orders exist but DB is idle - this is a real orphan
-                logger.warning(f"⚠️ State Mismatch for {name}: DB says IDLE, but Exchange has {len(open_orders)} OPEN ORDERS.")
-                logger.info("   -> Action: Cancelling orphaned orders to reset state.")
+        # Scenario C: Orphaned Orders (Idle DB & No Position, but orders exist)
+        if not is_in_trade and not has_exchange_position and has_open_orders:
+            logger.warning(f"State Mismatch for {name}: DB is IDLE, but Exchange has orphaned orders.")
+            logger.info("   -> Action: Cancelling orphaned orders.")
+            try:
+                exchange.cancel_all_orders(pair)
+            except Exception: pass
 
-                try:
-                    exchange.cancel_all_orders(pair)
-                    logger.info(f"   ✅ Orphaned orders cancelled for {name}.")
-                except Exception as e:
-                    logger.error(f"   ❌ Failed to cancel orphans for {name}: {e}")
+        logger.info(f"Bot {name} state synchronized. (In Trade: {has_exchange_position}, Open Orders: {len(open_orders)})")
 
-        # Case 2: Ghost Trades / TP Hit Offline
-        # DB says "In Trade", but Exchange has NO Open Orders.
-        # IMPROVEMENT: Check entry_confirmed before assuming TP hit
-        elif is_in_trade and not has_open_orders:
-            if entry_confirmed:
-                # Entry was confirmed, so this is likely a TP hit while offline
-                logger.warning(f"⚠️ State Mismatch for {name}: DB says IN TRADE (Invested: {total_invested}), but Exchange has NO ORDERS.")
-                logger.info("   -> Entry was confirmed. Assuming TP hit while offline.")
-                logger.info("   -> Action: Marking trade as closed in DB.")
 
-                # We use the target_tp_price as the exit price since we can't easily fetch the exact fill price without 'fetch_my_trades'
-                exit_price = target_tp if target_tp > 0 else 0
-
-                reset_bot_after_tp(bot_id, exit_price=exit_price)
-                logger.info(f"   ✅ Trade marked as closed for {name} (Saved Exit Price: {exit_price}).")
-
-            else:
-                # Entry was NOT confirmed! This is a ghost trade or corrupted state
-                logger.critical(f"🚨 CRITICAL: Bot {name} shows INVESTED > 0 but NO entry confirmation!")
-                logger.critical(f"   - DB: Invested ${total_invested:.2f}")
-                logger.critical(f"   - Trade History: No entry records found")
-                logger.critical(f"   - Exchange: No open orders")
-                logger.critical(f"   -> Action: RESETING TO IDLE (Ghost trade cleanup)")
-
-                # Reset to idle state
-                try:
-                    import sqlite3
-                    from engine.database import DB_PATH
-                    conn_reset = sqlite3.connect(DB_PATH, timeout=30.0)
-                    cursor_reset = conn_reset.cursor()
-                    cursor_reset.execute('''
-                        UPDATE trades
-                        SET current_step = 0,
-                            total_invested = 0,
-                            avg_entry_price = 0,
-                            target_tp_price = 0
-                        WHERE bot_id = ?
-                    ''', (bot_id,))
-                    conn_reset.commit()
-                    conn_reset.close()
-                    logger.info(f"   ✅ Ghost trade reset for {name}")
-                except Exception as reset_e:
-                    logger.error(f"   ❌ Failed to reset ghost trade: {reset_e}")
-
-        # Case 3: States Match (roughly)
-        else:
-            # - Idle & No Orders
-            # - In Trade & Has Orders
-            logger.info(f"✅ Bot {name} state is synchronized. (In Trade: {is_in_trade}, Open Orders: {len(open_orders)}, EntryConfirmed: {entry_confirmed})")
 
     except Exception as e:
         logger.error(f"Critical error during sync for {name}: {e}")

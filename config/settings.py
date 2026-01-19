@@ -31,7 +31,8 @@ class Config:
     # Users select via UI dropdown in Bot Creator/Manager
     ALLOWED_SYMBOLS = os.getenv("ALLOWED_SYMBOLS", "BTC/USDT,ETH/USDT,SOL/USDT,BNB/USDT,XRP/USDT,BTC/USDC,ETH/USDC,SOL/USDC").split(",")
     MARKET_TYPE = os.getenv("MARKET_TYPE", "future").lower() # 'spot' or 'future' (USDT-M) or 'swap' - DEFAULT: FUTURES
-    MAX_ORDER_USD = float(os.getenv("MAX_ORDER_USD", 100))
+    MAX_ORDER_USD = float(os.getenv("MAX_ORDER_USD", 10000))
+
     
     # Circuit Breaker / Safety
     GLOBAL_STOP_LOSS_PCT = float(os.getenv("GLOBAL_STOP_LOSS_PCT", 50.0)) # Stop if account drops 50%

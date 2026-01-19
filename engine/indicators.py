@@ -1,7 +1,8 @@
 import pandas as pd
+from pandas import Series, DataFrame
 import numpy as np
 
-def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+def rsi(series: Series, period: int = 14) -> Series:
     """
     Relative Strength Index (RSI)
     """
@@ -15,9 +16,9 @@ def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     # Prevent division by zero
     rs = np.where(avg_loss != 0, avg_gain / avg_loss, 100.0)
     rsi_val = 100 - (100 / (1 + rs))
-    return pd.Series(rsi_val, index=series.index).fillna(50)
+    return Series(rsi_val, index=series.index).fillna(50)
 
-def cci(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+def cci(high: Series, low: Series, close: Series, period: int = 14) -> Series:
     """
     Commodity Channel Index (CCI)
     """
@@ -28,7 +29,7 @@ def cci(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> 
     cci_val = (tp - sma_tp) / (0.015 * mad)
     return cci_val.fillna(0)
 
-def bollinger_bands(close: pd.Series, period: int = 20, deviation: float = 2.0):
+def bollinger_bands(close: Series, period: int = 20, deviation: float = 2.0):
     """
     Bollinger Bands
     Returns: upper, mid, lower Series
@@ -39,9 +40,9 @@ def bollinger_bands(close: pd.Series, period: int = 20, deviation: float = 2.0):
     upper = mid + (std * deviation)
     lower = mid - (std * deviation)
     
-    return upper.fillna(close), mid.fillna(close), lower.fillna(close)
+    return Series(upper).fillna(close), Series(mid).fillna(close), Series(lower).fillna(close)
 
-def stochastic(high: pd.Series, low: pd.Series, close: pd.Series, k_period: int = 5, d_period: int = 3, slowing: int = 3):
+def stochastic(high: Series, low: Series, close: Series, k_period: int = 5, d_period: int = 3, slowing: int = 3):
     """
     Stochastic Oscillator
     Returns: %K, %D Series    
@@ -51,7 +52,11 @@ def stochastic(high: pd.Series, low: pd.Series, close: pd.Series, k_period: int 
     highest_high = high.rolling(window=k_period).max()
     
     # Fast %K
-    fast_k = 100 * ((close - lowest_low) / (highest_high - lowest_low))
+    # Handle possible division by zero
+    diff = highest_high - lowest_low
+    # Ensure it stays a series for further rolling
+    fast_k = 100 * ((close - lowest_low) / diff)
+    fast_k = Series(fast_k).replace([np.inf, -np.inf], 50.0).fillna(50.0)
     
     # Slowing %K (moving average of Fast %K)
     if slowing > 1:
@@ -60,11 +65,11 @@ def stochastic(high: pd.Series, low: pd.Series, close: pd.Series, k_period: int 
         k = fast_k
         
     # %D (moving average of %K)
-    d = k.rolling(window=d_period).mean()
+    d = Series(k).rolling(window=d_period).mean()
     
-    return k.fillna(50), d.fillna(50)
+    return Series(k).fillna(50), Series(d).fillna(50)
 
-def macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
+def macd(close: Series, fast: int = 12, slow: int = 26, signal: int = 9):
     """
     Moving Average Convergence Divergence (MACD)
     Returns: macd_line, signal_line
@@ -77,7 +82,7 @@ def macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
     
     return macd_line.fillna(0), signal_line.fillna(0)
 
-def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+def atr(high: Series, low: Series, close: Series, period: int = 14) -> Series:
     """
     Average True Range (ATR)
     """
@@ -86,17 +91,35 @@ def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> 
     tr3 = (low - close.shift()).abs()
     
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    atr_val = tr.rolling(window=period).mean() # Simple Moving Average of TR
+    atr_val = Series(tr).rolling(window=period).mean() # Simple Moving Average of TR
     
-    return atr_val.fillna(tr.mean())
+    return Series(atr_val).fillna(tr.mean())
 
-def atr_percentile(high: pd.Series, low: pd.Series, close: pd.Series, period_atr: int = 14, period_lookback: int = 100) -> float:
+def iATR(high: Series, low: Series, close: Series, period: int = 14) -> float:
+    """Standard iATR returning single value (float)."""
+    res = atr(high, low, close, period)
+    if res.empty or pd.isna(res.iloc[-1]): return 0.0
+    return float(res.iloc[-1])
+
+def atr_percentile(high: Series, low: Series, close: Series, period_atr: int = 14, period_lookback: int = 100) -> float:
     """
     Calculates where the current ATR sits relative to the last X periods (0-100).
     """
-    atr_val = atr(high, low, close, period=period_atr)
-    if atr_val is None or len(atr_val) < period_lookback:
+    atr_series = atr(high, low, close, period=period_atr)
+    if atr_series is None or len(atr_series) < 2:
         return 50.0
+    
+    current_val = atr_series.iloc[-1]
+    history = atr_series.iloc[-period_lookback:]
+    
+    # Percentile rank logic
+    rank = (history < current_val).sum() / len(history) * 100.0
+    return float(rank)
+
+def iATRPercentile(high: Series, low: Series, close: Series, period: int = 14, lookback: int = 100) -> float:
+    """Alias for atr_percentile to match engine calls."""
+    return atr_percentile(high, low, close, period, lookback)
+
     
     current_atr = atr_val.iloc[-1]
     history = atr_val.iloc[-period_lookback:]

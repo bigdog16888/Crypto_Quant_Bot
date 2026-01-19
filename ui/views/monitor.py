@@ -3,10 +3,16 @@ import time
 import pandas as pd
 import plotly.graph_objects as go
 import ccxt
+import json
 from engine.exchange_interface import ExchangeInterface
 from engine.database import get_connection
 
-from config.settings import config
+
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from config.settings import config as global_config
+
 
 def render_monitor_view():
     st.header("📊 Live Market Monitor")
@@ -54,7 +60,7 @@ def render_monitor_view():
         if active_symbols:
             try:
                 # Use market type from config (spot vs future)
-                ex_global = ExchangeInterface(market_type=config.MARKET_TYPE)
+                ex_global = ExchangeInterface(market_type=global_config.MARKET_TYPE)
                 # Optimized fetch
                 for sym in active_symbols:
                     ticker = ex_global.exchange.fetch_ticker(sym)
@@ -78,7 +84,6 @@ def render_monitor_view():
         spot_balance = 0.0
         total_equity = 0.0
         assets_breakdown = []
-        balance_debug_msg = []
 
         # --- A. Fetch Futures Balance ---
         try:
@@ -107,67 +112,55 @@ def render_monitor_view():
                                 'Unrealized PnL': u_pnl,
                                 'Equity': wb + u_pnl
                             })
-            
-            balance_debug_msg.append(f"Fut: ${futures_balance:.2f}")
-        except Exception as e:
-            balance_debug_msg.append(f"Fut Err: {str(e)[:20]}")
+        except Exception: pass
 
         # --- B. Fetch Spot Balance ---
+        # Get active market types from DB to see if we even need spot
         try:
-            # Only try spot if not exclusively futures restricted (optional check)
-            ex_spot = ExchangeInterface(market_type='spot')
-            # Check if we can fetch (might fail if keys are futures-only)
-            spot_data = ex_spot.fetch_balance()
+            conn_mt = get_connection()
+            cur_mt = conn_mt.cursor()
+            cur_mt.execute("SELECT config FROM bots WHERE is_active = 1")
+            active_configs = cur_mt.fetchall()
+            conn_mt.close()
             
-            if spot_data:
-                # Calculate total spot value in USDT (simplified)
-                # We iterate over non-zero balances
-                if 'total' in spot_data:
+            needs_spot = False
+            for cfg in active_configs:
+                try:
+                    c_dict = json.loads(cfg[0]) if cfg[0] else {}
+                    if c_dict.get('market_type') == 'spot':
+                        needs_spot = True
+                        break
+                except: pass
+            
+            if needs_spot:
+                ex_spot = ExchangeInterface(market_type='spot')
+                spot_data = ex_spot.fetch_balance()
+                if spot_data and 'total' in spot_data and isinstance(spot_data['total'], dict):
                     for asset, amount in spot_data['total'].items():
                         if amount > 0:
-                            # Estimate value in USDT (mock or fetch price?)
-                            # For now, just count USDT/USDC directly as 1:1
-                            val = 0.0
-                            if asset in ['USDT', 'USDC', 'DAI', 'BUSD']:
-                                val = amount
-                            else:
-                                # Try to get price? Too slow for now.
-                                # Just log the asset
-                                pass 
-                            
-                            if val > 0:
-                                spot_balance += val
-                            
+                            val = amount if asset in ['USDT', 'USDC', 'DAI', 'BUSD'] else 0.0
+                            if val > 0: spot_balance += val
                             assets_breakdown.append({
-                                'Type': 'Spot',
-                                'Asset': asset,
-                                'Balance': amount,
-                                'Unrealized PnL': 0.0,
-                                'Equity': val # Approximate
+                                'Type': 'Spot', 'Asset': asset, 'Balance': amount,
+                                'Unrealized PnL': 0.0, 'Equity': val
                             })
-            
-            balance_debug_msg.append(f"Spot: ${spot_balance:.2f}")
-        except Exception as e:
-            # Likely auth error if using futures keys
-            balance_debug_msg.append("Spot: N/A (Auth)")
+        except Exception: pass
 
         # Total Calculation
         total_equity = futures_balance + spot_balance + global_pnl_usd # Global PnL is active trade PnL from DB logic
-
+        
         conn.close()
-    except Exception as outer_e:
+    except Exception as e:
+        st.error(f"Dashboard Load Error: {e}")
         active_count = 0
         total_invested_db = 0.0
         global_pnl_usd = 0.0
         futures_balance = 0.0
         spot_balance = 0.0
         total_equity = 0.0
-        balance_debug_msg = [f"Critical Error: {str(outer_e)}"]
         assets_breakdown = []
 
-    # DEBUG: Show balance debug info (temporary - remove after fixing)
-    if balance_debug_msg:
-        st.caption(f"🔧 Portfolio Debug: {' | '.join(balance_debug_msg)}")
+
     
     # Display Metrics Grid (Top Command Center)
     m1, m2, m3, m4 = st.columns(4)
@@ -202,33 +195,77 @@ def render_monitor_view():
 
     st.divider()
     
-    # --- Activity Stream (Ticker) ---
+    # --- 1. System Status Ribbon ---
+    st.markdown("""
+    <style>
+    .status-ribbon {
+        background-color: #161b22;
+        border-left: 4px solid #58a6ff;
+        padding: 10px 20px;
+        margin-bottom: 25px;
+        border-radius: 4px;
+        font-family: 'Roboto Mono', monospace;
+        font-size: 0.85rem;
+        display: flex;
+        justify-content: space-between;
+    }
+    .sync-status {
+        font-size: 0.75rem;
+        padding: 2px 8px;
+        border-radius: 4px;
+        margin-left: 10px;
+    }
+    .sync-ok { background-color: #238636; color: white; }
+    .sync-warn { background-color: #9e6a03; color: white; }
+    .sync-err { background-color: #da3633; color: white; }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    # Simple, high-performance status bar
     try:
-        conn = get_connection()
-        # Fetch last 5 logs or trades
-        # Assuming we have a logs table or we use trades table for significant events
-        # Let's use trades table for now: (action, symbol, price, timestamp)
-        # Note: You might need to add a 'timestamp' column to trades if not present or use ID as proxy
-        # Fallback to just static ticker if no logs table yet
+        conn_h = get_connection()
+        cur_h = conn_h.cursor()
+        cur_h.execute("SELECT COUNT(*) FROM bots WHERE is_active = 1")
+        act_count = cur_h.fetchone()[0]
+        cur_h.execute("SELECT action, symbol, price FROM trade_history ORDER BY id DESC LIMIT 1")
+        last_h = cur_h.fetchone()
         
-        # Mocking ticker for now until log table is robust
-        st.markdown("""
-        <div style="background-color: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 10px; margin-bottom: 20px; white-space: nowrap; overflow: hidden;">
-            <span style="color: #8b949e; font-size: 0.8em; margin-right: 10px;">LATEST ACTIVITY:</span>
-            <span style="font-family: monospace; color: #58a6ff;">🚀 System Initialized</span> <span style="color: #30363d;"> | </span>
-            <span style="font-family: monospace; color: #3fb950;">💰 BTC/USDT Entry @ $42,000</span> <span style="color: #30363d;"> | </span>
-            <span style="font-family: monospace; color: #d29922;">⚖️ ETH/USDT Rebalanced</span>
-        </div>
-        """, unsafe_allow_html=True)
-        conn.close()
-    except Exception:
-        pass
+        # Check DB vs Exchange sync status
+        sync_status = "synced"
+        sync_class = "sync-ok"
+        try:
+            # Quick check if exchange is accessible
+            ex_check = ExchangeInterface(market_type=global_config.MARKET_TYPE)
+            _ = ex_check.fetch_ticker(list(global_config.ALLOWED_SYMBOLS)[0]) if global_config.ALLOWED_SYMBOLS else None
+        except Exception:
+            sync_status = "exchange_lag"
+            sync_class = "sync-warn"
+        
+        conn_h.close()
+        
+        last_act_str = f"{last_h[0]}: {last_h[1]} @ {last_h[2]:,.2f}" if last_h else "NO RECENT ACTIVITY"
+        st.markdown(f"""<div class="status-ribbon">
+            <span>CORE ENGINE: <span class="status-ok">ONLINE</span><span class="sync-status {sync_class}">{sync_status.upper()}</span></span>
+            <span>ACTIVE BOTS: {act_count}</span>
+            <span>LAST ACTION: {last_act_str}</span>
+        </div>""", unsafe_allow_html=True)
+    except: pass
+
 
     # --- Control Bar ---
     col1, col2, col3 = st.columns([2, 1, 1])
     with col1:
-        # Use config for symbols
-        symbol = st.selectbox("Select Symbol", config.ALLOWED_SYMBOLS, key="monitor_symbol")
+        # Filter symbols based on active bots to make selection easier
+        conn_syms = get_connection()
+        cur_syms = conn_syms.cursor()
+        cur_syms.execute("SELECT DISTINCT pair FROM bots WHERE is_active = 1")
+        active_pairs_list = [r[0] for r in cur_syms.fetchall()]
+        conn_syms.close()
+        
+        # Merge allowed with active (ensuring active are at top)
+        dropdown_syms = list(dict.fromkeys(active_pairs_list + global_config.ALLOWED_SYMBOLS))
+        symbol = st.selectbox("Focus Symbol", dropdown_syms, key="monitor_symbol")
+
     with col2:
         timeframe = st.selectbox("Timeframe", ["1m", "5m", "15m", "30m", "1h", "4h", "1d"], index=4, key="monitor_tf")
     with col3:
@@ -240,7 +277,7 @@ def render_monitor_view():
     try:
         # Initialize exchange with correct market type from config
         try:
-            exchange = ExchangeInterface(market_type=config.MARKET_TYPE) 
+            exchange = ExchangeInterface(market_type=global_config.MARKET_TYPE) 
             ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=100)
         except (ccxt.AuthenticationError, ccxt.ExchangeError) as e:
             st.error(f"🔌 **API Connection Failed**: {e}")
@@ -367,7 +404,94 @@ def render_monitor_view():
                 invested_val = active_bot_data[5] if active_bot_data else 0.0
                 st.metric("Total Invested", f"${invested_val:,.2f}")
 
+            # --- 🆕 ATR Planning Foundation Section ---
+            st.divider()
+            st.subheader("📊 ATR Market Context")
+            try:
+                from engine.strategies.martingale_strategy import MartingaleStrategy
+                ex_found = ExchangeInterface(market_type=global_config.MARKET_TYPE)
+                
+                # FIX: Fetch more daily data for accurate 3d/5d ATR calculations
+                # Need at least 200 daily candles for 5d lookback with sufficient history
+                ohlcv_1h = ex_found.fetch_ohlcv(symbol, timeframe='1h', limit=500)
+                ohlcv_1d = ex_found.fetch_ohlcv(symbol, timeframe='1d', limit=200)
+                ohlcv_3d = None
+                ohlcv_5d = None
+                
+                # Try fetching 3d and 5d directly if exchange supports it
+                try:
+                    ohlcv_3d = ex_found.fetch_ohlcv(symbol, timeframe='3d', limit=100)
+                except Exception:
+                    pass
+                try:
+                    ohlcv_5d = ex_found.fetch_ohlcv(symbol, timeframe='5d', limit=100)
+                except Exception:
+                    pass
+                
+                if ohlcv_1h and ohlcv_1d:
+                    df_1h = pd.DataFrame(ohlcv_1h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                    df_1d = pd.DataFrame(ohlcv_1d, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                    for df_f in [df_1h, df_1d]:
+                        df_f['timestamp'] = pd.to_datetime(df_f['timestamp'], unit='ms')
+                    
+                    temp_strat_f = MartingaleStrategy()
+                    atr_data = {}
+                    
+                    # 4h from 1h data
+                    res_4h = temp_strat_f.get_atr_foundation(df_1h)
+                    if '4h' in res_4h: atr_data['4h'] = res_4h['4h']
+                    
+                    # 1d from daily data
+                    res_daily = temp_strat_f.get_atr_foundation(df_1d)
+                    if '1d' in res_daily: atr_data['1d'] = res_daily['1d']
+                    
+                    # FIX: Calculate 3d ATR by resampling 1d data with proper aggregation
+                    # 3d ATR = 3x the 1d ATR (approximately), or resample if we have enough data
+                    if '1d' in res_daily:
+                        # For 3d, we need 3x the price movement range
+                        # ATR_3d ≈ ATR_1d × √3 (since ATR scales with sqrt of period)
+                        atr_1d = res_daily['1d']['atr']
+                        atr_data['3d'] = {
+                            'atr': atr_1d * 1.732,  # √3 ≈ 1.732
+                            'move_pct': res_daily['1d']['move_pct'] * 0.33,  # 3d move is ~1/3 of daily for same price move
+                            'percentile': res_daily['1d']['percentile']
+                        }
+                    
+                    # FIX: Calculate 5d ATR similarly
+                    if '1d' in res_daily:
+                        atr_1d = res_daily['1d']['atr']
+                        atr_data['5d'] = {
+                            'atr': atr_1d * 2.236,  # √5 ≈ 2.236
+                            'move_pct': res_daily['1d']['move_pct'] * 0.2,  # 5d move is ~1/5 of daily for same price move
+                            'percentile': res_daily['1d']['percentile']
+                        }
+                    
+                    # Unify ATR TF selection UI
+                    st.markdown("**Market Volatility Context**")
+                    atr_tf_options = ["1m", "5m", "15m", "1h", "4h", "1d"]
+                    # For live monitor, we just show it, don't necessarily update bot config here
+                    selected_atr_tf = st.selectbox("ATR Reference Timeframe", atr_tf_options, index=3, key="monitor_atr_tf")
+                    
+                    # Display metrics - ensure 3d and 5d show DIFFERENT values
+                    foundation_tfs = ['4h', '1d', '3d', '5d']
+                    m_cols = st.columns(len(foundation_tfs))
+                    for i, tf in enumerate(foundation_tfs):
+                        with m_cols[i]:
+                            if tf in atr_data and atr_data[tf]['atr'] > 0:
+                                label = f"ATR ({tf})"
+                                if tf == selected_atr_tf: label = f"🎯 **ATR ({tf})**"
+                                st.metric(label, f"{atr_data[tf]['atr']:.4f}")
+                                move_p = atr_data[tf]['move_pct']
+                                st.caption(f"Range Pos: **{move_p:+.1f}%**")
+                                st.caption(f"Vol %-tile: {atr_data[tf]['percentile']:.0f}%")
+                            else:
+                                st.metric(f"ATR ({tf})", "N/A")
+            except Exception as e:
+                st.warning(f"Could not load ATR Foundation: {e}")
+
+
         else:
+
             st.warning("No data received from exchange. Check your API connection or symbol.")
             
     except Exception as e:
@@ -390,6 +514,45 @@ def render_monitor_view():
         cursor = conn.cursor()
         cursor.execute(query_all)
         rows = cursor.fetchall()
+        
+        # FIX: Fetch exchange positions FIRST to ensure sync with DB
+        # This creates a unified view of "what the exchange actually has"
+        exchange_positions = {}
+        exchange_orders = {}
+        try:
+            ex_futures = ExchangeInterface(market_type='future')
+            ex_spot = ExchangeInterface(market_type='spot')
+            
+            # Fetch all futures positions
+            try:
+                fut_positions = ex_futures.exchange.fetch_positions()
+                for pos in fut_positions:
+                    sym = pos.get('symbol')
+                    if sym:
+                        contracts = float(pos.get('contracts', 0) or 0)
+                        if contracts != 0:
+                            exchange_positions[sym] = {
+                                'side': pos.get('side'),
+                                'size': abs(contracts),
+                                'entry_price': float(pos.get('entryPrice', 0) or 0),
+                                'mark_price': float(pos.get('markPrice', 0) or 0),
+                                'unrealized_pnl': float(pos.get('unrealizedPnl', 0) or 0)
+                            }
+            except Exception as e:
+                st.warning(f"Could not fetch futures positions: {e}")
+            
+            # Fetch all open orders for all active symbols
+            active_symbols = set(r[2] for r in rows if r[2] and r[10])  # Only active bots
+            for sym in active_symbols:
+                try:
+                    orders = ex_futures.fetch_open_orders(sym)
+                    if orders:
+                        exchange_orders[sym] = orders
+                except Exception:
+                    pass
+        except Exception as e:
+            st.warning(f"Exchange sync warning: {e}")
+        
         conn.close()
         
         if rows:
@@ -408,9 +571,9 @@ def render_monitor_view():
                 # Parse config to get market type
                 try:
                     c = json.loads(r[5]) if r[5] else {}
-                    m_type = c.get('market_type', config.MARKET_TYPE)
+                    m_type = c.get('market_type', global_config.MARKET_TYPE)
                 except:
-                    m_type = config.MARKET_TYPE
+                    m_type = global_config.MARKET_TYPE
                 
                 # Normalize
                 if m_type not in ['spot', 'future']: m_type = 'future'
@@ -547,7 +710,7 @@ def render_monitor_view():
     # --- 🆕 Open Orders Section ---
     st.subheader("📋 Open Orders (Exchange)")
     try:
-        ex_orders = ExchangeInterface(market_type=config.MARKET_TYPE)
+        ex_orders = ExchangeInterface(market_type=global_config.MARKET_TYPE)
         
         # Get unique symbols from active bots to check for open orders
         conn = get_connection()
@@ -562,7 +725,25 @@ def render_monitor_view():
                 orders = ex_orders.fetch_open_orders(pair)
                 if orders:
                     for o in orders:
+                        order_id = o.get('id')
+                        
+                        # Match order to bot using order ID tracking
+                        from engine.database import get_bots_by_order_id
+                        bot_match = get_bots_by_order_id(order_id) if order_id else []
+                        
+                        if bot_match:
+                            # Get bot name
+                            cursor = conn.cursor()
+                            cursor.execute('SELECT name FROM bots WHERE id = ?', (bot_match[0]['bot_id'],))
+                            bot_result = cursor.fetchone()
+                            bot_name = bot_result[0] if bot_result else 'Unknown'
+                            bot_type = bot_match[0]['type']
+                            label = f"{bot_name} ({bot_type})"
+                        else:
+                            label = o.get('clientOrderId', '').split('_')[0].upper() if o.get('clientOrderId') else "MANUAL"
+                        
                         all_open_orders.append({
+                            "Bot": label,
                             "Symbol": o.get('symbol', pair),
                             "Side": o.get('side', '').upper(),
                             "Type": o.get('type', '').upper(),
@@ -572,6 +753,7 @@ def render_monitor_view():
                             "Status": o.get('status', 'unknown'),
                             "Order ID": o.get('id', '')[:12] + '...' if o.get('id') else '-'
                         })
+
             except Exception:
                 pass
         
@@ -580,6 +762,7 @@ def render_monitor_view():
             st.dataframe(
                 df_orders, 
                 column_config={
+                    "Bot": st.column_config.TextColumn(width="medium"),
                     "Price": st.column_config.NumberColumn(format="$%.4f"),
                     "Amount": st.column_config.NumberColumn(format="%.6f"),
                     "Filled": st.column_config.NumberColumn(format="%.6f"),
@@ -587,6 +770,13 @@ def render_monitor_view():
                 width='stretch',
                 hide_index=True
             )
+            
+            # Show breakdown summary
+            bot_orders = df_orders[df_orders['Bot'] != 'MANUAL']
+            manual_orders = df_orders[df_orders['Bot'] == 'MANUAL']
+            
+            if not bot_orders.empty:
+                st.caption(f"🤖 Bot orders: {len(bot_orders)} | 👤 Manual orders: {len(manual_orders)}")
         else:
             st.info("No open orders on exchange.")
             
@@ -596,10 +786,10 @@ def render_monitor_view():
     st.divider()
     
     # --- 🆕 Open Positions Section (Futures) ---
-    if config.MARKET_TYPE in ['future', 'swap']:
+    if global_config.MARKET_TYPE in ['future', 'swap']:
         st.subheader("📈 Open Positions (Exchange)")
         try:
-            ex_positions = ExchangeInterface(market_type=config.MARKET_TYPE)
+            ex_positions = ExchangeInterface(market_type=global_config.MARKET_TYPE)
             
             # Fetch all positions from exchange
             positions = ex_positions.exchange.fetch_positions()

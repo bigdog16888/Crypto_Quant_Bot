@@ -105,19 +105,30 @@ def render_bot_manager_view():
                     # Fetch minimal OHLCV for ATR grid if needed
                     market_data = pd.DataFrame() # Placeholder, ATR needs data
                     if params.get('UseATRGrid'):
-                        ohlcv = bot_exchange.fetch_ohlcv(pair, timeframe='1h', limit=50)
-                        if ohlcv:
-                            market_data = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                        # Unify ATR TF selection UI in Manager too
+                        # We use the bot's configured ATR TF
+                        target_tf = params.get('ATR_Timeframe', '1h')
+                        
+                        # Hybrid fetch for accurate metrics
+                        ohlcv_1h = bot_exchange.fetch_ohlcv(pair, timeframe='1h', limit=500)
+                        ohlcv_1d = bot_exchange.fetch_ohlcv(pair, timeframe='1d', limit=100)
+                        
+                        if ohlcv_1h and ohlcv_1d:
+                            df_1h = pd.DataFrame(ohlcv_1h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                            df_1d = pd.DataFrame(ohlcv_1d, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                            for dff in [df_1h, df_1d]:
+                                dff['timestamp'] = pd.to_datetime(dff['timestamp'], unit='ms')
+                            
+                            # Determine source based on timeframe
+                            market_data = df_1d if 'd' in target_tf else df_1h
                     
                     next_order = strat.calculate_next_grid_price(raw_params[2], curr_price, be, step, market_data)
                     
-                    # Early Exit Visualization
-                    # Note: render_bot_manager_view runs every frame, but calculation needs time context
-                    # Just showing a label for now if active.
-                    
-                    row_cols[5].caption(f"**BE:** {be:,.2f}")
-                    row_cols[5].caption(f"**TP:** {tp:,.2f}")
-                    row_cols[5].caption(f"**NO:** {next_order:,.2f}")
+                    # Highlight which TF is being used for the active bot
+                    atr_active_tf = params.get('ATR_Timeframe', '1h')
+                    row_cols[5].markdown(f"**BE:** {be:,.2f} | **TP:** {tp:,.2f}")
+                    row_cols[5].markdown(f"**NO:** `{next_order:,.2f}` (ATR: {atr_active_tf})")
+
                     
                     if params.get('UseEarlyExit'):
                         # Check decay status if we have last exit info or can infer duration

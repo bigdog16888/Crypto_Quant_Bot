@@ -3,16 +3,13 @@ import math
 def calculate_next_trade_size(current_lots: float, multiplier: float, lot_step: float, lot_decimal: int) -> float:
     """
     Calculates the next trade size using Martingale logic.
-    Logic from MQL4:
-    Lots[Index] = ND(MathMax(Lots[Index - 1] * Multiplier_, Lots[Index - 1] + LotStep), LotDecimal);
     """
     next_lots_mult = current_lots * multiplier
     next_lots_step = current_lots + lot_step
     
-    # Use standard round if lot_decimal is 0 (standard lots usually 2, but logic allows 0)
-    # Python round() rounds to nearest even number for .5 cases, MQL4 NormalizeDouble uses standard rounding.
-    # For safety in finance, we often want explicit control, but replicating MQL4 ND behavior:
+    # Use standard round
     next_lots = max(next_lots_mult, next_lots_step)
+
     
     if lot_decimal == 0:
         return float(round(next_lots))
@@ -22,14 +19,11 @@ def calculate_next_trade_size(current_lots: float, multiplier: float, lot_step: 
 def calculate_break_even_price(orders: list) -> float:
     """
     Calculates the new break-even price for a basket of orders.
-    MQL4 Logic:
-    BEb = ND(BEb / LbT, Digits);
-    Where BEb initially is Sum(OrderLots * OrderOpenPrice)
-    and LbT is TotalLots.
     
     orders: list of dicts with keys 'lots', 'open_price', 'type' (BUY/SELL)
             Assumes all orders in list are of same direction for simple BE calc.
     """
+
     total_lots = 0.0
     weighted_sum = 0.0
     
@@ -60,12 +54,13 @@ def calculate_grid_spacing_atr(atr_value: float, total_orders: int, settings: di
     """
     Calculates the Grid Distance and Grid TakeProfit based on ATR and Martingale level.
     
-    Logic ported from MQL4 (AutoCal block):
+    Logic:
        If Level > Set4: Grid = ATR * 12, TP = ATR * 18
        If Level > Set3: Grid = ATR * 8,  TP = ATR * 12
        If Level > Set2: Grid = ATR * 4,  TP = ATR * 8
        If Level > Set1: Grid = ATR * 2,  TP = ATR * 4
        Else:            Grid = ATR * 1,  TP = ATR * 2
+
        
     Args:
         atr_value: Current ATR value (in PRICE units, e.g., 0.0020 for 20 pips).

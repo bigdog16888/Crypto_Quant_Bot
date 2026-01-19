@@ -6,7 +6,7 @@
 - **Lead Architect**: Responsible for `ui/views`, user experience, and config validation (e.g. `bot_creator.py` integrity).
 - **Senior Backend Engineer**: Owns `engine/runner.py`, `engine/sync.py`, and `engine/database.py`. Focuses on reliability, state consistency, and crash recovery.
 - **Security Specialist**: Owns `engine/exchange_interface.py` and `config/settings.py`. Enforces `validate_order`, circuit breakers, and secret sanitization.
-- **Quant Analyst**: Owns `engine/strategies/mql4_strategy.py`, `engine/risk.py`, and `engine/manager.py`. Focuses on math correctness (fees, slippage, indicators).
+- **Quant Analyst**: Owns `engine/strategies/martingale_strategy.py`, `engine/risk.py`, and `engine/manager.py`. Focuses on math correctness (fees, slippage, indicators).
 
 ### 2. Core Systems (v0.4 Status)
 

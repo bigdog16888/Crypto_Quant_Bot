@@ -31,31 +31,44 @@ st.set_page_config(
 # Initialize Database
 init_db()
 
-# Custom Styling (Rich Aesthetics)
+# Custom Styling (Professional Aesthetics)
 st.markdown("""
     <style>
     .main {
-        background-color: #0e1117;
+        background-color: #0d1117;
     }
     .stTabs [data-baseweb="tab-list"] {
         gap: 24px;
+        background-color: #161b22;
+        padding: 10px 20px 0px 20px;
+        border-radius: 8px 8px 0px 0px;
     }
     .stTabs [data-baseweb="tab"] {
         height: 50px;
         white-space: pre-wrap;
-        background-color: #161b22;
+        background-color: transparent;
         border-radius: 4px 4px 0px 0px;
-        gap: 1px;
-        padding-top: 10px;
-        padding-bottom: 10px;
-        color: #c9d1d9;
+        color: #8b949e;
+        border: none;
     }
     .stTabs [aria-selected="true"] {
-        background-color: #21262d;
+        background-color: #0d1117;
         color: #58a6ff;
+        border-bottom: 2px solid #58a6ff;
+    }
+    div[data-testid="stMetricValue"] {
+        font-size: 1.8rem;
+        color: #f0f6fc;
+    }
+    div[data-testid="stMetricDelta"] {
+        font-size: 0.9rem;
+    }
+    .stButton>button {
+        border-radius: 6px;
     }
     </style>
     """, unsafe_allow_html=True)
+
 
 # Sidebar - Global Settings
 with st.sidebar:

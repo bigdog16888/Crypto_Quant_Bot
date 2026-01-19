@@ -120,6 +120,34 @@ def init_db():
         cursor.execute('ALTER TABLE trades ADD COLUMN entry_confirmed BOOLEAN DEFAULT 0')
         conn.commit()
     
+    # Migration for order ID tracking (v0.4.1)
+    # Track exchange order IDs to support multiple bots on same pair
+    try:
+        cursor.execute('SELECT entry_order_id FROM trades LIMIT 1')
+    except sqlite3.OperationalError:
+        cursor.execute('ALTER TABLE trades ADD COLUMN entry_order_id TEXT')
+        cursor.execute('ALTER TABLE trades ADD COLUMN tp_order_id TEXT')
+        conn.commit()
+    
+    # Create separate table for grid orders (each step can have an order)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS bot_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            bot_id INTEGER NOT NULL,
+            step INTEGER NOT NULL,
+            order_type TEXT NOT NULL,  -- 'entry', 'tp', 'grid'
+            order_id TEXT,  -- Exchange order ID
+            price REAL,
+            amount REAL,
+            status TEXT DEFAULT 'open',  -- 'open', 'filled', 'cancelled'
+            created_at INTEGER DEFAULT 0,
+            filled_at INTEGER DEFAULT 0,
+            FOREIGN KEY (bot_id) REFERENCES bots (id)
+        )
+    ''')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_bot_orders_bot ON bot_orders(bot_id)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_bot_orders_order_id ON bot_orders(order_id)')
+    
     # Trade history table: Permanent log of all trades for post-mortem analysis
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS trade_history (
@@ -518,6 +546,185 @@ def get_bot_pnl_summary(bot_id):
         'loss_count': result[3] or 0
     }
     # Note: No conn.close() - using thread-local connection
+
+# ============================================
+# ORDER ID TRACKING FOR MULTI-BOT SUPPORT (v0.4.1)
+# ============================================
+
+def save_bot_order(bot_id, order_type, order_id, price, amount):
+    """
+    Save an exchange order ID to track which bot owns which order.
+    
+    Args:
+        bot_id: The bot that placed the order
+        order_type: 'entry', 'tp', 'grid'
+        order_id: The exchange order ID
+        price: Order price
+        amount: Order amount
+    """
+    import time
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    # Also update the trades table for quick lookup
+    if order_type == 'entry':
+        cursor.execute('UPDATE trades SET entry_order_id = ? WHERE bot_id = ?', (order_id, bot_id))
+    elif order_type == 'tp':
+        cursor.execute('UPDATE trades SET tp_order_id = ? WHERE bot_id = ?', (order_id, bot_id))
+    
+    # Also save to detailed bot_orders table for full tracking
+    cursor.execute('''
+        INSERT INTO bot_orders (bot_id, order_type, order_id, price, amount, status, created_at)
+        VALUES (?, ?, ?, ?, ?, 'open', ?)
+    ''', (bot_id, order_type, order_id, price, amount, int(time.time())))
+    
+    conn.commit()
+
+def get_bot_order_ids(bot_id):
+    """
+    Get all order IDs for a bot.
+    
+    Returns:
+        Dict with 'entry_order_id', 'tp_order_id', and 'grid_orders'
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    # Get from trades table
+    cursor.execute('SELECT entry_order_id, tp_order_id FROM trades WHERE bot_id = ?', (bot_id,))
+    result = cursor.fetchone()
+    
+    orders = {
+        'entry_order_id': result[0] if result else None,
+        'tp_order_id': result[1] if result else None,
+        'grid_orders': []
+    }
+    
+    # Get grid orders from bot_orders table
+    cursor.execute('''
+        SELECT id, order_type, order_id, price, amount, status 
+        FROM bot_orders 
+        WHERE bot_id = ? AND status = 'open'
+    ''', (bot_id,))
+    
+    for row in cursor.fetchall():
+        orders['grid_orders'].append({
+            'id': row[0],
+            'type': row[1],
+            'order_id': row[2],
+            'price': row[3],
+            'amount': row[4],
+            'status': row[5]
+        })
+    
+    return orders
+
+def update_order_status(order_id, status, filled_price=None):
+    """
+    Update order status in bot_orders table.
+    
+    Args:
+        order_id: The exchange order ID
+        status: 'open', 'filled', 'cancelled'
+        filled_price: Price if filled
+    """
+    import time
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    if filled_price:
+        cursor.execute('''
+            UPDATE bot_orders 
+            SET status = ?, filled_at = ?
+            WHERE order_id = ?
+        ''', (status, int(time.time()), order_id))
+    else:
+        cursor.execute('''
+            UPDATE bot_orders 
+            SET status = ?
+            WHERE order_id = ?
+        ''', (status, order_id))
+    
+    conn.commit()
+
+def get_bots_by_order_id(order_id):
+    """
+    Find which bot(s) own a specific order ID.
+    
+    Args:
+        order_id: The exchange order ID
+        
+    Returns:
+        List of bot IDs that own this order
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    # Check trades table
+    bot_ids = []
+    
+    # Check entry_order_id
+    cursor.execute('SELECT bot_id FROM trades WHERE entry_order_id = ?', (order_id,))
+    for row in cursor.fetchall():
+        bot_ids.append({'bot_id': row[0], 'type': 'entry'})
+    
+    # Check tp_order_id
+    cursor.execute('SELECT bot_id FROM trades WHERE tp_order_id = ?', (order_id,))
+    for row in cursor.fetchall():
+        bot_ids.append({'bot_id': row[0], 'type': 'tp'})
+    
+    # Check bot_orders table
+    cursor.execute('SELECT bot_id, order_type FROM bot_orders WHERE order_id = ?', (order_id,))
+    for row in cursor.fetchall():
+        bot_ids.append({'bot_id': row[0], 'type': row[1]})
+    
+    return bot_ids
+
+def match_exchange_orders_to_bots(exchange_orders):
+    """
+    Match exchange orders to bots by order ID.
+    
+    Args:
+        exchange_orders: List of order dicts from exchange (with 'id' field)
+        
+    Returns:
+        Dict mapping order_id -> {'bot_id': X, 'bot_name': Y, 'type': Z}
+    """
+    order_to_bot = {}
+    
+    for order in exchange_orders:
+        order_id = order.get('id')
+        if not order_id:
+            continue
+        
+        # Find which bot owns this order
+        bots = get_bots_by_order_id(order_id)
+        
+        if bots:
+            # Get first bot's name
+            from .database import get_connection
+            conn = get_connection()
+            cursor = conn.cursor()
+            cursor.execute('SELECT name FROM bots WHERE id = ?', (bots[0]['bot_id'],))
+            result = cursor.fetchone()
+            bot_name = result[0] if result else 'Unknown'
+            
+            order_to_bot[order_id] = {
+                'bot_id': bots[0]['bot_id'],
+                'bot_name': bot_name,
+                'type': bots[0]['type'],
+                'order_info': order
+            }
+        else:
+            # Order not tracked by any bot (possibly manual order)
+            order_to_bot[order_id] = {
+                'bot_id': None,
+                'bot_name': 'MANUAL',
+                'type': 'unknown',
+                'order_info': order
+            }
+    
+    return order_to_bot
 
 if __name__ == "__main__":
     # Self-test block

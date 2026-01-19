@@ -2,7 +2,8 @@ from .base import BaseStrategy
 import pandas as pd
 import engine.indicators as ta_custom
 
-# Helper functions for MQL4-style indicators (kept local or could be moved to utils)
+# Helper functions for standard indicators (kept local or could be moved to utils)
+
 def iATR(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> float:
     atr_series = ta_custom.atr(high, low, close, period=period)
     if atr_series is None or atr_series.empty:
@@ -40,14 +41,15 @@ class MartingaleStrategy(BaseStrategy):
     """
     Martingale Grid DCA Strategy.
     Uses confluence of indicators (CCI, Bollinger, RSI, etc.) for entry timing.
-    Originally ported from MQL4 EA logic.
+    Originally ported from strategy logic.
     """
     def __init__(self, name: str = "Martingale_Grid", params: dict = None):
         super().__init__(name, params)
         
-        # Default MQL4 settings (can be overridden by params)
+        # Default settings (can be overridden by params)
         self.use_any_entry = self.params.get('use_any_entry', False)
         self.force_market_cond = self.params.get('force_market_cond', 3)
+
         
         # Entry Switches (0=Off, 1=Standard, 2=Reverse)
         self.cci_entry = self.params.get('cci_entry', 0)
@@ -104,8 +106,12 @@ class MartingaleStrategy(BaseStrategy):
             return data
             
         # Map string tf to pandas alias
-        tf_map = {'1m': '1min', '5m': '5min', '15m': '15min', '30m': '30min', '1h': '1h', '4h': '4h', '1d': '1D'}
+        tf_map = {
+            '1m': '1min', '5m': '5min', '15m': '15min', '30m': '30min', 
+            '1h': '1h', '4h': '4h', '1d': '1D', '3d': '3D', '5d': '5D'
+        }
         pd_tf = tf_map.get(timeframe, '1h')
+
         
         try:
             # Ensure index is datetime
@@ -343,8 +349,28 @@ class MartingaleStrategy(BaseStrategy):
             
             avg_price = total_cost_basis / total_qty
             
-            # TP Price Calculation (Dollar vs Percent)
-            tp_type = self.params.get('TakeProfitType', 'USD') # Default USD for backward compat
+        # TP Price Calculation (Dollar vs Percent)
+        tp_type = self.params.get('TakeProfitType', 'USD') # Default USD for backward compat
+        
+        # Early Exit logic (Simulated for projection)
+        ee_enabled = self.params.get('UseEarlyExit', False)
+        decay_interval = self.params.get('DecayIntervalMins', 15.0)
+        decay_pct = self.params.get('DecayPercentPerInterval', 30.0) / 100.0
+        
+        for i in range(self.params.get('max_steps', 10)):
+            step_size = base_size * (multiplier ** i)
+            total_invested += (step_size * cost_factor)
+            
+            # Absolute Price math
+            # Step 0 is entry, Step 1 is grid 1
+            order_price = base_price - (i * grid_pips * direction)
+            if order_price <= 0: order_price = 0.01 # Safety
+            
+            qty = step_size / order_price
+            total_qty += qty
+            total_cost_basis += (qty * order_price)
+            
+            avg_price = total_cost_basis / total_qty
             
             if tp_type == 'Percent':
                 # TP = AvgPrice * (1 + pct)
@@ -354,23 +380,22 @@ class MartingaleStrategy(BaseStrategy):
                 else: # SHORT
                     tp_price = avg_price * (1 - tp_pct)
             else:
-                # Dollar TP: Break-even + (target_usd / total_qty)
-                # Logic: We want to make $10 total profit on the entire position.
-                # Total Value at TP = Total Cost + Target Profit
-                # Price * Qty = Cost + Target
-                # Price = (Cost + Target) / Qty
                 tp_target_usd = self.params.get('TakeProfitBase', 10.0)
-                tp_price = (total_invested + tp_target_usd) / total_qty
-                
-                # Verify direction logic if using distance adder instead
-                # If SHORT, Cost is handled differently? 
-                # For Short: Entry 100, Qty 1. Cost $100.
-                # Target Profit $10. We want equity $110? No, in Short, profit is (Entry - Exit) * Qty.
-                # Profit = (AvgPrice - ExitPrice) * Qty
-                # 10 = (Avg - Exit) * Qty -> 10/Qty = Avg - Exit -> Exit = Avg - (10/Qty)
-                
-                if direction == -1: # SHORT
-                     tp_price = avg_price - (tp_target_usd / total_qty)
+                if direction == 1: # LONG
+                    tp_price = (total_invested + tp_target_usd) / total_qty
+                else: # SHORT
+                    tp_price = (total_invested - tp_target_usd) / total_qty # Simplified for Short
+            
+            # Apply Early Exit Decay (Simulated: 1 interval per step after step 0)
+            if ee_enabled and i > 0:
+                # Assuming 1 decay interval per martingale step for visualization
+                # This shows how the TP "moves" closer to BE as we go deeper
+                dist_to_be = tp_price - avg_price
+                # Each step reduces the profit margin by decay_pct
+                # (This is a simplified simulation for the UI table)
+                decay_factor = (1.0 - decay_pct) ** i
+                tp_price = avg_price + (dist_to_be * decay_factor)
+
             
             is_hedge = i + 1 >= hedge_step if self.params.get('UseHedge') else False
             hedge_size = round(total_invested, 2) if is_hedge else 0.0

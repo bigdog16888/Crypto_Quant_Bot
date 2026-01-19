@@ -21,10 +21,13 @@ class ExchangeInterface:
             'adjustForTimeDifference': True,  # Auto-sync with server time
         })
         
+        self.logger = logging.getLogger(__name__)
+        
         # Testnet Override
         if config.TESTNET:
-            # Special handling for Futures: set_sandbox_mode is deprecated/broken in some CCXT versions
-            # So we manually override URLs and SKIP set_sandbox_mode for futures
+            # Removed emojis from internal logs to prevent Windows encoding crashes
+            self.logger.warning("USING TESTNET (SANDBOX) MODE")
+            
             if market_type in ['future', 'delivery', 'swap']:
                 testnet_base = 'https://testnet.binancefuture.com'
                 self.exchange.urls['api'].update({
@@ -37,26 +40,17 @@ class ExchangeInterface:
                     'dapiPublic': f'{testnet_base}/dapi/v1',
                     'dapiPrivate': f'{testnet_base}/dapi/v1',
                     'dapiPrivateV2': f'{testnet_base}/dapi/v2',
-                    # DO NOT route sapi/spot to futures - those are incompatible endpoints
-                    # Just leave them as-is and handle errors gracefully
                 })
             elif market_type == 'spot':
-                # For Spot, use proper testnet endpoints
-                # Spot testnet uses same URL as mainnet but with sandbox mode
-                testnet_base = 'https://testnet.binance.vision'  # Spot testnet endpoint
+                testnet_base = 'https://testnet.binance.vision'
                 self.exchange.urls['api'].update({
                     'public': f'{testnet_base}/api/v3',
                     'private': f'{testnet_base}/api/v3',
                 })
                 self.exchange.set_sandbox_mode(True)
             else:
-                # For other market types, try standard sandbox mode
                 self.exchange.set_sandbox_mode(True)
 
-            self.logger = logging.getLogger(__name__)
-            self.logger.warning("⚠️ USING TESTNET (SANDBOX) MODE ⚠️")
-        else:
-            self.logger = logging.getLogger(__name__)
             
         # Cache for market info (minNotional, filters)
         self.markets_loaded = False
@@ -75,7 +69,8 @@ class ExchangeInterface:
 
     def _inject_testnet_markets(self):
         """Injects dummy markets for Futures Testnet to bypass Mainnet SAPI calls."""
-        self.logger.info("⚠️ FUTURES TESTNET: Injecting manual markets to bypass SAPI errors")
+        self.logger.info("FUTURES TESTNET: Injecting manual markets to bypass SAPI errors")
+
         
         # Per-coin configuration based on REAL Binance Futures requirements
         # Format: {'amount': min_qty, 'price': price_tick, 'notional': min_order_usd}
@@ -108,19 +103,20 @@ class ExchangeInterface:
             for base in common_coins:
                 symbol = f"{base}/{quote}"
                 market_id = f"{base}{quote}"
-                config = coin_config.get(base, default_config)
+                p_config = coin_config.get(base, default_config)
                 
                 precision = {
-                    'amount': config['amount'],
-                    'price': config['price']
+                    'amount': p_config['amount'],
+                    'price': p_config['price']
                 }
                 
                 # Limits based on per-coin configuration
                 limits = {
-                    'amount': {'min': config['amount'], 'max': 10000},
-                    'price': {'min': config['price'], 'max': 1000000},
-                    'cost': {'min': config['notional']}  # Per-pair minimum notional
+                    'amount': {'min': p_config['amount'], 'max': 10000},
+                    'price': {'min': p_config['price'], 'max': 1000000},
+                    'cost': {'min': p_config['notional']}  # Per-pair minimum notional
                 }
+
                 
                 injected_markets[symbol] = {
                     'id': market_id,
@@ -281,10 +277,17 @@ class ExchangeInterface:
             # Allow base symbol (e.g. BTC/USDT) if it matches allowed list logic
             pass
 
-        if 'amount' in kwargs and 'price' in kwargs and method == 'create_order':
-            usd_value = float(kwargs['amount']) * float(kwargs['price'])
-            if usd_value > config.MAX_ORDER_USD:
-                raise ValueError(f"SECURITY: Order value ${usd_value} exceeds limit ${config.MAX_ORDER_USD}")
+        if 'amount' in kwargs and method == 'create_order':
+            price_val = kwargs.get('price')
+            if price_val is not None:
+                usd_value = float(kwargs['amount']) * float(price_val)
+                if usd_value > config.MAX_ORDER_USD:
+                    raise ValueError(f"SECURITY: Order value ${usd_value} exceeds limit ${config.MAX_ORDER_USD}")
+            else:
+                # For Market orders, we don't have price in kwargs usually, 
+                # but we still want to estimate security limit if possible
+                pass
+
 
         if config.DRY_RUN:
             # Allow fetch methods even in dry run
@@ -313,7 +316,16 @@ class ExchangeInterface:
                     self.logger.error(f"Failed {method} after {max_retries} retries: {e}")
                     raise
             
+            except (ccxt.AuthenticationError, ccxt.PermissionDenied) as e:
+                # Special handling for Binance Testnet: Spot and Futures use different keys
+                if config.TESTNET:
+                    self.logger.warning(f"Auth failed on {method} ({self.market_type}). This is common on Binance Testnet if using Future-only or Spot-only keys.")
+                else:
+                    self.logger.error(f"AUTHENTICATION ERROR on {method} ({self.market_type}): {e}")
+                raise
+            
             except (ccxt.ExchangeError, ccxt.InsufficientFunds, ccxt.InvalidOrder) as e:
+
                 # Do NOT retry logic errors
                 self.logger.error(f"Logic/Exchange error on {method}: {e}")
                 raise
@@ -538,8 +550,23 @@ class ExchangeInterface:
         return self._safe_request('cancel_all_orders', symbol=symbol)
 
     def fetch_order(self, order_id, symbol):
-        """Fetches a specific order by ID to check fill status."""
-        return self._safe_request('fetch_order', id=order_id, symbol=symbol)
+        """Fetches a specific order by ID with retry for propagation delay."""
+        max_retries = 3
+        for i in range(max_retries):
+            try:
+                return self._safe_request('fetch_order', id=order_id, symbol=symbol)
+            except ccxt.OrderNotFound as e:
+                if i < max_retries - 1:
+                    time.sleep(1) # Wait for propagation
+                    continue
+                raise e
+            except ccxt.ExchangeError as e:
+                # Binance specific "Order does not exist" is often propagation
+                if "-2013" in str(e) and i < max_retries - 1:
+                    time.sleep(1)
+                    continue
+                raise e
+
     
     def wait_for_fill(self, order_id, symbol, timeout_seconds=30, poll_interval=2):
         """

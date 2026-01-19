@@ -5,7 +5,7 @@ import os
 import logging
 import numpy as np
 from engine.strategies.market_maker import MarketMakerStrategy
-from engine.strategies.mql4_strategy import MQL4Strategy
+from engine.strategies.martingale_strategy import MartingaleStrategy
 
 # Configure basic logging
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
@@ -64,7 +64,7 @@ def test_patterns():
     # Create data with Rising Prices but FALLING RSI (Divergence setup)
     # This requires precise construction, or we just test the 'check_pattern' method directly.
     
-    strategy = MQL4Strategy("TestPat")
+    strategy = MartingaleStrategy("TestPat")
     
     # 1. Consecutive Up Pattern
     series_up = pd.Series([10, 11, 12, 13, 14, 15])

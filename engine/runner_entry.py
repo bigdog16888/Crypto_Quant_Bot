@@ -2,7 +2,7 @@
         """
         Place the first order and initialize the trade in DB.
         """
-        logger.info(f"🚀 [ENTRY] Bot: {name} | Side: {side} | Amount: ${amount}")
+        logger.info(f"[ENTRY] Bot: {name} | Side: {side} | Amount: ${amount}")
         
         # Validated Create Order
         # Fetch current price for limit order safety
