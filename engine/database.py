@@ -128,7 +128,31 @@ def init_db():
         cursor.execute('ALTER TABLE trades ADD COLUMN entry_order_id TEXT')
         cursor.execute('ALTER TABLE trades ADD COLUMN tp_order_id TEXT')
         conn.commit()
+
+    # Migration for independent position tracking (v0.5.0)
+    # Each bot tracks its own position independently
+    # SQLite doesn't support adding UNIQUE columns directly, so we add without constraint
+    # The uniqueness is guaranteed by bot_id being the PRIMARY KEY of trades table
+    try:
+        cursor.execute('SELECT bot_position_id FROM trades LIMIT 1')
+    except sqlite3.OperationalError:
+        cursor.execute('ALTER TABLE trades ADD COLUMN bot_position_id TEXT')
+        conn.commit()
     
+    # Add close_type column (single column, no UNIQUE)
+    try:
+        cursor.execute('SELECT close_type FROM trades LIMIT 1')
+    except sqlite3.OperationalError:
+        cursor.execute('ALTER TABLE trades ADD COLUMN close_type TEXT DEFAULT NULL')
+        conn.commit()
+    
+    # Migration for manual close percentage in config
+    try:
+        cursor.execute('SELECT manual_close_pct FROM bots LIMIT 1')
+    except sqlite3.OperationalError:
+        cursor.execute("ALTER TABLE bots ADD COLUMN manual_close_pct REAL DEFAULT 100.0")
+        conn.commit()
+
     # Create separate table for grid orders (each step can have an order)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS bot_orders (
@@ -453,7 +477,7 @@ def delete_bot(bot_id):
         return False
     # Note: No conn.close() - using thread-local connection
 
-def log_trade(bot_id, action, symbol, price, amount, cost_usdc=0, order_id=None, step=0, pnl=0, notes=None):
+def log_trade(bot_id, action, symbol, price, amount, cost_usdc=0.0, order_id=None, step=0, pnl=0.0, notes=None):
     """
     Logs a trade to the permanent trade_history table for post-mortem analysis.
     
@@ -551,33 +575,34 @@ def get_bot_pnl_summary(bot_id):
 # ORDER ID TRACKING FOR MULTI-BOT SUPPORT (v0.4.1)
 # ============================================
 
-def save_bot_order(bot_id, order_type, order_id, price, amount):
+def save_bot_order(bot_id, order_type, order_id, price, amount, step=0):
     """
     Save an exchange order ID to track which bot owns which order.
-    
+
     Args:
         bot_id: The bot that placed the order
         order_type: 'entry', 'tp', 'grid'
         order_id: The exchange order ID
         price: Order price
         amount: Order amount
+        step: Martingale step number (default 0 for entry)
     """
     import time
     conn = get_connection()
     cursor = conn.cursor()
-    
+
     # Also update the trades table for quick lookup
     if order_type == 'entry':
         cursor.execute('UPDATE trades SET entry_order_id = ? WHERE bot_id = ?', (order_id, bot_id))
     elif order_type == 'tp':
         cursor.execute('UPDATE trades SET tp_order_id = ? WHERE bot_id = ?', (order_id, bot_id))
-    
+
     # Also save to detailed bot_orders table for full tracking
     cursor.execute('''
-        INSERT INTO bot_orders (bot_id, order_type, order_id, price, amount, status, created_at)
-        VALUES (?, ?, ?, ?, ?, 'open', ?)
-    ''', (bot_id, order_type, order_id, price, amount, int(time.time())))
-    
+        INSERT INTO bot_orders (bot_id, step, order_type, order_id, price, amount, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'open', ?)
+    ''', (bot_id, step, order_type, order_id, price, amount, int(time.time())))
+
     conn.commit()
 
 def get_bot_order_ids(bot_id):
@@ -725,6 +750,254 @@ def match_exchange_orders_to_bots(exchange_orders):
             }
     
     return order_to_bot
+
+
+# ============================================
+# BOT POSITION MANAGEMENT (v0.5.0)
+# Each bot tracks its own position independently
+# ============================================
+
+import uuid
+import json
+
+def generate_bot_position_id():
+    """Generate a unique ID for this bot's position tracking"""
+    return str(uuid.uuid4())[:8].upper()
+
+
+def get_bot_position_id(bot_id):
+    """
+    Get the unique position ID for a bot.
+    Creates one if it doesn't exist.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT bot_position_id FROM trades WHERE bot_id = ?', (bot_id,))
+    result = cursor.fetchone()
+    
+    if result and result[0]:
+        conn.close()
+        return result[0]
+    
+    # Generate new position ID
+    position_id = generate_bot_position_id()
+    cursor.execute('UPDATE trades SET bot_position_id = ? WHERE bot_id = ?', (position_id, bot_id))
+    conn.commit()
+    conn.close()
+    
+    return position_id
+
+
+def close_bot_position(bot_id, close_type='MANUAL', close_price=0.0, close_pct=100.0, notes=None):
+    """
+    Close a bot's position (partial or full).
+    
+    Args:
+        bot_id: The bot to close
+        close_type: 'MANUAL', 'STOP_AFTER_PNL', 'STOP_AFTER_TIME'
+        close_price: Price at which position was closed
+        close_pct: Percentage of position to close (100 = full close)
+        notes: Additional notes for trade history
+    
+    Returns:
+        dict with details of the close action
+    """
+    import time
+    
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    # Get current trade state
+    cursor.execute('''
+        SELECT t.total_invested, t.avg_entry_price, t.target_tp_price, 
+               t.current_step, b.name, b.pair, b.direction, t.bot_position_id,
+               b.config
+        FROM trades t
+        JOIN bots b ON t.bot_id = b.id
+        WHERE t.bot_id = ?
+    ''', (bot_id,))
+    
+    result = cursor.fetchone()
+    if not result:
+        conn.close()
+        return {'success': False, 'error': 'Bot not found'}
+    
+    total_invested, avg_entry_price, target_tp, step, name, pair, direction, position_id, config_json = result
+    
+    if total_invested <= 0:
+        conn.close()
+        return {'success': False, 'error': 'No position to close'}
+    
+    # Calculate close amount
+    close_amount = total_invested * (close_pct / 100.0)
+    close_qty = close_amount / avg_entry_price if avg_entry_price > 0 else 0
+    
+    # Calculate PnL for this close
+    if direction == 'LONG':
+        pnl = (close_price - avg_entry_price) * close_qty if close_price > 0 else 0
+    else:  # SHORT
+        pnl = (avg_entry_price - close_price) * close_qty if close_price > 0 else 0
+    
+    # Log to trade history
+    log_trade(
+        bot_id=bot_id,
+        action=f'{close_type}_CLOSE',
+        symbol=pair,
+        price=close_price,
+        amount=close_qty,
+        cost_usdc=close_amount,
+        order_id=f"CLOSE_{position_id}",
+        step=step,
+        pnl=pnl,
+        notes=notes or f"{close_type} close: {close_pct:.0f}%"
+    )
+    
+    # Update trades table based on close percentage
+    if close_pct >= 100:
+        # Full close - reset to idle
+        cursor.execute('''
+            UPDATE trades
+            SET current_step = 0,
+                total_invested = 0,
+                avg_entry_price = 0,
+                target_tp_price = 0,
+                last_exit_price = ?,
+                last_exit_time = ?,
+                basket_start_time = 0,
+                close_type = ?
+            WHERE bot_id = ?
+        ''', (close_price, int(time.time()), close_type, bot_id))
+    else:
+        # Partial close - reduce position proportionally
+        remaining_pct = 100 - close_pct
+        remaining_invested = total_invested * (remaining_pct / 100.0)
+        
+        cursor.execute('''
+            UPDATE trades
+            SET total_invested = ?,
+                last_exit_price = ?,
+                last_exit_time = ?,
+                close_type = ?
+            WHERE bot_id = ?
+        ''', (remaining_invested, close_price, int(time.time()), close_type, bot_id))
+    
+    conn.commit()
+    conn.close()
+    
+    return {
+        'success': True,
+        'bot_id': bot_id,
+        'bot_name': name,
+        'close_type': close_type,
+        'close_pct': close_pct,
+        'close_price': close_price,
+        'close_amount': close_amount,
+        'pnl': pnl,
+        'position_id': position_id
+    }
+
+
+def get_bot_close_settings(bot_id):
+    """
+    Get manual close settings for a bot from its config.
+    
+    Returns:
+        dict with manual_close_pct, stop_after_pnl, stop_after_time
+    """
+    params = get_bot_params(bot_id)
+    if not params:
+        return None
+    
+    config_json = params[7]  # config is at index 7
+    config_dict = json.loads(config_json) if config_json else {}
+    
+    return {
+        'manual_close_pct': config_dict.get('manual_close_pct', 100.0),
+        'stop_after_pnl': config_dict.get('stop_after_pnl', 0.0),  # 0 = disabled
+        'stop_after_time': config_dict.get('stop_after_time', 0),  # 0 = disabled (hours)
+    }
+
+
+def update_bot_close_settings(bot_id, manual_close_pct=None, stop_after_pnl=None, stop_after_time=None):
+    """
+    Update manual close settings for a bot.
+    
+    Args:
+        bot_id: The bot to update
+        manual_close_pct: % of position to close when manual close triggered
+        stop_after_pnl: Close when PnL reaches X USD
+        stop_after_time: Close after X hours in trade
+    """
+    params = get_bot_params(bot_id)
+    if not params:
+        return False
+    
+    config_json = params[7]
+    config_dict = json.loads(config_json) if config_json else {}
+    config_dict = config_dict if isinstance(config_dict, dict) else {}
+    
+    if manual_close_pct is not None:
+        config_dict['manual_close_pct'] = manual_close_pct
+    if stop_after_pnl is not None:
+        config_dict['stop_after_pnl'] = stop_after_pnl
+    if stop_after_time is not None:
+        config_dict['stop_after_time'] = stop_after_time
+    
+    # Update bot with new config
+    from .database import update_bot
+    return update_bot(
+        bot_id=bot_id,
+        name=params[0],
+        pair=params[1],
+        direction=params[2],
+        rsi_limit=params[3],
+        martingale_multiplier=params[4],
+        base_size=params[5],
+        strategy_type=params[6],
+        config_dict=config_dict
+    )
+
+
+def check_stop_after_conditions(bot_id, current_pnl, hours_in_trade):
+    """
+    Check if stop-after conditions are met.
+    
+    Args:
+        bot_id: The bot to check
+        current_pnl: Current unrealized PnL
+        hours_in_trade: Hours since position opened
+    
+    Returns:
+        dict with triggered conditions
+    """
+    settings = get_bot_close_settings(bot_id)
+    if not settings:
+        return {'triggered': False}
+    
+    triggered = []
+    
+    # Check PnL stop
+    if settings['stop_after_pnl'] > 0:
+        if current_pnl >= settings['stop_after_pnl']:
+            triggered.append({
+                'type': 'STOP_AFTER_PNL',
+                'reason': f'PnL ${current_pnl:.2f} >= target ${settings["stop_after_pnl"]:.2f}'
+            })
+    
+    # Check time stop
+    if settings['stop_after_time'] > 0:
+        if hours_in_trade >= settings['stop_after_time']:
+            triggered.append({
+                'type': 'STOP_AFTER_TIME',
+                'reason': f'Hours in trade {hours_in_trade:.1f} >= limit {settings["stop_after_time"]}'
+            })
+    
+    return {
+        'triggered': len(triggered) > 0,
+        'conditions': triggered
+    }
+
 
 if __name__ == "__main__":
     # Self-test block

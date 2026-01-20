@@ -12,13 +12,30 @@ Usage:
     pytest tests/test_pl_sync.py -v --headed
     or
     python tests/test_pl_sync.py
+    
+Requires: pytest-playwright
+    pip install pytest-playwright
+    playwright install
 """
 
 import pytest
 import time
 import json
-from playwright.sync_api import Page, expect
 from datetime import datetime
+
+# Check if playwright is available
+try:
+    from playwright.sync_api import Page, expect
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+    Page = None  # type: ignore
+
+# Skip all tests in this module if playwright is not available
+pytestmark = pytest.mark.skipif(
+    not PLAYWRIGHT_AVAILABLE,
+    reason="pytest-playwright not installed. Run: pip install pytest-playwright && playwright install"
+)
 
 
 class TestPLSync:

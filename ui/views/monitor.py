@@ -5,7 +5,7 @@ import plotly.graph_objects as go
 import ccxt
 import json
 from engine.exchange_interface import ExchangeInterface
-from engine.database import get_connection
+from engine.database import get_connection, get_bots_by_order_id
 
 
 import sys
@@ -18,21 +18,7 @@ def render_monitor_view():
     st.header("📊 Live Market Monitor")
     
     # --- Command Center (Health Dashboard) ---
-    st.markdown("""
-    <style>
-    .metric-card {
-        background-color: #161b22;
-        border: 1px solid #30363d;
-        border-radius: 8px;
-        padding: 15px;
-        text-align: center;
-    }
-    .metric-value { font-size: 1.8em; font-weight: bold; color: #f0f6fc; }
-    .metric-label { font-size: 0.9em; color: #8b949e; text-transform: uppercase; letter-spacing: 1px; }
-    .status-ok { color: #3fb950; font-weight: bold; }
-    .status-warn { color: #d29922; font-weight: bold; }
-    </style>
-    """, unsafe_allow_html=True)
+    # Global CSS in app.py handles .metric-card styling
     
     # Fetch real stats
     try:
@@ -196,30 +182,7 @@ def render_monitor_view():
     st.divider()
     
     # --- 1. System Status Ribbon ---
-    st.markdown("""
-    <style>
-    .status-ribbon {
-        background-color: #161b22;
-        border-left: 4px solid #58a6ff;
-        padding: 10px 20px;
-        margin-bottom: 25px;
-        border-radius: 4px;
-        font-family: 'Roboto Mono', monospace;
-        font-size: 0.85rem;
-        display: flex;
-        justify-content: space-between;
-    }
-    .sync-status {
-        font-size: 0.75rem;
-        padding: 2px 8px;
-        border-radius: 4px;
-        margin-left: 10px;
-    }
-    .sync-ok { background-color: #238636; color: white; }
-    .sync-warn { background-color: #9e6a03; color: white; }
-    .sync-err { background-color: #da3633; color: white; }
-    </style>
-    """, unsafe_allow_html=True)
+    # Global CSS in app.py handles .status-ribbon styling
     
     # Simple, high-performance status bar
     try:
@@ -355,10 +318,13 @@ def render_monitor_view():
                 title=f"{symbol} - {timeframe.upper()} Live Chart",
                 yaxis_title="Price (USDT)",
                 xaxis_title="Time",
-                template="plotly_dark",
+                template="plotly_white",
                 height=600,
                 xaxis_rangeslider_visible=True, # Interactive Zoom
-                margin=dict(l=10, r=10, t=40, b=10)
+                margin=dict(l=10, r=10, t=40, b=10),
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(0,0,0,0)',
+                font=dict(color='#1f2328')
             )
             
             # Range Selector Buttons
@@ -717,8 +683,6 @@ def render_monitor_view():
         cursor = conn.cursor()
         cursor.execute("SELECT DISTINCT pair FROM bots WHERE is_active = 1")
         active_pairs = [row[0] for row in cursor.fetchall()]
-        conn.close()
-        
         all_open_orders = []
         for pair in active_pairs:
             try:
@@ -728,7 +692,6 @@ def render_monitor_view():
                         order_id = o.get('id')
                         
                         # Match order to bot using order ID tracking
-                        from engine.database import get_bots_by_order_id
                         bot_match = get_bots_by_order_id(order_id) if order_id else []
                         
                         if bot_match:
@@ -779,6 +742,8 @@ def render_monitor_view():
                 st.caption(f"🤖 Bot orders: {len(bot_orders)} | 👤 Manual orders: {len(manual_orders)}")
         else:
             st.info("No open orders on exchange.")
+        
+        conn.close()
             
     except Exception as e:
         st.warning(f"Could not fetch open orders: {e}")

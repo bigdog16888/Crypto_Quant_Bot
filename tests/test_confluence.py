@@ -6,7 +6,7 @@ import os
 # Ensure engine can be imported
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from engine.strategies.mql4_strategy import MQL4Strategy
+from engine.strategies.martingale_strategy import MartingaleStrategy
 
 def generate_mock_data(n=100):
     dates = pd.date_range(start='2023-01-01', periods=n, freq='15min')
@@ -26,7 +26,7 @@ def test_8_trigger_confluence():
     params = {
         'mode_cci': 1, 'cci_level': 50, 'cci_period': 14, 'cci_tf': '15m'
     }
-    strat = MQL4Strategy(params=params)
+    strat = MartingaleStrategy(params=params)
     data = generate_mock_data(100) # Trends up, CCI will be high
     buy, sell = strat.check_signals(data)
     print(f"Single Indicator (CCI Above): Buy={buy}, Sell={sell}")
@@ -36,7 +36,7 @@ def test_8_trigger_confluence():
     params.update({
         'pat_1_mode': 2, 'pat_1_count': 3, 'pat_1_tf': '15m'
     })
-    strat = MQL4Strategy(params=params)
+    strat = MartingaleStrategy(params=params)
     # Mock data is trending UP, so Pattern (Consec Down) should fail the confluence
     buy, sell = strat.check_signals(data)
     print(f"Confluence (CCI Above + Pattern Down): Buy={buy}, Sell={sell}")
@@ -50,7 +50,7 @@ def test_8_trigger_confluence():
     params = {
         'pat_1_mode': 2, 'pat_1_count': 3, 'pat_1_tf': '15m'
     }
-    strat = MQL4Strategy(params=params)
+    strat = MartingaleStrategy(params=params)
     buy, sell = strat.check_signals(data_mixed)
     print(f"Pattern Trigger (Consec Down): Buy={buy}, Sell={sell}")
     assert buy == True, "Pattern trigger failed on matching data"

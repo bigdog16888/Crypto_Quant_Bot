@@ -151,22 +151,7 @@ def render_bot_creator_view():
         # --- Visual Strategy Selector (Cards) ---
         st.markdown("### 🧠 Select Strategy Logic")
         
-        # Custom CSS for Strategy Cards
-        st.markdown("""
-        <style>
-        .strat-card {
-            border: 1px solid #30363d;
-            border-radius: 8px;
-            padding: 15px;
-            background-color: #161b22;
-            height: 100%;
-            text-align: center;
-        }
-        .strat-icon { font-size: 2em; margin-bottom: 10px; }
-        .strat-title { font-weight: bold; font-size: 1.1em; color: #58a6ff; margin-bottom: 5px; }
-        .strat-desc { font-size: 0.9em; color: #8b949e; }
-        </style>
-        """, unsafe_allow_html=True)
+        # Global CSS in app.py handles .strat-card styling
         
         strat_col1, strat_col2, strat_col3 = st.columns(3)
         
@@ -490,15 +475,18 @@ def render_bot_creator_view():
                         fig.add_trace(go.Scatter(x=steps, y=tps, mode='lines+markers', name='Take Profit', line=dict(color='#3fb950', dash='dash')))
                         
                         # Current Price Line
-                        fig.add_hline(y=current_price, line_dash="solid", line_color="white", annotation_text="Current Price")
+                        fig.add_hline(y=current_price, line_dash="solid", line_color="#1f2328", annotation_text="Current Price")
                         
                         fig.update_layout(
                             title=f"Grid Visualizer (ATR TF: {proj_tf})",
                             xaxis_title="Martingale Step",
                             yaxis_title="Price ($)",
-                            template="plotly_dark",
+                            template="plotly_white",
                             height=300,
-                            margin=dict(l=10, r=10, t=30, b=10)
+                            margin=dict(l=10, r=10, t=30, b=10),
+                            paper_bgcolor='rgba(0,0,0,0)',
+                            plot_bgcolor='rgba(0,0,0,0)',
+                            font=dict(color='#1f2328')
                         )
                         st.plotly_chart(fig, width='stretch')
                     # ----------------------------------

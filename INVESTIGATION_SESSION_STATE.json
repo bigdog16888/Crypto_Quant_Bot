@@ -1,0 +1,33 @@
+{
+  "session_id": "crypto-bot-investigation-001",
+  "started_at": "2026-01-20T15:18:00Z",
+  "last_updated": "2026-01-20T15:30:00Z",
+  "status": "in_progress",
+  "issue": "5 running bots but only 2 open orders on exchange",
+  "investigation_progress": {
+    "phase": "code_analysis_complete",
+    "next_phase": "database_diagnostic"
+  },
+  "findings": {
+    "architecture": "First-Claim Policy for multi-bot positions",
+    "order_tracking": "Uses entry_order_id, tp_order_id in trades table + bot_orders table",
+    "potential_causes": [
+      "Order IDs not being saved",
+      "Passenger bots don't have orders (expected)",
+      "Race condition during crash",
+      "Orphaned orders"
+    ]
+  },
+  "files_created": [
+    "CRASH_INVESTIGATION_CONTEXT.md",
+    "QUICK_INVESTIGATION_CHECKLIST.md",
+    "load_context.py",
+    "load_investigation_context.bat"
+  ],
+  "commands_to_run_next": [
+    "python load_context.py",
+    "sqlite3 crypto_bot.db \"SELECT COUNT(*) FROM trades WHERE entry_order_id IS NOT NULL\"",
+    "sqlite3 crypto_bot.db \"SELECT COUNT(*) FROM bot_orders WHERE status='open'\""
+  ],
+  "memory_note": "System ran out of memory during investigation. Use sqlite3 CLI commands instead of Python reads for large files."
+}

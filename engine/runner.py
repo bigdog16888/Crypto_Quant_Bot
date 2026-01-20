@@ -13,14 +13,19 @@ from engine.database import get_connection, init_db, get_bot_status, update_mart
 from engine.exchange_interface import ExchangeInterface
 from engine.strategies.martingale_strategy import MartingaleStrategy
 from engine.manager import manage_trade
-from engine.sync import sync_bot_state
+from engine.reconciliation import sync_all_bots
+from engine.ownership import (
+    init_ownership_tables, OwnershipState, OwnershipEvent,
+    claim_ownership, become_passenger, handle_position_closed,
+    check_first_claim_policy, reconcile_pair, get_pair_ownership,
+    get_ownership_state, update_ownership_state
+)
 from config.settings import config
 from config.constants import (
     MIN_ORDER_USD,
     MAX_ORDERS_PER_CYCLE,
     MAX_ORDERS_PER_BOT_DAILY,
     POLL_INTERVAL_SECONDS,
-    ORDER_FILL_TIMEOUT_SECONDS,
     MAX_CONSECUTIVE_FAILURES,
     STABLECOINS
 )
@@ -76,19 +81,47 @@ class BotRunner:
 
     def sync_all_bots(self):
         """
-        Synchronizes the state of all active bots with the exchange on startup.
+        Synchronizes the state of all active bots with the exchange.
+        Uses the new comprehensive reconciliation system.
         """
-        logger.info("Starting global state synchronization...")
-        active_bots = self.get_active_bots()
-        for bot in active_bots:
-            # bot tuple: (id, name, pair, direction, strategy_type, config, base_size, mm, rsi, is_active)
-            bot_id = bot[0]
-            config_json = bot[5] # Corrected index for config
-            config_dict = json.loads(config_json) if config_json else {}
-            market_type = config_dict.get('market_type', config.MARKET_TYPE)
-            bot_exchange = self.exchanges.get(market_type, self.exchange)
-            sync_bot_state(bot_id, bot_exchange)
-        logger.info("Global state synchronization complete.")
+        logger.info("Starting comprehensive state reconciliation...")
+        results = sync_all_bots()
+        
+        # Log summary
+        owner_count = sum(1 for r in results if r.position_owner.value == "owner")
+        passenger_count = sum(1 for r in results if r.position_owner.value == "passenger")
+        orphan_count = sum(1 for r in results if r.requires_manual_intervention)
+        
+        logger.info(f"Reconciliation complete: {owner_count} owners, {passenger_count} passengers, {orphan_count} require manual review")
+    
+
+    def _reconcile_ownership(self):
+        """Reconcile ownership states across all pairs - check for failover and stale records."""
+        try:
+            # Get all active pairs with ownership
+            from engine.ownership import get_all_active_ownerships, reconcile_pair, cleanup_stale_ownerships
+            
+            active_pairs = get_all_active_ownerships()
+            
+            for pair_ownership in active_pairs:
+                # Reconcile each pair
+                result = reconcile_pair(pair_ownership.pair, pair_ownership.exchange_position_exists)
+                
+                if result["actions_taken"]:
+                    for action in result["actions_taken"]:
+                        logger.info(f"🔄 Ownership reconciliation: {action}")
+                
+                if result["new_owner"]:
+                    logger.info(f"👑 New owner assigned for {pair_ownership.pair}: Bot {result['new_owner']}")
+            
+            # Clean up stale ownership records (inactive bots with old positions)
+            cleaned = cleanup_stale_ownerships(max_age_seconds=7200)  # 2 hours
+            if cleaned > 0:
+                logger.info(f"🧹 Cleaned up {cleaned} stale ownership records")
+                
+        except Exception as e:
+            logger.error(f"Ownership reconciliation failed: {e}")
+
 
 
     def _initialize_safety_baseline(self):
@@ -244,7 +277,7 @@ class BotRunner:
             # Market Data
             ohlcv = bot_exchange.fetch_ohlcv(symbol=pair, timeframe=timeframe, limit=100)
             if not ohlcv: return
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])  # type: ignore[arg-type]
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
 
             if strat_type == 'MarketMaker':
@@ -280,14 +313,31 @@ class BotRunner:
                 if can_enter:
                     buy_signal, sell_signal = strategy.check_signals(df)
                     if direction == 'LONG' and buy_signal:
-                        self.execute_entry(bot_id, name, pair, 'buy', base_size, exchange=bot_exchange)
+                        # First-Claim Policy: Check if another bot owns this pair
+                        can_enter, owner_id, _ = check_first_claim_policy(bot_id, pair)
+                        if not can_enter:
+                            logger.info(f"🚫 {name}: Another bot (ID:{owner_id}) already owns {pair}. Becoming passenger.")
+                        else:
+                            self.execute_entry(bot_id, name, pair, 'buy', base_size, exchange=bot_exchange)
                     elif direction == 'SHORT' and sell_signal:
-                        self.execute_entry(bot_id, name, pair, 'sell', base_size, exchange=bot_exchange)
+                        # First-Claim Policy: Check if another bot owns this pair
+                        can_enter, owner_id, _ = check_first_claim_policy(bot_id, pair)
+                        if not can_enter:
+                            logger.info(f"🚫 {name}: Another bot (ID:{owner_id}) already owns {pair}. Becoming passenger.")
+                        else:
+                            self.execute_entry(bot_id, name, pair, 'sell', base_size, exchange=bot_exchange)
             else:
-                strategy.last_market_data = df
-                mission = manage_trade(bot_id, name, pair, direction, params, trade_data, current_price, strategy, bot_exchange)
-                if mission and mission.get('action') != 'none':
-                    self.execute_mission(mission, exchange=bot_exchange)
+                # Check stop-after conditions before managing trade
+                from engine.bot_management import check_and_execute_stops
+                stop_result = check_and_execute_stops(bot_id)
+                if stop_result and stop_result.get('action') == 'stop_executed':
+                    logger.warning(f"🛑 Stop condition triggered for {name}: {stop_result['reason']}")
+                    is_in_trade = False  # Position was closed
+                else:
+                    strategy.last_market_data = df
+                    mission = manage_trade(bot_id, name, pair, direction, params, trade_data, current_price, strategy, bot_exchange)
+                    if mission and mission.get('action') != 'none':
+                        self.execute_mission(mission, exchange=bot_exchange)
 
         except (ccxt.BadSymbol, ccxt.ExchangeError) as e:
             if "symbol" in str(e).lower() or "market" in str(e).lower():
@@ -324,6 +374,7 @@ class BotRunner:
             elif action == 'maintain_orders':
                 grid_price = mission.get('grid_price')
                 grid_qty = mission.get('grid_qty')
+                grid_step = mission.get('grid_step')
                 tp_price = mission.get('tp_price')
                 tp_qty = mission.get('tp_qty')
                 
@@ -331,13 +382,38 @@ class BotRunner:
                 grid_side = 'buy' if direction == 'LONG' else 'sell'
                 tp_side = 'sell' if direction == 'LONG' else 'buy'
                 
-                grid_orders = [o for o in open_orders if o and o.get('side') == grid_side]
-                tp_orders = [o for o in open_orders if o and o.get('side') == tp_side]
+                # =========== MULTI-BOT FIX (v0.5.1) ===========
+                # Each bot must check for ITS OWN orders, not just any order on the pair
+                # Otherwise, when 5 bots trade the same pair, only 1 gets TP/Grid orders
+                bot_order_ids = get_bot_order_ids(bot_id)
+                my_tp_order_id = bot_order_ids.get('tp_order_id')
+                my_grid_order_ids = [o.get('order_id') for o in bot_order_ids.get('grid_orders', []) if o.get('type') == 'grid']
                 
-                # Manage Grid
+                # Filter exchange orders to only THIS bot's orders
+                my_grid_orders = [o for o in open_orders if isinstance(o, dict) and o.get('id') in my_grid_order_ids]
+                my_tp_orders = [o for o in open_orders if isinstance(o, dict) and o.get('id') == my_tp_order_id]
+
+                # Fallback: If we don't have order ID tracking yet, use side-based matching (legacy)
+                # This handles bots that were in trade before the fix
+                if not my_tp_order_id and not my_grid_order_ids:
+                    logger.warning(f"No order IDs tracked for {bot_name}. Using legacy side-based matching.")
+                    my_grid_orders = [o for o in open_orders if isinstance(o, dict) and o.get('side') == grid_side]
+                    # For TP orders, be more careful - only match if we own the position
+                    # Check if another bot has an entry order on this pair (we're a passenger)
+                    can_enter, owner_id, _ = check_first_claim_policy(bot_id, pair)
+                    if not can_enter:
+                        # We're a passenger - don't manage TP orders, the owner will handle it
+                        logger.info(f"👀 {bot_name}: Passenger on {pair}. Skipping TP order management (Owner: Bot {owner_id})")
+                        my_tp_orders = []
+                    else:
+                        # We might be the owner - use side matching as fallback
+                        my_tp_orders = [o for o in open_orders if isinstance(o, dict) and o.get('side') == tp_side]
+                # =========== END MULTI-BOT FIX ===========
+                
+                # Manage Grid - now uses THIS bot's orders only
                 grid_ok = False
                 if grid_price and grid_price > 0:
-                    for o in grid_orders:
+                    for o in my_grid_orders:
                         if abs(float(o['price']) - grid_price) / grid_price < 0.001: grid_ok = True
                         else: ex.exchange.cancel_order(o['id'], pair)
                     if not grid_ok:
@@ -356,19 +432,24 @@ class BotRunner:
                         # Added metadata for better tracking
                         grid_params = {'postOnly': True, 'clientOrderId': f"grid_{bot_id}_{int(time.time())}"}
                         try:
-                            ex.create_order(pair, 'limit', grid_side, s_amt, s_price, params=grid_params)
+                            grid_order = ex.create_order(pair, 'limit', grid_side, s_amt, s_price, params=grid_params)
+                            if grid_order:
+                                # Save grid order ID for multi-bot tracking
+                                save_bot_order(bot_id, 'grid', grid_order.get('id'), s_price, s_amt, grid_step if grid_step else 0)
                         except ccxt.InvalidOrder as e:
                             # Handle Post Only rejection (-5022)
                             if "-5022" in str(e):
                                 logger.warning(f"Post Only Rejected for {bot_name} at {s_price}. Market moved. Retrying as regular limit...")
                                 grid_params.pop('postOnly', None)
-                                ex.create_order(pair, 'limit', grid_side, s_amt, s_price, params=grid_params)
+                                grid_order = ex.create_order(pair, 'limit', grid_side, s_amt, s_price, params=grid_params)
+                                if grid_order:
+                                    save_bot_order(bot_id, 'grid', grid_order.get('id'), s_price, s_amt, grid_step if grid_step else 0)
                             else: raise e
                 
-                # Manage TP
+                # Manage TP - now uses THIS bot's orders only (multi-bot fix)
                 tp_ok = False
                 if tp_price and tp_price > 0:
-                    for o in tp_orders:
+                    for o in my_tp_orders:
                         if abs(float(o['price']) - tp_price) / tp_price < 0.001: tp_ok = True
                         else: ex.exchange.cancel_order(o['id'], pair)
                     if not tp_ok:
@@ -381,7 +462,7 @@ class BotRunner:
                         tp_order = ex.create_order(pair, 'limit', tp_side, tp_qty, tp_price, params=tp_params)
                         if tp_order:
                             # Save TP order ID for multi-bot tracking
-                            save_bot_order(bot_id, 'tp', tp_order.get('id'), tp_price, tp_qty)
+                            save_bot_order(bot_id, 'tp', tp_order.get('id'), tp_price, tp_qty, trade_data[2] if trade_data else 0)
 
             elif action == 'hedge_open':
                 price, qty, amount_usd, step = mission.get('price'), mission.get('qty'), mission.get('amount_usd'), mission.get('step')
@@ -408,20 +489,22 @@ class BotRunner:
             ex = self.exchanges.get(mt, self.exchange)
             
             open_orders = ex.fetch_open_orders(pair) or []
-            current_bids = [o for o in open_orders if o and o.get('side') == 'buy']
-            current_asks = [o for o in open_orders if o and o.get('side') == 'sell']
+            current_bids = [o for o in open_orders if isinstance(o, dict) and o.get('side') == 'buy']
+            current_asks = [o for o in open_orders if isinstance(o, dict) and o.get('side') == 'sell']
             
             if not current_bids: self.execute_entry(bot_id, name, pair, 'buy', strategy.order_size, price=ideal_bid, params={'postOnly': True}, exchange=ex)
             else:
-                bid_price = float(max(current_bids, key=lambda x: float(x.get('price', 0))).get('price', 0))
-                if abs(bid_price - ideal_bid) / ideal_bid > strategy.reprice_threshold:
+                best_bid = max(current_bids, key=lambda x: float(x.get('price', 0)))
+                bid_price = float(best_bid.get('price', 0)) if best_bid else 0.0
+                if bid_price > 0 and abs(bid_price - ideal_bid) / ideal_bid > strategy.reprice_threshold:
                     ex.cancel_all_orders(pair)
                     self.execute_entry(bot_id, name, pair, 'buy', strategy.order_size, price=ideal_bid, params={'postOnly': True}, exchange=ex)
 
             if not current_asks: self.execute_entry(bot_id, name, pair, 'sell', strategy.order_size, price=ideal_ask, params={'postOnly': True}, exchange=ex)
             else:
-                ask_price = float(min(current_asks, key=lambda x: float(x.get('price', 0))).get('price', 0))
-                if abs(ask_price - ideal_ask) / ideal_ask > strategy.reprice_threshold:
+                best_ask = min(current_asks, key=lambda x: float(x.get('price', 0)))
+                ask_price = float(best_ask.get('price', 0)) if best_ask else 0.0
+                if ask_price > 0 and abs(ask_price - ideal_ask) / ideal_ask > strategy.reprice_threshold:
                     ex.cancel_all_orders(pair)
                     self.execute_entry(bot_id, name, pair, 'sell', strategy.order_size, price=ideal_ask, params={'postOnly': True}, exchange=ex)
         except Exception as e: logger.error(f"MM Loop failed for {name}: {e}")
@@ -479,7 +562,7 @@ class BotRunner:
                 order = ex.create_order(pair, 'limit', side, s_amt, s_price, params=params)
                 if not order: continue
                 filled, final_order = ex.wait_for_fill(order.get('id'), pair, timeout_seconds=interval)
-                if filled:
+                if filled and final_order:
                     self._finalize_entry(bot_id, name, pair, side, amount, final_order.get('average', s_price), order.get('id'))
                     return
                 ex.exchange.cancel_order(order.get('id'), pair)
@@ -501,8 +584,20 @@ class BotRunner:
         update_martingale_step(bot_id, 0, amount, fill_price, tp_price)
         self._record_order(bot_id)
         # Save entry order ID for multi-bot tracking
-        save_bot_order(bot_id, 'entry', order_id, fill_price, amount/fill_price)
+        save_bot_order(bot_id, 'entry', order_id, fill_price, amount/fill_price, step=0)
         log_trade(bot_id, 'BUY' if side == 'buy' else 'SELL', pair, fill_price, amount/fill_price, amount, order_id, 0, 0, f"Entry {name}")
+        
+        # Claim ownership or become passenger based on First-Claim Policy
+        success, message = claim_ownership(
+            bot_id=bot_id,
+            bot_name=name,
+            pair=pair,
+            entry_order_id=order_id,
+            entry_price=fill_price,
+            amount_usd=amount,
+            tp_price=tp_price
+        )
+        logger.info(f"🏁 Entry finalized for {name}: {message}")
 
     def _simulate_dry_run_entry(self, bot_id, name, pair, side, amount, price):
         tp_price = price * (1.015 if side == 'buy' else 0.985)
@@ -525,6 +620,10 @@ class BotRunner:
         for bot in bots:
             if os.path.exists(config.PATHS["EMERGENCY_FILE"]) or os.path.exists(config.PATHS["STOP_FILE"]): break
             self.process_bot(bot)
+        
+        # Ownership reconciliation: Check for owner failover and stale ownerships
+        self._reconcile_ownership()
+        
         return True
 
     def handle_emergency_liquidation(self):
@@ -541,7 +640,11 @@ class BotRunner:
                     base = pair.split('/')[0]
                     # Simple spot balance fetch for liquidation
                     balance = ex.fetch_balance()
-                    qty = balance.get(base, {}).get('free', 0)
+                    if isinstance(balance, dict):
+                        asset_balance = balance.get(base, {})
+                        qty = asset_balance.get('free', 0) if isinstance(asset_balance, dict) else 0
+                    else:
+                        qty = 0
                     if qty > 0:
                         logger.warning(f"Emergency Market Close {qty} {base} for {name}")
                         # ex.create_order(pair, 'market', 'sell', qty) # Still commented for safety
@@ -549,6 +652,7 @@ class BotRunner:
 
 if __name__ == "__main__":
     init_db()
+    init_ownership_tables()  # Initialize ownership tracking tables
     logger.info("Bot Service Started.")
     try: runner = BotRunner()
     except Exception as e:

@@ -34,40 +34,278 @@ init_db()
 # Custom Styling (Professional Aesthetics)
 st.markdown("""
     <style>
+    /* --- GLOBAL THEME (LIGHT PROFESSIONAL) --- */
+    :root {
+        --bg-color: #f6f8fa;
+        --card-bg: #ffffff;
+        --border-color: #d0d7de;
+        --text-primary: #1f2328;
+        --text-secondary: #656d76;
+        --accent-color: #0969da;
+        --success-color: #1a7f37;
+        --success-text: #1a7f37;
+        --danger-color: #cf222e;
+        --danger-text: #cf222e;
+        --warning-color: #9a6700;
+        --shadow-sm: 0 1px 3px rgba(31, 35, 40, 0.12);
+        --shadow-md: 0 3px 6px rgba(140, 149, 159, 0.15);
+    }
+
+    /* Main App Background */
+    .stApp {
+        background-color: var(--bg-color);
+        color: var(--text-primary);
+    }
+    
     .main {
-        background-color: #0d1117;
+        background-color: var(--bg-color);
     }
+
+    /* Sidebar */
+    [data-testid="stSidebar"] {
+        background-color: #f6f8fa;
+        border-right: 1px solid var(--border-color);
+    }
+    
+    [data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3 {
+         color: var(--text-primary) !important;
+    }
+    
+    /* Headings */
+    h1, h2, h3, h4, h5, h6 {
+        color: var(--text-primary) !important;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+        font-weight: 600;
+    }
+
+    /* --- TABS --- */
     .stTabs [data-baseweb="tab-list"] {
-        gap: 24px;
-        background-color: #161b22;
-        padding: 10px 20px 0px 20px;
-        border-radius: 8px 8px 0px 0px;
-    }
-    .stTabs [data-baseweb="tab"] {
-        height: 50px;
-        white-space: pre-wrap;
+        gap: 8px;
         background-color: transparent;
-        border-radius: 4px 4px 0px 0px;
-        color: #8b949e;
+        padding-bottom: 0px;
+        border-bottom: 1px solid var(--border-color);
+    }
+    
+    .stTabs [data-baseweb="tab"] {
+        height: 45px;
+        background-color: transparent;
+        border-radius: 6px 6px 0px 0px;
+        color: var(--text-secondary);
         border: none;
+        padding: 0 20px;
+        font-weight: 500;
     }
+    
     .stTabs [aria-selected="true"] {
-        background-color: #0d1117;
-        color: #58a6ff;
-        border-bottom: 2px solid #58a6ff;
+        background-color: var(--card-bg);
+        color: var(--accent-color);
+        border: 1px solid var(--border-color);
+        border-bottom: 1px solid var(--card-bg); /* Blend with container */
+        position: relative;
+        top: 1px;
     }
+
+    /* --- DATAFRAMES & TABLES --- */
+    [data-testid="stDataFrame"] {
+        background-color: var(--card-bg);
+        border: 1px solid var(--border-color);
+        border-radius: 6px;
+        padding: 5px;
+        box-shadow: var(--shadow-sm);
+    }
+
+    [data-testid="stTable"] {
+        background-color: var(--card-bg);
+        color: var(--text-primary);
+    }
+    
+    /* Force text color in tables */
+    div[data-testid="stDataFrame"] div[role="columnheader"] {
+        color: var(--text-primary) !important;
+        background-color: #f6f8fa !important;
+        font-weight: 600;
+        border-bottom: 1px solid var(--border-color);
+    }
+    
+    div[data-testid="stDataFrame"] div[role="gridcell"] {
+        color: var(--text-primary) !important;
+        background-color: var(--card-bg) !important;
+    }
+
+    /* --- METRICS --- */
     div[data-testid="stMetricValue"] {
         font-size: 1.8rem;
-        color: #f0f6fc;
+        color: var(--text-primary) !important; /* Force black/dark */
+        font-weight: 600;
     }
-    div[data-testid="stMetricDelta"] {
+    
+    div[data-testid="stMetricLabel"] {
+        color: var(--text-secondary);
         font-size: 0.9rem;
     }
+    
+    /* Specific fix for metric deltas to ensure they are visible */
+    [data-testid="stMetricDelta"] {
+        background-color: rgba(0,0,0,0.03);
+        padding: 2px 6px;
+        border-radius: 4px;
+    }
+
+    /* --- INPUTS --- */
+    .stTextInput input, .stSelectbox div[data-baseweb="select"], .stNumberInput input {
+        background-color: #ffffff;
+        color: var(--text-primary);
+        border-color: var(--border-color);
+        border-radius: 6px;
+    }
+    
+    .stTextInput input:focus, .stSelectbox div[data-baseweb="select"]:focus-within {
+        border-color: var(--accent-color);
+        box-shadow: 0 0 0 2px rgba(9, 105, 218, 0.2);
+    }
+    
+    /* Buttons */
     .stButton>button {
+        border-radius: 6px;
+        font-weight: 600;
+        background-color: #f6f8fa;
+        color: var(--text-primary);
+        border: 1px solid var(--border-color);
+        transition: all 0.2s cubic-bezier(0.3, 0, 0.5, 1);
+        box-shadow: var(--shadow-sm);
+    }
+    
+    .stButton>button:hover {
+        background-color: #f3f4f6;
+        border-color: #8c959f;
+        box-shadow: var(--shadow-md);
+    }
+    
+    .stButton>button[kind="primary"] {
+        background-color: #1f883d;
+        color: white;
+        border: 1px solid rgba(27, 31, 36, 0.15);
+    }
+    
+    .stButton>button[kind="primary"]:hover {
+        background-color: #1a7f37;
+    }
+    
+    .stButton>button[kind="secondary"] {
+        color: var(--danger-color);
+        border-color: var(--border-color);
+    }
+
+    /* --- CUSTOM CLASSES --- */
+    
+    /* Monitor View: Metric Cards */
+    .metric-card {
+        background-color: var(--card-bg);
+        border: 1px solid var(--border-color);
+        border-radius: 8px;
+        padding: 24px 20px;
+        text-align: center;
+        box-shadow: var(--shadow-sm);
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        transition: transform 0.2s ease, box-shadow 0.2s ease;
+    }
+    
+    .metric-card:hover {
+        transform: translateY(-2px);
+        box-shadow: var(--shadow-md);
+    }
+    
+    .metric-value { 
+        font-size: 1.8em; 
+        font-weight: 700; 
+        color: var(--text-primary);
+        margin-top: 8px;
+        letter-spacing: -0.5px;
+    }
+    
+    .metric-label { 
+        font-size: 0.85em; 
+        color: var(--text-secondary); 
+        text-transform: uppercase; 
+        letter-spacing: 0.5px; 
+        font-weight: 600;
+    }
+    
+    .status-ok { color: var(--success-text); font-weight: bold; }
+    .status-warn { color: var(--warning-color); font-weight: bold; }
+    .status-err { color: var(--danger-text); font-weight: bold; }
+
+    /* Monitor View: Status Ribbon */
+    .status-ribbon {
+        background-color: #ffffff; /* Explicit white to pop from grey bg */
+        border-left: 4px solid var(--accent-color);
+        padding: 15px 25px;
+        margin-bottom: 25px;
+        border-radius: 6px;
+        font-family: 'SF Mono', 'Segoe UI Mono', 'Roboto Mono', monospace;
+        font-size: 0.9rem;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        color: var(--text-primary);
+        border: 1px solid var(--border-color);
+        border-left-width: 4px;
+        box-shadow: var(--shadow-sm);
+    }
+    
+    .sync-status {
+        font-size: 0.75rem;
+        padding: 2px 8px;
+        border-radius: 4px;
+        margin-left: 10px;
+        font-weight: bold;
+    }
+    
+    .sync-ok { background-color: #dafbe1; color: #1a7f37; border: 1px solid rgba(26, 127, 55, 0.2); }
+    .sync-warn { background-color: #fff8c5; color: #9a6700; border: 1px solid rgba(154, 103, 0, 0.2); }
+    .sync-err { background-color: #ffebe9; color: #cf222e; border: 1px solid rgba(207, 34, 46, 0.2); }
+    
+    /* Bot Creator: Strategy Cards */
+    .strat-card {
+        border: 1px solid var(--border-color);
+        border-radius: 8px;
+        padding: 25px;
+        background-color: var(--card-bg);
+        height: 100%;
+        text-align: center;
+        transition: all 0.2s ease;
+        box-shadow: var(--shadow-sm);
+        cursor: pointer; /* Implies interactive */
+    }
+    
+    .strat-card:hover {
+        border-color: var(--accent-color);
+        box-shadow: 0 4px 12px rgba(9, 105, 218, 0.15);
+        transform: translateY(-2px);
+    }
+    
+    .strat-icon { font-size: 3em; margin-bottom: 15px; }
+    .strat-title { font-weight: 700; font-size: 1.25em; color: var(--text-primary); margin-bottom: 8px; }
+    .strat-desc { font-size: 0.95em; color: var(--text-secondary); line-height: 1.5; }
+
+    /* Dividers */
+    hr {
+        margin: 2em 0;
+        border: 0;
+        border-top: 1px solid var(--border-color);
+    }
+    
+    /* Expander */
+    .streamlit-expanderHeader {
+        background-color: #ffffff;
         border-radius: 6px;
     }
     </style>
     """, unsafe_allow_html=True)
+
 
 
 # Sidebar - Global Settings

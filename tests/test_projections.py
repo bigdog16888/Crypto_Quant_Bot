@@ -4,7 +4,7 @@ import sys
 # Add root to sys.path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from engine.strategies.mql4_strategy import MQL4Strategy
+from engine.strategies.martingale_strategy import MartingaleStrategy
 
 def test_projections():
     print("\n--- Testing Martingale Projections ---")
@@ -14,7 +14,7 @@ def test_projections():
         'UseHedge': True,
         'HedgeStartStep': 5
     }
-    strat = MQL4Strategy(params=params)
+    strat = MartingaleStrategy(params=params)
     projections = strat.calculate_projections(base_price=40000.0)
     
     for p in projections:

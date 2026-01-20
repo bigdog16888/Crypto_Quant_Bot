@@ -300,6 +300,49 @@ class MartingaleStrategy(BaseStrategy):
         # Standard Multiplier scaling
         return base_size * (multiplier ** current_step)
 
+    def calculate_next_grid_price(self, direction: str, current_price: float, avg_entry: float, current_step: int, market_data=None) -> float:
+        """
+        Calculate next grid order price using ATR if enabled.
+        
+        ATR Calculation:
+        - ATR_Timeframe: The candle timeframe to use (1m, 5m, 15m, 1h, 4h, 1d)
+        - ATRPeriods: The lookback period for ATR calculation (default 14)
+        - ATRGridFactor: Multiplier for the ATR value (default 1.0)
+        
+        Example:
+        - 1h timeframe ATR = 1000 units
+        - 4h setting = average ATR over last 4 hours of 1h data
+        - 1d setting = average ATR over last 24 hours of 1h data
+        
+        The grid spacing = ATR value * ATRGridFactor
+        """
+        if self.use_atr_grid and market_data is not None and not market_data.empty:
+            # Get ATR timeframe
+            atr_tf = self.atr_tf or '1h'
+            
+            # Resample data to ATR timeframe
+            df_atr = self._resample(market_data, atr_tf)
+            
+            if not df_atr.empty and len(df_atr) >= self.atr_period:
+                # Calculate ATR
+                atr_val = iATR(df_atr['high'], df_atr['low'], df_atr['close'], self.atr_period)
+                
+                # Apply ATR grid factor
+                grid_spacing = atr_val * self.atr_grid_factor
+                
+                # For LONG: next grid is below current price
+                # For SHORT: next grid is above current price
+                if direction == 'LONG':
+                    return current_price - grid_spacing
+                else:
+                    return current_price + grid_spacing
+        
+        # Fallback to fixed base_grid spacing
+        spacing = self.params.get('base_grid', 100.0)
+        if direction == 'LONG':
+            return current_price - spacing
+        return current_price + spacing
+
     def calculate_projections(self, base_price: float, current_atr: float = None) -> list:
         """
         Generates a list of dictionaries representing the risk/investment at each step.

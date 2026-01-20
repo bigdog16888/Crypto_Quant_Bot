@@ -8,6 +8,10 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 from engine.database import get_all_bots, toggle_bot_active, delete_bot, get_bot_params, update_bot, get_bot_status, get_trade_history
 from engine.exchange_interface import ExchangeInterface
 from engine.strategies.martingale_strategy import MartingaleStrategy
+from engine.bot_management import (
+    close_position, partial_close, set_stop_after_pnl, set_stop_after_time,
+    set_manual_close_pct, get_position_summary, check_and_execute_stops
+)
 import engine.indicators as ta
 import pandas as pd
 import json
@@ -114,8 +118,8 @@ def render_bot_manager_view():
                         ohlcv_1d = bot_exchange.fetch_ohlcv(pair, timeframe='1d', limit=100)
                         
                         if ohlcv_1h and ohlcv_1d:
-                            df_1h = pd.DataFrame(ohlcv_1h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                            df_1d = pd.DataFrame(ohlcv_1d, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                            df_1h = pd.DataFrame(ohlcv_1h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])  # type: ignore[arg-type]
+                            df_1d = pd.DataFrame(ohlcv_1d, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])  # type: ignore[arg-type]
                             for dff in [df_1h, df_1d]:
                                 dff['timestamp'] = pd.to_datetime(dff['timestamp'], unit='ms')
                             
@@ -150,9 +154,31 @@ def render_bot_manager_view():
                 if last_logs and last_logs[0][3] == 'ERROR_STOP': # action is index 3
                      error_reason = last_logs[0][11] # notes is index 11
 
-            # Status Pulse Logic
-            pulse_color = "#3fb950" if is_active else ("#cf222e" if error_reason else "#d29922") # Green vs Red (Error) vs Yellow (Paused)
-            status_text = 'Active' if is_active else ('Stopped' if error_reason else 'Paused')
+            # Determine trading state (IN TRADE vs IDLE)
+            in_trade = total_invested > 0
+            
+            # Status logic:
+            # - Active + In Trade = "IN TRADE" (green)
+            # - Active + Idle = "SCANNING" (blue)
+            # - Paused = "PAUSED" (yellow)
+            # - Error = "ERROR" (red)
+            
+            if error_reason:
+                status_text = 'ERROR'
+                pulse_color = "#cf222e"  # Red
+                state_label = "ERROR"
+            elif in_trade:
+                status_text = 'IN TRADE'
+                pulse_color = "#3fb950"  # Green
+                state_label = f"TRADE (S{step})"
+            elif is_active:
+                status_text = 'SCANNING'
+                pulse_color = "#58a6ff"  # Blue
+                state_label = "IDLE"
+            else:
+                status_text = 'PAUSED'
+                pulse_color = "#d29921"  # Yellow
+                state_label = "PAUSED"
 
             pulse_anim = """
             <style>
@@ -176,6 +202,9 @@ def render_bot_manager_view():
             """
             st.markdown(pulse_anim + f"<div style='display:flex;align-items:center;'><div class='blob'></div> {status_text}</div>", unsafe_allow_html=True)
             
+            # Show trading state below status
+            st.caption(f"State: {state_label}")
+            
             if error_reason:
                  st.caption(f"🛑 {error_reason}")
             
@@ -184,6 +213,102 @@ def render_bot_manager_view():
                 toggle_bot_active(b_id, not bool(is_active))
                 st.success(f"✅ Bot {name} status updated!")
                 st.rerun()
+            
+            # Position Management Section (only show if in trade)
+            if total_invested > 0:
+                with st.expander(f"🎛️ Position Controls for {name}", expanded=False):
+                    # Get position summary
+                    pos_summary = get_position_summary(b_id)
+                    
+                    # Display PnL
+                    pnl = pos_summary.get('unrealized_pnl', 0)
+                    pnl_pct = pos_summary.get('pnl_pct', 0)
+                    pnl_color = "green" if pnl >= 0 else "red"
+                    st.markdown(f"""
+                    **Current PnL:** <span style="color:{pnl_color}">${pnl:,.2f} ({pnl_pct:+.2f}%)</span>
+                    """, unsafe_allow_html=True)
+                    
+                    # Close buttons
+                    st.markdown("**🛑 Close Position**")
+                    close_cols = st.columns([1, 1, 1])
+                    
+                    # Full close button
+                    if close_cols[0].button("🔴 Close All", key=f"close_all_{b_id}", help="Close 100% of position"):
+                        result = close_position(b_id, close_pct=100.0, reason="Manual close from UI")
+                        if result['success']:
+                            st.success(f"✅ Closed position for {name}. PnL: ${result.get('pnl', 0):.2f}")
+                            st.rerun()
+                        else:
+                            st.error(f"❌ Failed: {result.get('error')}")
+                    
+                    # Partial close buttons
+                    if close_cols[1].button("🟡 50%", key=f"close_50_{b_id}", help="Close 50% of position"):
+                        result = partial_close(b_id, pct=50, reason="Partial close 50%")
+                        if result['success']:
+                            st.success(f"✅ Closed 50% of {name}. PnL: ${result.get('pnl', 0):.2f}")
+                            st.rerun()
+                        else:
+                            st.error(f"❌ Failed: {result.get('error')}")
+                    
+                    if close_cols[2].button("🟢 25%", key=f"close_25_{b_id}", help="Close 25% of position"):
+                        result = partial_close(b_id, pct=25, reason="Partial close 25%")
+                        if result['success']:
+                            st.success(f"✅ Closed 25% of {name}. PnL: ${result.get('pnl', 0):.2f}")
+                            st.rerun()
+                        else:
+                            st.error(f"❌ Failed: {result.get('error')}")
+                    
+                    # Stop settings
+                    st.markdown("---")
+                    st.markdown("**⚙️ Auto-Close Settings**")
+                    
+                    close_settings = pos_summary.get('close_settings', {})
+                    set_cols = st.columns(3)
+                    
+                    with set_cols[0]:
+                        current_pnl_target = close_settings.get('stop_after_pnl', 0)
+                        new_pnl_target = st.number_input(
+                            "Stop after PnL ($)", 
+                            min_value=0.0, 
+                            value=float(current_pnl_target),
+                            step=5.0,
+                            key=f"stop_pnl_{b_id}",
+                            help="Close when PnL reaches this amount (0 = disabled)"
+                        )
+                        if st.button("💾 Save PnL Target", key=f"save_pnl_{b_id}"):
+                            if set_stop_after_pnl(b_id, new_pnl_target):
+                                st.success("✅ PnL target updated")
+                                st.rerun()
+                    
+                    with set_cols[1]:
+                        current_time_limit = close_settings.get('stop_after_time', 0)
+                        new_time_limit = st.number_input(
+                            "Stop after (hours)", 
+                            min_value=0, 
+                            value=int(current_time_limit),
+                            step=1,
+                            key=f"stop_time_{b_id}",
+                            help="Close after this many hours in trade (0 = disabled)"
+                        )
+                        if st.button("💾 Save Time Limit", key=f"save_time_{b_id}"):
+                            if set_stop_after_time(b_id, new_time_limit):
+                                st.success("✅ Time limit updated")
+                                st.rerun()
+                    
+                    with set_cols[2]:
+                        current_manual_pct = close_settings.get('manual_close_pct', 100)
+                        new_manual_pct = st.number_input(
+                            "Manual Close %", 
+                            min_value=10, 
+                            max_value=100, 
+                            value=int(current_manual_pct),
+                            key=f"manual_pct_{b_id}",
+                            help="Default % to close when using manual close"
+                        )
+                        if st.button("💾 Save Close %", key=f"save_close_{b_id}"):
+                            if set_manual_close_pct(b_id, new_manual_pct):
+                                st.success("✅ Manual close % updated")
+                                st.rerun()
 
         # Actions
         with row_cols[7]:
@@ -374,7 +499,7 @@ def render_edit_form(bot_id):
         exchange = ExchangeInterface(market_type=new_market_type)
         # Use new_pair which is the selected pair from the dropdown
         ohlcv = exchange.fetch_ohlcv(new_pair if new_pair else "BTC/USDT", timeframe='1m', limit=1)
-        curr_p = float(ohlcv[0][4]) if ohlcv else 40000.0
+        curr_p = float(ohlcv[0][4]) if ohlcv and isinstance(ohlcv, list) and len(ohlcv) > 0 else 40000.0  # type: ignore[index]
         
         # Pass ATR context for grid
         # Use 'ATR_Timeframe' from config if present
@@ -386,8 +511,8 @@ def render_edit_form(bot_id):
             # Fetch more data for ATR calculation (need ~20+ periods)
             ohlcv_atr = exchange.fetch_ohlcv(new_pair if new_pair else "BTC/USDT", timeframe=atr_tf, limit=50)
             if ohlcv_atr:
-                df_atr = pd.DataFrame(ohlcv_atr, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                atr_series = ta.atr(df_atr['high'], df_atr['low'], df_atr['close'], period=14)
+                df_atr = pd.DataFrame(ohlcv_atr, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])  # type: ignore[arg-type]
+                atr_series = ta.atr(df_atr['high'], df_atr['low'], df_atr['close'], period=14)  # type: ignore[arg-type]
                 p_atr = atr_series.iloc[-1]
             else:
                 p_atr = curr_p * 0.01 # Fallback 1% if data fetch fails
@@ -423,15 +548,18 @@ def render_edit_form(bot_id):
                 fig.add_trace(go.Scatter(x=steps, y=tps, mode='lines+markers', name='Take Profit', line=dict(color='#3fb950', dash='dash')))
                 
                 # Current Price Line
-                fig.add_hline(y=curr_p, line_dash="solid", line_color="white", annotation_text="Entry")
+                fig.add_hline(y=curr_p, line_dash="solid", line_color="#1f2328", annotation_text="Entry")
                 
                 fig.update_layout(
                     title="Grid Visualizer",
                     xaxis_title="Martingale Step",
                     yaxis_title="Price ($)",
-                    template="plotly_dark",
+                    template="plotly_white",
                     height=300,
-                    margin=dict(l=10, r=10, t=30, b=10)
+                    margin=dict(l=10, r=10, t=30, b=10),
+                    paper_bgcolor='rgba(0,0,0,0)',
+                    plot_bgcolor='rgba(0,0,0,0)',
+                    font=dict(color='#1f2328')
                 )
                 st.plotly_chart(fig, width='stretch')
             # -------------------------------

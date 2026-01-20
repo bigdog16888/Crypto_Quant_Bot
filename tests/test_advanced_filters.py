@@ -6,7 +6,7 @@ import numpy as np
 # Add root to sys.path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from engine.strategies.mql4_strategy import MQL4Strategy
+from engine.strategies.martingale_strategy import MartingaleStrategy
 
 def test_mtf_logic():
     print("\n--- Testing MTF Confluence Logic ---")
@@ -27,7 +27,7 @@ def test_mtf_logic():
         'UseMTFConfluence': True,
         'MTF_Timeframe': '1h'
     }
-    strat = MQL4Strategy(name="MTF_Test", params=params_mtf)
+    strat = MartingaleStrategy(name="MTF_Test", params=params_mtf)
     buy, sell = strat.check_signals(data_5m)
     print(f"MTF Enabled (High TF Random) - Buy: {buy}, Sell: {sell}")
 
@@ -46,7 +46,7 @@ def test_consecutive_logic():
         'boll_deviation': 2.0,
         'trigger_candles': 4
     }
-    strat = MQL4Strategy(name="Cons_Test", params=params_cons)
+    strat = MartingaleStrategy(name="Cons_Test", params=params_cons)
     
     # Price 96 is far below any random high, so boll buy might trigger if distance allows
     # But we want to see if trigger_candles filters it
