@@ -298,61 +298,31 @@ class StateReconciler:
         """
         Determine which bots own positions/orders on a pair.
         
-        Uses First-Claim Policy:
-        - Bot with earliest entry_order_id "owns" the position
-        - Other bots on same pair become "passengers"
-        - If no order IDs match, position is "orphan"
+        Uses Virtual Ownership Policy:
+        - ANY bot with a tracked order ID or active DB state is an OWNER.
+        - We trust the DB state for tracking virtual positions.
         """
         ownership = {}
         
-        if not position or position.size == 0:
-            # No position - all bots should be idle
-            for bot in bot_states:
-                if bot.pair == pair:
-                    ownership[bot.bot_id] = PositionOwner.NONE
-            return ownership
+        # If no position, usually NONE, but check if we have virtual hedged bots
+        # The reconcile_bot logic handles the virtual hedge check, so here we just
+        # identify who *thinks* they are an owner.
         
-        # Find which bot placed the first order for this position
-        owner_bot_id = None
-        owner_order_time = float('inf')
-        
-        for order in orders:
-            if order.status != 'open':
-                continue
-            
-            matched_bot = self.match_order_to_bot(order.order_id, bot_states)
-            if matched_bot and matched_bot.pair == pair:
-                # Get order creation time from DB
-                conn = get_connection()
-                cursor = conn.cursor()
-                cursor.execute('''
-                    SELECT created_at FROM bot_orders WHERE order_id = ?
-                ''', (order.order_id,))
-                result = cursor.fetchone()
-                conn.close()
-                
-                order_time = result[0] if result else 0
-                if order_time < owner_order_time:
-                    owner_order_time = order_time
-                    owner_bot_id = matched_bot.bot_id
-        
-        # Assign ownership
         for bot in bot_states:
             if bot.pair != pair:
                 continue
             
-            if bot.bot_id == owner_bot_id:
+            # If bot has active trade in DB, it is an OWNER of its virtual slice
+            if bot.in_trade:
                 ownership[bot.bot_id] = PositionOwner.OWNER
             else:
-                # Other bots on same pair are passengers
-                ownership[bot.bot_id] = PositionOwner.PASSENGER
-        
-        # Check for orphan position (no matching bot)
-        if owner_bot_id is None:
-            # Position exists but no bot claims it
-            ownership[0] = PositionOwner.ORPHAN  # Special key for orphan
-        
+                ownership[bot.bot_id] = PositionOwner.NONE
+                
         return ownership
+
+        # Legacy First-Claim Logic (Disabled)
+        # if not position or position.size == 0:
+        # ...
     
     def reconcile_bot(
         self,
@@ -367,7 +337,55 @@ class StateReconciler:
         
         # Scenario 1: Bot thinks in trade, Exchange has NO position
         if bot.in_trade and (not position or position.size == 0):
-            logger.warning(f"🔄 {bot.name}: DB shows IN TRADE but Exchange has NO position")
+            # Virtual Positioning Logic:
+            # If exchange has 0 position, it might be because Bot A (Long) and Bot B (Short) cancel out.
+            # We must calculate the NET virtual position of all bots on this pair.
+            
+            # 1. Get all bots on this pair
+            bots_on_pair_list = get_all_bots() # This gets raw tuples
+            net_virtual_size = 0.0
+            
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            for b_tuple in bots_on_pair_list:
+                # b_tuple: id, name, pair, is_active...
+                b_id, b_pair = b_tuple[0], b_tuple[2]
+                if b_pair != bot.pair: continue
+                
+                # Get trade status
+                status = get_bot_status(b_id)
+                # status: name, pair, step, invested, avg_entry...
+                if status and status[3] > 0: # invested > 0
+                    # Get direction
+                    cursor.execute('SELECT direction FROM bots WHERE id = ?', (b_id,))
+                    d_res = cursor.fetchone()
+                    if d_res:
+                        d_dir = d_res[0]
+                        # Calculate approximate size (Invested / Entry)
+                        # Use 0 if entry is 0 to avoid div zero
+                        qty = status[3] / status[4] if status[4] > 0 else 0
+                        if d_dir == 'LONG':
+                            net_virtual_size += qty
+                        else:
+                            net_virtual_size -= qty
+            
+            conn.close()
+            
+            # If the Net Virtual Position is close to 0 (allow small dust error), then 0 on exchange is CORRECT.
+            # We are "Virtually Hedged".
+            if abs(net_virtual_size) < 0.0001: # Tolerance for rounding
+                return ReconciliationResult(
+                    bot_id=bot.bot_id,
+                    bot_name=bot.name,
+                    pair=bot.pair,
+                    position_owner=owner_status,
+                    action_taken=ReconciliationAction.NO_ACTION,
+                    details="Virtually Hedged (Net Position ~0). State preserved.",
+                    requires_manual_intervention=False
+                )
+
+            logger.warning(f"🔄 {bot.name}: DB shows IN TRADE but Exchange has NO position (Net Virtual: {net_virtual_size:.4f})")
             
             if bot.has_confirmed_entry:
                 # Entry was confirmed - likely TP hit while offline
@@ -417,15 +435,16 @@ class StateReconciler:
                     requires_manual_intervention=False
                 )
             else:
-                # Orphan position
+                # Orphan position - likely manual trade
+                logger.warning(f"Orphan position detected for {bot.name} ({bot.pair}). Likely manual trade. Ignoring.")
                 return ReconciliationResult(
                     bot_id=bot.bot_id,
                     bot_name=bot.name,
                     pair=bot.pair,
                     position_owner=PositionOwner.ORPHAN,
-                    action_taken=ReconciliationAction.REQUIRE_MANUAL,
-                    details="ORPHAN POSITION detected! No bot claims this position. Manual intervention required.",
-                    requires_manual_intervention=True
+                    action_taken=ReconciliationAction.NO_ACTION,
+                    details="Orphan position detected (Manual/External). Ignoring.",
+                    requires_manual_intervention=False
                 )
         
         # Scenario 3: Both in trade - verify ownership

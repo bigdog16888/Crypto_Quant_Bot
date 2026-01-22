@@ -1,6 +1,13 @@
 import sqlite3
 import os
 import threading
+import json
+import time
+import logging
+import uuid
+
+# Setup logger
+logger = logging.getLogger(__name__)
 
 # Use absolute path to ensure database is found regardless of working directory
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -48,163 +55,180 @@ def close_connection():
 def init_db():
     """Initializes the database and creates tables if they don't exist."""
     # Use a fresh connection for init (not thread-local) since this runs once at startup
-    conn = sqlite3.connect(DB_PATH, timeout=30.0)
-    conn.execute("PRAGMA journal_mode=WAL")
-    cursor = conn.cursor()
-    
-    # Bots table: Stores configuration for each bot
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS bots (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE NOT NULL,
-            strategy_type TEXT DEFAULT 'MQL4',
-            pair TEXT NOT NULL,
-            direction TEXT CHECK(direction IN ('LONG', 'SHORT')) NOT NULL,
-            rsi_limit REAL NOT NULL,
-            martingale_multiplier REAL NOT NULL,
-            base_size REAL NOT NULL,
-            config TEXT DEFAULT '{}',
-            is_active BOOLEAN DEFAULT 1
-        )
-    ''')
-    
-    # Check if strategy_type exists (migration for existing db)
     try:
-        cursor.execute('SELECT strategy_type FROM bots LIMIT 1')
-    except sqlite3.OperationalError:
-        cursor.execute('ALTER TABLE bots ADD COLUMN strategy_type TEXT DEFAULT "MQL4"')
-        conn.commit()
+        conn = sqlite3.connect(DB_PATH, timeout=60.0, check_same_thread=False)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=60000")
+        cursor = conn.cursor()
+        
+        # Bots table: Stores configuration for each bot
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS bots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL,
+                strategy_type TEXT DEFAULT 'MQL4',
+                pair TEXT NOT NULL,
+                direction TEXT CHECK(direction IN ('LONG', 'SHORT')) NOT NULL,
+                rsi_limit REAL NOT NULL,
+                martingale_multiplier REAL NOT NULL,
+                base_size REAL NOT NULL,
+                config TEXT DEFAULT '{}',
+                is_active BOOLEAN DEFAULT 1
+            )
+        ''')
+        
+        # Check if strategy_type exists (migration for existing db)
+        try:
+            cursor.execute('SELECT strategy_type FROM bots LIMIT 1')
+        except sqlite3.OperationalError:
+            cursor.execute('ALTER TABLE bots ADD COLUMN strategy_type TEXT DEFAULT "MQL4"')
+            conn.commit()
 
-    # Check if config exists (migration for existing db)
-    try:
-        cursor.execute('SELECT config FROM bots LIMIT 1')
-    except sqlite3.OperationalError:
-        cursor.execute('ALTER TABLE bots ADD COLUMN config TEXT DEFAULT "{}"')
-        conn.commit()
-    
-    # Trades table: Tracks active positions and Martingale steps
-    # bot_id is a foreign key linked to bots.id
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS trades (
-            bot_id INTEGER PRIMARY KEY,
-            current_step INTEGER DEFAULT 0,
-            total_invested REAL DEFAULT 0,
-            avg_entry_price REAL DEFAULT 0,
-            target_tp_price REAL DEFAULT 0,
-            last_exit_price REAL DEFAULT 0,
-            last_exit_time INTEGER DEFAULT 0,
-            basket_start_time INTEGER DEFAULT 0,
-            FOREIGN KEY (bot_id) REFERENCES bots (id)
-        )
-    ''')
-    
-    # Migrations for new columns
-    try:
-        cursor.execute('SELECT last_exit_price FROM trades LIMIT 1')
-    except sqlite3.OperationalError:
-        cursor.execute('ALTER TABLE trades ADD COLUMN last_exit_price REAL DEFAULT 0')
-        cursor.execute('ALTER TABLE trades ADD COLUMN last_exit_time INTEGER DEFAULT 0')
-        conn.commit()
+        # Check if config exists (migration for existing db)
+        try:
+            cursor.execute('SELECT config FROM bots LIMIT 1')
+        except sqlite3.OperationalError:
+            cursor.execute('ALTER TABLE bots ADD COLUMN config TEXT DEFAULT "{}"')
+            conn.commit()
+        
+        # Trades table: Tracks active positions and Martingale steps
+        # bot_id is a foreign key linked to bots.id
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS trades (
+                bot_id INTEGER PRIMARY KEY,
+                current_step INTEGER DEFAULT 0,
+                total_invested REAL DEFAULT 0,
+                avg_entry_price REAL DEFAULT 0,
+                target_tp_price REAL DEFAULT 0,
+                last_exit_price REAL DEFAULT 0,
+                last_exit_time INTEGER DEFAULT 0,
+                basket_start_time INTEGER DEFAULT 0,
+                FOREIGN KEY (bot_id) REFERENCES bots (id)
+            )
+        ''')
+        
+        # Migrations for new columns
+        try:
+            cursor.execute('SELECT last_exit_price FROM trades LIMIT 1')
+        except sqlite3.OperationalError:
+            cursor.execute('ALTER TABLE trades ADD COLUMN last_exit_price REAL DEFAULT 0')
+            cursor.execute('ALTER TABLE trades ADD COLUMN last_exit_time INTEGER DEFAULT 0')
+            conn.commit()
 
-    # Migration for basket_start_time
-    try:
-        cursor.execute('SELECT basket_start_time FROM trades LIMIT 1')
-    except sqlite3.OperationalError:
-        cursor.execute('ALTER TABLE trades ADD COLUMN basket_start_time INTEGER DEFAULT 0')
-        conn.commit()
+        # Migration for basket_start_time
+        try:
+            cursor.execute('SELECT basket_start_time FROM trades LIMIT 1')
+        except sqlite3.OperationalError:
+            cursor.execute('ALTER TABLE trades ADD COLUMN basket_start_time INTEGER DEFAULT 0')
+            conn.commit()
 
-    # Migration for entry_confirmed
-    try:
-        cursor.execute('SELECT entry_confirmed FROM trades LIMIT 1')
-    except sqlite3.OperationalError:
-        cursor.execute('ALTER TABLE trades ADD COLUMN entry_confirmed BOOLEAN DEFAULT 0')
-        conn.commit()
-    
-    # Migration for order ID tracking (v0.4.1)
-    # Track exchange order IDs to support multiple bots on same pair
-    try:
-        cursor.execute('SELECT entry_order_id FROM trades LIMIT 1')
-    except sqlite3.OperationalError:
-        cursor.execute('ALTER TABLE trades ADD COLUMN entry_order_id TEXT')
-        cursor.execute('ALTER TABLE trades ADD COLUMN tp_order_id TEXT')
-        conn.commit()
+        # Migration for entry_confirmed
+        try:
+            cursor.execute('SELECT entry_confirmed FROM trades LIMIT 1')
+        except sqlite3.OperationalError:
+            cursor.execute('ALTER TABLE trades ADD COLUMN entry_confirmed BOOLEAN DEFAULT 0')
+            conn.commit()
+        
+        # Migration for order ID tracking (v0.4.1)
+        # Track exchange order IDs to support multiple bots on same pair
+        try:
+            cursor.execute('SELECT entry_order_id FROM trades LIMIT 1')
+        except sqlite3.OperationalError:
+            cursor.execute('ALTER TABLE trades ADD COLUMN entry_order_id TEXT')
+            cursor.execute('ALTER TABLE trades ADD COLUMN tp_order_id TEXT')
+            conn.commit()
 
-    # Migration for independent position tracking (v0.5.0)
-    # Each bot tracks its own position independently
-    # SQLite doesn't support adding UNIQUE columns directly, so we add without constraint
-    # The uniqueness is guaranteed by bot_id being the PRIMARY KEY of trades table
-    try:
-        cursor.execute('SELECT bot_position_id FROM trades LIMIT 1')
-    except sqlite3.OperationalError:
-        cursor.execute('ALTER TABLE trades ADD COLUMN bot_position_id TEXT')
-        conn.commit()
-    
-    # Add close_type column (single column, no UNIQUE)
-    try:
-        cursor.execute('SELECT close_type FROM trades LIMIT 1')
-    except sqlite3.OperationalError:
-        cursor.execute('ALTER TABLE trades ADD COLUMN close_type TEXT DEFAULT NULL')
-        conn.commit()
-    
-    # Migration for manual close percentage in config
-    try:
-        cursor.execute('SELECT manual_close_pct FROM bots LIMIT 1')
-    except sqlite3.OperationalError:
-        cursor.execute("ALTER TABLE bots ADD COLUMN manual_close_pct REAL DEFAULT 100.0")
-        conn.commit()
+        # Migration for independent position tracking (v0.5.0)
+        # Each bot tracks its own position independently
+        # SQLite doesn't support adding UNIQUE columns directly, so we add without constraint
+        # The uniqueness is guaranteed by bot_id being the PRIMARY KEY of trades table
+        try:
+            cursor.execute('SELECT bot_position_id FROM trades LIMIT 1')
+        except sqlite3.OperationalError:
+            cursor.execute('ALTER TABLE trades ADD COLUMN bot_position_id TEXT')
+            conn.commit()
+        
+        # Add close_type column (single column, no UNIQUE)
+        try:
+            cursor.execute('SELECT close_type FROM trades LIMIT 1')
+        except sqlite3.OperationalError:
+            cursor.execute('ALTER TABLE trades ADD COLUMN close_type TEXT DEFAULT NULL')
+            conn.commit()
+        
+        # Migration for manual close percentage in config
+        try:
+            cursor.execute('SELECT manual_close_pct FROM bots LIMIT 1')
+        except sqlite3.OperationalError:
+            cursor.execute("ALTER TABLE bots ADD COLUMN manual_close_pct REAL DEFAULT 100.0")
+            conn.commit()
 
-    # Create separate table for grid orders (each step can have an order)
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS bot_orders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            bot_id INTEGER NOT NULL,
-            step INTEGER NOT NULL,
-            order_type TEXT NOT NULL,  -- 'entry', 'tp', 'grid'
-            order_id TEXT,  -- Exchange order ID
-            price REAL,
-            amount REAL,
-            status TEXT DEFAULT 'open',  -- 'open', 'filled', 'cancelled'
-            created_at INTEGER DEFAULT 0,
-            filled_at INTEGER DEFAULT 0,
-            FOREIGN KEY (bot_id) REFERENCES bots (id)
-        )
-    ''')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_bot_orders_bot ON bot_orders(bot_id)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_bot_orders_order_id ON bot_orders(order_id)')
+        # Create separate table for grid orders (each step can have an order)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS bot_orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bot_id INTEGER NOT NULL,
+                step INTEGER NOT NULL,
+                order_type TEXT NOT NULL,  -- 'entry', 'tp', 'grid'
+                order_id TEXT,  -- Exchange order ID
+                price REAL,
+                amount REAL,
+                status TEXT DEFAULT 'open',  -- 'open', 'filled', 'cancelled'
+                created_at INTEGER DEFAULT 0,
+                filled_at INTEGER DEFAULT 0,
+                FOREIGN KEY (bot_id) REFERENCES bots (id)
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_bot_orders_bot ON bot_orders(bot_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_bot_orders_order_id ON bot_orders(order_id)')
+        
+        # Trade history table: Permanent log of all trades for post-mortem analysis
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS trade_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bot_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                price REAL NOT NULL,
+                amount REAL NOT NULL,
+                cost_usdc REAL DEFAULT 0,
+                order_id TEXT,
+                step INTEGER DEFAULT 0,
+                pnl REAL DEFAULT 0,
+                timestamp INTEGER NOT NULL,
+                notes TEXT,
+                FOREIGN KEY (bot_id) REFERENCES bots (id)
+            )
+        ''')
+        
+        # Index for faster queries by bot and time
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_trade_history_bot ON trade_history(bot_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_trade_history_time ON trade_history(timestamp)')
+        
+        conn.commit()
+    except Exception as e:
+        # Handle WinError 233 (Pipe broken) or database locked - non-fatal
+        # This prevents Streamlit crash on reload
+        try:
+            logger.warning(f"Database init warning (non-fatal): {e}")
+        except:
+            pass  # Logger itself might be broken
+        return  # Exit gracefully
+    finally:
+        try:
+            conn.close()
+        except:
+            pass
     
-    # Trade history table: Permanent log of all trades for post-mortem analysis
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS trade_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            bot_id INTEGER NOT NULL,
-            action TEXT NOT NULL,
-            symbol TEXT NOT NULL,
-            price REAL NOT NULL,
-            amount REAL NOT NULL,
-            cost_usdc REAL DEFAULT 0,
-            order_id TEXT,
-            step INTEGER DEFAULT 0,
-            pnl REAL DEFAULT 0,
-            timestamp INTEGER NOT NULL,
-            notes TEXT,
-            FOREIGN KEY (bot_id) REFERENCES bots (id)
-        )
-    ''')
-    
-    # Index for faster queries by bot and time
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_trade_history_bot ON trade_history(bot_id)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_trade_history_time ON trade_history(timestamp)')
-    
-    conn.commit()
-    conn.close()
-    print(f"Database initialized at {DB_PATH}")
+    try:
+        logger.info(f"Database initialized at {DB_PATH}")
+    except Exception: 
+        pass
 
 def add_bot(name, pair, direction, rsi_limit, martingale_multiplier, base_size, strategy_type="Martingale", config_dict=None):
     """Adds a new bot and initializes its trade state."""
     if config_dict is None:
         config_dict = {}
     
-    import json
     config_json = json.dumps(config_dict)
 
     conn = get_connection()
@@ -223,7 +247,7 @@ def add_bot(name, pair, direction, rsi_limit, martingale_multiplier, base_size, 
         conn.commit()
         return bot_id
     except sqlite3.IntegrityError:
-        print(f"Error: Bot name '{name}' already exists.")
+        logger.warning(f"Error: Bot name '{name}' already exists.")
         return None
     # Note: No conn.close() - using thread-local connection
 
@@ -238,7 +262,6 @@ def get_bot_params(bot_id):
 
 def update_bot(bot_id, name, pair, direction, rsi_limit, martingale_multiplier, base_size, strategy_type, config_dict):
     """Updates an existing bot configuration."""
-    import json
     config_json = json.dumps(config_dict)
     
     conn = get_connection()
@@ -254,16 +277,15 @@ def update_bot(bot_id, name, pair, direction, rsi_limit, martingale_multiplier, 
         conn.commit()
         return True
     except sqlite3.IntegrityError:
-        print(f"Error: Bot name '{name}' already exists.")
+        logger.warning(f"Error: Bot name '{name}' already exists.")
         return False
     except Exception as e:
-        print(f"Error updating bot {bot_id}: {e}")
+        logger.error(f"Error updating bot {bot_id}: {e}")
         return False
     # Note: No conn.close() - using thread-local connection
 
 def update_martingale_step(bot_id, next_step, added_investment, new_avg_price, new_tp_price):
     """Updates the active position stats when a new Martingale step is triggered."""
-    import time
     conn = get_connection()
     cursor = conn.cursor()
     
@@ -320,19 +342,15 @@ def deactivate_bot(bot_id, reason="Unknown Error"):
         
         conn.commit()
         # Note: No conn.close() - using thread-local connection
-        print(f"Bot {bot_id} deactivated: {reason}")
+        logger.info(f"Bot {bot_id} deactivated: {reason}")
         return True
     except Exception as e:
-        print(f"Failed to deactivate bot {bot_id}: {e}")
+        logger.error(f"Failed to deactivate bot {bot_id}: {e}")
         return False
 
 def reset_bot_after_tp(bot_id, exit_price=0):
     """Resets the trade stats after a Take Profit (TP) hit, saving exit metadata.
     IMPROVED: Now logs to trade_history with PnL calculation."""
-    import time
-    import logging
-    logger = logging.getLogger("Database")
-
     conn = get_connection()
     cursor = conn.cursor()
 
@@ -473,27 +491,14 @@ def delete_bot(bot_id):
         conn.commit()
         return True
     except Exception as e:
-        print(f"Error deleting bot {bot_id}: {e}")
+        logger.error(f"Error deleting bot {bot_id}: {e}")
         return False
     # Note: No conn.close() - using thread-local connection
 
 def log_trade(bot_id, action, symbol, price, amount, cost_usdc=0.0, order_id=None, step=0, pnl=0.0, notes=None):
     """
     Logs a trade to the permanent trade_history table for post-mortem analysis.
-    
-    Args:
-        bot_id: The bot that executed this trade
-        action: 'BUY', 'SELL', 'TP_HIT', 'HEDGE_OPEN', 'HEDGE_CLOSE', 'STOP_LOSS'
-        symbol: Trading pair (e.g., 'BTC/USDC')
-        price: Execution price
-        amount: Position size in base currency
-        cost_usdc: Total cost in USDC
-        order_id: Exchange order ID (optional)
-        step: Martingale step number
-        pnl: Realized PnL for closing trades
-        notes: Additional context (optional)
     """
-    import time
     conn = get_connection()
     cursor = conn.cursor()
     try:
@@ -505,20 +510,13 @@ def log_trade(bot_id, action, symbol, price, amount, cost_usdc=0.0, order_id=Non
         conn.commit()
         return cursor.lastrowid
     except Exception as e:
-        print(f"Error logging trade for bot {bot_id}: {e}")
+        logger.error(f"Error logging trade for bot {bot_id}: {e}")
         return None
     # Note: No conn.close() - using thread-local connection
 
 def get_trade_history(bot_id=None, limit=100):
     """
     Fetches trade history for analysis.
-    
-    Args:
-        bot_id: Filter by bot (None = all bots)
-        limit: Max records to return
-    
-    Returns:
-        List of trade records
     """
     conn = get_connection()
     cursor = conn.cursor()
@@ -578,16 +576,7 @@ def get_bot_pnl_summary(bot_id):
 def save_bot_order(bot_id, order_type, order_id, price, amount, step=0):
     """
     Save an exchange order ID to track which bot owns which order.
-
-    Args:
-        bot_id: The bot that placed the order
-        order_type: 'entry', 'tp', 'grid'
-        order_id: The exchange order ID
-        price: Order price
-        amount: Order amount
-        step: Martingale step number (default 0 for entry)
     """
-    import time
     conn = get_connection()
     cursor = conn.cursor()
 
@@ -647,13 +636,7 @@ def get_bot_order_ids(bot_id):
 def update_order_status(order_id, status, filled_price=None):
     """
     Update order status in bot_orders table.
-    
-    Args:
-        order_id: The exchange order ID
-        status: 'open', 'filled', 'cancelled'
-        filled_price: Price if filled
     """
-    import time
     conn = get_connection()
     cursor = conn.cursor()
     
@@ -676,9 +659,6 @@ def get_bots_by_order_id(order_id):
     """
     Find which bot(s) own a specific order ID.
     
-    Args:
-        order_id: The exchange order ID
-        
     Returns:
         List of bot IDs that own this order
     """
@@ -727,7 +707,7 @@ def match_exchange_orders_to_bots(exchange_orders):
         
         if bots:
             # Get first bot's name
-            from .database import get_connection
+            # Reuse get_connection from module scope
             conn = get_connection()
             cursor = conn.cursor()
             cursor.execute('SELECT name FROM bots WHERE id = ?', (bots[0]['bot_id'],))
@@ -756,9 +736,6 @@ def match_exchange_orders_to_bots(exchange_orders):
 # BOT POSITION MANAGEMENT (v0.5.0)
 # Each bot tracks its own position independently
 # ============================================
-
-import uuid
-import json
 
 def generate_bot_position_id():
     """Generate a unique ID for this bot's position tracking"""
@@ -803,8 +780,6 @@ def close_bot_position(bot_id, close_type='MANUAL', close_price=0.0, close_pct=1
     Returns:
         dict with details of the close action
     """
-    import time
-    
     conn = get_connection()
     cursor = conn.cursor()
     
@@ -945,7 +920,7 @@ def update_bot_close_settings(bot_id, manual_close_pct=None, stop_after_pnl=None
         config_dict['stop_after_time'] = stop_after_time
     
     # Update bot with new config
-    from .database import update_bot
+    # Reuse update_bot from module scope
     return update_bot(
         bot_id=bot_id,
         name=params[0],
@@ -1001,6 +976,7 @@ def check_stop_after_conditions(bot_id, current_pnl, hours_in_trade):
 
 if __name__ == "__main__":
     # Self-test block
+    logging.basicConfig(level=logging.INFO)
     init_db()
     
     # Test: Create a bot

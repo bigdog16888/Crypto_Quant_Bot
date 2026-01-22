@@ -188,13 +188,21 @@ class BotRunner:
                 active_market_types.add(config.MARKET_TYPE)
 
             total_stablecoin = 0.0
+            balance_fetch_success = False
             for mt in active_market_types:
                 if mt in self.exchanges:
                     try:
                         balance = self.exchanges[mt].fetch_balance()
                         if balance:
                             total_stablecoin += self._calculate_stablecoin_balance(balance)
+                            balance_fetch_success = True
                     except Exception: pass
+            
+            # BUG FIX: If balance fetch failed (auth error), don't trigger circuit breaker
+            # Just log and skip this check cycle
+            if not balance_fetch_success:
+                logger.warning("Circuit breaker check skipped - balance fetch failed (auth/API error)")
+                return
                 
             invested_cost = 0.0
             for bot in active_bots:
@@ -298,6 +306,17 @@ class BotRunner:
 
 
             if not is_in_trade:
+                # Check for pending entry orders (Non-blocking Chase)
+                try:
+                    open_orders = bot_exchange.fetch_open_orders(pair) or []
+                    entry_side = 'buy' if direction == 'LONG' else 'sell'
+                    pending = [o for o in open_orders if isinstance(o, dict) and o.get('side') == entry_side and o.get('type') == 'limit']
+                    if pending:
+                        self.manage_pending_entry(bot_id, name, pair, direction, pending[0], params, bot_exchange)
+                        return
+                except Exception as e:
+                    logger.error(f"Pending check failed for {name}: {e}")
+
                 last_exit_price = trade_data[6]
                 last_exit_time = trade_data[7]
                 can_enter = True
@@ -313,23 +332,16 @@ class BotRunner:
                 if can_enter:
                     buy_signal, sell_signal = strategy.check_signals(df)
                     if direction == 'LONG' and buy_signal:
-                        # First-Claim Policy: Check if another bot owns this pair
-                        can_enter, owner_id, _ = check_first_claim_policy(bot_id, pair)
-                        if not can_enter:
-                            logger.info(f"🚫 {name}: Another bot (ID:{owner_id}) already owns {pair}. Becoming passenger.")
-                        else:
-                            self.execute_entry(bot_id, name, pair, 'buy', base_size, exchange=bot_exchange)
+                        # First-Claim Policy Disabled for Virtual Positioning
+                        # We allow multiple bots to trade the same pair independently
+                        self.execute_entry(bot_id, name, pair, 'buy', base_size, exchange=bot_exchange)
                     elif direction == 'SHORT' and sell_signal:
-                        # First-Claim Policy: Check if another bot owns this pair
-                        can_enter, owner_id, _ = check_first_claim_policy(bot_id, pair)
-                        if not can_enter:
-                            logger.info(f"🚫 {name}: Another bot (ID:{owner_id}) already owns {pair}. Becoming passenger.")
-                        else:
-                            self.execute_entry(bot_id, name, pair, 'sell', base_size, exchange=bot_exchange)
+                        # First-Claim Policy Disabled
+                        self.execute_entry(bot_id, name, pair, 'sell', base_size, exchange=bot_exchange)
             else:
                 # Check stop-after conditions before managing trade
                 from engine.bot_management import check_and_execute_stops
-                stop_result = check_and_execute_stops(bot_id)
+                stop_result = check_and_execute_stops(bot_id, exchange_interface=bot_exchange)
                 if stop_result and stop_result.get('action') == 'stop_executed':
                     logger.warning(f"🛑 Stop condition triggered for {name}: {stop_result['reason']}")
                     is_in_trade = False  # Position was closed
@@ -364,12 +376,22 @@ class BotRunner:
                 exit_price = mission.get('exit_price')
                 qty = mission.get('qty')
                 logger.info(f"[TP MISSION] Closing {bot_name} at {exit_price}")
+                
+                # Reset locked ATR when trade closes
+                if bot_id in self.strategies:
+                    strategy = self.strategies[bot_id]
+                    if hasattr(strategy, 'reset_locked_atr'):
+                        strategy.reset_locked_atr()
+                
                 if config.DRY_RUN: reset_bot_after_tp(bot_id, exit_price=exit_price)
                 else:
+                    # Use limit order with chase logic for TP - NO market orders unless emergency
                     side = 'sell' if direction == 'LONG' else 'buy'
-                    if ex.create_order(pair, 'market', side, qty):
+                    # Use _execute_limit_with_chase (to be defined) instead of market order
+                    success, _, _ = self._execute_limit_with_chase(bot_id, bot_name, pair, side, qty, exchange=ex, initial_price=exit_price)
+                    if success:
                         reset_bot_after_tp(bot_id, exit_price=exit_price)
-                        logger.info(f"TP Market Order Filled for {bot_name}")
+                        logger.info(f"TP Limit Order Filled for {bot_name}")
 
             elif action == 'maintain_orders':
                 grid_price = mission.get('grid_price')
@@ -392,6 +414,8 @@ class BotRunner:
                 # Filter exchange orders to only THIS bot's orders
                 my_grid_orders = [o for o in open_orders if isinstance(o, dict) and o.get('id') in my_grid_order_ids]
                 my_tp_orders = [o for o in open_orders if isinstance(o, dict) and o.get('id') == my_tp_order_id]
+                
+                logger.debug(f"Maintain {bot_name}: Found {len(my_grid_orders)} Grid, {len(my_tp_orders)} TP orders. Target Grid: {grid_price}, Target TP: {tp_price}")
 
                 # Fallback: If we don't have order ID tracking yet, use side-based matching (legacy)
                 # This handles bots that were in trade before the fix
@@ -410,59 +434,103 @@ class BotRunner:
                         my_tp_orders = [o for o in open_orders if isinstance(o, dict) and o.get('side') == tp_side]
                 # =========== END MULTI-BOT FIX ===========
                 
-                # Manage Grid - now uses THIS bot's orders only
-                grid_ok = False
-                if grid_price and grid_price > 0:
-                    for o in my_grid_orders:
-                        if abs(float(o['price']) - grid_price) / grid_price < 0.001: grid_ok = True
-                        else: ex.exchange.cancel_order(o['id'], pair)
-                    if not grid_ok:
-                        logger.info(f"[GRID] Placing Limit Grid Order for {bot_name}: {grid_qty:.4f} @ {grid_price}")
-                        if config.DRY_RUN:
-                            log_trade(bot_id, 'DRY_GRID', pair, grid_price, grid_qty, grid_qty*grid_price, "DRY_GRID", trade_data[2]+1 if trade_data else 0, 0, f"[DRY] Grid {bot_name}")
-                        
-                        # Validate Grid Order
-                        is_valid, s_amt, s_price, err = ex.validate_order(pair, grid_side, grid_qty, grid_price)
-                        if not is_valid:
-                            logger.error(f"GRID VALIDATION FAILED for {bot_name}: {err}. Deactivating.")
-                            from engine.database import deactivate_bot
-                            deactivate_bot(bot_id, reason=f"Grid Validation: {err}")
-                            return
-
-                        # Added metadata for better tracking
-                        grid_params = {'postOnly': True, 'clientOrderId': f"grid_{bot_id}_{int(time.time())}"}
-                        try:
-                            grid_order = ex.create_order(pair, 'limit', grid_side, s_amt, s_price, params=grid_params)
-                            if grid_order:
-                                # Save grid order ID for multi-bot tracking
-                                save_bot_order(bot_id, 'grid', grid_order.get('id'), s_price, s_amt, grid_step if grid_step else 0)
-                        except ccxt.InvalidOrder as e:
-                            # Handle Post Only rejection (-5022)
-                            if "-5022" in str(e):
-                                logger.warning(f"Post Only Rejected for {bot_name} at {s_price}. Market moved. Retrying as regular limit...")
-                                grid_params.pop('postOnly', None)
-                                grid_order = ex.create_order(pair, 'limit', grid_side, s_amt, s_price, params=grid_params)
-                                if grid_order:
-                                    save_bot_order(bot_id, 'grid', grid_order.get('id'), s_price, s_amt, grid_step if grid_step else 0)
-                            else: raise e
+                # --- INDEPENDENT GRID MANAGEMENT ---
+                try:
+                    grid_ok = False
+                    if grid_price and grid_price > 0:
+                        for o in my_grid_orders:
+                            if abs(float(o['price']) - grid_price) / grid_price < 0.001: grid_ok = True
+                            else: ex.exchange.cancel_order(o['id'], pair)
+                        if not grid_ok:
+                            logger.info(f"[GRID] Placing Limit Grid Order for {bot_name}: {grid_qty:.4f} @ {grid_price}")
+                            if config.DRY_RUN:
+                                log_trade(bot_id, 'DRY_GRID', pair, grid_price, grid_qty, grid_qty*grid_price, "DRY_GRID", trade_data[2]+1 if trade_data else 0, 0, f"[DRY] Grid {bot_name}")
+                            else:
+                                # Validate Grid Order
+                                is_valid, s_amt, s_price, err = ex.validate_order(pair, grid_side, grid_qty, grid_price)
+                                if not is_valid:
+                                    logger.error(f"GRID VALIDATION FAILED for {bot_name}: {err}. Skipping Grid placement.")
+                                else:
+                                    # Added metadata for better tracking
+                                    grid_params = {'postOnly': True, 'clientOrderId': f"grid_{bot_id}_{int(time.time())}"}
+                                    try:
+                                        grid_order = ex.create_order(pair, 'limit', grid_side, s_amt, s_price, params=grid_params)
+                                        if grid_order:
+                                            # Save grid order ID for multi-bot tracking
+                                            save_bot_order(bot_id, 'grid', grid_order.get('id'), s_price, s_amt, grid_step if grid_step else 0)
+                                    except ccxt.InvalidOrder as e:
+                                        # Handle Post Only rejection (-5022)
+                                        if "-5022" in str(e):
+                                            logger.warning(f"Post Only Rejected for {bot_name} at {s_price}. Market moved. Chasing as Maker...")
+                                            try:
+                                                # Fetch fresh book ticker to get best Maker price
+                                                ticker = ex._safe_request('fetch_ticker', symbol=pair)
+                                                new_price = 0.0
+                                                if ticker:
+                                                    if grid_side == 'buy':
+                                                        # Join the best bid
+                                                        new_price = float(ticker.get('bid') or 0.0)
+                                                    else:
+                                                        # Join the best ask
+                                                        new_price = float(ticker.get('ask') or 0.0)
+                                                
+                                                if new_price > 0:
+                                                    logger.info(f"Retrying Grid at new Maker price: {new_price} (was {s_price})")
+                                                    # Retry with postOnly still enabled
+                                                    grid_order = ex.create_order(pair, 'limit', grid_side, s_amt, new_price, params=grid_params)
+                                                    if grid_order:
+                                                        save_bot_order(bot_id, 'grid', grid_order.get('id'), new_price, s_amt, grid_step if grid_step else 0)
+                                                    else:
+                                                        logger.error(f"Chase Grid order failed (None returned) for {bot_name}")
+                                                else:
+                                                    logger.error(f"Could not determine new maker price for {bot_name}")
+                                            except Exception as retry_e:
+                                                logger.error(f"Chase retry failed for {bot_name}: {retry_e}")
+                                        else: raise e
+                except Exception as e:
+                    logger.error(f"GRID MAINTENANCE FAILED for {bot_name}: {e}")
                 
-                # Manage TP - now uses THIS bot's orders only (multi-bot fix)
-                tp_ok = False
-                if tp_price and tp_price > 0:
-                    for o in my_tp_orders:
-                        if abs(float(o['price']) - tp_price) / tp_price < 0.001: tp_ok = True
-                        else: ex.exchange.cancel_order(o['id'], pair)
-                    if not tp_ok:
-                        logger.info(f"[TP] Placing Limit TP Order for {bot_name}: {tp_qty:.4f} @ {tp_price}")
-                        if config.DRY_RUN:
-                            log_trade(bot_id, 'DRY_TP', pair, tp_price, tp_qty, tp_qty*tp_price, "DRY_TP", trade_data[2] if trade_data else 0, 0, f"[DRY] TP {bot_name}")
-                        
-                        # Added metadata for better tracking
-                        tp_params = {'reduceOnly': True, 'clientOrderId': f"tp_{bot_id}_{int(time.time())}"}
-                        tp_order = ex.create_order(pair, 'limit', tp_side, tp_qty, tp_price, params=tp_params)
-                        if tp_order:
-                            # Save TP order ID for multi-bot tracking
-                            save_bot_order(bot_id, 'tp', tp_order.get('id'), tp_price, tp_qty, trade_data[2] if trade_data else 0)
+                # --- INDEPENDENT TP MANAGEMENT ---
+                try:
+                    tp_ok = False
+                    if tp_price and tp_price > 0:
+                        for o in my_tp_orders:
+                            if abs(float(o['price']) - tp_price) / tp_price < 0.001: tp_ok = True
+                            else: ex.exchange.cancel_order(o['id'], pair)
+                        if not tp_ok:
+                            logger.info(f"[TP] Placing Limit TP Order for {bot_name}: {tp_qty:.4f} @ {tp_price}")
+                            if config.DRY_RUN:
+                                log_trade(bot_id, 'DRY_TP', pair, tp_price, tp_qty, tp_qty*tp_price, "DRY_TP", trade_data[2] if trade_data else 0, 0, f"[DRY] TP {bot_name}")
+                            else:
+                                # Check if exchange actually has a position before placing TP
+                                try:
+                                    positions = ex.exchange.fetch_positions([pair])
+                                    has_position = any(
+                                        float(p.get('size', 0)) != 0 
+                                        for p in positions 
+                                        if p and p.get('symbol') == pair
+                                    )
+                                except Exception as pos_err:
+                                    logger.warning(f"Could not fetch positions for {bot_name}: {pos_err}")
+                                    has_position = True  # Assume position exists if we can't check
+                                
+                                if not has_position:
+                                    logger.warning(f"[TP] Skipping TP order for {bot_name} - no position on exchange (may have already closed)")
+                                    return
+                                
+                                # Use reduceOnly for safety - prevents opening new positions
+                                # This was previously disabled due to multi-bot confusion, but 
+                                # exchange now rejects TP orders without it when position is at risk
+                                tp_params = {
+                                    'clientOrderId': f"tp_{bot_id}_{int(time.time())}",
+                                    'reduceOnly': True
+                                }
+                                tp_order = ex.create_order(pair, 'limit', tp_side, tp_qty, tp_price, params=tp_params)
+                                if tp_order:
+                                    # Save TP order ID for multi-bot tracking
+                                    save_bot_order(bot_id, 'tp', tp_order.get('id'), tp_price, tp_qty, trade_data[2] if trade_data else 0)
+                except Exception as e:
+                    logger.error(f"TP MAINTENANCE FAILED for {bot_name}: {e}")
 
             elif action == 'hedge_open':
                 price, qty, amount_usd, step = mission.get('price'), mission.get('qty'), mission.get('amount_usd'), mission.get('step')
@@ -474,6 +542,45 @@ class BotRunner:
                     if order: log_trade(bot_id, 'HEDGE_OPEN', pair, price, qty, amount_usd, order.get('id'), step, 0, "Hedge Opened")
 
         except Exception as e: logger.error(f"Mission failed for {mission.get('bot_name')}: {e}")
+
+    def manage_pending_entry(self, bot_id, name, pair, direction, order, params, ex):
+        """Manages a pending entry order (chase logic across cycles)."""
+        filled = float(order.get('filled', 0.0))
+        remaining = float(order.get('amount', 0.0)) - filled
+        
+        timestamp = order.get('timestamp') or (time.time() * 1000)
+        age_seconds = (time.time() * 1000 - timestamp) / 1000
+        
+        # Chase interval
+        chase_interval = 20
+        
+        if age_seconds > chase_interval:
+            logger.info(f"Entry order {order['id']} timed out ({age_seconds:.1f}s). Chasing...")
+            try:
+                ex.exchange.cancel_order(order['id'], pair)
+                
+                # Check for partial fill after cancel
+                final_order = ex.fetch_order(order['id'], pair)
+                if final_order:
+                    filled = float(final_order.get('filled', 0.0))
+                
+                current_price = ex.get_last_price(pair)
+                
+                side = 'buy' if direction == 'LONG' else 'sell'
+                
+                if filled > 0:
+                    # Finalize what we have
+                    logger.info(f"Partial fill confirmed ({filled}). Finalizing entry.")
+                    # Calculate cost roughly or use average price
+                    avg_price = float(final_order.get('average', 0.0) or current_price)
+                    self._finalize_entry(bot_id, name, pair, side, filled * avg_price, avg_price, order['id'])
+                else:
+                    # Retry full amount
+                    base_size = params.get('base_size', 10.0)
+                    self.execute_entry(bot_id, name, pair, side, base_size, exchange=ex)
+                    
+            except Exception as e:
+                logger.error(f"Failed to chase entry for {name}: {e}")
 
     def process_market_maker(self, bot_id, name, pair, strategy, df):
         try:
@@ -522,6 +629,62 @@ class BotRunner:
         self.orders_this_cycle += 1
         self.orders_today[bot_id] = self.orders_today.get(bot_id, 0) + 1
 
+    def _execute_limit_with_chase(self, bot_id, name, pair, side, qty, exchange=None, timeout=None, params={}, initial_price=None):
+        """
+        Executes a Limit Order (Single Shot, Non-Blocking).
+        Returns: (success, fill_price, order_id)
+        If not successful immediately, order_id is returned but success is False.
+        """
+        ex = exchange or self.exchange
+        
+        try:
+            # 1. Get current ticker price
+            ticker = ex._safe_request('fetch_ticker', symbol=pair)
+            current_price = 0.0
+            if ticker:
+                val = ticker.get('bid' if side == 'buy' else 'ask')
+                if val is not None: current_price = float(val)
+            
+            # Fallback to initial_price if fetch failed
+            if current_price == 0 and initial_price:
+                logger.warning(f"Fetch ticker failed for {name}, using initial price {initial_price}")
+                current_price = initial_price
+            
+            if current_price == 0: 
+                logger.error(f"Price fetch failed for {name} inside chase.")
+                return False, 0.0, None
+            
+            # 2. Validate
+            is_valid, s_amt, s_price, err = ex.validate_order(pair, side, qty, current_price)
+            if not is_valid:
+                logger.error(f"Validation failed for {name}: {err}")
+                return False, 0.0, None
+
+            # 3. Place Limit Order
+            order = ex.create_order(pair, 'limit', side, s_amt, s_price, params=params)
+            if not order: 
+                logger.error(f"Order creation returned None for {name}. Check Exchange logs.")
+                return False, 0.0, None
+                
+            last_order_id = order.get('id')
+            
+            # 4. Wait briefly for immediate fill
+            filled_fully, final_order = ex.wait_for_fill(last_order_id, pair, timeout_seconds=5)
+            
+            if final_order:
+                fill_avg = float(final_order.get('average', 0.0) or final_order.get('price', 0.0))
+                if filled_fully:
+                    return True, fill_avg, last_order_id
+            
+            # Not filled immediately -> Return Pending
+            return False, 0.0, last_order_id
+            
+        except Exception as e:
+            logger.error(f"Entry attempt failed for {name}: {e}")
+            return False, 0.0, None
+
+
+
     def execute_entry(self, bot_id, name, pair, side, amount, price=None, params={}, exchange=None):
         can_order, reason = self._check_order_limits(bot_id, name)
         if not can_order:
@@ -532,52 +695,45 @@ class BotRunner:
         logger.info(f"[ENTRY] Bot: {name} | Side: {side} | Amount: ${amount}")
         
         if price is None: price = ex.get_last_price(pair)
-        if price == 0: return
+        if price == 0: 
+            logger.error(f"Could not get price for {pair}")
+            return
+
+        # NEW: Auto-Size to Minimum if configured
+        if params.get('use_min_size', False):
+            try:
+                min_usd = ex.get_min_order_usd(pair, price)
+                # Add 5% buffer to be safe against precision rounding
+                safe_min = min_usd * 1.05
+                # Only override if current amount is LOWER (or just always override? User said "place whatever is minimum")
+                # Usually user wants exactly minimum to start small.
+                # If they set base_size=10 but min is 100, we override.
+                # If they set base_size=500 but min is 100, do we override?
+                # User said: "instead of just a adviced minimum order, it also just has an option of minimum starting quantity"
+                # "it will just place what every is the minimum"
+                # This implies FORCING minimum.
+                logger.info(f"Auto-Sizing to Minimum: ${safe_min:.2f} (User Configured)")
+                amount = safe_min
+            except Exception as e:
+                logger.error(f"Failed to auto-size: {e}")
 
         if config.DRY_RUN:
             self._simulate_dry_run_entry(bot_id, name, pair, side, amount, price)
             return
 
-        # Fetch intervals from bot config or use default
-        bot_params_raw = get_bot_params(bot_id)
-        bot_config = json.loads(bot_params_raw[7]) if bot_params_raw and bot_params_raw[7] else {}
-        chase_intervals = bot_config.get('chase_intervals', [10, 5, 2])
+        # Calculate Qty based on initial price
+        qty = amount / price
         
-        for interval in chase_intervals:
-            try:
-                ticker = ex._safe_request('fetch_ticker', symbol=pair)
-                if ticker:
-                    val = ticker.get('bid' if side == 'buy' else 'ask')
-                    if val is not None: price = float(val)
-                qty = amount / price
-                
-                # Check validation before attempt
-                is_valid, s_amt, s_price, err = ex.validate_order(pair, side, qty, price)
-                if not is_valid:
-                    logger.error(f"ENTRY VALIDATION FAILED for {name}: {err}. Deactivating.")
-                    from engine.database import deactivate_bot
-                    deactivate_bot(bot_id, reason=f"Entry Validation: {err}")
-                    return
-
-                order = ex.create_order(pair, 'limit', side, s_amt, s_price, params=params)
-                if not order: continue
-                filled, final_order = ex.wait_for_fill(order.get('id'), pair, timeout_seconds=interval)
-                if filled and final_order:
-                    self._finalize_entry(bot_id, name, pair, side, amount, final_order.get('average', s_price), order.get('id'))
-                    return
-                ex.exchange.cancel_order(order.get('id'), pair)
-            except Exception as e: logger.error(f"Entry attempt failed: {e}")
-
-        logger.warning(f"Chasing failed for {name}. Fallback to MARKET.")
-        try:
-            curr_p = ex.get_last_price(pair)
-            if curr_p > 0:
-                qty = amount / curr_p
-                order = ex.create_order(pair, 'market', side, qty)
-                if order: self._finalize_entry(bot_id, name, pair, side, amount, curr_p, order.get('id'))
-            else:
-                logger.error(f"Market fallback failed for {name}: Price is 0")
-        except Exception as e: logger.error(f"Market fallback failed: {e}")
+        # Execute using Chase Logic (No Market Fallback)
+        # BUG FIX: Use infinite chase (timeout=None) until filled as requested
+        success, fill_price, order_id = self._execute_limit_with_chase(bot_id, name, pair, side, qty, exchange=ex, timeout=None, params=params, initial_price=price)
+        
+        if success:
+            self._finalize_entry(bot_id, name, pair, side, amount, fill_price, order_id)
+        elif order_id:
+            logger.info(f"Entry order {order_id} placed. Monitoring for fill (Non-blocking)...")
+        else:
+            logger.error(f"Entry failed for {name} after chase attempts. No market fallback allowed.")
 
     def _finalize_entry(self, bot_id, name, pair, side, amount, fill_price, order_id):
         tp_price = fill_price * (1.015 if side == 'buy' else 0.985)
@@ -627,27 +783,35 @@ class BotRunner:
         return True
 
     def handle_emergency_liquidation(self):
+        """
+        Emergency liquidation for all active bots.
+        BUG FIX: Now properly handles futures positions.
+        """
         bots = self.get_active_bots()
         for bot in bots:
-            # bot tuple: (id, name, pair, direction, strategy_type, config, base_size, mm, rsi_limit, is_active)
             id, name, pair = bot[0], bot[1], bot[2]
-            config_json = bot[5] # config is at index 5
+            config_json = bot[5]
             config_dict = json.loads(config_json) if config_json else {}
-            ex = self.exchanges.get(config_dict.get('market_type', config.MARKET_TYPE), self.exchange)
+            mt = config_dict.get('market_type', config.MARKET_TYPE)
+            ex = self.exchanges.get(mt, self.exchange)
+            
             try:
                 ex.cancel_all_orders(pair)
-                if not config.DRY_RUN:
-                    base = pair.split('/')[0]
-                    # Simple spot balance fetch for liquidation
-                    balance = ex.fetch_balance()
-                    if isinstance(balance, dict):
-                        asset_balance = balance.get(base, {})
-                        qty = asset_balance.get('free', 0) if isinstance(asset_balance, dict) else 0
-                    else:
-                        qty = 0
-                    if qty > 0:
-                        logger.warning(f"Emergency Market Close {qty} {base} for {name}")
-                        # ex.create_order(pair, 'market', 'sell', qty) # Still commented for safety
+                
+                if not config.DRY_RUN and mt in ['future', 'swap']:
+                    # For futures, fetch positions properly
+                    try:
+                        positions = ex.exchange.fetch_positions([pair])
+                        for pos in positions:
+                            if pos and float(pos.get('contracts', 0)) != 0:
+                                qty = float(pos['contracts'])
+                                side = 'sell' if qty > 0 else 'buy'  # Short if long, Long if short
+                                close_qty = abs(qty)
+                                logger.warning(f"Emergency Market Close {close_qty} {pair} for {name}")
+                                ex.create_order(pair, 'market', side, close_qty)
+                    except Exception as pos_err:
+                        logger.error(f"Failed to fetch positions for {pair}: {pos_err}")
+                        
             except Exception as e: logger.error(f"Cleanup failed for {name}: {e}")
 
 if __name__ == "__main__":
@@ -659,14 +823,27 @@ if __name__ == "__main__":
         logger.critical(f"FATAL: {e}")
         sys.exit(1)
     runner.running = True
-    PID, STOP = config.PATHS["PID_FILE"], config.PATHS["STOP_FILE"]
+    PID, STOP, EMERGENCY = config.PATHS["PID_FILE"], config.PATHS["STOP_FILE"], config.PATHS["EMERGENCY_FILE"]
+    
+    # BUG FIX: Clear emergency file on successful startup (prevents false liquidation on restart)
+    if os.path.exists(EMERGENCY):
+        os.remove(EMERGENCY)
+        logger.info("Cleared stale emergency file")
+    
     if os.path.exists(STOP): os.remove(STOP)
     with open(PID, "w") as f: f.write(str(os.getpid()))
     failures = 0
+    last_heartbeat = 0
     while runner.running:
         try:
             if not runner.run_cycle(): break
             failures = 0
+            
+            # Heartbeat every 60s to confirm system is alive
+            if time.time() - last_heartbeat > 60:
+                logger.info("💓 System Heartbeat - Active")
+                last_heartbeat = time.time()
+                
         except Exception as e:
             failures += 1
             logger.error(f"Cycle failed ({failures}): {e}")

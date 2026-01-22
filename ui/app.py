@@ -28,8 +28,12 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Initialize Database
-init_db()
+# Initialize Database (Cached to prevent re-init issues)
+@st.cache_resource
+def initialize_database():
+    init_db()
+
+initialize_database()
 
 # Custom Styling (Professional Aesthetics)
 st.markdown("""
@@ -457,7 +461,7 @@ with st.sidebar:
                 st.session_state['show_emergency_confirm'] = False
                 st.rerun()
 
-# Main Area - Tabs
+# Main Area - Navigation
 st.title("🤖 Multi-Bot Crypto Trading System")
 
 # ========== TESTNET/SAFETY WARNING BANNER ==========
@@ -469,13 +473,24 @@ else:
     st.error("🔴 **LIVE TRADING MODE** - Real funds at risk! Be careful.")
 # ===================================================
 
-tab1, tab2, tab3 = st.tabs(["📊 Live Monitor", "🏗️ Bot Creator", "🛠️ Bot Manager"])
+# Navigation (Sidebar) to isolate page execution
+with st.sidebar:
+    st.markdown("---")
+    st.subheader("Navigation")
+    # Using radio for explicit page selection
+    selected_page = st.radio(
+        "Go to", 
+        ["📊 Live Monitor", "🏗️ Bot Creator", "🛠️ Bot Manager"], 
+        index=0,
+        label_visibility="collapsed"
+    )
 
-with tab1:
+# Render ONLY the selected page
+if selected_page == "📊 Live Monitor":
     render_monitor_view()
 
-with tab2:
+elif selected_page == "🏗️ Bot Creator":
     render_bot_creator_view()
 
-with tab3:
+elif selected_page == "🛠️ Bot Manager":
     render_bot_manager_view()

@@ -1,10 +1,11 @@
 import ccxt
 import time
 import logging
+import os
 from config.settings import config
 
 class ExchangeInterface:
-    def __init__(self, exchange_id='binance', market_type='spot'):
+    def __init__(self, exchange_id='binance', market_type='spot', validate=False):
         self.exchange_id = exchange_id
         
         # Determine options based on market type
@@ -66,6 +67,48 @@ class ExchangeInterface:
         # We must inject markets IMMEDIATELY to prevent any accidental auto-load triggering SAPI calls.
         if config.TESTNET and self.market_type in ['future', 'swap']:
             self._inject_testnet_markets()
+
+        # Validate API keys only if requested (default False for performance)
+        if validate:
+            self._validate_api_keys()
+
+    def _validate_api_keys(self):
+        """
+        Validates API keys by making a simple request.
+        Returns True if keys are valid, False otherwise.
+        """
+        try:
+            # Try to fetch balance - this validates API keys
+            if not config.DRY_RUN:
+                self.logger.info("Validating API keys...")
+                
+                # Check if keys are from environment variables or .env
+                env_key = os.getenv("BINANCE_API_KEY") or os.getenv("BINANCE_TESTNET_API_KEY")
+                config_key = config.API_KEY
+                
+                # Only show warning if using placeholder keys in .env file
+                if config_key and ('your_' in config_key or config_key.startswith('your_')):
+                    self.logger.critical("⚠️  USING PLACEHOLDER API KEYS IN .env FILE!")
+                    self.logger.critical("Please update your .env file with valid API keys")
+                    return False
+                
+                balance = self.fetch_balance()
+                if balance:
+                    self.logger.info("API keys validated successfully")
+                    return True
+                else:
+                    self.logger.warning("API key validation returned empty balance")
+                    return False
+        except ccxt.AuthenticationError as e:
+            self.logger.critical(f"API KEY VALIDATION FAILED: {e}")
+            self.logger.critical("Please check your API keys are correct and have the right permissions")
+            if config.TESTNET:
+                self.logger.critical("For TESTNET mode, make sure you're using TESTNET API keys, not mainnet keys!")
+                self.logger.critical("Get testnet keys from: https://testnet.binancefuture.com/")
+            return False
+        except Exception as e:
+            self.logger.warning(f"API key validation encountered an issue (may be network-related): {e}")
+            return True  # Don't block startup on network issues
 
     def _inject_testnet_markets(self):
         """Injects dummy markets for Futures Testnet to bypass Mainnet SAPI calls."""
@@ -326,9 +369,65 @@ class ExchangeInterface:
             
             except (ccxt.ExchangeError, ccxt.InsufficientFunds, ccxt.InvalidOrder) as e:
 
-                # Do NOT retry logic errors
-                self.logger.error(f"Logic/Exchange error on {method}: {e}")
-                raise
+                # Improved error handling with specific recovery strategies
+                error_msg = str(e)
+                error_code = ""
+
+                # Extract error code from Binance responses if available
+                if "code" in error_msg:
+                    import re
+                    match = re.search(r'"code":(-?\d+)', error_msg)
+                    if match:
+                        error_code = match.group(1)
+
+                # Handle specific error codes with recovery strategies
+                if error_code == "-2015":
+                    # Invalid API-key - this is auth/config issue, don't retry
+                    self.logger.error(f"CRITICAL: Authentication failed. Check API keys and IP whitelist. Error: {e}")
+                    raise
+
+                elif error_code == "-2010" or error_code == "-2011":
+                    # Insufficient funds or balance not enough
+                    self.logger.error(f"Insufficient funds for order: {e}")
+                    raise
+
+                elif error_code == "-1021" or error_code == "-1022":
+                    # Timestamp/precision errors
+                    self.logger.warning(f"Timestamp/precision error, retrying: {e}")
+                    if attempt < max_retries:
+                        time.sleep(delay * (attempt + 1))
+                        continue
+                    else:
+                        raise
+
+                elif error_code == "-5022":
+                    # Post Only Rejection - already handled in order_manager, but catch here too
+                    self.logger.warning(f"Post-only order rejected: {e}")
+                    raise
+
+                elif error_code in ["-2013", "-2014", "-2019"]:
+                    # Order does not exist / cancel failed / too many requests
+                    # If cancelling, -2013 means success (it's gone)
+                    if method == 'cancel_order' or method == 'cancel_all_orders':
+                        self.logger.info(f"Order already closed/cancelled (Code {error_code}). Treating as success.")
+                        return {'status': 'closed', 'id': kwargs.get('id', 'unknown')}
+                    
+                    self.logger.warning(f"Order operation failed, retrying: {e}")
+                    if attempt < max_retries:
+                        time.sleep(delay * (attempt + 1))
+                        continue
+                    else:
+                        raise
+
+                else:
+                    # Generic exchange error - log and decide based on attempt
+                    self.logger.error(f"Exchange error on {method}: {e}")
+                    if attempt < max_retries:
+                        self.logger.warning(f"Retrying ({attempt+1}/{max_retries})...")
+                        time.sleep(delay * (attempt + 1))
+                        continue
+                    else:
+                        raise
                 
             except Exception as e:
                 import traceback
@@ -460,6 +559,16 @@ class ExchangeInterface:
             return fallback
 
     def fetch_ohlcv(self, symbol, timeframe='1h', limit=100):
+        """
+        Fetches OHLCV data with validation and fallback for invalid timeframes.
+        """
+        # Validate timeframe
+        valid_timeframes = ['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d', '3d', '1w', '1M']
+        
+        if timeframe not in valid_timeframes:
+            self.logger.warning(f"Invalid timeframe '{timeframe}'. Falling back to '1h'")
+            timeframe = '1h'
+        
         return self._safe_request('fetch_ohlcv', symbol=symbol, timeframe=timeframe, limit=limit)
 
     def create_order(self, symbol, type, side, amount, price=None, params={}):
@@ -479,8 +588,34 @@ class ExchangeInterface:
         if price is not None:
             is_valid, s_amt, s_price, err = self.validate_order(symbol, side, amount, price)
             if not is_valid:
-                self.logger.error(f"Order Validation Failed: {err}")
-                raise ValueError(f"Order Validation Failed: {err}")
+                self.logger.error(f"ORDER VALIDATION FAILED for {symbol} {side} {amount}@{price}: {err}")
+                # Instead of raising immediately, try with minimum viable amount
+                min_usd = self.get_min_order_usd(symbol, price)
+                self.logger.warning(f"Attempting fallback: minimum order for {symbol} is ${min_usd:.2f} USD")
+                
+                # Try with minimum amount
+                if amount * price < min_usd * 0.5:  # If we're way below minimum
+                    # Calculate minimum amount needed
+                    min_qty = min_usd / price * 0.95  # 5% buffer
+                    # Round to precision
+                    try:
+                        min_qty = float(self.exchange.amount_to_precision(symbol, min_qty))
+                    except:
+                        pass
+                    
+                    if min_qty > 0:
+                        self.logger.info(f"Retrying with minimum quantity: {min_qty} {symbol}")
+                        is_valid, s_amt, s_price, err = self.validate_order(symbol, side, min_qty, price)
+                        if is_valid:
+                            amount = s_amt
+                            price = s_price
+                            self.logger.info(f"Fallback successful: {s_amt} {symbol} @ {s_price}")
+                        else:
+                            raise ValueError(f"Order Validation Failed (even with minimum): {err}")
+                    else:
+                        raise ValueError(f"Order Validation Failed: {err}")
+                else:
+                    raise ValueError(f"Order Validation Failed: {err}")
             
             # Update args with sanitized values
             amount = s_amt
@@ -575,13 +710,17 @@ class ExchangeInterface:
         """
         import time
         start_time = time.time()
+        last_order_state = None
         
         while time.time() - start_time < timeout_seconds:
             try:
                 order = self.fetch_order(order_id, symbol)
                 if order is None:
-                    return False, None
-                    
+                    # Keep waiting if None returned (rare but possible on error)
+                    time.sleep(poll_interval)
+                    continue
+                
+                last_order_state = order
                 status = order.get('status', 'unknown')
                 
                 if status == 'closed':
@@ -602,4 +741,4 @@ class ExchangeInterface:
                 time.sleep(poll_interval)
         
         self.logger.warning(f"Order {order_id} did not fill within {timeout_seconds}s")
-        return False, None
+        return False, last_order_state

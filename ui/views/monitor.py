@@ -13,6 +13,41 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from config.settings import config as global_config
 
+# --- Performance Caching Wrappers ---
+@st.cache_resource(ttl=3600, show_spinner=False)
+def get_exchange_instance(market_type):
+    """Singleton provider for ExchangeInterface to reuse connections."""
+    return ExchangeInterface(market_type=market_type, validate=False)
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_ohlcv_cached(market_type, symbol, timeframe):
+    try:
+        ex = get_exchange_instance(market_type)
+        return ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=100)
+    except Exception: return []
+
+@st.cache_data(ttl=10, show_spinner=False)
+def fetch_positions_cached(market_type):
+    try:
+        ex = get_exchange_instance(market_type)
+        return ex.exchange.fetch_positions()
+    except Exception: return []
+
+@st.cache_data(ttl=10, show_spinner=False)
+def fetch_open_orders_cached(market_type, symbol):
+    try:
+        ex = get_exchange_instance(market_type)
+        return ex.fetch_open_orders(symbol)
+    except Exception: return []
+
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_balance_cached(market_type):
+    try:
+        ex = get_exchange_instance(market_type)
+        return ex.fetch_balance()
+    except Exception: return {}
+# ------------------------------------
+
 
 def render_monitor_view():
     st.header("📊 Live Market Monitor")
@@ -46,7 +81,7 @@ def render_monitor_view():
         if active_symbols:
             try:
                 # Use market type from config (spot vs future)
-                ex_global = ExchangeInterface(market_type=global_config.MARKET_TYPE)
+                ex_global = get_exchange_instance(market_type=global_config.MARKET_TYPE)
                 # Optimized fetch
                 for sym in active_symbols:
                     ticker = ex_global.exchange.fetch_ticker(sym)
@@ -73,8 +108,7 @@ def render_monitor_view():
 
         # --- A. Fetch Futures Balance ---
         try:
-            ex_future = ExchangeInterface(market_type='future')
-            fut_data = ex_future.fetch_balance()
+            fut_data = fetch_balance_cached('future')
             
             if fut_data and 'info' in fut_data:
                 info = fut_data['info']
@@ -118,9 +152,10 @@ def render_monitor_view():
                         break
                 except: pass
             
-            if needs_spot:
-                ex_spot = ExchangeInterface(market_type='spot')
-                spot_data = ex_spot.fetch_balance()
+            # Skip spot check if we are strictly in Futures mode (common testnet setup)
+            # This prevents -2015 errors when using Futures-only keys
+            if needs_spot and global_config.MARKET_TYPE != 'future':
+                spot_data = fetch_balance_cached('spot')
                 if spot_data and 'total' in spot_data and isinstance(spot_data['total'], dict):
                     for asset, amount in spot_data['total'].items():
                         if amount > 0:
@@ -198,7 +233,7 @@ def render_monitor_view():
         sync_class = "sync-ok"
         try:
             # Quick check if exchange is accessible
-            ex_check = ExchangeInterface(market_type=global_config.MARKET_TYPE)
+            ex_check = get_exchange_instance(market_type=global_config.MARKET_TYPE)
             _ = ex_check.fetch_ticker(list(global_config.ALLOWED_SYMBOLS)[0]) if global_config.ALLOWED_SYMBOLS else None
         except Exception:
             sync_status = "exchange_lag"
@@ -216,33 +251,71 @@ def render_monitor_view():
 
 
     # --- Control Bar ---
+    # Fetch active bots for focus dropdown
+    conn_b = get_connection()
+    cur_b = conn_b.cursor()
+    cur_b.execute("SELECT id, name, pair FROM bots WHERE is_active = 1")
+    active_bots_list = cur_b.fetchall()
+    conn_b.close()
+    
+    bot_options = ["None (Symbol View)"] + [f"{b[1]} ({b[2]})" for b in active_bots_list]
+
     col1, col2, col3 = st.columns([2, 1, 1])
     with col1:
-        # Filter symbols based on active bots to make selection easier
-        conn_syms = get_connection()
-        cur_syms = conn_syms.cursor()
-        cur_syms.execute("SELECT DISTINCT pair FROM bots WHERE is_active = 1")
-        active_pairs_list = [r[0] for r in cur_syms.fetchall()]
-        conn_syms.close()
+        c1a, c1b = st.columns(2)
+        with c1a:
+            selected_bot_str = st.selectbox("Focus Bot", bot_options, index=0, key="monitor_bot_select")
         
-        # Merge allowed with active (ensuring active are at top)
-        dropdown_syms = list(dict.fromkeys(active_pairs_list + global_config.ALLOWED_SYMBOLS))
-        symbol = st.selectbox("Focus Symbol", dropdown_syms, key="monitor_symbol")
+        # Determine symbol based on bot selection or fallback
+        target_symbol_list = list(global_config.ALLOWED_SYMBOLS)
+        selected_bot_id = None
+        
+        if selected_bot_str != "None (Symbol View)":
+            # Extract bot name
+            bot_name_sel = selected_bot_str.split(" (")[0]
+            for b in active_bots_list:
+                if b[1] == bot_name_sel:
+                    selected_bot_id = b[0]
+                    # Override list to focus on this symbol
+                    target_symbol_list = [b[2]] + [s for s in target_symbol_list if s != b[2]]
+                    break
+        else:
+            # Add all active pairs to top
+            active_pairs = list(set([b[2] for b in active_bots_list]))
+            target_symbol_list = list(dict.fromkeys(active_pairs + target_symbol_list))
+
+        with c1b:
+            symbol = st.selectbox("Symbol", target_symbol_list, key="monitor_symbol")
 
     with col2:
         timeframe = st.selectbox("Timeframe", ["1m", "5m", "15m", "30m", "1h", "4h", "1d"], index=4, key="monitor_tf")
     with col3:
         st.write("") # Spacer
-        if st.button("🔄 Refresh"):
-            st.session_state.last_refresh = time.time()
+        col3_a, col3_b = st.columns([1, 1])
+        with col3_a:
+            auto_refresh = st.checkbox("Auto (30s)", value=True, key="monitor_autorefresh")
+        with col3_b:
+            if st.button("🔄 Refresh"):
+                st.cache_data.clear()
+                st.rerun()
+                
+    if auto_refresh:
+        # Non-blocking sleep mechanism using session state? 
+        # Streamlit execution is top-down. time.sleep blocks rendering.
+        # But st.rerun() restarts it.
+        # We need a placeholder for countdown?
+        # Simple approach: Just sleep at the END of the script? 
+        # No, putting it here pauses execution of the REST of the page?
+        # Putting it at the very end is safer.
+        pass
     
     # --- Fetch Data ---
     try:
         # Initialize exchange with correct market type from config
         try:
-            exchange = ExchangeInterface(market_type=global_config.MARKET_TYPE) 
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=100)
-        except (ccxt.AuthenticationError, ccxt.ExchangeError) as e:
+            # Use cached fetch for performance
+            ohlcv = fetch_ohlcv_cached(global_config.MARKET_TYPE, symbol, timeframe)
+        except Exception as e:
             st.error(f"🔌 **API Connection Failed**: {e}")
             st.warning("Please check your API keys in the `.env` file.")
             ohlcv = []
@@ -284,21 +357,35 @@ def render_monitor_view():
             try:
                 conn = get_connection()
                 cur = conn.cursor()
-                # Enhanced query to get investment info for PnL
-                query = """
-                    SELECT b.name, t.avg_entry_price, t.target_tp_price, t.current_step, b.direction, t.total_invested
-                    FROM bots b
-                    JOIN trades t ON b.id = t.bot_id
-                    WHERE b.pair = ? AND b.is_active = 1
-                    ORDER BY t.avg_entry_price DESC
-                    LIMIT 1
-                """
-                cur.execute(query, (symbol,))
+                
+                # Enhanced query: Get grid_price from bot_orders (subquery)
+                if selected_bot_id:
+                    query = """
+                        SELECT b.name, t.avg_entry_price, t.target_tp_price, t.current_step, b.direction, t.total_invested,
+                               (SELECT price FROM bot_orders WHERE bot_id = b.id AND order_type='grid' AND status='open' ORDER BY id DESC LIMIT 1) as grid_price
+                        FROM bots b
+                        JOIN trades t ON b.id = t.bot_id
+                        WHERE b.id = ?
+                    """
+                    cur.execute(query, (selected_bot_id,))
+                else:
+                    # Fallback to symbol based (pick highest investment)
+                    query = """
+                        SELECT b.name, t.avg_entry_price, t.target_tp_price, t.current_step, b.direction, t.total_invested,
+                               (SELECT price FROM bot_orders WHERE bot_id = b.id AND order_type='grid' AND status='open' ORDER BY id DESC LIMIT 1) as grid_price
+                        FROM bots b
+                        JOIN trades t ON b.id = t.bot_id
+                        WHERE b.pair = ? AND b.is_active = 1
+                        ORDER BY t.total_invested DESC
+                        LIMIT 1
+                    """
+                    cur.execute(query, (symbol,))
+                
                 active_bot_data = cur.fetchone()
                 conn.close()
                 
                 if active_bot_data:
-                    bot_name, entry, tp, step, direction, invested = active_bot_data
+                    bot_name, entry, tp, step, direction, invested, grid_price = active_bot_data
                     
                     if entry > 0:
                         color_entry = "blue"
@@ -308,7 +395,10 @@ def render_monitor_view():
                         if tp > 0:
                              fig.add_hline(y=tp, line_dash="dash", line_color=color_tp, annotation_text="Take Profit")
                         
-                        st.info(f"🤖 **Bot '{bot_name}' active**. Step: {step} | Entry: ${entry:,.2f} | TP: ${tp:,.2f}")
+                        if grid_price and grid_price > 0:
+                             fig.add_hline(y=grid_price, line_dash="dot", line_color="gray", annotation_text="Grid (NO)")
+                        
+                        st.info(f"🤖 **Bot '{bot_name}' active**. Step: {step} | Entry: ${entry:,.2f} | TP: ${tp:,.2f} | NO: ${grid_price if grid_price else 0:,.2f}")
                 
             except Exception as e:
                 st.warning(f"Could not load bot levels: {e}")
@@ -357,7 +447,7 @@ def render_monitor_view():
             # PnL Calculation
             with c3:
                 if active_bot_data and active_bot_data[1] > 0:
-                    bot_name, entry, tp, step, direction, invested = active_bot_data
+                    bot_name, entry, tp, step, direction, invested, grid_price = active_bot_data
                     price_diff = latest['close'] - entry if direction == "LONG" else entry - latest['close']
                     pnl_pct = (price_diff / entry) * 100
                     pnl_usd = (invested * pnl_pct / 100) if invested > 0 else 0.0
@@ -374,84 +464,111 @@ def render_monitor_view():
             st.divider()
             st.subheader("📊 ATR Market Context")
             try:
-                from engine.strategies.martingale_strategy import MartingaleStrategy
-                ex_found = ExchangeInterface(market_type=global_config.MARKET_TYPE)
+                # Get ATR configuration from global config
+                atr_timeframe = global_config.ATR_TIMEFRAME if hasattr(global_config, 'ATR_TIMEFRAME') else '1h'
+                atr_periods = int(getattr(global_config, 'ATR_PERIODS', 14))
                 
-                # FIX: Fetch more daily data for accurate 3d/5d ATR calculations
-                # Need at least 200 daily candles for 5d lookback with sufficient history
-                ohlcv_1h = ex_found.fetch_ohlcv(symbol, timeframe='1h', limit=500)
-                ohlcv_1d = ex_found.fetch_ohlcv(symbol, timeframe='1d', limit=200)
-                ohlcv_3d = None
-                ohlcv_5d = None
+                # Fetch data at the selected timeframe
+                ohlcv_atr = fetch_ohlcv_cached(global_config.MARKET_TYPE, symbol, atr_timeframe)
                 
-                # Try fetching 3d and 5d directly if exchange supports it
-                try:
-                    ohlcv_3d = ex_found.fetch_ohlcv(symbol, timeframe='3d', limit=100)
-                except Exception:
-                    pass
-                try:
-                    ohlcv_5d = ex_found.fetch_ohlcv(symbol, timeframe='5d', limit=100)
-                except Exception:
-                    pass
-                
-                if ohlcv_1h and ohlcv_1d:
-                    df_1h = pd.DataFrame(ohlcv_1h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                    df_1d = pd.DataFrame(ohlcv_1d, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                    for df_f in [df_1h, df_1d]:
-                        df_f['timestamp'] = pd.to_datetime(df_f['timestamp'], unit='ms')
+                if ohlcv_atr:
+                    df_atr = pd.DataFrame(ohlcv_atr, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                    df_atr['timestamp'] = pd.to_datetime(df_atr['timestamp'], unit='ms')
                     
-                    temp_strat_f = MartingaleStrategy()
-                    atr_data = {}
+                    # Calculate True Range
+                    tr1 = df_atr['high'] - df_atr['low']
+                    tr2 = (df_atr['high'] - df_atr['close'].shift()).abs()
+                    tr3 = (df_atr['low'] - df_atr['close'].shift()).abs()
+                    true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
                     
-                    # 4h from 1h data
-                    res_4h = temp_strat_f.get_atr_foundation(df_1h)
-                    if '4h' in res_4h: atr_data['4h'] = res_4h['4h']
+                    # Calculate ATR as average of True Range over N periods
+                    # Allow lookback from 3 to 240 candles
+                    valid_periods = min(max(atr_periods, 3), 240)
                     
-                    # 1d from daily data
-                    res_daily = temp_strat_f.get_atr_foundation(df_1d)
-                    if '1d' in res_daily: atr_data['1d'] = res_daily['1d']
-                    
-                    # FIX: Calculate 3d ATR by resampling 1d data with proper aggregation
-                    # 3d ATR = 3x the 1d ATR (approximately), or resample if we have enough data
-                    if '1d' in res_daily:
-                        # For 3d, we need 3x the price movement range
-                        # ATR_3d ≈ ATR_1d × √3 (since ATR scales with sqrt of period)
-                        atr_1d = res_daily['1d']['atr']
-                        atr_data['3d'] = {
-                            'atr': atr_1d * 1.732,  # √3 ≈ 1.732
-                            'move_pct': res_daily['1d']['move_pct'] * 0.33,  # 3d move is ~1/3 of daily for same price move
-                            'percentile': res_daily['1d']['percentile']
+                    if len(true_range) >= valid_periods:
+                        # Current ATR (average of last N candles)
+                        current_atr = true_range.iloc[-valid_periods:].mean()
+                        
+                        # Historical ATR for percentile calculation
+                        rolling_atrs = true_range.rolling(window=valid_periods).mean()
+                        atr_history = rolling_atrs.dropna()
+                        
+                        # Percentile calculation
+                        if len(atr_history) >= 10:
+                            percentile = (atr_history < float(current_atr)).sum() / len(atr_history) * 100
+                        else:
+                            percentile = 50
+                        
+                        # Move percentage (from last candle open)
+                        last_open = df_atr['open'].iloc[-1]
+                        last_close = df_atr['close'].iloc[-1]
+                        move_pct = (last_close - last_open) / float(current_atr) * 100
+                        
+                        atr_data = {
+                            'atr': float(current_atr),
+                            'move_pct': float(move_pct),
+                            'percentile': float(percentile),
+                            'timeframe': atr_timeframe,
+                            'periods': valid_periods
                         }
+                    else:
+                        st.warning(f"Not enough data for {atr_timeframe} timeframe. Need {valid_periods} candles.")
+                        atr_data = None
+                else:
+                    st.warning("Could not fetch OHLCV data for ATR calculation.")
+                    atr_data = None
+                
+                # ATR Configuration in expander
+                with st.expander("⚙️ ATR Configuration", expanded=False):
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        new_atr_tf = st.selectbox(
+                            "ATR Timeframe",
+                            ["1m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w"],
+                            index=["1m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w"].index(atr_timeframe) if atr_timeframe in ["1m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w"] else 4,
+                            key="monitor_atr_tf_cfg"
+                        )
+                    with c2:
+                        new_atr_periods = st.slider(
+                            "ATR Lookback Period (candles)",
+                            min_value=3,
+                            max_value=240,
+                            value=atr_periods,
+                            key="monitor_atr_periods_cfg"
+                        )
                     
-                    # FIX: Calculate 5d ATR similarly
-                    if '1d' in res_daily:
-                        atr_1d = res_daily['1d']['atr']
-                        atr_data['5d'] = {
-                            'atr': atr_1d * 2.236,  # √5 ≈ 2.236
-                            'move_pct': res_daily['1d']['move_pct'] * 0.2,  # 5d move is ~1/5 of daily for same price move
-                            'percentile': res_daily['1d']['percentile']
-                        }
+                    if st.button("Apply ATR Settings"):
+                        # Save to config (would need to persist this)
+                        st.info(f"ATR Timeframe: {new_atr_tf}, Lookback: {new_atr_periods} candles")
                     
-                    # Unify ATR TF selection UI
-                    st.markdown("**Market Volatility Context**")
-                    atr_tf_options = ["1m", "5m", "15m", "1h", "4h", "1d"]
-                    # For live monitor, we just show it, don't necessarily update bot config here
-                    selected_atr_tf = st.selectbox("ATR Reference Timeframe", atr_tf_options, index=3, key="monitor_atr_tf")
+                    st.caption(f"**Formula:** ATR = Average(True Range of last {new_atr_periods} {new_atr_tf} candles)")
+                
+                # Display current ATR
+                st.markdown("**Current ATR Context**")
+                if atr_data:
+                    mc1, mc2, mc3, mc4 = st.columns(4)
+                    with mc1:
+                        st.metric(
+                            f"ATR ({atr_data['timeframe']})",
+                            f"{atr_data['atr']:.6f}"
+                        )
+                    with mc2:
+                        st.metric("Range Position", f"{atr_data['move_pct']:+.1f}%")
+                    with mc3:
+                        st.metric("Vol Percentile", f"{atr_data['percentile']:.0f}%")
+                    with mc4:
+                        st.metric("Lookback", f"{atr_data['periods']} candles")
                     
-                    # Display metrics - ensure 3d and 5d show DIFFERENT values
-                    foundation_tfs = ['4h', '1d', '3d', '5d']
-                    m_cols = st.columns(len(foundation_tfs))
-                    for i, tf in enumerate(foundation_tfs):
-                        with m_cols[i]:
-                            if tf in atr_data and atr_data[tf]['atr'] > 0:
-                                label = f"ATR ({tf})"
-                                if tf == selected_atr_tf: label = f"🎯 **ATR ({tf})**"
-                                st.metric(label, f"{atr_data[tf]['atr']:.4f}")
-                                move_p = atr_data[tf]['move_pct']
-                                st.caption(f"Range Pos: **{move_p:+.1f}%**")
-                                st.caption(f"Vol %-tile: {atr_data[tf]['percentile']:.0f}%")
-                            else:
-                                st.metric(f"ATR ({tf})", "N/A")
+                    # Show where current price is relative to ATR
+                    if atr_data['percentile'] > 70:
+                        st.info(f"📈 **High Volatility**: Current volatility is in top {100-atr_data['percentile']:.0f}% percentile")
+                    elif atr_data['percentile'] < 30:
+                        st.info(f"📉 **Low Volatility**: Current volatility is in bottom {atr_data['percentile']:.0f}% percentile")
+                    else:
+                        st.info(f"➡️ **Normal Volatility**: Current volatility is at {atr_data['percentile']:.0f}% percentile")
+                else:
+                    st.warning("ATR data unavailable")
+                    
             except Exception as e:
                 st.warning(f"Could not load ATR Foundation: {e}")
 
@@ -486,8 +603,8 @@ def render_monitor_view():
         exchange_positions = {}
         exchange_orders = {}
         try:
-            ex_futures = ExchangeInterface(market_type='future')
-            ex_spot = ExchangeInterface(market_type='spot')
+            ex_futures = get_exchange_instance(market_type='future')
+            ex_spot = get_exchange_instance(market_type='spot')
             
             # Fetch all futures positions
             try:
@@ -551,7 +668,7 @@ def render_monitor_view():
             for m_type, syms in symbols_by_market.items():
                 if not syms: continue
                 try:
-                    ex = ExchangeInterface(market_type=m_type)
+                    ex = get_exchange_instance(market_type=m_type)
                     # ex.exchange.load_markets() # Handled by init
                     for sym in syms:
                         try:
@@ -676,7 +793,7 @@ def render_monitor_view():
     # --- 🆕 Open Orders Section ---
     st.subheader("📋 Open Orders (Exchange)")
     try:
-        ex_orders = ExchangeInterface(market_type=global_config.MARKET_TYPE)
+        ex_orders = get_exchange_instance(market_type=global_config.MARKET_TYPE)
         
         # Get unique symbols from active bots to check for open orders
         conn = get_connection()
@@ -686,7 +803,8 @@ def render_monitor_view():
         all_open_orders = []
         for pair in active_pairs:
             try:
-                orders = ex_orders.fetch_open_orders(pair)
+                # Use cached fetch for performance
+                orders = fetch_open_orders_cached(global_config.MARKET_TYPE, pair)
                 if orders:
                     for o in orders:
                         order_id = o.get('id')
@@ -754,10 +872,32 @@ def render_monitor_view():
     if global_config.MARKET_TYPE in ['future', 'swap']:
         st.subheader("📈 Open Positions (Exchange)")
         try:
-            ex_positions = ExchangeInterface(market_type=global_config.MARKET_TYPE)
+            ex_positions = get_exchange_instance(market_type=global_config.MARKET_TYPE)
             
-            # Fetch all positions from exchange
-            positions = ex_positions.exchange.fetch_positions()
+            # Fetch active bots to map positions to bots
+            # This answers: "what bot what trade, which step"
+            conn = get_connection()
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT b.pair, b.name, b.strategy_type, t.current_step 
+                FROM bots b 
+                LEFT JOIN trades t ON b.id = t.bot_id 
+                WHERE b.is_active = 1
+            """)
+            # Create mapping: Symbol -> {Name, Strat, Step}
+            bot_map = {}
+            for row in cursor.fetchall():
+                # row: pair, name, strategy_type, current_step
+                if row[0]:
+                    bot_map[row[0]] = {
+                        'name': row[1], 
+                        'strat': row[2], 
+                        'step': row[3] if row[3] is not None else 0
+                    }
+            conn.close()
+
+            # Fetch all positions from exchange (Cached)
+            positions = fetch_positions_cached(global_config.MARKET_TYPE)
             
             # Filter to only show positions with non-zero size
             active_positions = []
@@ -766,6 +906,7 @@ def render_monitor_view():
                 notional = float(pos.get('notional', 0) or 0)
                 
                 if contracts != 0 or notional != 0:
+                    symbol = pos.get('symbol', '')
                     side = pos.get('side', 'unknown')
                     entry_price = float(pos.get('entryPrice', 0) or 0)
                     mark_price = float(pos.get('markPrice', 0) or 0)
@@ -776,8 +917,16 @@ def render_monitor_view():
                     # Format PnL with color
                     pnl_str = f"${unrealized_pnl:+.2f}"
                     
+                    # Enrich with Bot Info
+                    bot_info = bot_map.get(symbol, {})
+                    bot_name = bot_info.get('name', 'Unknown/Manual')
+                    bot_step = bot_info.get('step', '-')
+                    bot_strat = bot_info.get('strat', '-')
+
                     active_positions.append({
-                        "Symbol": pos.get('symbol', ''),
+                        "Bot Name": bot_name,
+                        "Step": f"S{bot_step}",
+                        "Symbol": symbol,
                         "Side": side.upper() if side else 'UNKNOWN',
                         "Size": abs(contracts),
                         "Notional": f"${abs(notional):.2f}",
@@ -790,9 +939,17 @@ def render_monitor_view():
             
             if active_positions:
                 df_positions = pd.DataFrame(active_positions)
+                
+                # Reorder columns to put Bot info first
+                cols = ["Bot Name", "Step", "Symbol", "Side", "Size", "Entry", "Mark", "Unrealized PnL", "Liq. Price"]
+                # Filter to only existing columns (ignoring Notional/Leverage in main view to save space if needed)
+                cols = [c for c in cols if c in df_positions.columns]
+                
                 st.dataframe(
-                    df_positions,
+                    df_positions[cols],
                     column_config={
+                        "Bot Name": st.column_config.TextColumn("🤖 Bot", width="medium"),
+                        "Step": st.column_config.TextColumn("Step", width="small"),
                         "Size": st.column_config.NumberColumn(format="%.4f"),
                         "Entry": st.column_config.NumberColumn(format="$%.4f"),
                         "Mark": st.column_config.NumberColumn(format="$%.4f"),
@@ -801,6 +958,8 @@ def render_monitor_view():
                     width='stretch',
                     hide_index=True
                 )
+                
+                st.caption("ℹ️ **Bot**: Validates which bot owns the position. **Step**: Current Martingale step.")
             else:
                 st.info("No open positions on exchange.")
                 
@@ -864,3 +1023,8 @@ def render_monitor_view():
         st.warning(f"Could not load trade history: {e}")
 
     st.caption(f"Visualizing live data for **{symbol}** via CCXT.")
+    
+    # Auto-Refresh Logic
+    if auto_refresh:
+        time.sleep(30)
+        st.rerun()

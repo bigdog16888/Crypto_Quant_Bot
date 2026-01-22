@@ -85,7 +85,19 @@ class MartingaleStrategy(BaseStrategy):
         self.use_atr_grid = self.params.get('UseATRGrid', False)
         self.atr_grid_factor = self.params.get('ATRGridFactor', 1.0)
         self.atr_period = self.params.get('ATRPeriods', 21)
-        self.atr_tf = self.params.get('ATR_Timeframe', None) # New: Specific TF for Grid ATR
+        self.atr_tf = self.params.get('ATR_Timeframe', None) # Specific TF for Grid ATR
+        
+        # Flexible Grid System (NEW)
+        # ATR Mode: 'dynamic' (recalculate each cycle) or 'locked' (capture at first entry)
+        self.atr_mode = self.params.get('ATRMode', 'dynamic')
+        self.locked_atr = None  # Will store ATR value when mode is 'locked'
+        
+        # Step-based Grid Rules: List of rules applied by step range
+        # Format: [{"start": 1, "end": 4, "type": "atr", "multiplier": 1.0},
+        #          {"start": 5, "end": 7, "type": "atr", "multiplier": 1.1},
+        #          {"start": 8, "end": 10, "type": "fixed", "value": 500}]
+        # type: 'atr' (uses ATR * multiplier) or 'fixed' (uses fixed $ value)
+        self.grid_step_rules = self.params.get('GridStepRules', [])
         
         self.use_hedge = self.params.get('UseHedge', False)
         self.hedge_start = self.params.get('HedgeStart', 20.0)
@@ -300,53 +312,127 @@ class MartingaleStrategy(BaseStrategy):
         # Standard Multiplier scaling
         return base_size * (multiplier ** current_step)
 
+    def _calculate_atr(self, market_data) -> float:
+        """
+        Calculate ATR value from market data.
+        Returns ATR in price units (e.g., $500 for BTC).
+        """
+        if market_data is None or market_data.empty:
+            return 0.0
+            
+        atr_tf = self.atr_tf or '1h'
+        atr_periods = getattr(self, 'atr_period', 14)
+        atr_periods = min(max(atr_periods, 3), 240)
+        
+        df_atr = self._resample(market_data, atr_tf)
+        
+        if df_atr.empty or len(df_atr) < atr_periods:
+            return 0.0
+            
+        # Calculate True Range
+        tr1 = df_atr['high'] - df_atr['low']
+        tr2 = (df_atr['high'] - df_atr['close'].shift()).abs()
+        tr3 = (df_atr['low'] - df_atr['close'].shift()).abs()
+        true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        
+        return float(true_range.iloc[-atr_periods:].mean())
+    
+    def _get_grid_spacing_for_step(self, step: int, atr_value: float) -> float:
+        """
+        Get grid spacing for a specific step based on GridStepRules.
+        
+        Rules format: [
+            {"start": 1, "end": 4, "type": "atr", "multiplier": 1.0},
+            {"start": 5, "end": 7, "type": "atr", "multiplier": 1.1},
+            {"start": 8, "end": 10, "type": "fixed", "value": 500}
+        ]
+        
+        If no rule matches, falls back to default ATR * ATRGridFactor or base_grid.
+        """
+        # Check step-based rules first
+        for rule in self.grid_step_rules:
+            start = rule.get('start', 1)
+            end = rule.get('end', 999)
+            rule_type = rule.get('type', 'atr')
+            
+            if start <= step <= end:
+                if rule_type == 'fixed':
+                    # Fixed $ grid spacing
+                    return float(rule.get('value', 100.0))
+                elif rule_type == 'atr':
+                    # ATR-based with custom multiplier
+                    multiplier = float(rule.get('multiplier', 1.0))
+                    if atr_value > 0:
+                        return atr_value * multiplier
+                    # Fallback if ATR is 0
+                    return self.params.get('base_grid', 100.0)
+        
+        # No rule matched - use default behavior
+        if self.use_atr_grid and atr_value > 0:
+            return atr_value * self.atr_grid_factor
+        
+        return self.params.get('base_grid', 100.0)
+    
+    def lock_atr(self, market_data) -> float:
+        """
+        Lock ATR value at first entry. Called when entering a new trade.
+        Returns the locked ATR value.
+        """
+        atr_val = self._calculate_atr(market_data)
+        self.locked_atr = atr_val
+        return atr_val
+    
+    def reset_locked_atr(self):
+        """Reset locked ATR when trade closes."""
+        self.locked_atr = None
+
     def calculate_next_grid_price(self, direction: str, current_price: float, avg_entry: float, current_step: int, market_data=None) -> float:
         """
-        Calculate next grid order price using ATR if enabled.
+        Calculate next grid order price using flexible step-based rules.
         
-        ATR Calculation:
-        - ATR_Timeframe: The candle timeframe to use (1m, 5m, 15m, 1h, 4h, 1d)
-        - ATRPeriods: The lookback period for ATR calculation (default 14)
-        - ATRGridFactor: Multiplier for the ATR value (default 1.0)
+        Supports:
+        1. ATR Mode: 'locked' (use ATR captured at entry) or 'dynamic' (recalculate each cycle)
+        2. Step-based Rules: Different spacing rules for different step ranges
+           - type: 'atr' with multiplier (e.g., ATR * 1.1)
+           - type: 'fixed' with value (e.g., $500 fixed spacing)
         
-        Example:
-        - 1h timeframe ATR = 1000 units
-        - 4h setting = average ATR over last 4 hours of 1h data
-        - 1d setting = average ATR over last 24 hours of 1h data
-        
-        The grid spacing = ATR value * ATRGridFactor
+        Example GridStepRules:
+        [
+            {"start": 1, "end": 4, "type": "atr", "multiplier": 1.0},    # Steps 1-4: 100% ATR
+            {"start": 5, "end": 7, "type": "atr", "multiplier": 1.1},    # Steps 5-7: ATR * 1.1
+            {"start": 8, "end": 10, "type": "fixed", "value": 500}       # Steps 8-10: Fixed $500
+        ]
         """
-        if self.use_atr_grid and market_data is not None and not market_data.empty:
-            # Get ATR timeframe
-            atr_tf = self.atr_tf or '1h'
-            
-            # Resample data to ATR timeframe
-            df_atr = self._resample(market_data, atr_tf)
-            
-            if not df_atr.empty and len(df_atr) >= self.atr_period:
-                # Calculate ATR
-                atr_val = iATR(df_atr['high'], df_atr['low'], df_atr['close'], self.atr_period)
-                
-                # Apply ATR grid factor
-                grid_spacing = atr_val * self.atr_grid_factor
-                
-                # For LONG: next grid is below current price
-                # For SHORT: next grid is above current price
-                if direction == 'LONG':
-                    return current_price - grid_spacing
-                else:
-                    return current_price + grid_spacing
+        next_step = current_step + 1
         
-        # Fallback to fixed base_grid spacing
-        spacing = self.params.get('base_grid', 100.0)
+        # Determine which ATR value to use
+        atr_value = 0.0
+        if self.use_atr_grid or self.grid_step_rules:
+            if self.atr_mode == 'locked' and self.locked_atr is not None:
+                # Use locked ATR from first entry
+                atr_value = self.locked_atr
+            else:
+                # Dynamic: recalculate ATR each cycle
+                atr_value = self._calculate_atr(market_data)
+                
+                # Auto-lock on first entry if mode is 'locked' and not yet locked
+                if self.atr_mode == 'locked' and self.locked_atr is None and atr_value > 0:
+                    self.locked_atr = atr_value
+        
+        # Get spacing for this step
+        grid_spacing = self._get_grid_spacing_for_step(next_step, atr_value)
+        
+        # Apply direction
         if direction == 'LONG':
-            return current_price - spacing
-        return current_price + spacing
+            return current_price - grid_spacing
+        else:
+            return current_price + grid_spacing
 
     def calculate_projections(self, base_price: float, current_atr: float = None) -> list:
         """
         Generates a list of dictionaries representing the risk/investment at each step.
         Includes absolute price levels for grid, TP, and hedging.
+        Uses step-based grid spacing rules for flexible grid calculation.
         """
         projections = []
         total_invested = 0
@@ -358,32 +444,40 @@ class MartingaleStrategy(BaseStrategy):
         hedge_step = self.params.get('HedgeStartStep', 7)
         tp_target_usd = self.params.get('TakeProfitBase', 10.0)
         
-        # Grid Distance math
-        grid_pips = self.params.get('base_grid', 25.0)
-        
-        if self.use_atr_grid:
-            # Use ATR from params if provided (for projection), else default
-            current_atr = current_atr if current_atr is not None else 20.0
-            grid_pips = current_atr * self.params.get('ATRGridFactor', 1.0)
-        
-        # Ensure grid_pips is reasonable for crypto prices
-        # If ATR is "Huge" (daily), and we use it directly, grid steps might be massive.
-        # User concern: "Huge ATR".
-        # Logic: If price ~40k, ATR ~1000. Grid step 1000 is 2.5%.
-        # If user wants smaller steps, they should reduce ATRGridFactor (e.g. 0.1) OR use fixed pips.
-        
         direction = 1 if self.params.get('direction', 'LONG').upper() == 'LONG' else -1
         fee_rate = self.params.get('fee_rate', 0.001)
         slippage_rate = self.params.get('slippage_rate', 0.0005)
         cost_factor = 1.0 + fee_rate + slippage_rate
-
+        
+        # Determine ATR to use for projections
+        atr_value = 0.0
+        if self.use_atr_grid or self.grid_step_rules:
+            if current_atr is not None:
+                atr_value = current_atr
+            else:
+                # Default fallback ATR for projection
+                atr_value = base_price * 0.01  # 1% of price as default
+        
+        # Calculate projections with step-based grid spacing
         for i in range(self.params.get('max_steps', 10)):
             step_size = base_size * (multiplier ** i)
             total_invested += (step_size * cost_factor)
             
+            # Use step-based grid spacing
+            # i = 0 is entry, i = 1 is first grid order (step 1)
+            next_step = i  # i represents the step number we're calculating for
+            
+            # Get grid spacing for this specific step
+            grid_spacing = self._get_grid_spacing_for_step(next_step, atr_value)
+            
             # Absolute Price math
-            # Step 0 is entry, Step 1 is grid 1
-            order_price = base_price - (i * grid_pips * direction)
+            # For LONG: price goes down (subtract spacing)
+            # For SHORT: price goes up (add spacing)
+            if direction == 1:  # LONG
+                order_price = base_price - (grid_spacing * next_step)
+            else:  # SHORT
+                order_price = base_price + (grid_spacing * next_step)
+                
             if order_price <= 0: order_price = 0.01 # Safety
             
             qty = step_size / order_price
@@ -464,70 +558,87 @@ class MartingaleStrategy(BaseStrategy):
 
     def calculate_grid_distance(self, current_step: int, market_data: pd.DataFrame) -> float:
         """
-        Calculates the distance in pips for the next grid order.
-        If UseATRGrid is true, uses ATR-based dynamic spacing.
-        """
-        base_grid = self.params.get('base_grid', 25.0) # Default 25 pips
+        Calculates distance in pips for the next grid order.
+        Now uses step-based grid rules for flexible spacing.
         
-        if self.use_atr_grid:
-            # Determine which dataframe to use
-            df_calc = market_data
-            if self.atr_tf:
-                 # Attempt resample (only works if atr_tf >= market_data tf)
-                 # If atr_tf < market_data tf, resampling will yield bad data (flat candles -> ATR=0), 
-                 # but we rely on UI validation to prevent that config.
-                 df_calc = self._resample(market_data, self.atr_tf)
-
-            # Assume Ta-Lib or custom ATR available
-            atr_series = ta_custom.atr(df_calc['high'], df_calc['low'], df_calc['close'], period=self.atr_period)
-            if atr_series is not None and not atr_series.empty:
-                current_atr = atr_series.iloc[-1]
-                # Blessing 3 logic: Grid = ATR * GAF
-                return current_atr * self.atr_grid_factor
+        Delegates to _get_grid_spacing_for_step which handles:
+        - Step-based rules (ATR with multiplier or fixed values)
+        - ATR mode (dynamic vs locked)
+        - Fallback to base_grid
+        """
+        next_step = current_step + 1
+        
+        # Determine which ATR value to use
+        atr_value = 0.0
+        if self.use_atr_grid or self.grid_step_rules:
+            if self.atr_mode == 'locked' and self.locked_atr is not None:
+                atr_value = self.locked_atr
+            else:
+                atr_value = self._calculate_atr(market_data)
                 
-        return base_grid
-
-    def calculate_next_grid_price(self, direction: str, current_price: float, avg_entry: float, current_step: int, market_data: pd.DataFrame) -> float:
-        """
-        Calculates the exact price level for the next grid order.
-        """
-        grid_dist = self.calculate_grid_distance(current_step, market_data)
+                # Auto-lock on first entry if mode is 'locked' and not yet locked
+                if self.atr_mode == 'locked' and self.locked_atr is None and atr_value > 0:
+                    self.locked_atr = atr_value
         
-        # In crypto, we use absolute price distance (simplified pips/points logic)
-        # Assuming grid_dist is in same units as price or percentage if configured.
-        # For simplicity, if step 0, we use current_price. If step > 0, we use avg_entry.
-        ref_price = avg_entry if (current_step > 0 and avg_entry > 0) else current_price
-        
-        if direction.upper() == 'LONG':
-            return ref_price - grid_dist
-        else:
-            return ref_price + grid_dist
+        return self._get_grid_spacing_for_step(next_step, atr_value)
 
     def get_atr_foundation(self, market_data: pd.DataFrame):
         """
-        Fetches ATR and Percentile for planning (4H, 1D, 3D, 5D).
+        Fetches ATR and Percentile for the configured ATR timeframe and lookback.
+        
+        ATR Calculation:
+        - ATR_Timeframe: The candle timeframe to use (1m, 5m, 15m, 1h, 4h, 1d, etc.)
+        - ATRPeriods: Number of candles to average (3 to 240)
+        
+        Formula: ATR = Average(True Range of last N candles at the selected timeframe)
         """
         results = {}
-        for tf in ['4h', '1d', '3d', '5d']:
-            try:
-                df = self._resample(market_data, tf)
-                if df.empty: continue
-                
-                atr_val = iATR(df['high'], df['low'], df['close'], 14)
-                open_p = df['open'].iloc[-1]
-                curr_p = market_data['close'].iloc[-1]
-                
-                # Move as % of ATR
-                if atr_val > 0:
-                    move_pct = (curr_p - open_p) / atr_val * 100.0
-                else:
-                    move_pct = 0.0
-                
-                perc = iATRPercentile(df['high'], df['low'], df['close'], 14, 100)
-                results[tf] = {'atr': atr_val, 'move_pct': move_pct, 'percentile': perc}
-            except Exception as e:
-                results[tf] = {'atr': 0, 'move_pct': 0, 'percentile': 0, 'error': str(e)}
-        return results
+        
+        # Get ATR configuration
+        atr_tf = self.atr_tf or '1h'
+        atr_periods = getattr(self, 'atr_period', 14)
+        atr_periods = min(max(atr_periods, 3), 240)
+        
+        # Resample to ATR timeframe
+        df = self._resample(market_data, atr_tf)
+        
+        if df.empty or len(df) < atr_periods:
+            return {'error': f'Not enough data for {atr_tf} timeframe'}
+        
+        # Calculate True Range
+        tr1 = df['high'] - df['low']
+        tr2 = (df['high'] - df['close'].shift()).abs()
+        tr3 = (df['low'] - df['close'].shift()).abs()
+        true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        
+        # Calculate ATR as average of True Range over N periods
+        atr_val = true_range.iloc[-atr_periods:].mean()
+        
+        # Get current price for move percentage
+        open_p = df['open'].iloc[-1]
+        curr_p = df['close'].iloc[-1]
+        
+        # Move as % of ATR
+        if float(atr_val) > 0:
+            move_pct = (curr_p - open_p) / float(atr_val) * 100.0
+        else:
+            move_pct = 0.0
+        
+        # Calculate percentile
+        rolling_atrs = true_range.rolling(window=atr_periods).mean()
+        atr_history = rolling_atrs.dropna()
+        if len(atr_history) >= 10:
+            percentile = (atr_history < float(atr_val)).sum() / len(atr_history) * 100
+        else:
+            percentile = 50
+        
+        return {
+            'atr': float(atr_val),
+            'move_pct': float(move_pct),
+            'percentile': float(percentile),
+            'timeframe': atr_tf,
+            'periods': atr_periods
+        }
 
     def _aggregate_signal(self, current_buy, current_sell, new_buy, new_sell, count):
         if self.use_any_entry:

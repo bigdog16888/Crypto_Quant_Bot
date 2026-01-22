@@ -9,6 +9,36 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 from engine.database import add_bot
 from engine.exchange_interface import ExchangeInterface
 
+# --- Performance Caching Wrappers ---
+@st.cache_resource(ttl=3600, show_spinner=False)
+def get_exchange_instance(market_type):
+    """Singleton provider for ExchangeInterface to reuse connections."""
+    return ExchangeInterface(market_type=market_type, validate=False)
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_symbols_cached(market_type, quote_asset):
+    try:
+        ex = get_exchange_instance(market_type)
+        # load_markets is internal to get_available_symbols but we can force it here if needed
+        # get_available_symbols calls _ensure_markets() which calls load_markets()
+        return ex.get_available_symbols(quote_asset=quote_asset)
+    except Exception: return []
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_min_order_cached(market_type, pair):
+    try:
+        ex = get_exchange_instance(market_type)
+        return ex.get_min_order_usd(pair)
+    except Exception: return 5.0
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_ohlcv_cached(market_type, symbol, timeframe, limit=100):
+    try:
+        ex = get_exchange_instance(market_type)
+        return ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    except Exception: return []
+# ------------------------------------
+
 def render_bot_creator_view():
     st.header("🏗️ Strategy & Bot Creator")
     st.caption("Configure and launch new trading bots with advanced martingale and confluence logic.")
@@ -41,27 +71,22 @@ def render_bot_creator_view():
     with col_m3:
         # Fetch symbols dynamically based on selection
         try:
-            exchange = ExchangeInterface(market_type=mode_id)
-            # Ensure markets are loaded before querying symbols
-            exchange.exchange.load_markets()
-
             # Store market type in session for bot_manager consistency
             st.session_state['market_type'] = mode_id
-            available_pairs = exchange.get_available_symbols(quote_asset=quote_asset)
+            available_pairs = fetch_symbols_cached(mode_id, quote_asset)
+            
             if not available_pairs:
                 st.warning("No pairs found. Check connection or API keys.")
                 available_pairs = [f"BTC/{quote_asset}", f"ETH/{quote_asset}"] # Fallback
         except Exception as e:
             st.error(f"Error fetching symbols: {e}")
             available_pairs = [f"BTC/{quote_asset}"]
-            exchange = None # Initialize to avoid UnboundLocalError
         
         # Refresh Button for Pairs
         if st.button("🔄 Refresh Pairs", help="Force reload of market pairs"):
              try:
-                 temp_ex = ExchangeInterface(market_type=mode_id)
-                 temp_ex.exchange.load_markets(reload=True)
-                 st.success("Markets reloaded!")
+                 fetch_symbols_cached.clear()
+                 st.success("Cache cleared! Reloading...")
                  st.rerun()
              except Exception as e:
                  st.error(f"Reload failed: {e}")
@@ -70,9 +95,9 @@ def render_bot_creator_view():
 
         # Dynamic Min Order Calculation
         min_order_usd = 5.0
-        if exchange and pair:
+        if pair:
             try:
-                min_order_usd = exchange.get_min_order_usd(pair)
+                min_order_usd = fetch_min_order_cached(mode_id, pair)
             except Exception as e:
                 pass # Fallback to default
 
@@ -88,56 +113,183 @@ def render_bot_creator_view():
     # This dictionary stores all user selections for the new bot
     bot_config = {}
     
-    with st.expander("📊 ATR Planning Foundation (Market Context)", expanded=True):
-        st.info("💡 Use these live values to baseline your Grid Range and First Entry Price.")
+    with st.expander("📊 ATR Configuration (Flexible)", expanded=True):
+        st.info("💡 Configure ATR for Grid Spacing and Entry Triggers")
+        
+        # Flexible ATR Configuration
+        c_atr1, c_atr2 = st.columns(2)
+        with c_atr1:
+            atr_timeframe = st.selectbox(
+                "ATR Timeframe",
+                ["1m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w"],
+                index=4,
+                key="bot_creator_atr_tf"
+            )
+        with c_atr2:
+            atr_periods = st.slider(
+                "ATR Lookback Period (candles)",
+                min_value=3,
+                max_value=240,
+                value=14,
+                key="bot_creator_atr_periods"
+            )
+        
+        bot_config['ATR_Timeframe'] = atr_timeframe
+        bot_config['ATRPeriods'] = atr_periods
+        
+        # Calculate ATR
         try:
-            if exchange:
-                from engine.strategies.martingale_strategy import MartingaleStrategy
-                # Fetch data for foundation
-                # Hybrid Fetch: 1h for 4h/1d, 1d for 3d/5d
-                ohlcv_1h = exchange.fetch_ohlcv(pair, timeframe='1h', limit=500)
-                ohlcv_1d = exchange.fetch_ohlcv(pair, timeframe='1d', limit=100)
-                
-                if ohlcv_1h and ohlcv_1d:
-                    df_1h = pd.DataFrame(ohlcv_1h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                    df_1d = pd.DataFrame(ohlcv_1d, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                    for df_temp in [df_1h, df_1d]:
-                        df_temp['timestamp'] = pd.to_datetime(df_temp['timestamp'], unit='ms')
+            # Fetch data at ATR timeframe
+            ohlcv_atr = fetch_ohlcv_cached(mode_id, pair if pair else "BTC/USDT", timeframe=atr_timeframe, limit=250)
+            if ohlcv_atr:
+                    df_atr = pd.DataFrame(ohlcv_atr, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                    df_atr['timestamp'] = pd.to_datetime(df_atr['timestamp'], unit='ms')
                     
-                    temp_strat_f = MartingaleStrategy()
-                    atr_data = {}
-                    # 4h from 1h data
-                    res_4h = temp_strat_f.get_atr_foundation(df_1h)
-                    if '4h' in res_4h: atr_data['4h'] = res_4h['4h']
-                    # 1d, 3d, 5d from 1d data
-                    res_daily = temp_strat_f.get_atr_foundation(df_1d)
-                    for tf in ['1d', '3d', '5d']:
-                        if tf in res_daily: atr_data[tf] = res_daily[tf]
+                    # Calculate True Range
+                    tr1 = df_atr['high'] - df_atr['low']
+                    tr2 = (df_atr['high'] - df_atr['close'].shift()).abs()
+                    tr3 = (df_atr['low'] - df_atr['close'].shift()).abs()
+                    true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
                     
-                    # Store selected ATR TF in config
-                    st.markdown("**Grid ATR Context**")
-                    atr_tf_options = ["1m", "5m", "15m", "1h", "4h", "1d"]
-                    selected_atr_tf = st.selectbox("ATR Timeframe for Grid", atr_tf_options, index=3, key="bot_creator_atr_tf")
-                    bot_config['ATR_Timeframe'] = selected_atr_tf
-                    
-                    # Display metrics
-                    foundation_tfs = ['4h', '1d', '3d', '5d']
-                    m_cols = st.columns(len(foundation_tfs))
-                    for i, tf in enumerate(foundation_tfs):
-                        with m_cols[i]:
-                            if tf in atr_data:
-                                # Highlight if matches current grid TF
-                                label = f"ATR ({tf})"
-                                if tf == selected_atr_tf: label = f"🎯 **ATR ({tf})**"
-                                st.metric(label, f"{atr_data[tf]['atr']:.4f}")
-                                move_p = atr_data[tf]['move_pct']
-                                st.caption(f"Range Pos: **{move_p:+.1f}%**")
-                                st.caption(f"Vol %-tile: {atr_data[tf]['percentile']:.0f}%")
-
-                else:
-                    st.warning("No OHLCV data returned from exchange.")
+                    if len(true_range) >= atr_periods:
+                        current_atr = float(true_range.iloc[-atr_periods:].mean())
+                        
+                        # Historical ATR for percentile
+                        rolling_atrs = true_range.rolling(window=atr_periods).mean()
+                        atr_history = rolling_atrs.dropna()
+                        
+                        if len(atr_history) >= 10:
+                            percentile = (atr_history < current_atr).sum() / len(atr_history) * 100
+                        else:
+                            percentile = 50
+                        
+                        # Move percentage
+                        last_open = df_atr['open'].iloc[-1]
+                        last_close = df_atr['close'].iloc[-1]
+                        move_pct = (last_close - last_open) / current_atr * 100
+                        
+                        # Display ATR
+                        m1, m2, m3 = st.columns(3)
+                        with m1:
+                            st.metric(f"ATR ({atr_timeframe})", f"{current_atr:.6f}")
+                        with m2:
+                            st.metric("Range Position", f"{move_pct:+.1f}%")
+                        with m3:
+                            st.metric("Vol Percentile", f"{percentile:.0f}%")
+                        
+                        st.caption(f"**Formula:** ATR = Average(True Range of last {atr_periods} {atr_timeframe} candles)")
+                        
+                        # Volatility insight
+                        if percentile > 70:
+                            st.info(f"📈 **High Volatility**: Top {100-percentile:.0f}% percentile")
+                        elif percentile < 30:
+                            st.info(f"📉 **Low Volatility**: Bottom {percentile:.0f}% percentile")
+                        else:
+                            st.info(f"➡️ **Normal Volatility**: {percentile:.0f}% percentile")
+                        
+                        p_atr = current_atr
+                    else:
+                        st.warning(f"Not enough data. Need {atr_periods} candles, have {len(true_range)}")
+                        p_atr = df_atr['close'].iloc[-1] * 0.01
+            else:
+                st.warning("No OHLCV data returned from exchange.")
+                p_atr = 10.0
         except Exception as e:
-            st.warning(f"Could not load ATR Foundation: {e}")
+            st.warning(f"ATR Calculation Error: {e}")
+            p_atr = 10.0
+
+    # --- Flexible Grid System Configuration (NEW) ---
+    st.divider()
+    with st.expander("📐 Flexible Grid System", expanded=False):
+        st.info("💡 Configure step-based grid spacing rules. Apply different strategies for different martingale levels.")
+        
+        # ATR Mode
+        atr_mode = st.radio(
+            "ATR Update Mode",
+            ["dynamic", "locked"],
+            index=0,
+            horizontal=True,
+            help="'dynamic': Recalculate ATR every cycle. 'locked': Capture ATR at first entry and keep it constant."
+        )
+        bot_config['ATRMode'] = atr_mode
+        
+        # Default ATR Grid settings
+        use_atr_grid = st.checkbox("Use ATR Grid Spacing", value=True, help="Enable ATR-based grid spacing instead of fixed $ values.")
+        bot_config['UseATRGrid'] = use_atr_grid
+        
+        if use_atr_grid:
+            c_g1, c_g2 = st.columns(2)
+            with c_g1:
+                atr_grid_factor = st.number_input("Default ATR Multiplier", min_value=0.1, max_value=5.0, step=0.1, value=1.0, help="Grid spacing = ATR × this factor (used when no step rule applies).")
+                bot_config['ATRGridFactor'] = atr_grid_factor
+            with c_g2:
+                base_grid_fixed = st.number_input("Fallback Fixed Grid ($)", min_value=0.1, step=1.0, value=100.0, help="Used when ATR is 0 or UseATRGrid is disabled.")
+                bot_config['base_grid'] = base_grid_fixed
+        
+        # Step-Based Grid Rules
+        st.markdown("### 🎯 Step-Based Grid Rules")
+        st.caption("Define custom grid spacing for specific step ranges. Rules are processed in order.")
+        
+        # Initialize session state for grid rules
+        if 'grid_rules' not in st.session_state:
+            st.session_state.grid_rules = []
+        
+        # Add/Remove rules
+        r_col1, r_col2, r_col3 = st.columns([2, 2, 1])
+        with r_col1:
+            rule_start = st.number_input("Start Step", min_value=1, max_value=20, value=1, key="rule_start")
+        with r_col2:
+            rule_end = st.number_input("End Step", min_value=1, max_value=20, value=4, key="rule_end")
+        with r_col3:
+            rule_type = st.selectbox("Rule Type", ["atr", "fixed"], key="rule_type")
+        
+        if rule_type == "atr":
+            c_r1, c_r2 = st.columns(2)
+            with c_r1:
+                rule_multiplier = st.number_input("ATR Multiplier", min_value=0.1, max_value=5.0, step=0.1, value=1.0, key="rule_mult")
+            with c_r2:
+                if st.button("Add ATR Rule", key="add_atr_rule", width='stretch'):
+                    st.session_state.grid_rules.append({
+                        "start": rule_start,
+                        "end": rule_end,
+                        "type": "atr",
+                        "multiplier": rule_multiplier
+                    })
+                    st.rerun()
+        else:
+            rule_value = st.number_input("Fixed Spacing ($)", min_value=0.1, step=1.0, value=500.0, key="rule_value")
+            if st.button("Add Fixed Rule", key="add_fixed_rule", width='stretch'):
+                st.session_state.grid_rules.append({
+                    "start": rule_start,
+                    "end": rule_end,
+                    "type": "fixed",
+                    "value": rule_value
+                })
+                st.rerun()
+        
+        # Display existing rules
+        if st.session_state.grid_rules:
+            st.markdown("**Active Rules:**")
+            for i, rule in enumerate(st.session_state.grid_rules):
+                r_desc = f"Steps {rule['start']}-{rule['end']}: "
+                if rule['type'] == 'atr':
+                    r_desc += f"ATR × {rule['multiplier']}"
+                else:
+                    r_desc += f"Fixed ${rule['value']}"
+                
+                r_col, btn_col = st.columns([3, 1])
+                with r_col:
+                    st.markdown(f"- {r_desc}")
+                with btn_col:
+                    if st.button("🗑️", key=f"del_rule_{i}"):
+                        st.session_state.grid_rules.pop(i)
+                        st.rerun()
+            
+            # Save rules to config
+            bot_config['GridStepRules'] = st.session_state.grid_rules
+        else:
+            st.caption("No custom rules defined. Using default ATR or fixed spacing.")
+            bot_config['GridStepRules'] = []
 
     # --- Configuration Sections ---
     # bot_config is initialized above in the expander
@@ -209,7 +361,11 @@ def render_bot_creator_view():
 
         with col2:
             base_size = st.number_input(f"Base Order Size (Min: ${min_order_usd:.2f})", min_value=min_order_usd, step=1.0, value=max(10.0, min_order_usd))
-            if base_size < min_order_usd:
+            
+            use_min_size = st.checkbox("Use Minimum Quantity (Auto-Size)", value=False, help="If checked, the bot will automatically use the exchange's minimum valid quantity + 5% buffer, overriding the Base Size.")
+            bot_config['use_min_size'] = use_min_size
+            
+            if base_size < min_order_usd and not use_min_size:
                     st.warning(f"Order size below minimum ${min_order_usd:.2f}")
 
             martingale_multiplier = st.number_input("Martingale Multiplier", min_value=1.0, step=0.1, value=1.8)
@@ -429,8 +585,12 @@ def render_bot_creator_view():
 
         # --- MOVED PROJECTION LOGIC ---
         try:
-            if df_f is not None and not df_f.empty:
-                current_price = df_f['close'].iloc[-1]
+            # Optimized Projection Data Fetch (Cached)
+            ohlcv_proj = fetch_ohlcv_cached(mode_id, pair if pair else "BTC/USDT", timeframe='1m', limit=1)
+            if ohlcv_proj and len(ohlcv_proj) > 0:
+                current_price = float(ohlcv_proj[0][4])
+            
+            if current_price > 0:
                 
                 # Determine correct ATR for projection
                 proj_tf = timeframe
@@ -488,7 +648,7 @@ def render_bot_creator_view():
                             plot_bgcolor='rgba(0,0,0,0)',
                             font=dict(color='#1f2328')
                         )
-                        st.plotly_chart(fig, width='stretch')
+                        st.plotly_chart(fig, use_container_width=True)
                     # ----------------------------------
 
                     st.success(f"📈 Simulated Martingale Grid based on current price: **{current_price:,.2f}**")

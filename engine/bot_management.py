@@ -20,7 +20,7 @@ from .exchange_interface import ExchangeInterface
 logger = logging.getLogger("BotManagement")
 
 
-def close_position(bot_id: int, close_pct: float = 100.0, reason: str = "Manual Close") -> Dict[str, Any]:
+def close_position(bot_id: int, close_pct: float = 100.0, reason: str = "Manual Close", exchange_interface=None) -> Dict[str, Any]:
     """
     Close a bot's position (partial or full) on the exchange.
     
@@ -28,6 +28,7 @@ def close_position(bot_id: int, close_pct: float = 100.0, reason: str = "Manual 
         bot_id: The bot to close
         close_pct: Percentage of position to close (100 = full close)
         reason: Reason for close
+        exchange_interface: Optional ExchangeInterface instance to reuse
     
     Returns:
         dict with success status and details
@@ -52,7 +53,7 @@ def close_position(bot_id: int, close_pct: float = 100.0, reason: str = "Manual 
         return {'success': False, 'error': 'No position to close'}
     
     # Get exchange and current price
-    exchange = ExchangeInterface(market_type=market_type)
+    exchange = exchange_interface or ExchangeInterface(market_type=market_type)
     current_price = exchange.get_last_price(pair)
     
     if current_price == 0:
@@ -186,13 +187,14 @@ def set_manual_close_pct(bot_id: int, pct: float) -> bool:
     return update_bot_close_settings(bot_id, manual_close_pct=pct)
 
 
-def check_and_execute_stops(bot_id: int) -> Optional[Dict[str, Any]]:
+def check_and_execute_stops(bot_id: int, exchange_interface=None) -> Optional[Dict[str, Any]]:
     """
     Check if any stop conditions are met and execute close if so.
     Call this at the start of each cycle.
     
     Args:
         bot_id: The bot to check
+        exchange_interface: Optional ExchangeInterface instance to reuse
     
     Returns:
         dict with result if stop was executed, None otherwise
@@ -217,7 +219,7 @@ def check_and_execute_stops(bot_id: int) -> Optional[Dict[str, Any]]:
     config_dict = config_json if isinstance(config_json, dict) else {}
     market_type = config_dict.get('market_type', 'future')
     
-    exchange = ExchangeInterface(market_type=market_type)
+    exchange = exchange_interface or ExchangeInterface(market_type=market_type)
     current_price = exchange.get_last_price(pair)
     
     if current_price == 0:
@@ -260,7 +262,8 @@ def check_and_execute_stops(bot_id: int) -> Optional[Dict[str, Any]]:
         close_result = close_position(
             bot_id=bot_id,
             close_pct=100.0,
-            reason=first_condition.get('type', 'UNKNOWN')
+            reason=first_condition.get('type', 'UNKNOWN'),
+            exchange_interface=exchange
         )
         
         return {

@@ -16,7 +16,31 @@ import engine.indicators as ta
 import pandas as pd
 import json
 
+# --- Caching Wrappers ---
+@st.cache_resource(ttl=3600, show_spinner=False)
+def get_exchange_instance(market_type):
+    """
+    Singleton provider for ExchangeInterface to reuse connections.
+    """
+    return ExchangeInterface(market_type=market_type, validate=False)
+
+@st.cache_data(ttl=15, show_spinner=False)
+def fetch_last_price_cached(market_type, symbol):
+    try:
+        ex = get_exchange_instance(market_type)
+        return ex.get_last_price(symbol)
+    except Exception: return 0.0
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_ohlcv_cached(market_type, symbol, timeframe):
+    try:
+        ex = get_exchange_instance(market_type)
+        return ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=500)
+    except Exception: return []
+# ------------------------
+
 def render_bot_manager_view():
+    print("DEBUG: Entering Bot Manager")
     st.header("🤖 Bot Manager")
     st.caption("📊 Manage existing bots: Toggle Status, Edit Settings, or Delete.")
 
@@ -26,7 +50,9 @@ def render_bot_manager_view():
     from config.settings import config
     
     # Fetch Data
+    print("DEBUG: Fetching bots...")
     bots = get_all_bots()
+    print(f"DEBUG: Found {len(bots)} bots")
     
     if not bots:
         st.info("No bots found. Go to 'Bot Creator' to deploy one.")
@@ -50,11 +76,16 @@ def render_bot_manager_view():
     editing_bot_id = st.session_state.get('editing_bot_id')
 
     for bot in bots:
+        print(f"DEBUG: Processing bot {bot[1]}")
         # Note: update engine/database.py get_all_bots to return these if not already
         # Current get_all_bots returns: b.id, b.name, b.pair, b.is_active, b.strategy_type, t.total_invested, t.current_step
         # We need t.avg_entry_price, t.target_tp_price as well.
         b_id, name, pair, is_active, strat_type, total_invested, step = bot[:7]
         
+        # FIX: Handle potential None values from LEFT JOIN if trade record missing
+        total_invested = float(total_invested) if total_invested is not None else 0.0
+        step = int(step) if step is not None else 0
+
         # Display Row
         row_cols = st.columns([0.5, 1.5, 1.5, 1.5, 2, 2, 2, 2])
         row_cols[0].write(f"#{b_id}")
@@ -78,8 +109,7 @@ def render_bot_manager_view():
                     bot_market_type = params_config.get('market_type', config.MARKET_TYPE)
                     
                     # Create exchange with bot's market type
-                    bot_exchange = ExchangeInterface(market_type=bot_market_type)
-                    curr_price = bot_exchange.get_last_price(pair)
+                    curr_price = fetch_last_price_cached(bot_market_type, pair)
                     
                     # raw_params: name, pair, direction, rsi_limit, mm, base, strat, config_json
                     direction_str = raw_params[2]
@@ -114,8 +144,8 @@ def render_bot_manager_view():
                         target_tf = params.get('ATR_Timeframe', '1h')
                         
                         # Hybrid fetch for accurate metrics
-                        ohlcv_1h = bot_exchange.fetch_ohlcv(pair, timeframe='1h', limit=500)
-                        ohlcv_1d = bot_exchange.fetch_ohlcv(pair, timeframe='1d', limit=100)
+                        ohlcv_1h = fetch_ohlcv_cached(bot_market_type, pair, '1h')
+                        ohlcv_1d = fetch_ohlcv_cached(bot_market_type, pair, '1d')
                         
                         if ohlcv_1h and ohlcv_1d:
                             df_1h = pd.DataFrame(ohlcv_1h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])  # type: ignore[arg-type]
@@ -482,6 +512,89 @@ def render_edit_form(bot_id):
         config_dict['TakeProfitType'] = 'Percent'
         config_dict['TakeProfitPct'] = new_tp_pct
 
+    # --- NEW: ATR Configuration Section ---
+    st.markdown("#### 📊 ATR Configuration")
+    with st.expander("ATR & Grid Settings", expanded=False):
+        c_atr1, c_atr2 = st.columns(2)
+        with c_atr1:
+            atr_tf = st.selectbox(
+                "ATR Timeframe",
+                ["1m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w"],
+                index=["1m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w"].index(config_dict.get('ATR_Timeframe', '1h')),
+                key=f"edit_atr_tf_{bot_id}"
+            )
+            config_dict['ATR_Timeframe'] = atr_tf
+        with c_atr2:
+            atr_periods = st.slider(
+                "ATR Lookback (candles)",
+                min_value=3,
+                max_value=240,
+                value=int(config_dict.get('ATRPeriods', 14)),
+                key=f"edit_atr_periods_{bot_id}"
+            )
+            config_dict['ATRPeriods'] = atr_periods
+        
+        # ATR Mode
+        atr_mode = st.radio(
+            "ATR Update Mode",
+            ["dynamic", "locked"],
+            index=0 if config_dict.get('ATRMode', 'dynamic') == 'dynamic' else 1,
+            horizontal=True,
+            help="'dynamic': Recalculate ATR every cycle. 'locked': Capture ATR at first entry and keep it constant.",
+            key=f"edit_atr_mode_{bot_id}"
+        )
+        config_dict['ATRMode'] = atr_mode
+        
+        # ATR Grid Settings
+        use_atr_grid = st.checkbox("Use ATR Grid Spacing", value=config_dict.get('UseATRGrid', False), key=f"edit_use_atr_grid_{bot_id}")
+        config_dict['UseATRGrid'] = use_atr_grid
+        
+        if use_atr_grid:
+            c_g1, c_g2 = st.columns(2)
+            with c_g1:
+                atr_grid_factor = st.number_input(
+                    "ATR Grid Multiplier",
+                    min_value=0.1,
+                    max_value=5.0,
+                    step=0.1,
+                    value=float(config_dict.get('ATRGridFactor', 1.0)),
+                    key=f"edit_atr_grid_factor_{bot_id}"
+                )
+                config_dict['ATRGridFactor'] = atr_grid_factor
+            with c_g2:
+                base_grid_fixed = st.number_input(
+                    "Fallback Fixed Grid ($)",
+                    min_value=0.1,
+                    step=1.0,
+                    value=float(config_dict.get('base_grid', 100.0)),
+                    key=f"edit_base_grid_{bot_id}"
+                )
+                config_dict['base_grid'] = base_grid_fixed
+        else:
+            base_grid_fixed = st.number_input(
+                "Fixed Grid Spacing ($)",
+                min_value=0.1,
+                step=1.0,
+                value=float(config_dict.get('base_grid', 100.0)),
+                key=f"edit_base_grid_only_{bot_id}"
+            )
+            config_dict['base_grid'] = base_grid_fixed
+        
+        # Grid Step Rules Display
+        grid_rules = config_dict.get('GridStepRules', [])
+        if grid_rules:
+            st.markdown("**📐 Step-Based Grid Rules:**")
+            for rule in grid_rules:
+                r_desc = f"Steps {rule['start']}-{rule['end']}: "
+                if rule['type'] == 'atr':
+                    r_desc += f"ATR × {rule['multiplier']}"
+                else:
+                    r_desc += f"Fixed ${rule['value']}"
+                st.markdown(f"- {r_desc}")
+            st.caption("ℹ️ To modify rules, delete and recreate the bot from Bot Creator.")
+        else:
+            st.caption("No custom step rules. Using default ATR or fixed spacing.")
+
     # Math Projection in Editor
     try:
         # Merge basic params with config_dict to ensure Strategy __init__ sees everything (like UseATRGrid)
@@ -507,15 +620,29 @@ def render_edit_form(bot_id):
         
         # Calculate Real ATR for Projection
         p_atr = 0.0
+        atr_timeframe = config_dict.get('ATR_Timeframe', '1h')
+        atr_period = int(config_dict.get('ATRPeriods', 14))
+        atr_period = min(max(atr_period, 3), 240)  # Clamp to valid range
+        
         try:
-            # Fetch more data for ATR calculation (need ~20+ periods)
-            ohlcv_atr = exchange.fetch_ohlcv(new_pair if new_pair else "BTC/USDT", timeframe=atr_tf, limit=50)
+            # Fetch data at ATR timeframe
+            ohlcv_atr = exchange.fetch_ohlcv(new_pair if new_pair else "BTC/USDT", timeframe=atr_timeframe, limit=250)
             if ohlcv_atr:
-                df_atr = pd.DataFrame(ohlcv_atr, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])  # type: ignore[arg-type]
-                atr_series = ta.atr(df_atr['high'], df_atr['low'], df_atr['close'], period=14)  # type: ignore[arg-type]
-                p_atr = atr_series.iloc[-1]
+                df_atr = pd.DataFrame(ohlcv_atr, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                
+                # Calculate True Range
+                tr1 = df_atr['high'] - df_atr['low']
+                tr2 = (df_atr['high'] - df_atr['close'].shift()).abs()
+                tr3 = (df_atr['low'] - df_atr['close'].shift()).abs()
+                true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+                
+                if len(true_range) >= atr_period:
+                    # Average True Range over atr_period
+                    p_atr = float(true_range.iloc[-atr_period:].mean())
+                else:
+                    p_atr = curr_p * 0.01  # Fallback 1% if not enough data
             else:
-                p_atr = curr_p * 0.01 # Fallback 1% if data fetch fails
+                p_atr = curr_p * 0.01  # Fallback 1% if data fetch fails
         except Exception as e:
             p_atr = curr_p * 0.01
             st.warning(f"ATR Calc Failed: {e}")
@@ -561,7 +688,7 @@ def render_edit_form(bot_id):
                     plot_bgcolor='rgba(0,0,0,0)',
                     font=dict(color='#1f2328')
                 )
-                st.plotly_chart(fig, width='stretch')
+                st.plotly_chart(fig, use_container_width=True)
             # -------------------------------
 
             st.caption(f"Simulated levels starting at: **{curr_p:,.2f}**")
