@@ -1,0 +1,42 @@
+{
+  "General": {
+    "LOG_LEVEL": "INFO",
+    "POLL_INTERVAL_SECONDS": 10,
+    "METRICS_PORT": 9099,
+    "ALLOWED_SYMBOLS": "BTC/USDT,ETH/USDT,SOL/USDT,BNB/USDT,XRP/USDT,BTC/USDC,ETH/USDC,SOL/USDC",
+    "MARKET_TYPE": "future",
+    "MAX_ORDER_USD": 10000.0,
+    "DRY_RUN": true
+  },
+  "Safety": {
+    "GLOBAL_STOP_LOSS_PCT": 50.0,
+    "MAX_RETRIES": 3,
+    "RETRY_DELAY": 2
+  },
+  "Strategy_Defaults": {
+    "Grid_Settings": {
+      "UseATRGrid": true,
+      "ATRGridFactor": 1.0,
+      "GridLevelMultipliers": {
+        "1": 1.0,
+        "2": 1.0,
+        "3": 1.2,
+        "4": 1.5,
+        "5": 2.0
+      }
+    },
+    "Early_Exit_Settings": {
+      "UseEarlyExit": true,
+      "EEHoursPC": 0.5,
+      "EEStartHours": 2.0,
+      "EEStartLevel": 1
+    },
+    "Market_Maker_Settings": {
+      "SpreadPct": 0.002,
+      "SkewFactor": 0.0,
+      "MMOrderSize": 0.01,
+      "MaxInventory": 1.0,
+      "RepriceThreshold": 0.001
+    }
+  }
+}

@@ -61,11 +61,12 @@ st.markdown("""
         color: var(--text-primary);
     }
     
-    .main {
+    /* Force opaque background for main container to prevent ghosting */
+    .main .block-container {
         background-color: var(--bg-color);
+        padding-top: 2rem;
     }
 
-    /* Sidebar */
     [data-testid="stSidebar"] {
         background-color: #f6f8fa;
         border-right: 1px solid var(--border-color);
@@ -386,9 +387,17 @@ with st.sidebar:
     if not engine_running:
         if st.button("▶️ Start Monitoring"):
             # Start engine logic...
-            CREATE_NEW_CONSOLE = 0x00000010 # For Windows to run detached
             runner_path = os.path.join(ROOT_DIR, "engine", "runner.py")
-            process = subprocess.Popen([sys.executable, runner_path], creationflags=CREATE_NEW_CONSOLE)
+            
+            # Start runner and redirect output to a specific log file for debugging
+            LOG_FILE_PATH = os.path.join(ROOT_DIR, "engine_runner_debug.log")
+            with open(LOG_FILE_PATH, "a") as log_f:
+                process = subprocess.Popen([sys.executable, runner_path], 
+                                           stdout=log_f, 
+                                           stderr=log_f, 
+                                           creationflags=subprocess.CREATE_NEW_CONSOLE if sys.platform == "win32" else 0,
+                                           close_fds=True)
+            
             with open(PID_FILE, "w") as f:
                 f.write(str(process.pid))
             st.success("Monitoring service started. Refreshing page...")
@@ -486,11 +495,22 @@ with st.sidebar:
     )
 
 # Render ONLY the selected page
-if selected_page == "📊 Live Monitor":
-    render_monitor_view()
+# Use containers to ensure clean DOM separation between views
+main_container = st.container()
 
-elif selected_page == "🏗️ Bot Creator":
-    render_bot_creator_view()
+with main_container:
+    if selected_page == "📊 Live Monitor":
+        # Clear Bot Manager specific state when leaving
+        if 'editing_bot_id' in st.session_state:
+            del st.session_state['editing_bot_id']
+            
+        render_monitor_view()
 
-elif selected_page == "🛠️ Bot Manager":
-    render_bot_manager_view()
+    elif selected_page == "🏗️ Bot Creator":
+        if 'editing_bot_id' in st.session_state:
+            del st.session_state['editing_bot_id']
+            
+        render_bot_creator_view()
+
+    elif selected_page == "🛠️ Bot Manager":
+        render_bot_manager_view()

@@ -56,7 +56,7 @@ def init_db():
     """Initializes the database and creates tables if they don't exist."""
     # Use a fresh connection for init (not thread-local) since this runs once at startup
     try:
-        conn = sqlite3.connect(DB_PATH, timeout=60.0, check_same_thread=False)
+        conn = sqlite3.connect(DB_PATH, timeout=60.0)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=60000")
         cursor = conn.cursor()
@@ -73,9 +73,22 @@ def init_db():
                 martingale_multiplier REAL NOT NULL,
                 base_size REAL NOT NULL,
                 config TEXT DEFAULT '{}',
-                is_active BOOLEAN DEFAULT 1
+                is_active BOOLEAN DEFAULT 1,
+                status TEXT DEFAULT 'Stopped'
             )
         ''')
+        
+        # System table: Stores global, non-bot-specific configurations/state
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS system_equity (
+                key TEXT PRIMARY KEY,
+                value REAL
+            )
+        ''')
+        
+        # Set default starting equity if not present
+        cursor.execute("INSERT OR IGNORE INTO system_equity (key, value) VALUES (?, ?)", ('STARTING_EQUITY', 10000.0))
+        cursor.execute("INSERT OR IGNORE INTO system_equity (key, value) VALUES (?, ?)", ('BOT_TRADING_BALANCE', 10000.0))
         
         # Check if strategy_type exists (migration for existing db)
         try:
@@ -89,6 +102,13 @@ def init_db():
             cursor.execute('SELECT config FROM bots LIMIT 1')
         except sqlite3.OperationalError:
             cursor.execute('ALTER TABLE bots ADD COLUMN config TEXT DEFAULT "{}"')
+            conn.commit()
+            
+        # Check if status exists (migration for existing db)
+        try:
+            cursor.execute('SELECT status FROM bots LIMIT 1')
+        except sqlite3.OperationalError:
+            cursor.execute("ALTER TABLE bots ADD COLUMN status TEXT DEFAULT 'Stopped'")
             conn.commit()
         
         # Trades table: Tracks active positions and Martingale steps
@@ -204,6 +224,9 @@ def init_db():
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_trade_history_bot ON trade_history(bot_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_trade_history_time ON trade_history(timestamp)')
         
+        # Index for faster queries by bot activation status
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_bots_active ON bots(is_active)')
+
         conn.commit()
     except Exception as e:
         # Handle WinError 233 (Pipe broken) or database locked - non-fatal
@@ -568,6 +591,38 @@ def get_bot_pnl_summary(bot_id):
         'loss_count': result[3] or 0
     }
     # Note: No conn.close() - using thread-local connection
+    
+def get_starting_equity():
+    """Fetches the system's starting equity from the database."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT value FROM system_equity WHERE key = 'STARTING_EQUITY'")
+    result = cursor.fetchone()
+    return result[0] if result else 10000.0
+
+def get_system_pnl_exposure():
+    """
+    Fetches the system's baseline equity and total realized PnL.
+    
+    Returns:
+        Dict with 'starting_equity', 'total_realized_pnl'
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    # 1. Get Starting Equity
+    cursor.execute("SELECT value FROM system_equity WHERE key = 'STARTING_EQUITY'")
+    starting_equity = cursor.fetchone()
+    starting_equity = starting_equity[0] if starting_equity else 10000.0
+    
+    # 2. Get Total Realized PnL (sum PnL from all completed trades)
+    cursor.execute("SELECT COALESCE(SUM(pnl), 0) FROM trade_history")
+    total_realized_pnl = cursor.fetchone()[0]
+
+    return {
+        'starting_equity': starting_equity,
+        'total_realized_pnl': total_realized_pnl
+    }
 
 # ============================================
 # ORDER ID TRACKING FOR MULTI-BOT SUPPORT (v0.4.1)
@@ -754,16 +809,35 @@ def get_bot_position_id(bot_id):
     result = cursor.fetchone()
     
     if result and result[0]:
-        conn.close()
         return result[0]
-    
-    # Generate new position ID
-    position_id = generate_bot_position_id()
-    cursor.execute('UPDATE trades SET bot_position_id = ? WHERE bot_id = ?', (position_id, bot_id))
-    conn.commit()
-    conn.close()
-    
-    return position_id
+    else:
+        # Create new ID
+        new_id = generate_bot_position_id()
+        cursor.execute('UPDATE trades SET bot_position_id = ? WHERE bot_id = ?', (new_id, bot_id))
+        conn.commit()
+        return new_id
+
+def update_bot_config_value(bot_id, key, value):
+    """Updates a single key in the bot's config JSON."""
+    conn = get_connection()
+    c = conn.cursor()
+    try:
+        c.execute('SELECT config FROM bots WHERE id = ?', (bot_id,))
+        row = c.fetchone()
+        if row:
+            config_str = row[0]
+            config = json.loads(config_str) if config_str else {}
+            
+            # Only update if changed
+            if config.get(key) != value:
+                config[key] = value
+                new_json = json.dumps(config)
+                c.execute('UPDATE bots SET config = ? WHERE id = ?', (new_json, bot_id))
+                conn.commit()
+                return True
+    except Exception as e:
+        logger.error(f"Error updating config value for bot {bot_id}: {e}")
+    return False
 
 
 def close_bot_position(bot_id, close_type='MANUAL', close_price=0.0, close_pct=100.0, notes=None):

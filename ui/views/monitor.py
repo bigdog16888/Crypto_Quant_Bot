@@ -1,12 +1,11 @@
+import json
 import streamlit as st
 import time
 import pandas as pd
 import plotly.graph_objects as go
 import ccxt
-import json
 from engine.exchange_interface import ExchangeInterface
 from engine.database import get_connection, get_bots_by_order_id
-
 
 import sys
 import os
@@ -18,6 +17,7 @@ from config.settings import config as global_config
 def get_exchange_instance(market_type):
     """Singleton provider for ExchangeInterface to reuse connections."""
     return ExchangeInterface(market_type=market_type, validate=False)
+
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_ohlcv_cached(market_type, symbol, timeframe):
@@ -38,7 +38,9 @@ def fetch_open_orders_cached(market_type, symbol):
     try:
         ex = get_exchange_instance(market_type)
         return ex.fetch_open_orders(symbol)
-    except Exception: return []
+    except Exception as e:
+        print(f"Error fetching orders for {symbol}: {e}")
+        return []
 
 @st.cache_data(ttl=30, show_spinner=False)
 def fetch_balance_cached(market_type):
@@ -110,29 +112,43 @@ def render_monitor_view():
         try:
             fut_data = fetch_balance_cached('future')
             
-            if fut_data and 'info' in fut_data:
-                info = fut_data['info']
-                # Try standard Total Wallet Balance (Binance specific)
-                if 'totalWalletBalance' in info:
-                    futures_balance = float(info['totalWalletBalance'])
-                # Fallback to USDT total if specific key missing
-                elif 'USDT' in fut_data:
-                    futures_balance = float(fut_data['USDT'].get('total', 0))
+            if fut_data:
+                # 1. Try 'info' (Exchange specific raw data)
+                if 'info' in fut_data:
+                    info = fut_data['info']
+                    # Binance Futures
+                    if 'totalWalletBalance' in info:
+                        futures_balance = float(info['totalWalletBalance'])
+                    # Bybit / Others
+                    elif 'result' in info and 'list' in info['result']:
+                         # Logic for Bybit...
+                         pass
                 
+                # 2. If standard fetch failed, try CCXT unified structure
+                if futures_balance == 0.0:
+                    # Check common stablecoins
+                    for coin in ['USDT', 'USDC', 'USD', 'BUSD']:
+                        if coin in fut_data and 'total' in fut_data[coin]:
+                            futures_balance += float(fut_data[coin]['total'] or 0)
+                            
                 # Extract assets for breakdown
-                if 'assets' in info:
-                    for asset in info['assets']:
-                        wb = float(asset.get('walletBalance', 0))
-                        u_pnl = float(asset.get('unrealizedProfit', 0))
-                        if wb > 0 or u_pnl != 0:
+                # Unified CCXT 'total' dictionary
+                if 'total' in fut_data:
+                    for asset, amount in fut_data['total'].items():
+                        if amount and amount > 0:
+                            # Try to find uPnL if available
+                            u_pnl = 0.0
+                            # Some exchanges put uPnL in 'info'
                             assets_breakdown.append({
                                 'Type': 'Futures',
-                                'Asset': asset.get('asset'),
-                                'Balance': wb,
-                                'Unrealized PnL': u_pnl,
-                                'Equity': wb + u_pnl
+                                'Asset': asset,
+                                'Balance': amount,
+                                'Unrealized PnL': u_pnl, # Hard to get generically without positions
+                                'Equity': amount + u_pnl
                             })
-        except Exception: pass
+        except Exception as e: 
+            print(f"Error fetching futures balance: {e}")
+            pass
 
         # --- B. Fetch Spot Balance ---
         # Get active market types from DB to see if we even need spot
@@ -209,7 +225,7 @@ def render_monitor_view():
                     "Unrealized PnL": st.column_config.NumberColumn(format="$%.2f"),
                     "Equity": st.column_config.NumberColumn(format="$%.2f"),
                 },
-                width='stretch',
+                use_container_width=True,
                 hide_index=True
             )
 
@@ -293,7 +309,7 @@ def render_monitor_view():
         st.write("") # Spacer
         col3_a, col3_b = st.columns([1, 1])
         with col3_a:
-            auto_refresh = st.checkbox("Auto (30s)", value=True, key="monitor_autorefresh")
+            auto_refresh = st.checkbox("Auto (30s)", value=False, help="Keeps app in 'Running' state to refresh data.", key="monitor_autorefresh")
         with col3_b:
             if st.button("🔄 Refresh"):
                 st.cache_data.clear()
@@ -588,7 +604,7 @@ def render_monitor_view():
         conn = get_connection()
         # Fetch all bots (Active & Paused) with trade info
         query_all = """
-            SELECT b.id, b.name, b.pair, b.direction, b.strategy_type, b.config, t.current_step, t.total_invested, t.avg_entry_price, t.target_tp_price, b.is_active
+            SELECT b.id, b.name, b.pair, b.direction, b.strategy_type, b.config, t.current_step, t.total_invested, t.avg_entry_price, t.target_tp_price, b.is_active, b.status
             FROM bots b
             LEFT JOIN trades t ON b.id = t.bot_id
             -- Show all bots so users can see paused/errored ones too
@@ -681,107 +697,198 @@ def render_monitor_view():
                     # Log error but don't crash UI
                     st.warning(f"Price fetch warning ({m_type}): {e}")
 
-            # 3. Build DataFrame with calculated P/L
-            processed_data = []
+            # Helper to get current prices
+            # We already fetched current_prices above for PnL calculation
+            
+            # 3. Group Bots by Category
+            grouped_positions = {}
+            scanner_rows = []
+            inactive_rows = []
+            
             for r in rows:
-                # r: id, name, pair, direction, strat, config, step, invested, entry, tp, is_active
-                name, pair, direction, strat_type, config_json, step, invested, entry, tp, is_active = r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10]
+                # r: id, name, pair, direction, strat, config, step, invested, entry, tp, is_active, status
+                id, name, pair, direction, strat_type, config_json, step, invested, entry, tp, is_active, status = r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11]
                 
-                # --- PARSE STRATEGY SUMMARY ---
-                strat_summary = strat_type
-                try:
-                    c = json.loads(config_json) if config_json else {}
-                    triggers = []
+                has_position = invested and invested > 0
+                
+                if has_position:
+                    # --- 1. POSITION GROUP ---
+                    key = (pair, direction)
+                    if key not in grouped_positions:
+                        grouped_positions[key] = {
+                            'bots': [],
+                            'total_invested': 0.0, 
+                            'internal_net_pnl_usd': 0.0
+                        }
                     
-                    if strat_type == "Martingale":
-                        if c.get('mode_rsi'): triggers.append(f"RSI({c.get('rsi_tf','?')})")
-                        if c.get('mode_cci'): triggers.append(f"CCI({c.get('cci_tf','?')})")
-                        if c.get('mode_boll'): triggers.append(f"BB({c.get('boll_tf','?')})")
-                        if c.get('mode_stoch'): triggers.append(f"Stoch({c.get('stoch_tf','?')})")
-                        if c.get('mode_price'): triggers.append(f"Price")
-                        if c.get('mode_atrp'): triggers.append(f"Vol%")
-                        
-                        # Pattern Slots
-                        pat_count = 0
-                        for i in range(1, 5):
-                             if c.get(f'pat_{i}_mode'): pat_count += 1
-                        if pat_count > 0: triggers.append(f"Pat(x{pat_count})")
-                        
-                        if triggers:
-                            strat_summary = f"{', '.join(triggers)}"
-                        else:
-                            strat_summary = "Martingale (No Triggers)"
-                            
-                    elif strat_type == "Market Maker":
-                        spread = c.get('spread_pct', '?')
-                        strat_summary = f"MM (Spr: {spread}%)"
-                        
-                    elif strat_type == "Magic Hour":
-                        hour = c.get('magic_hour', '?')
-                        strat_summary = f"Magic (Hr: {hour})"
-                        
-                except:
-                    pass
-                # ------------------------------
-
-                curr_p = current_prices.get(pair, 0.0)
-                pnl_str = "-"
-                status_icon = "🟢" if is_active else "🔴"
-                
-                # Logic to handle "Scanning" vs "Active" state
-                if is_active:
-                    if entry and entry > 0 and curr_p > 0 and invested > 0:
-                        # ACTIVE TRADE
-                        if direction == "LONG":
+                    group = grouped_positions[key]
+                    group['total_invested'] += (invested if invested else 0.0)
+                    
+                    # Calculate Individual PnL
+                    pnl_usd = 0.0
+                    pnl_pct = 0.0
+                    curr_p = current_prices.get(pair, 0.0)
+                    
+                    if entry and entry > 0 and curr_p > 0:
+                         if direction == "LONG":
                             pnl_raw = (curr_p - entry) / entry
-                        else: # SHORT
+                         else: # SHORT
                             pnl_raw = (entry - curr_p) / entry
-                        
-                        pnl_pct = pnl_raw * 100
-                        pnl_usd = invested * pnl_raw
-                        
-                        # Formatting
-                        icon = "🟢" if pnl_pct >= 0 else "🔴"
-                        pnl_str = f"{icon} {pnl_pct:+.2f}% (${pnl_usd:+.2f})"
-                    else:
-                        # IDLE / SCANNING
-                        entry = None 
-                        tp = None
-                        invested = None
-                        pnl_str = "⏳ Scanning..."
+                         pnl_usd = (invested or 0) * pnl_raw
+                         group['internal_net_pnl_usd'] += pnl_usd
+                         pnl_pct = pnl_raw * 100
+                    
+                    # Safe Step
+                    safe_step = step if step is not None else 0
+                    
+                    group['bots'].append({
+                        'id': id,
+                        'name': name,
+                        'strat': strat_type,
+                        'step': safe_step,
+                        'invested': invested if invested else 0.0,
+                        'entry': entry,
+                        'tp': tp,
+                        'pnl_usd': pnl_usd,
+                        'pnl_pct': pnl_pct,
+                        'is_active': is_active,
+                        'status': status
+                    })
+                elif is_active:
+                    # --- 2. SCANNER LIST ---
+                    scanner_rows.append({
+                        "ID": f"#{id}",
+                        "Name": name,
+                        "Pair": pair,
+                        "Strategy": strat_type,
+                        "Direction": direction,
+                        "Status": "🟢 Scanning"
+                    })
                 else:
-                    # PAUSED / STOPPED
-                    pnl_str = "⛔ Stopped"
+                    # --- 3. INACTIVE / ERROR LIST ---
+                    # Check for keywords in status to highlight errors
+                    status_display = status if status else "Stopped"
+                    if "error" in str(status_display).lower():
+                        status_display = f"🔴 {status_display}"
+                    else:
+                        status_display = f"⚫ {status_display}"
+                        
+                    inactive_rows.append({
+                        "ID": f"#{id}",
+                        "Name": name,
+                        "Pair": pair,
+                        "Strategy": strat_type,
+                        "Direction": direction,
+                        "Status": status_display
+                    })
 
-                processed_data.append({
-                    "Status": "Running" if is_active else "Stopped",
-                    "Bot Name": name,
-                    "Strategy / Triggers": strat_summary,
-                    "Symbol": pair,
-                    "Side": direction,
-                    "Step": step if step > 0 else "-",
-                    "Invested": invested, # None = "missing" value, distinct from 0
-                    "Entry": entry,
-                    "Target TP": tp,
-                    "Current Price": curr_p,
-                    "P/L": pnl_str
-                })
+            # 4. Render Active Positions
+            st.markdown("### 💰 Active Positions")
+            if not grouped_positions:
+                st.info("No bots currently hold a position.")
+            else:
+                for (pair, direction), group in grouped_positions.items():
+                    bots = group['bots']
+                    total_inv = group['total_invested']
+                    total_pnl = group['internal_net_pnl_usd']
+                    bot_count = len(bots)
+                    
+                    
+                    # Get Exchange Data Reference (Robust Lookup)
+                    # Try exact match first, then normalized
+                    ex_pos_data = exchange_positions.get(pair)
+                    if not ex_pos_data:
+                        # Normalize keys in exchange_positions to handle BTC/USDC:USDC vs BTC/USDC mismatch
+                        norm_pair = pair.split(':')[0]
+                        for k, v in exchange_positions.items():
+                            if k.split(':')[0] == norm_pair:
+                                ex_pos_data = v
+                                break
+                    
+                    ex_size = 0.0
+                    ex_pnl = 0.0
+                    ex_side = "NONE"
+                    
+                    if ex_pos_data:
+                         ex_size = ex_pos_data.get('size', 0)
+                         ex_pnl = ex_pos_data.get('unrealized_pnl', 0)
+                         ex_side = ex_pos_data.get('side', 'NONE').upper()
+                    
+                    pnl_color = "green" if total_pnl >= 0 else "red"
+                    
+                    # Card Header
+                    with st.expander(f"{pair} {direction} | Inv: ${total_inv:,.2f} | PnL: ${total_pnl:+.2f}", expanded=True):
+                        
+                        # Comparison Metric Row
+                        c1, c2, c3 = st.columns([2, 1, 1])
+                        with c1:
+                             st.markdown(f"**🤖 Internal Bot Aggregation**")
+                             st.write(f"Bots in Trade: **{bot_count}**")
+                             st.write(f"Total Size: **${total_inv:,.2f}**")
+                             st.markdown(f"Agg. PnL: <span style='color:{pnl_color}'>**${total_pnl:+.2f}**</span>", unsafe_allow_html=True)
+                        
+                        with c2:
+                             st.markdown("**🏦 Exchange Actual**")
+                             st.write(f"Side: **{ex_side}**")
+                             st.write(f"Size: **{ex_size}**")
+                             epnl_color = "green" if ex_pnl >= 0 else "red"
+                             st.markdown(f"Unr. PnL: <span style='color:{epnl_color}'>**${ex_pnl:+.2f}**</span>", unsafe_allow_html=True)
+                             
+                        with c3:
+                            curr_p = current_prices.get(pair, 0.0)
+                            st.metric("Market Price", f"${curr_p:,.2f}")
+
+                        st.divider()
+                        st.markdown(f"**👇 Bot Details ({pair})**")
+                        
+                        bot_rows = []
+                        for b in bots:
+                            status_icon = "🟢" if b['is_active'] else "⏸️"
+                            if "error" in str(b.get('status','')).lower():
+                                status_icon = "🔴"
+                                
+                            bot_rows.append({
+                                "ID": f"#{b['id']}",
+                                "Status": status_icon,
+                                "Name": b['name'],
+                                "Step": b['step'],
+                                "Invested": b['invested'],
+                                "Entry": b['entry'],
+                                "PnL ($)": b['pnl_usd'],
+                                "PnL (%)": b['pnl_pct']
+                            })
+                        
+                        df_bots = pd.DataFrame(bot_rows)
+                        st.dataframe(
+                            df_bots,
+                            column_config={
+                                "Invested": st.column_config.NumberColumn(format="$%.2f"),
+                                "Entry": st.column_config.NumberColumn(format="$%.4f"),
+                                "PnL ($)": st.column_config.NumberColumn(format="$%.2f"),
+                                "PnL (%)": st.column_config.NumberColumn(format="%.2f%%"),
+                            },
+                            use_container_width=True,
+                            hide_index=True
+                        )
             
-            df_display = pd.DataFrame(processed_data)
+            st.divider()
             
-            st.dataframe(
-                df_display,
-                column_config={
-                    "Status": st.column_config.TextColumn(width="small"),
-                    "Strategy / Triggers": st.column_config.TextColumn(width="medium"),
-                    "Invested": st.column_config.NumberColumn(format="$%.2f"),
-                    "Entry": st.column_config.NumberColumn(format="$%.4f"),
-                    "Target TP": st.column_config.NumberColumn(format="$%.4f"),
-                    "Current Price": st.column_config.NumberColumn(format="$%.4f"),
-                },
-                width='stretch',
-                hide_index=True
-            )
+            # 5. Render Active Scanners
+            st.markdown("### 📡 Active Scanners (Searching for Entry)")
+            if scanner_rows:
+                st.dataframe(pd.DataFrame(scanner_rows), use_container_width=True, hide_index=True)
+            else:
+                st.info("No bots are currently scanning.")
+                
+            st.divider()
+            
+            # 6. Render Inactive / Stopped / Error Section
+            # Only show if there are entries, or always show to be 'professional' as requested
+            with st.expander("🛑 Stopped / Inactive Bots", expanded=False):
+                if inactive_rows:
+                    st.dataframe(pd.DataFrame(inactive_rows), use_container_width=True, hide_index=True)
+                else:
+                    st.caption("No stopped or inactive bots.")
         else:
             st.info("No active bots running.")
             
@@ -848,7 +955,7 @@ def render_monitor_view():
                     "Amount": st.column_config.NumberColumn(format="%.6f"),
                     "Filled": st.column_config.NumberColumn(format="%.6f"),
                 },
-                width='stretch',
+                use_container_width=True,
                 hide_index=True
             )
             
@@ -879,7 +986,7 @@ def render_monitor_view():
             conn = get_connection()
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT b.pair, b.name, b.strategy_type, t.current_step 
+                SELECT b.pair, b.name, b.strategy_type, t.current_step, t.total_invested 
                 FROM bots b 
                 LEFT JOIN trades t ON b.id = t.bot_id 
                 WHERE b.is_active = 1
@@ -887,13 +994,20 @@ def render_monitor_view():
             # Create mapping: Symbol -> {Name, Strat, Step}
             bot_map = {}
             for row in cursor.fetchall():
-                # row: pair, name, strategy_type, current_step
-                if row[0]:
-                    bot_map[row[0]] = {
-                        'name': row[1], 
-                        'strat': row[2], 
-                        'step': row[3] if row[3] is not None else 0
-                    }
+                # row: pair, name, strategy_type, current_step, total_invested
+                pair, name, strat, step, invested = row[0], row[1], row[2], row[3], row[4]
+                
+                # STRICT FILTER: Only map bots that are actually IN TRADE (Invested > 0)
+                # This prevents "Scanning/Watching" bots from confusing the position view (e.g. "9 Bots")
+                if invested and invested > 0:
+                    if pair:
+                        if pair not in bot_map:
+                            bot_map[pair] = []
+                        bot_map[pair].append({
+                            'name': name, 
+                            'strat': strat, 
+                            'step': step if step is not None else 0
+                        })
             conn.close()
 
             # Fetch all positions from exchange (Cached)
@@ -918,10 +1032,24 @@ def render_monitor_view():
                     pnl_str = f"${unrealized_pnl:+.2f}"
                     
                     # Enrich with Bot Info
-                    bot_info = bot_map.get(symbol, {})
-                    bot_name = bot_info.get('name', 'Unknown/Manual')
-                    bot_step = bot_info.get('step', '-')
-                    bot_strat = bot_info.get('strat', '-')
+                    # Normalize symbol (BTC/USDC:USDC -> BTC/USDC)
+                    base_symbol = symbol.split(':')[0]
+                    bot_list = bot_map.get(symbol) or bot_map.get(base_symbol) or []
+                    
+                    if len(bot_list) == 1:
+                        bot_name = bot_list[0]['name']
+                        bot_step = bot_list[0]['step']
+                        bot_strat = bot_list[0]['strat']
+                    elif len(bot_list) > 1:
+                        bot_name = f"Multiple ({len(bot_list)} Bots)"
+                        # Show max step?
+                        max_step = max(b['step'] for b in bot_list)
+                        bot_step = f"Max {max_step}"
+                        bot_strat = "Mixed"
+                    else:
+                        bot_name = 'Unknown/Manual'
+                        bot_step = '-'
+                        bot_strat = '-'
 
                     active_positions.append({
                         "Bot Name": bot_name,
@@ -955,11 +1083,9 @@ def render_monitor_view():
                         "Mark": st.column_config.NumberColumn(format="$%.4f"),
                         "Liq. Price": st.column_config.NumberColumn(format="$%.2f"),
                     },
-                    width='stretch',
+                    use_container_width=True,
                     hide_index=True
                 )
-                
-                st.caption("ℹ️ **Bot**: Validates which bot owns the position. **Step**: Current Martingale step.")
             else:
                 st.info("No open positions on exchange.")
                 
@@ -1013,7 +1139,7 @@ def render_monitor_view():
                     "Amount": st.column_config.NumberColumn(format="%.6f"),
                     "Cost ($)": st.column_config.NumberColumn(format="$%.2f"),
                 },
-                width='stretch',
+                use_container_width=True,
                 hide_index=True
             )
         else:
@@ -1026,5 +1152,9 @@ def render_monitor_view():
     
     # Auto-Refresh Logic
     if auto_refresh:
-        time.sleep(30)
+        # Create a placeholder for the countdown to avoid blocking "running" state invisibly
+        placeholder = st.empty()
+        for i in range(30, 0, -1):
+            placeholder.caption(f"⏳ Auto-refresh in {i} seconds...")
+            time.sleep(1)
         st.rerun()

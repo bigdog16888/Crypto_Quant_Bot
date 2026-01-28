@@ -1,0 +1,33 @@
+﻿======================================================================
+DEEP DIAGNOSTIC: Bot #43 - long btc price
+======================================================================
+Current Price: $88,894.10
+
+TRIGGER CONFIGURATION:
+----------------------------------------------------------------------
+mode_price: 1 (0=OFF, 1=Above, 2=Below)
+price_threshold: $87,000.00
+
+MANUAL TRIGGER CHECK:
+----------------------------------------------------------------------
+Price Check: 88,894.10 >= 87,000.00 = True
+Expected: buy_allow=True, sell_allow=True if price >= threshold
+
+ACTUAL STRATEGY CHECK:
+----------------------------------------------------------------------
+Calling strategy.check_signals(df)...
+Result: buy_signal=True, sell_signal=True
+
+DIRECTION CHECK:
+----------------------------------------------------------------------
+Bot Direction: LONG
+buy_signal: True
+sell_signal: True
+
+Should Enter Trade: True
+
+ANALYSIS:
+======================================================================
+⚠️  BOTH signals are True (unusual)
+   This means all triggers passed, but direction check determines entry
+   ✅ Should enter based on direction

@@ -119,10 +119,19 @@ class StateReconciler:
     """
     
     def __init__(self):
-        self.exchanges = {
-            'spot': ExchangeInterface(market_type='spot'),
-            'future': ExchangeInterface(market_type='future')
-        }
+        from config.settings import config
+        
+        # Skip spot exchange if in FUTURES_ONLY_MODE (e.g., testnet with futures-only keys)
+        if getattr(config, 'FUTURES_ONLY_MODE', False):
+            self.exchanges = {
+                'future': ExchangeInterface(market_type='future')
+            }
+            logger.info("FUTURES_ONLY_MODE: Skipping spot exchange initialization")
+        else:
+            self.exchanges = {
+                'spot': ExchangeInterface(market_type='spot'),
+                'future': ExchangeInterface(market_type='future')
+            }
         self.results: List[ReconciliationResult] = []
         
     def get_exchange(self, market_type: str) -> ExchangeInterface:
@@ -136,7 +145,7 @@ class StateReconciler:
         for mt, ex in self.exchanges.items():
             try:
                 if mt == 'future':
-                    raw_positions = ex.exchange.fetch_positions()
+                    raw_positions = ex.fetch_positions()
                 else:
                     # Spot: check balances for base assets
                     raw_positions = self._fetch_spot_positions(ex)
@@ -168,7 +177,7 @@ class StateReconciler:
                         # Get price for this asset
                         pair = f"{asset}/USDT"
                         try:
-                            ticker = ex.exchange.fetch_ticker(pair)
+                            ticker = ex.fetch_ticker(pair)
                             if ticker:
                                 positions.append({
                                     'symbol': pair,

@@ -5,6 +5,7 @@
 ### N8N Instance
 - **URL**: https://gionie-n8n-free.hf.space/
 - **API Base**: https://gionie-n8n-free.hf.space/api/v1
+- **Management**: [Config & Secrets](./N8N_HUGGINGFACE_CONFIG.md) (Contains HF Token)
 
 ### Authentication Token (EXPIRED - NEEDS REFRESH)
 ```

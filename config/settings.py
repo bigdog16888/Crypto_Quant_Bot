@@ -17,6 +17,8 @@ class Config:
 
     # Use testnet keys when TESTNET is True
     TESTNET = os.getenv("TESTNET", "True").lower() == "true"
+    FUTURES_ONLY_MODE = os.getenv("FUTURES_ONLY_MODE", "True" if TESTNET else "False").lower() == "true"
+    
     if TESTNET:
         API_KEY = os.getenv("BINANCE_TESTNET_API_KEY", os.getenv("BINANCE_API_KEY", ""))
         API_SECRET = os.getenv("BINANCE_TESTNET_API_SECRET", os.getenv("BINANCE_API_SECRET", ""))
@@ -34,6 +36,9 @@ class Config:
     MAX_ORDER_USD = float(os.getenv("MAX_ORDER_USD", 10000))
 
     
+    # Metrics
+    METRICS_PORT = int(os.getenv("METRICS_PORT", 8000))
+
     # Circuit Breaker / Safety
     GLOBAL_STOP_LOSS_PCT = float(os.getenv("GLOBAL_STOP_LOSS_PCT", 50.0)) # Stop if account drops 50%
     MAX_RETRIES = int(os.getenv("MAX_RETRIES", 3))

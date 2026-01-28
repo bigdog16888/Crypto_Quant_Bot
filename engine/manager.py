@@ -125,6 +125,56 @@ def calculate_hedge_lot(main_basket_lots: float, settings: dict) -> float:
     mult = settings.get('LotMultHedge', 1.0)
     return main_basket_lots * mult
 
+def _check_trailing_stop(bot_id, bot_name, direction, current_price, target_tp_price, avg_entry_price, settings, logger):
+    """
+    Evaluates Trailing Profit conditions.
+    Returns: (tp_hit: bool, is_trailing_exit: bool)
+    """
+    tp_hit = False
+    is_trailing_exit = False
+    trail_percent = float(settings.get('ProfitSet', 0.5))
+
+    if direction == 'LONG':
+        stored_peak = float(settings.get('trailing_peak', 0.0))
+        peak_price = max(stored_peak, current_price, target_tp_price)
+        
+        if peak_price > stored_peak and peak_price > target_tp_price:
+            try:
+                from engine.database import update_bot_config_value
+                update_bot_config_value(bot_id, 'trailing_peak', peak_price)
+                logger.info(f"📈 Trailing Peak for {bot_name} updated to {peak_price}")
+            except Exception as e:
+                logger.error(f"Failed to update trailing peak: {e}")
+        
+        stop_price = target_tp_price + (peak_price - target_tp_price) * trail_percent
+        
+        if current_price <= stop_price and current_price >= avg_entry_price:
+             tp_hit = True
+             is_trailing_exit = True
+             logger.info(f"Trailing Stop Hit for {bot_name}: Price {current_price} <= Stop {stop_price} (Peak {peak_price})")
+
+    elif direction == 'SHORT':
+         stored_peak_s = float(settings.get('trailing_peak', 99999999.0))
+         if stored_peak_s == 0.0: stored_peak_s = 99999999.0
+         
+         peak_price = min(stored_peak_s, current_price, target_tp_price)
+         
+         if peak_price < stored_peak_s and peak_price < target_tp_price:
+             try:
+                from engine.database import update_bot_config_value
+                update_bot_config_value(bot_id, 'trailing_peak', peak_price)
+                logger.info(f"📉 Trailing Peak for {bot_name} updated to {peak_price}")
+             except: pass
+         
+         stop_price = target_tp_price - (target_tp_price - peak_price) * trail_percent
+         
+         if current_price >= stop_price and current_price <= avg_entry_price:
+             tp_hit = True
+             is_trailing_exit = True
+             logger.info(f"Trailing Stop Hit for {bot_name}: Price {current_price} >= Stop {stop_price} (Peak {peak_price})")
+             
+    return tp_hit, is_trailing_exit
+
 def manage_trade(bot_id, bot_name, pair, direction, settings, trade_data, current_price, strategy, exchange_interface):
     """
     Core trade management logic called by the runner.
@@ -138,7 +188,13 @@ def manage_trade(bot_id, bot_name, pair, direction, settings, trade_data, curren
     if len(trade_data) >= 8:
         # Compatibility unpacking
         # (name, pair, current_step, total_invested, avg_entry_price, target_tp_price, last_exit_price, last_exit_time, *basket_start)
-        _, _, current_step, total_invested, avg_entry_price, target_tp_price, _, _ = trade_data[:8]
+        _, _, _current_step, _total_invested, _avg_entry_price, _target_tp_price, _, _ = trade_data[:8]
+        
+        # Enforce type safety to prevent NoneType crashes in Logic
+        current_step = int(_current_step) if _current_step is not None else 0
+        total_invested = float(_total_invested) if _total_invested is not None else 0.0
+        avg_entry_price = float(_avg_entry_price) if _avg_entry_price is not None else 0.0
+        target_tp_price = float(_target_tp_price) if _target_tp_price is not None else 0.0
     else:
         return {'action': 'none'}
     
@@ -160,6 +216,7 @@ def manage_trade(bot_id, bot_name, pair, direction, settings, trade_data, curren
     # 1. Check Take Profit
     effective_tp = target_tp_price
     
+    # Early Exit Decay Logic
     if settings.get('UseEarlyExit', False) and len(trade_data) > 8:
         basket_start_time = trade_data[8]
         if basket_start_time > 0:
@@ -181,14 +238,27 @@ def manage_trade(bot_id, bot_name, pair, direction, settings, trade_data, curren
             if effective_tp < target_tp_price * 0.999:
                 logger.debug(f"EE: {bot_name} TP decayed from {target_tp_price} to {effective_tp}")
 
+    # --- TRAILING PROFIT LOGIC (Replaces Moving Profit) ---
+    maximize_profit = settings.get('MaximizeProfit', False)
     tp_hit = False
-    if direction == 'LONG':
-        if current_price >= effective_tp: tp_hit = True
+    is_trailing_exit = False
+    
+    if maximize_profit:
+        tp_hit, is_trailing_exit = _check_trailing_stop(
+            bot_id, bot_name, direction, current_price, 
+            target_tp_price, avg_entry_price, settings, logger
+        )
+
+    # Standard TP Trigger (Only if NOT optimizing profit)
     else:
-        if current_price <= effective_tp: tp_hit = True
+        if direction == 'LONG':
+            if current_price >= effective_tp: tp_hit = True
+        else:
+            if current_price <= effective_tp: tp_hit = True
         
     if tp_hit:
-        logger.info(f"Profit Target Hit for {bot_name}! Signal to close at {current_price}")
+        reason = "Trailing Stop" if is_trailing_exit else "Take Profit Target"
+        logger.info(f"{reason} Hit for {bot_name}! Signal to close at {current_price}")
         est_qty = total_invested / avg_entry_price if avg_entry_price > 0 else 0
         pnl = (current_price - avg_entry_price) * est_qty if direction == 'LONG' else (avg_entry_price - current_price) * est_qty
         
@@ -203,6 +273,10 @@ def manage_trade(bot_id, bot_name, pair, direction, settings, trade_data, curren
     # 2. Check Next Martingale Grid Order
     max_steps = int(settings.get('max_steps', 10))
     grid_mission_active = current_step < max_steps
+    
+    # Initialize defaults to prevent UnboundLocalError on exception
+    grid_price, grid_qty, grid_step, grid_amount_usd = None, 0, 0, 0
+    next_order_price, new_avg, new_tp = 0, avg_entry_price, 0
 
     try:
         if grid_mission_active:
@@ -211,6 +285,8 @@ def manage_trade(bot_id, bot_name, pair, direction, settings, trade_data, curren
             added_investment = strategy.calculate_lot_size(next_step, 0)
             new_total = total_invested + added_investment
             new_avg = (avg_entry_price * total_invested + next_order_price * added_investment) / new_total
+            
+            logger.info(f"DEBUG_GRID: Step {next_step} | Price: {next_order_price} | Qty: {added_investment/next_order_price:.4f} | ATR: {strategy.locked_atr}")
             
             grid_price, grid_qty, grid_step, grid_amount_usd = next_order_price, added_investment / next_order_price, next_step, added_investment
         else:
@@ -235,13 +311,20 @@ def manage_trade(bot_id, bot_name, pair, direction, settings, trade_data, curren
 
         # MISSION: MAINTAIN ORDERS
         # If force_maintain is True (orders missing on exchange), we trigger the mission
+        
+        tp_limit_price = effective_tp
+        # If Trailing Profit is active, we do NOT want a physical Limit TP order.
+        # We handle exit via the "Smart Chase" trigger in Logic Block 1.
+        if settings.get('MaximizeProfit', False):
+            tp_limit_price = 0.0
+            
         return {
             'action': 'maintain_orders',
             'bot_id': bot_id, 'bot_name': bot_name, 'pair': pair,
             'direction': direction, 'current_price': current_price,
             'grid_price': grid_price, 'grid_step': grid_step,
             'grid_amount_usd': grid_amount_usd, 'grid_qty': grid_qty,
-            'tp_price': effective_tp,
+            'tp_price': tp_limit_price,
             'tp_qty': total_invested / avg_entry_price if avg_entry_price > 0 else 0,
             'future_avg': new_avg, 'future_tp': new_tp
         }

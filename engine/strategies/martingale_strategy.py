@@ -37,6 +37,21 @@ def iBands(close: pd.Series, period: int, deviation: float):
         return 0.0, 0.0, 0.0
     return upper_s.iloc[-1], mid_s.iloc[-1], lower_s.iloc[-1]
 
+def iMA(close: pd.Series, period: int, ma_type: str) -> float:
+    """
+    Moving Average Helper (SMA/EMA).
+    Returns the last value.
+    """
+    if close is None or close.empty: return 0.0
+    
+    if ma_type.upper() == 'EMA':
+        ma_s = close.ewm(span=period, adjust=False).mean()
+    else: # SMA
+        ma_s = close.rolling(window=period).mean()
+        
+    if ma_s is None or ma_s.empty: return 0.0
+    return ma_s.iloc[-1]
+
 class MartingaleStrategy(BaseStrategy):
     """
     Martingale Grid DCA Strategy.
@@ -79,7 +94,14 @@ class MartingaleStrategy(BaseStrategy):
         self.cci_tf = self.params.get('cci_tf', None)
         self.boll_tf = self.params.get('boll_tf', None)
         self.stoch_tf = self.params.get('stoch_tf', None)
+        self.stoch_tf = self.params.get('stoch_tf', None)
         self.macd_tf = self.params.get('macd_tf', None)
+
+        # MA Trigger (Trigger 12)
+        self.mode_ma = self.params.get('mode_ma', 0)
+        self.ma_period = self.params.get('ma_period', 200)
+        self.ma_tf = self.params.get('ma_tf', None)
+        self.ma_type = self.params.get('ma_type', 'SMA')
 
         # Advanced Blessing 3 Features
         self.use_atr_grid = self.params.get('UseATRGrid', False)
@@ -255,9 +277,9 @@ class MartingaleStrategy(BaseStrategy):
             current_price = market_data['close'].iloc[-1]
             threshold = self.params.get('price_threshold', 0.0)
             if mode_price == 1: # Above
-                if current_price <= threshold: buy_allow = sell_allow = False
+                if current_price < threshold: buy_allow = sell_allow = False
             else: # Below
-                if current_price >= threshold: buy_allow = sell_allow = False
+                if current_price > threshold: buy_allow = sell_allow = False
 
         # --- 4. ATR Percentile Trigger (Trigger 10) ---
         mode_atrp = self.params.get('mode_atrp', 0) # 0=Off, 1=Below Level (Low Vol), 2=Above Level (High Vol)
@@ -290,6 +312,23 @@ class MartingaleStrategy(BaseStrategy):
                     if expansion < target: buy_allow = False
                 else: # Move Down (Short trigger or Buy block)
                     if expansion > -target: sell_allow = False
+
+        # --- 6. MA Trigger (Trigger 12) ---
+        mode_ma = self.params.get('mode_ma', 0) # 0=Off, 1=Price > MA (Bullish), 2=Price < MA (Bearish)
+        if mode_ma > 0:
+            triggers_active += 1
+            ma_tf = self.params.get('ma_tf', '1h')
+            df_ma = self._resample(market_data, ma_tf)
+            
+            if not df_ma.empty:
+                ma_val = iMA(df_ma['close'], self.params.get('ma_period', 200), self.params.get('ma_type', 'SMA'))
+                curr_p = market_data['close'].iloc[-1]
+                
+                # Logic: Filter entries based on price relation to MA
+                if mode_ma == 1: # Bullish Bias (Price MUST be > MA)
+                    if curr_p <= ma_val: buy_allow = sell_allow = False
+                elif mode_ma == 2: # Bearish Bias (Price MUST be < MA)
+                    if curr_p >= ma_val: buy_allow = sell_allow = False
 
         # Final Confluence: All enabled must be true. 
         # For a Buy signal, buy_allow must be True and triggers_active > 0
@@ -337,7 +376,7 @@ class MartingaleStrategy(BaseStrategy):
         
         return float(true_range.iloc[-atr_periods:].mean())
     
-    def _get_grid_spacing_for_step(self, step: int, atr_value: float) -> float:
+    def _get_grid_spacing_for_step(self, step: int, atr_value: float, current_price: float) -> float:
         """
         Get grid spacing for a specific step based on GridStepRules.
         
@@ -347,7 +386,7 @@ class MartingaleStrategy(BaseStrategy):
             {"start": 8, "end": 10, "type": "fixed", "value": 500}
         ]
         
-        If no rule matches, falls back to default ATR * ATRGridFactor or base_grid.
+        If no rule matches, falls back to default ATR * ATRGridFactor or 1.0% of current price.
         """
         # Check step-based rules first
         for rule in self.grid_step_rules:
@@ -364,14 +403,15 @@ class MartingaleStrategy(BaseStrategy):
                     multiplier = float(rule.get('multiplier', 1.0))
                     if atr_value > 0:
                         return atr_value * multiplier
-                    # Fallback if ATR is 0
-                    return self.params.get('base_grid', 100.0)
+                    # Fallback if ATR is 0: 1.0% of current price
+                    return current_price * 0.01 
         
         # No rule matched - use default behavior
         if self.use_atr_grid and atr_value > 0:
             return atr_value * self.atr_grid_factor
         
-        return self.params.get('base_grid', 100.0)
+        # Final Fallback: 1.0% of current price
+        return current_price * 0.01 
     
     def lock_atr(self, market_data) -> float:
         """
@@ -420,7 +460,7 @@ class MartingaleStrategy(BaseStrategy):
                     self.locked_atr = atr_value
         
         # Get spacing for this step
-        grid_spacing = self._get_grid_spacing_for_step(next_step, atr_value)
+        grid_spacing = self._get_grid_spacing_for_step(next_step, atr_value, current_price)
         
         # Apply direction
         if direction == 'LONG':
@@ -442,12 +482,17 @@ class MartingaleStrategy(BaseStrategy):
         base_size = self.params.get('base_size', 10.0)
         multiplier = self.params.get('martingale_multiplier', 1.5)
         hedge_step = self.params.get('HedgeStartStep', 7)
+        tp_type = self.params.get('TakeProfitType', 'USD')
         tp_target_usd = self.params.get('TakeProfitBase', 10.0)
         
         direction = 1 if self.params.get('direction', 'LONG').upper() == 'LONG' else -1
         fee_rate = self.params.get('fee_rate', 0.001)
         slippage_rate = self.params.get('slippage_rate', 0.0005)
         cost_factor = 1.0 + fee_rate + slippage_rate
+        
+        # Early Exit logic parameters
+        ee_enabled = self.params.get('UseEarlyExit', False)
+        decay_pct = self.params.get('DecayPercentPerInterval', 30.0) / 100.0
         
         # Determine ATR to use for projections
         atr_value = 0.0
@@ -458,57 +503,40 @@ class MartingaleStrategy(BaseStrategy):
                 # Default fallback ATR for projection
                 atr_value = base_price * 0.01  # 1% of price as default
         
-        # Calculate projections with step-based grid spacing
+        # Track previous price for incremental grid calculation
+        current_grid_price = base_price
+        
         for i in range(self.params.get('max_steps', 10)):
-            step_size = base_size * (multiplier ** i)
-            total_invested += (step_size * cost_factor)
-            
-            # Use step-based grid spacing
-            # i = 0 is entry, i = 1 is first grid order (step 1)
-            next_step = i  # i represents the step number we're calculating for
-            
-            # Get grid spacing for this specific step
-            grid_spacing = self._get_grid_spacing_for_step(next_step, atr_value)
-            
-            # Absolute Price math
-            # For LONG: price goes down (subtract spacing)
-            # For SHORT: price goes up (add spacing)
-            if direction == 1:  # LONG
-                order_price = base_price - (grid_spacing * next_step)
-            else:  # SHORT
-                order_price = base_price + (grid_spacing * next_step)
+            # 1. Determine Order Price
+            if i == 0:
+                order_price = base_price
+            else:
+                # Get spacing for this specific step (i is current step index 1..N)
+                grid_spacing = self._get_grid_spacing_for_step(i, atr_value, current_grid_price)
                 
+                if direction == 1:  # LONG: Price goes down
+                    order_price = current_grid_price - grid_spacing
+                else:  # SHORT: Price goes up
+                    order_price = current_grid_price + grid_spacing
+                
+                current_grid_price = order_price
+
             if order_price <= 0: order_price = 0.01 # Safety
-            
-            qty = step_size / order_price
-            total_qty += qty
-            total_cost_basis += (qty * order_price)
-            
-            avg_price = total_cost_basis / total_qty
-            
-        # TP Price Calculation (Dollar vs Percent)
-        tp_type = self.params.get('TakeProfitType', 'USD') # Default USD for backward compat
-        
-        # Early Exit logic (Simulated for projection)
-        ee_enabled = self.params.get('UseEarlyExit', False)
-        decay_interval = self.params.get('DecayIntervalMins', 15.0)
-        decay_pct = self.params.get('DecayPercentPerInterval', 30.0) / 100.0
-        
-        for i in range(self.params.get('max_steps', 10)):
+
+            # 2. Determine Size
             step_size = base_size * (multiplier ** i)
-            total_invested += (step_size * cost_factor)
             
-            # Absolute Price math
-            # Step 0 is entry, Step 1 is grid 1
-            order_price = base_price - (i * grid_pips * direction)
-            if order_price <= 0: order_price = 0.01 # Safety
+            # 3. Update Position Totals
+            invested_amount = step_size * cost_factor
+            total_invested += invested_amount
             
             qty = step_size / order_price
             total_qty += qty
             total_cost_basis += (qty * order_price)
             
-            avg_price = total_cost_basis / total_qty
+            avg_price = total_cost_basis / total_qty if total_qty > 0 else 0
             
+            # 4. Calculate Take Profit Price
             if tp_type == 'Percent':
                 # TP = AvgPrice * (1 + pct)
                 tp_pct = self.params.get('TakeProfitPct', 1.0) / 100.0
@@ -517,28 +545,26 @@ class MartingaleStrategy(BaseStrategy):
                 else: # SHORT
                     tp_price = avg_price * (1 - tp_pct)
             else:
-                tp_target_usd = self.params.get('TakeProfitBase', 10.0)
+                # USD Target
                 if direction == 1: # LONG
-                    tp_price = (total_invested + tp_target_usd) / total_qty
+                    tp_price = (total_cost_basis + tp_target_usd) / total_qty
                 else: # SHORT
-                    tp_price = (total_invested - tp_target_usd) / total_qty # Simplified for Short
+                    # For shorts: Sell Price < Avg Price. Profit = (Avg - Exit) * Qty
+                    # Target = (Avg - Exit) * Qty => Exit = Avg - (Target / Qty)
+                    # Note: Using total_cost_basis approx implies simplistic PnL, accurate enough for projection
+                    tp_price = avg_price - (tp_target_usd / total_qty)
             
             # Apply Early Exit Decay (Simulated: 1 interval per step after step 0)
             if ee_enabled and i > 0:
-                # Assuming 1 decay interval per martingale step for visualization
-                # This shows how the TP "moves" closer to BE as we go deeper
                 dist_to_be = tp_price - avg_price
-                # Each step reduces the profit margin by decay_pct
-                # (This is a simplified simulation for the UI table)
                 decay_factor = (1.0 - decay_pct) ** i
                 tp_price = avg_price + (dist_to_be * decay_factor)
-
             
-            is_hedge = i + 1 >= hedge_step if self.params.get('UseHedge') else False
+            # 5. Hedge Logic
+            is_hedge = (i + 1) >= hedge_step if self.params.get('UseHedge') else False
             hedge_size = round(total_invested, 2) if is_hedge else 0.0
 
-            # Determine precision based on price magnitude
-            # If price < 1, use 6 decimals. If < 1000, 4 decimals. Else 2.
+            # 6. Precision & Formatting
             prec = 2
             if base_price < 1.0: prec = 6
             elif base_price < 1000.0: prec = 4
@@ -580,7 +606,12 @@ class MartingaleStrategy(BaseStrategy):
                 if self.atr_mode == 'locked' and self.locked_atr is None and atr_value > 0:
                     self.locked_atr = atr_value
         
-        return self._get_grid_spacing_for_step(next_step, atr_value)
+        # Get current price from market data for fallback calculation
+        current_price = 0.0
+        if market_data is not None and not market_data.empty:
+            current_price = float(market_data['close'].iloc[-1])
+            
+        return self._get_grid_spacing_for_step(next_step, atr_value, current_price)
 
     def get_atr_foundation(self, market_data: pd.DataFrame):
         """

@@ -1,0 +1,7 @@
+Trade Data from DB: ('TestBot_Verification', 'BTC/USDT', 1, 100.0, 50000.0, 51000.0, 0.0, 0, 1769488707)
+Calling manage_trade()...
+
+Mission Result: {'action': 'maintain_orders', 'bot_id': 40, 'bot_name': 'TestBot_Verification', 'pair': 'BTC/USDT', 'direction': 'LONG', 'current_price': 50000.0, 'grid_price': 49000.0, 'grid_step': 2, 'grid_amount_usd': 10.0, 'grid_qty': 0.00020408163265306123, 'tp_price': 51000.0, 'tp_qty': 0.002, 'future_avg': 49909.09090909091, 'future_tp': 54446.28099173554}
+
+Simulating Execution Phase...
+VERIFICATION SUCCEEDED: Logic generated 1 TP and 1 Grid order.

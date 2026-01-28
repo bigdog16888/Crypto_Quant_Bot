@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  crypto-bot-ui:
+    build: .
+    container_name: crypto_quant_bot
+    # Map the container port 8501 to the host port 8501
+    ports:
+      - "8501:8501"
+    # Mount the local database file and .env file for persistence and secrets
+    volumes:
+      # Mount the database file so bot state is persisted across container restarts
+      - ./crypto_bot.db:/app/crypto_bot.db
+      # Mount the .env file for configuration/secrets
+      - ./.env:/app/.env
+      # Mount the log file (optional)
+      - ./engine.log:/app/engine.log
+    # Restart the container automatically if it fails
+    restart: unless-stopped
+    # Add dependency installation for Streamlit/Playwright setup (if needed on the host, but here we assume the build handles it)
+    # The image is now fully defined

@@ -120,10 +120,11 @@ def render_bot_creator_view():
         c_atr1, c_atr2 = st.columns(2)
         with c_atr1:
             atr_timeframe = st.selectbox(
-                "ATR Timeframe",
+                "ATR Timeframe (Analysis)",
                 ["1m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w"],
                 index=4,
-                key="bot_creator_atr_tf"
+                key="bot_creator_atr_tf",
+                help="This timeframe is used for the Market Context metrics below and the initial Grid Preview. For actual Bot Execution, confirm settings in 'Risk Management'."
             )
         with c_atr2:
             atr_periods = st.slider(
@@ -248,7 +249,7 @@ def render_bot_creator_view():
             with c_r1:
                 rule_multiplier = st.number_input("ATR Multiplier", min_value=0.1, max_value=5.0, step=0.1, value=1.0, key="rule_mult")
             with c_r2:
-                if st.button("Add ATR Rule", key="add_atr_rule", width='stretch'):
+                if st.button("Add ATR Rule", key="add_atr_rule", use_container_width=True):
                     st.session_state.grid_rules.append({
                         "start": rule_start,
                         "end": rule_end,
@@ -258,7 +259,7 @@ def render_bot_creator_view():
                     st.rerun()
         else:
             rule_value = st.number_input("Fixed Spacing ($)", min_value=0.1, step=1.0, value=500.0, key="rule_value")
-            if st.button("Add Fixed Rule", key="add_fixed_rule", width='stretch'):
+            if st.button("Add Fixed Rule", key="add_fixed_rule", use_container_width=True):
                 st.session_state.grid_rules.append({
                     "start": rule_start,
                     "end": rule_end,
@@ -518,6 +519,18 @@ def render_bot_creator_view():
             with e_col3:
                 bot_config['atre_tf'] = st.selectbox("TF to Watch (T11)", ["1h","4h","1d"], index=0, key="create_atre_tf")
             
+            st.divider()
+            st.markdown("**Trigger 12: Moving Average Filter (Trend Bias)**")
+            ma_c1, ma_c2, ma_c3, ma_c4 = st.columns(4)
+            with ma_c1:
+                bot_config['mode_ma'] = st.selectbox("Trend Filter", [0, 1, 2], index=0, format_func=lambda x: {0: "OFF", 1: "Price > MA (Bullish)", 2: "Price < MA (Bearish)"}[x], key="create_mode_ma")
+            with ma_c2:
+                bot_config['ma_period'] = st.number_input("MA Period", value=200, min_value=1, key="create_ma_period")
+            with ma_c3:
+                bot_config['ma_tf'] = st.selectbox("MA Timeframe", ["1m","5m","15m","1h","4h","1d"], index=3, key="create_ma_tf", help="Timeframe for the Moving Average (e.g. 1h or 4h for trend).")
+            with ma_c4:    
+                bot_config['ma_type'] = st.selectbox("MA Type", ["SMA", "EMA"], index=0, key="create_ma_type")
+            
             temp_strat.params.update(bot_config)
 
             if df_f is not None and not df_f.empty and current_price > 0:
@@ -602,7 +615,17 @@ def render_bot_creator_view():
                         st.warning(f"⚠️ ATR Timeframe ({proj_tf}) is lower than Execution Timeframe ({timeframe}). This may cause grid calculation errors. Recommended: ATR TF >= Execution TF.")
                 
                 # Use data from Foundation if available, else default
-                p_atr = atr_data.get(proj_tf, {}).get('atr', 10.0)
+                # Fix: Don't overwrite p_atr if it was calculated correctly above and matches timeframe
+                if proj_tf != atr_timeframe:
+                     found_atr = atr_data.get(proj_tf, {}).get('atr')
+                     if found_atr:
+                         p_atr = found_atr
+                     else:
+                         # Fallback: Dynamic 1% instead of 10.0
+                         p_atr = current_price * 0.01
+                # If they match, p_atr is already set from lines 142+, just ensure it's sane
+                elif p_atr <= 0:
+                     p_atr = current_price * 0.01
                 
                 # Update strat params with full config before calculating
                 # temp_strat is already initialized, so we must recreate it or update its internal flags
