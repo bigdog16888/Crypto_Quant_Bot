@@ -3,8 +3,6 @@ import logging
 import json
 import sys
 import os
-import pandas as pd
-import ccxt
 from concurrent.futures import ThreadPoolExecutor
 import threading
 
@@ -68,6 +66,9 @@ def get_thread_exchange(market_type='future'):
 class BotRunner:
     def __init__(self):
         self.running = False
+        # BotExecutor instance (lazy initialization for strategy caching)
+        self._bot_executor: BotExecutor | None = None
+        
         # Main thread exchanges (kept for global ops like check_circuit_breaker)
         # Skip spot exchange if in FUTURES_ONLY_MODE (e.g., testnet with futures-only keys)
         if getattr(config, 'FUTURES_ONLY_MODE', False):
@@ -318,13 +319,19 @@ class BotRunner:
 
         bots = self.get_active_bots()
         
-        # Initialize BotExecutor once per cycle, passing self for state
-        bot_executor = BotExecutor(self)
+        # Reuse BotExecutor instance instead of creating new one each cycle
+        # This saves strategy instance creation overhead
+        if not hasattr(self, '_bot_executor') or self._bot_executor is None:
+            self._bot_executor = BotExecutor(self)
+        bot_executor = self._bot_executor
 
         # Parallel Execution: Process bots in concurrent threads
-        # This dramatically reduces loop time from (N * latency) to (latency)
-        # Using 5 workers to be safe with rate limits initially
-        with ThreadPoolExecutor(max_workers=5) as executor:
+        # Dynamically size workers: min(active_bots + 2, 20)
+        # +2 provides headroom for async tasks without starving bots
+        num_bots = len(bots)
+        max_workers = min(num_bots + 2, 20)
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
             # list() forces execution and waits for completion
             list(executor.map(bot_executor.process_bot, bots))
         

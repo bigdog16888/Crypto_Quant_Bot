@@ -412,9 +412,9 @@ def render_monitor_view():
                              fig.add_hline(y=tp, line_dash="dash", line_color=color_tp, annotation_text="Take Profit")
                         
                         if grid_price and grid_price > 0:
-                             fig.add_hline(y=grid_price, line_dash="dot", line_color="gray", annotation_text="Grid (NO)")
+                             fig.add_hline(y=grid_price, line_dash="dot", line_color="gray", annotation_text="Next Grid Price")
                         
-                        st.info(f"🤖 **Bot '{bot_name}' active**. Step: {step} | Entry: ${entry:,.2f} | TP: ${tp:,.2f} | NO: ${grid_price if grid_price else 0:,.2f}")
+                        st.info(f"🤖 **Bot '{bot_name}' active**. Step: {step} | Entry: ${entry:,.2f} | TP: ${tp:,.2f} | Next Grid: ${grid_price if grid_price else 0:,.2f}")
                 
             except Exception as e:
                 st.warning(f"Could not load bot levels: {e}")
@@ -535,7 +535,7 @@ def render_monitor_view():
                     atr_data = None
                 
                 # ATR Configuration in expander
-                with st.expander("⚙️ ATR Configuration", expanded=False):
+                with st.expander("⚙️ Adjust ATR View Settings (Analysis Only)", expanded=False):
                     c1, c2 = st.columns(2)
                     with c1:
                         new_atr_tf = st.selectbox(
@@ -604,7 +604,8 @@ def render_monitor_view():
         conn = get_connection()
         # Fetch all bots (Active & Paused) with trade info
         query_all = """
-            SELECT b.id, b.name, b.pair, b.direction, b.strategy_type, b.config, t.current_step, t.total_invested, t.avg_entry_price, t.target_tp_price, b.is_active, b.status
+            SELECT b.id, b.name, b.pair, b.direction, b.strategy_type, b.config, t.current_step, t.total_invested, t.avg_entry_price, t.target_tp_price, b.is_active, b.status,
+                   (SELECT price FROM bot_orders WHERE bot_id = b.id AND order_type='grid' AND status='open' ORDER BY id DESC LIMIT 1) as grid_price
             FROM bots b
             LEFT JOIN trades t ON b.id = t.bot_id
             -- Show all bots so users can see paused/errored ones too
@@ -706,8 +707,8 @@ def render_monitor_view():
             inactive_rows = []
             
             for r in rows:
-                # r: id, name, pair, direction, strat, config, step, invested, entry, tp, is_active, status
-                id, name, pair, direction, strat_type, config_json, step, invested, entry, tp, is_active, status = r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11]
+                # r: id, name, pair, direction, strat, config, step, invested, entry, tp, is_active, status, grid_price
+                id, name, pair, direction, strat_type, config_json, step, invested, entry, tp, is_active, status, grid_price = r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11], r[12]
                 
                 has_position = invested and invested > 0
                 
@@ -751,8 +752,12 @@ def render_monitor_view():
                         'tp': tp,
                         'pnl_usd': pnl_usd,
                         'pnl_pct': pnl_pct,
+                        'pnl_usd': pnl_usd,
+                        'pnl_pct': pnl_pct,
                         'is_active': is_active,
-                        'status': status
+                        'status': status,
+                        'next_tp': tp,
+                        'next_grid': grid_price if grid_price else 0.0
                     })
                 elif is_active:
                     # --- 2. SCANNER LIST ---
@@ -854,6 +859,8 @@ def render_monitor_view():
                                 "Step": b['step'],
                                 "Invested": b['invested'],
                                 "Entry": b['entry'],
+                                "Next TP ($)": b['next_tp'],
+                                "Next Grid ($)": b['next_grid'],
                                 "PnL ($)": b['pnl_usd'],
                                 "PnL (%)": b['pnl_pct']
                             })
@@ -864,6 +871,8 @@ def render_monitor_view():
                             column_config={
                                 "Invested": st.column_config.NumberColumn(format="$%.2f"),
                                 "Entry": st.column_config.NumberColumn(format="$%.4f"),
+                                "Next TP ($)": st.column_config.NumberColumn(format="$%.2f"),
+                                "Next Grid ($)": st.column_config.NumberColumn(format="$%.2f"),
                                 "PnL ($)": st.column_config.NumberColumn(format="$%.2f"),
                                 "PnL (%)": st.column_config.NumberColumn(format="%.2f%%"),
                             },
@@ -916,29 +925,32 @@ def render_monitor_view():
                     for o in orders:
                         order_id = o.get('id')
                         
-                        # Match order to bot using order ID tracking
+                        # STRICT MATCHING: Check if this order is known to our DB
                         bot_match = get_bots_by_order_id(order_id) if order_id else []
                         
                         if bot_match:
-                            # Get bot name
+                            # Known Bot Order
                             cursor = conn.cursor()
                             cursor.execute('SELECT name FROM bots WHERE id = ?', (bot_match[0]['bot_id'],))
                             bot_result = cursor.fetchone()
                             bot_name = bot_result[0] if bot_result else 'Unknown'
                             bot_type = bot_match[0]['type']
-                            label = f"{bot_name} ({bot_type})"
+                            label = f"🤖 {bot_name} ({bot_type})"
+                            owner_status = "Confirmed"
                         else:
-                            label = o.get('clientOrderId', '').split('_')[0].upper() if o.get('clientOrderId') else "MANUAL"
+                            # Unknown / External Order
+                            label = "👤 External (Manual/Other)"
+                            owner_status = "External"
                         
                         all_open_orders.append({
-                            "Bot": label,
+                            "Owner": label,
+                            "Status Type": owner_status,
                             "Symbol": o.get('symbol', pair),
                             "Side": o.get('side', '').upper(),
                             "Type": o.get('type', '').upper(),
                             "Price": o.get('price', 0),
                             "Amount": o.get('amount', 0),
                             "Filled": o.get('filled', 0),
-                            "Status": o.get('status', 'unknown'),
                             "Order ID": o.get('id', '')[:12] + '...' if o.get('id') else '-'
                         })
 
@@ -947,10 +959,12 @@ def render_monitor_view():
         
         if all_open_orders:
             df_orders = pd.DataFrame(all_open_orders)
+            
+            # Highlight External Orders
             st.dataframe(
                 df_orders, 
                 column_config={
-                    "Bot": st.column_config.TextColumn(width="medium"),
+                    "Owner": st.column_config.TextColumn(width="medium"),
                     "Price": st.column_config.NumberColumn(format="$%.4f"),
                     "Amount": st.column_config.NumberColumn(format="%.6f"),
                     "Filled": st.column_config.NumberColumn(format="%.6f"),
@@ -960,11 +974,14 @@ def render_monitor_view():
             )
             
             # Show breakdown summary
-            bot_orders = df_orders[df_orders['Bot'] != 'MANUAL']
-            manual_orders = df_orders[df_orders['Bot'] == 'MANUAL']
+            bot_orders = df_orders[df_orders['Status Type'] == 'Confirmed']
+            manual_orders = df_orders[df_orders['Status Type'] == 'External']
+            
+            if not manual_orders.empty:
+                st.warning(f"⚠️ Displaying {len(manual_orders)} external/manual orders. The bot will IGNORE these.")
             
             if not bot_orders.empty:
-                st.caption(f"🤖 Bot orders: {len(bot_orders)} | 👤 Manual orders: {len(manual_orders)}")
+                st.caption(f"🤖 Bot Orders: {len(bot_orders)} | 👤 External Orders: {len(manual_orders)}")
         else:
             st.info("No open orders on exchange.")
         
@@ -1152,9 +1169,5 @@ def render_monitor_view():
     
     # Auto-Refresh Logic
     if auto_refresh:
-        # Create a placeholder for the countdown to avoid blocking "running" state invisibly
-        placeholder = st.empty()
-        for i in range(30, 0, -1):
-            placeholder.caption(f"⏳ Auto-refresh in {i} seconds...")
-            time.sleep(1)
+        time.sleep(30)
         st.rerun()

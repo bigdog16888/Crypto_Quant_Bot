@@ -152,16 +152,20 @@ def init_ownership_tables():
     ''')
     
     # Active positions table (what's on the exchange)
+    # Re-create to ensure schema update (safe as it's just a cache)
+    cursor.execute('DROP TABLE IF EXISTS active_positions')
+    
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS active_positions (
-            pair TEXT PRIMARY KEY,
+            pair TEXT,
             side TEXT,
             size REAL NOT NULL DEFAULT 0,
             entry_price REAL DEFAULT 0,
             owner_bot_id INTEGER,
             owner_start_time INTEGER,
             last_checked INTEGER,
-            last_updated INTEGER DEFAULT (datetime('now'))
+            last_updated INTEGER DEFAULT (datetime('now')),
+            PRIMARY KEY (pair, side)
         )
     ''')
     

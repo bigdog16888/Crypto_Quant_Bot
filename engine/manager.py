@@ -175,13 +175,15 @@ def _check_trailing_stop(bot_id, bot_name, direction, current_price, target_tp_p
              
     return tp_hit, is_trailing_exit
 
-def manage_trade(bot_id, bot_name, pair, direction, settings, trade_data, current_price, strategy, exchange_interface):
+def manage_trade(bot_id, bot_name, pair, direction, settings, trade_data, current_price, strategy, exchange_interface, open_orders=None):
     """
     Core trade management logic called by the runner.
     trade_data: (name, pair, current_step, total_invested, avg_entry_price, target_tp_price, last_exit_price, last_exit_time, basket_start_time)
+    open_orders: Pre-fetched list of open orders from exchange (passed from process_bot for efficiency and consistency).
     Returns: dict with missions for the runner to execute (e.g. {'action': 'TP', 'price': ...})
     """
     import logging
+    from engine.database import get_bot_order_ids
     logger = logging.getLogger("TradeManager")
 
     # Safety unpack (handle cases where tuple length varies during migration)
@@ -198,20 +200,37 @@ def manage_trade(bot_id, bot_name, pair, direction, settings, trade_data, curren
     else:
         return {'action': 'none'}
     
-    # 0. Check if orders actually exist on exchange
-    # This ensures that even if DB says "In Trade", if orders are missing (e.g. manual cancel), we re-place them.
+    # --- STRUCTURAL FIX (v0.6.1): Use Passed Snapshot & Strict ID Matching ---
+    # REMOVED duplicate fetch_open_orders call (was lines 203-214).
+    # Use pre-fetched `open_orders` for consistency.
+    # Check for THIS bot's orders using tracked IDs, not generic side matching.
+    force_maintain = False
     try:
-        open_orders = exchange_interface.fetch_open_orders(pair)
-        grid_side = 'buy' if direction == 'LONG' else 'sell'
-        tp_side = 'sell' if direction == 'LONG' else 'buy'
+        if open_orders is None:
+            # Fallback if not passed (e.g., direct call for testing)
+            open_orders = exchange_interface.fetch_open_orders(pair) or []
+            logger.warning(f"manage_trade: open_orders not passed for {bot_name}, fetching (suboptimal).")
+
+        bot_order_ids = get_bot_order_ids(bot_id)
+        my_tp_id = bot_order_ids.get('tp_order_id')
+        my_grid_ids = [o.get('order_id') for o in bot_order_ids.get('grid_orders', []) if o.get('status') == 'open']
+
+        # Check: Does MY TP order exist on exchange?
+        has_my_tp = any(o.get('id') == my_tp_id for o in open_orders) if my_tp_id else False
+        # Check: Does MY Grid order exist?
+        has_my_grid = any(o.get('id') in my_grid_ids for o in open_orders) if my_grid_ids else False
+
+        # If EITHER is missing, we need to maintain (re-place) orders.
+        # Note: TP might be intentionally 0 if MaximizeProfit is active (trailing stop mode).
+        if not settings.get('MaximizeProfit', False):
+            force_maintain = not has_my_tp
+        force_maintain = force_maintain or not has_my_grid
         
-        has_tp = any(o.get('side') == tp_side for o in open_orders)
-        has_grid = any(o.get('side') == grid_side for o in open_orders)
-        
-        force_maintain = not has_tp or not has_grid
+        if force_maintain:
+            logger.info(f"🔧 Force Maintain for {bot_name}: My TP Found={has_my_tp}, My Grid Found={has_my_grid}")
     except Exception as e:
-        logger.error(f"Error checking exchange orders for {bot_name}: {e}")
-        force_maintain = False
+        logger.error(f"Error checking bot order IDs for {bot_name}: {e}")
+        force_maintain = True # Err on side of caution
 
     # 1. Check Take Profit
     effective_tp = target_tp_price
@@ -262,6 +281,12 @@ def manage_trade(bot_id, bot_name, pair, direction, settings, trade_data, curren
         est_qty = total_invested / avg_entry_price if avg_entry_price > 0 else 0
         pnl = (current_price - avg_entry_price) * est_qty if direction == 'LONG' else (avg_entry_price - current_price) * est_qty
         
+        # CLEAR Locked ATR on exit
+        try:
+             from engine.database import update_bot_config_value
+             update_bot_config_value(bot_id, 'locked_atr', None)
+        except: pass
+        
         return {
             'action': 'tp_hit',
             'bot_id': bot_id, 'bot_name': bot_name, 'pair': pair,
@@ -280,13 +305,44 @@ def manage_trade(bot_id, bot_name, pair, direction, settings, trade_data, curren
 
     try:
         if grid_mission_active:
-            next_order_price = strategy.calculate_next_grid_price(direction, current_price, avg_entry_price, current_step, strategy.last_market_data if hasattr(strategy, 'last_market_data') else None)
+            # Fetch Last Grid Price for Incremental Calculation
+            # (Allows Spacing from Last Order instead of Avg)
+            last_grid_price = 0.0
+            try:
+                from engine.database import get_last_filled_order
+                last_fill = get_last_filled_order(bot_id)
+                if last_fill: last_grid_price = float(last_fill['price'])
+            except Exception as e:
+                logger.warning(f"Failed to fetch last grid price: {e}")
+
+            # Load locked ATR from settings (persistence)
+            saved_atr = settings.get('locked_atr')
+            if saved_atr:
+                strategy.locked_atr = float(saved_atr)
+
+            next_order_price = strategy.calculate_next_grid_price(
+                direction, current_price, avg_entry_price, current_step, 
+                strategy.last_market_data if hasattr(strategy, 'last_market_data') else None,
+                last_grid_price=last_grid_price
+            )
+            
+            # Persist Locked ATR if newly locked
+            if strategy.locked_atr and strategy.locked_atr != saved_atr:
+                from engine.database import update_bot_config_value
+                update_bot_config_value(bot_id, 'locked_atr', strategy.locked_atr)
+                logger.info(f"🔒 Locked ATR for {bot_name}: {strategy.locked_atr:.4f}")
+            
             next_step = current_step + 1
             added_investment = strategy.calculate_lot_size(next_step, 0)
             new_total = total_invested + added_investment
             new_avg = (avg_entry_price * total_invested + next_order_price * added_investment) / new_total
             
             logger.info(f"DEBUG_GRID: Step {next_step} | Price: {next_order_price} | Qty: {added_investment/next_order_price:.4f} | ATR: {strategy.locked_atr}")
+
+            try:
+                from engine.database import log_trade
+                log_trade(bot_id, 'DEBUG_LOG', pair, next_order_price, 0, 0, "GRID_CALC", next_step, 0, f"Grid Calc: {next_order_price:.4f}")
+            except: pass
             
             grid_price, grid_qty, grid_step, grid_amount_usd = next_order_price, added_investment / next_order_price, next_step, added_investment
         else:
@@ -332,6 +388,10 @@ def manage_trade(bot_id, bot_name, pair, direction, settings, trade_data, curren
             
     except Exception as e:
         logger.error(f"Error checking grid for {bot_name}: {e}")
+        try:
+            from engine.database import log_trade
+            log_trade(bot_id, 'DEBUG_ERR', pair, 0, 0, 0, "GRID_CALC_ERR", current_step, 0, str(e))
+        except: pass
 
     # 3. Check Hedge
     drawdown_pc = 0.0

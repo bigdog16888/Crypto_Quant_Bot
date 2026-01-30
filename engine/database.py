@@ -55,11 +55,29 @@ def close_connection():
 def init_db():
     """Initializes the database and creates tables if they don't exist."""
     # Use a fresh connection for init (not thread-local) since this runs once at startup
+    conn = None
     try:
         conn = sqlite3.connect(DB_PATH, timeout=60.0)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=60000")
         cursor = conn.cursor()
+        
+        # Bots table: Stores configuration for each bot
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS bots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL,
+                strategy_type TEXT DEFAULT 'MQL4',
+                pair TEXT NOT NULL,
+                direction TEXT CHECK(direction IN ('LONG', 'SHORT')) NOT NULL,
+                rsi_limit REAL NOT NULL,
+                martingale_multiplier REAL NOT NULL,
+                base_size REAL NOT NULL,
+                config TEXT DEFAULT '{}',
+                is_active BOOLEAN DEFAULT 1,
+                status TEXT DEFAULT 'Stopped'
+            )
+        ''')
         
         # Bots table: Stores configuration for each bot
         cursor.execute('''
@@ -237,10 +255,11 @@ def init_db():
             pass  # Logger itself might be broken
         return  # Exit gracefully
     finally:
-        try:
-            conn.close()
-        except:
-            pass
+        if conn is not None:
+            try:
+                conn.close()
+            except:
+                pass
     
     try:
         logger.info(f"Database initialized at {DB_PATH}")
@@ -371,75 +390,160 @@ def deactivate_bot(bot_id, reason="Unknown Error"):
         logger.error(f"Failed to deactivate bot {bot_id}: {e}")
         return False
 
-def reset_bot_after_tp(bot_id, exit_price=0):
-    """Resets the trade stats after a Take Profit (TP) hit, saving exit metadata.
-    IMPROVED: Now logs to trade_history with PnL calculation."""
+def calculate_step_from_position(position_size: float, base_size: float, multiplier: float) -> int:
+    """
+    Calculate the martingale step from a position size.
+    
+    Uses the formula: position_size = base_size * (multiplier ^ step)
+    Solving for step: step = log(position_size / base_size) / log(multiplier)
+    
+    Args:
+        position_size: The position size in USD
+        base_size: The bot's base entry size
+        multiplier: The martingale multiplier
+        
+    Returns:
+        The calculated step (rounded to nearest integer), minimum 0
+    """
+    if position_size <= 0 or base_size <= 0 or multiplier <= 1:
+        return 0
+    
+    ratio = position_size / base_size
+    if ratio <= 1:
+        return 0
+    
+    import math
+    step = math.log(ratio) / math.log(multiplier)
+    return max(0, round(step))
+
+
+def reset_bot_after_tp(bot_id, exit_price=0.0, action_label='TP_HIT', exchange_positions=None, verify_with_exchange=True):
+    """
+    Called when TP is hit or when clearing a position.
+    
+    PROFESSIONAL STATE MACHINE LOGIC:
+    1. Calculate PnL if possible.
+    2. Log to trade_history.
+    3. Only reset trade state IF:
+       - verify_with_exchange=False (force reset), OR
+       - Exchange has no position for this bot's pair (verified position is closed)
+    
+    This prevents premature clearing when:
+    - Engine restarts and calls reset on stop
+    - Reconciliation has timing issues
+    - Exchange API temporarily returns empty positions
+    
+    Args:
+        bot_id: The bot to reset
+        exit_price: Price at which position was closed
+        action_label: Action name for trade history (TP_HIT, OFFLINE_CLOSE, etc.)
+        exchange_positions: Optional dict of {pair: position_data} to avoid extra API calls
+        verify_with_exchange: If True, checks exchange before clearing
+    """
     conn = get_connection()
     cursor = conn.cursor()
-
+    
+    # Get current trade details and bot config
+    cursor.execute('''
+        SELECT total_invested, avg_entry_price, current_step, b.name, b.pair, b.direction, b.base_size, b.martingale_multiplier
+        FROM trades t
+        JOIN bots b ON t.bot_id = b.id
+        WHERE t.bot_id = ?
+    ''', (bot_id,))
+    
+    row = cursor.fetchone()
+    if not row:
+        logger.warning(f"Bot {bot_id} not found for reset")
+        return
+        
+    total_invested, avg_entry_price, current_step, bot_name, pair, direction, base_size, mult = row
+    
+    # Check if there's actually a position to reset
+    if total_invested <= 0:
+        logger.info(f"Bot {bot_id} ({bot_name}) already has no position, skipping reset")
+        return
+    
     try:
-        # Fetch current trade state before resetting to calculate PnL
-        cursor.execute('''
-            SELECT t.total_invested, t.avg_entry_price, t.target_tp_price,
-                   b.name, b.pair, b.direction, t.current_step
-            FROM trades t
-            JOIN bots b ON t.bot_id = b.id
-            WHERE b.id = ?
-        ''', (bot_id,))
-        result = cursor.fetchone()
+        # VERIFICATION LOGIC: Only reset if position is actually closed on exchange
+        if verify_with_exchange and exchange_positions is not None:
+            # Normalize pair for exchange lookup
+            exchange_pair = pair.split(':')[0] if ':' in pair else pair
+            
+            # Check if exchange has a position for this pair
+            ex_pos = exchange_positions.get(exchange_pair) or exchange_positions.get(pair)
+            
+            if ex_pos and abs(ex_pos.get('size', 0)) > 0:
+                # Exchange still has position! Do NOT reset!
+                logger.critical(
+                    f"🚨 SAFETY BLOCK: Bot {bot_id} ({bot_name}) has ${total_invested:.2f} invested "
+                    f"but exchange shows {ex_pos.get('size', 0):.6f} {exchange_pair} position! "
+                    f"REFUSING to reset. Manual investigation required."
+                )
+                # Log this safety block
+                log_trade(
+                    bot_id=bot_id,
+                    action='RESET_BLOCKED',
+                    symbol=pair,
+                    price=exit_price,
+                    amount=total_invested / avg_entry_price if avg_entry_price > 0 else 0,
+                    cost_usdc=total_invested,
+                    step=current_step,
+                    pnl=0,
+                    notes=f"RESET BLOCKED: Exchange still has position, refusing to clear DB state"
+                )
+                return  # DO NOT PROCEED WITH RESET
+        
+        # Calculate PnL
+        pnl = 0.0
+        if exit_price > 0 and avg_entry_price > 0:
+            est_qty = total_invested / avg_entry_price
+            if direction.upper() == 'LONG':
+                pnl = (exit_price - avg_entry_price) * est_qty
+            else:  # SHORT
+                pnl = (avg_entry_price - exit_price) * est_qty
+            logger.info(f"{action_label} PnL for {bot_name}: Exit=${exit_price:.4f}, Entry=${avg_entry_price:.4f}, PnL=${pnl:.2f}")
 
-        if result:
-            total_invested, avg_entry_price, target_tp_price, bot_name, pair, direction, current_step = result
-
-            # Calculate PnL before resetting
-            pnl = 0.0
-            if exit_price > 0 and avg_entry_price > 0 and total_invested > 0:
-                # Estimate quantity (in base currency)
-                # Crypto: Base/Quote, Investment is Quote
-                # Qty = Investment / Price
-                est_qty = total_invested / avg_entry_price
-
-                if direction.upper() == 'LONG':
-                    pnl = (exit_price - avg_entry_price) * est_qty
-                else:  # SHORT
-                    pnl = (avg_entry_price - exit_price) * est_qty
-
-                logger.info(f"TP PnL for {bot_name}: Exit=${exit_price:.4f}, Entry=${avg_entry_price:.4f}, PnL=${pnl:.2f}")
-
-            # Log the TP hit to trade_history BEFORE resetting
-            log_trade(
-                bot_id=bot_id,
-                action='TP_HIT',
-                symbol=pair,
-                price=exit_price,
-                amount=total_invested / avg_entry_price if avg_entry_price > 0 else 0,
-                cost_usdc=total_invested,
-                step=current_step,
-                pnl=pnl,
-                notes=f"TP hit at step {current_step}, avg entry {avg_entry_price:.4f}"
-            )
-            logger.info(f"Logged TP_HIT to trade_history for {bot_name}")
+        # Log the exit to trade_history BEFORE resetting
+        log_trade(
+            bot_id=bot_id,
+            action=action_label,
+            symbol=pair,
+            price=exit_price,
+            amount=total_invested / avg_entry_price if avg_entry_price > 0 else 0,
+            cost_usdc=total_invested,
+            step=current_step,
+            pnl=pnl,
+            notes=f"{action_label} at step {current_step}, avg entry {avg_entry_price:.4f}"
+        )
+        logger.info(f"Logged {action_label} to trade_history for {bot_name}")
 
         # Reset the trade state
         cursor.execute('''
             UPDATE trades
             SET current_step = 0,
-                total_invested = 0,
-                avg_entry_price = 0,
-                target_tp_price = 0,
-                last_exit_price = ?,
-                last_exit_time = ?,
-                basket_start_time = 0
-            WHERE bot_id = ?
+            total_invested = 0,
+            avg_entry_price = 0,
+            target_tp_price = 0,
+            last_exit_price = ?,
+            last_exit_time = ?,
+            basket_start_time = 0,
+            entry_confirmed = 0,
+            entry_order_id = NULL,
+            tp_order_id = NULL,
+            bot_position_id = NULL
+        WHERE bot_id = ?
         ''', (exit_price, int(time.time()), bot_id))
         conn.commit()
-        logger.info(f"Reset trade state for bot {bot_id} at exit price {exit_price:.4f}")
+        logger.info(f"✅ Reset trade state for bot {bot_id} ({bot_name}) at exit price ${exit_price:.4f}")
 
     except Exception as e:
-        conn.rollback()
+        # Rollback on any error
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         logger.error(f"Error resetting trade for bot {bot_id}: {e}")
         raise
-    # Note: No conn.close() - using thread-local connection
 
 def get_bot_status(bot_id):
     """Fetches full status joining bot settings and trade data."""
@@ -454,6 +558,96 @@ def get_bot_status(bot_id):
     result = cursor.fetchone()
     # Note: No conn.close() - using thread-local connection
     return result
+
+def import_position_from_exchange(bot_id: int, pair: str, position_size: float, entry_price: float, direction: str):
+    """
+    Import a position from exchange into the database.
+    Used during reconciliation when orphaned positions are detected.
+    
+    PROFESSIONAL LOGIC:
+    1. Fetch bot's base_size and multiplier to calculate correct martingale step
+    2. Calculate step from position size: step = log(position/base) / log(multiplier)
+    3. Set all position fields correctly
+    4. Log the import with correct step for audit trail
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    try:
+        # Get bot's configuration for step calculation
+        cursor.execute('SELECT base_size, martingale_multiplier, name FROM bots WHERE id = ?', (bot_id,))
+        bot_config = cursor.fetchone()
+        
+        if not bot_config:
+            logger.error(f"Bot {bot_id} not found for position import")
+            return False
+        
+        base_size, multiplier, bot_name = bot_config
+        
+        # Calculate total invested (size * entry_price)
+        total_invested = position_size * entry_price
+        
+        # Calculate the correct martingale step from position size
+        calculated_step = calculate_step_from_position(total_invested, base_size, multiplier)
+        
+        # Calculate expected position size at this step for verification
+        expected_at_step = base_size * (multiplier ** calculated_step)
+        size_variance = abs(total_invested - expected_at_step) / expected_at_step if expected_at_step > 0 else 0
+        
+        # Log warning if position doesn't match expected step pattern
+        if size_variance > 0.1:  # More than 10% variance
+            logger.warning(
+                f"⚠️ Position size variance for bot {bot_id} ({bot_name}): "
+                f"Actual ${total_invested:.2f}, Expected at step {calculated_step}: ${expected_at_step:.2f} "
+                f"(Variance: {size_variance*100:.1f}%)"
+            )
+        
+        # Update trades table with position data using CALCULATED step
+        cursor.execute('''
+            UPDATE trades SET
+                current_step = ?,
+                total_invested = ?,
+                avg_entry_price = ?,
+                target_tp_price = 0,
+                last_exit_price = 0,
+                last_exit_time = 0,
+                entry_confirmed = 1,
+                basket_start_time = ?,
+                entry_order_id = 'IMPORTED',
+                tp_order_id = NULL,
+                bot_position_id = 'IMPORTED',
+                close_type = NULL
+            WHERE bot_id = ?
+        ''', (calculated_step, total_invested, entry_price, int(time.time()), bot_id))
+        
+        conn.commit()
+        
+        # Log the import with CORRECT step
+        log_trade(
+            bot_id=bot_id,
+            action='POSITION_IMPORT',
+            symbol=pair,
+            price=entry_price,
+            amount=position_size,
+            cost_usdc=total_invested,
+            order_id='IMPORTED',
+            step=calculated_step,
+            pnl=0,
+            notes=f"Position imported from exchange: {position_size} @ {entry_price} (calculated step {calculated_step}, base=${base_size}, mult={multiplier})"
+        )
+        
+        logger.info(
+            f"✅ Imported position for bot {bot_id} ({bot_name}): "
+            f"${total_invested:.2f} @ ${entry_price:.4f} | Step: {calculated_step} | "
+            f"Base: ${base_size} | Multiplier: {multiplier}x"
+        )
+        return True
+        
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Failed to import position for bot {bot_id}: {e}")
+        return False
+    # Note: No conn.close() - using thread-local connection
 
 def get_all_bots():
     """Fetches all bots status for the manager UI."""
@@ -628,26 +822,69 @@ def get_system_pnl_exposure():
 # ORDER ID TRACKING FOR MULTI-BOT SUPPORT (v0.4.1)
 # ============================================
 
-def save_bot_order(bot_id, order_type, order_id, price, amount, step=0):
+def get_order_owner(order_id):
+    """
+    Check which bot owns a given order ID.
+    
+    Returns:
+        bot_id (int or None): The bot that owns this order, or None if unowned
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    # Check bot_orders table
+    cursor.execute('''
+        SELECT bot_id FROM bot_orders 
+        WHERE order_id = ? AND status = 'open'
+        ORDER BY created_at DESC LIMIT 1
+    ''', (str(order_id),))
+    
+    result = cursor.fetchone()
+    if result:
+        return result[0]
+    
+    # Also check trades table for entry/tp orders
+    cursor.execute('''
+        SELECT bot_id FROM trades 
+        WHERE entry_order_id = ? OR tp_order_id = ?
+        LIMIT 1
+    ''', (str(order_id), str(order_id)))
+    
+    result = cursor.fetchone()
+    if result:
+        return result[0]
+    
+    return None
+
+def save_bot_order(bot_id, order_type, order_id, price, amount, step=0, status='open'):
     """
     Save an exchange order ID to track which bot owns which order.
     """
     conn = get_connection()
     cursor = conn.cursor()
 
-    # Also update the trades table for quick lookup
-    if order_type == 'entry':
-        cursor.execute('UPDATE trades SET entry_order_id = ? WHERE bot_id = ?', (order_id, bot_id))
-    elif order_type == 'tp':
-        cursor.execute('UPDATE trades SET tp_order_id = ? WHERE bot_id = ?', (order_id, bot_id))
+    try:
+        # Also update the trades table for quick lookup
+        if order_type == 'entry':
+            cursor.execute('UPDATE trades SET entry_order_id = ? WHERE bot_id = ?', (order_id, bot_id))
+        elif order_type == 'tp':
+            cursor.execute('UPDATE trades SET tp_order_id = ? WHERE bot_id = ?', (order_id, bot_id))
 
-    # Also save to detailed bot_orders table for full tracking
-    cursor.execute('''
-        INSERT INTO bot_orders (bot_id, step, order_type, order_id, price, amount, status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, 'open', ?)
-    ''', (bot_id, step, order_type, order_id, price, amount, int(time.time())))
+        # Also save to detailed bot_orders table for full tracking
+        cursor.execute('''
+            INSERT INTO bot_orders (bot_id, step, order_type, order_id, price, amount, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (bot_id, step, order_type, order_id, price, amount, status, int(time.time())))
 
-    conn.commit()
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Failed to save bot order {order_id} (Type: {order_type}): {e}")
+        try: log_trade(bot_id, 'DEBUG_ERR', 'SYS', 0, 0, 0, f"SAVE_FAIL_{order_type.upper()}", step, 0, str(e))
+        except: pass
+
+    # DEBUG TRACE ON SUCCESS
+    try: log_trade(bot_id, 'DEBUG_LOG', 'SYS', price, amount, 0, f"SAVED_{order_type.upper()}", step, 0, f"Saved {order_id}")
+    except: pass
 
 def get_bot_order_ids(bot_id):
     """
@@ -1066,3 +1303,29 @@ if __name__ == "__main__":
         # Test: Reset Bot
         reset_bot_after_tp(bot_id)
         print("Reset after TP:", get_bot_status(bot_id))
+
+def get_last_filled_order(bot_id):
+    """
+    Returns (price, amount, step, timestamp) of the last filled entry/grid order.
+    Used for incremental grid calculation and ZOMBIE CHECK grace periods.
+    """
+    conn = get_connection()
+    c = conn.cursor()
+    try:
+        # We want the highest step that is actually filled
+        c.execute('''
+            SELECT price, amount, step, created_at
+            FROM bot_orders 
+            WHERE bot_id = ? 
+              AND status = 'filled' 
+              AND order_type IN ('entry', 'grid')
+            ORDER BY step DESC 
+            LIMIT 1
+        ''', (bot_id,))
+        row = c.fetchone()
+        if row:
+            # created_at is usually proper ISO string or timestamp
+            return {'price': row[0], 'amount': row[1], 'step': row[2], 'timestamp': row[3]}
+    except Exception as e:
+        logger.error(f"Error getting last filled order for bot {bot_id}: {e}")
+    return None

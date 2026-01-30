@@ -4,12 +4,10 @@ import json
 import pandas as pd
 import ccxt
 import threading
-import os
-import sys
 
 # Local imports
 from engine.exchange_interface import ExchangeInterface
-from engine.database import get_bot_status, update_martingale_step, log_trade, reset_bot_after_tp, deactivate_bot, get_bot_params, save_bot_order, get_bot_order_ids
+from engine.database import get_bot_status, update_martingale_step, log_trade, reset_bot_after_tp, deactivate_bot, get_bot_params, save_bot_order, get_bot_order_ids, get_last_filled_order
 from engine.strategies.martingale_strategy import MartingaleStrategy
 from engine.manager import manage_trade
 from engine.bot_management import check_and_execute_stops
@@ -58,6 +56,12 @@ class BotExecutor:
         """Main logic loop for a single bot."""
         bot_id, name, pair, direction, strat_type, config_json, base_size, mm, rsi_limit, is_active = bot_data
         
+        # DEBUG TRACE: ENTRY
+        try:
+            log_trade(bot_id, 'DEBUG_LOG', pair, 0, 0, 0, "PROC_ENTRY", 0, 0, "Enter process_bot")
+        except Exception:
+            pass  # Silently fail logging - don't block bot execution
+        
         try:
             params = json.loads(config_json) if config_json else {}
             params.update({
@@ -104,7 +108,10 @@ class BotExecutor:
 
             # Market Data
             ohlcv = bot_exchange.fetch_ohlcv(symbol=pair, timeframe=timeframe, limit=100)
-            if not ohlcv: return
+            if not ohlcv: 
+                try: log_trade(bot_id, 'DEBUG_ERR', pair, 0, 0, 0, "NO_OHLCV", 0, 0, "Fetch failed")
+                except: pass
+                return
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])  # type: ignore[arg-type]
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
 
@@ -114,20 +121,16 @@ class BotExecutor:
                 return
 
             trade_data = get_bot_status(bot_id)
-            if not trade_data or len(trade_data) < 8: return
+            if not trade_data or len(trade_data) < 8: 
+                try: log_trade(bot_id, 'DEBUG_ERR', pair, 0, 0, 0, "NO_TRADE_DATA", 0, 0, "Status fetch failed")
+                except: pass
+                return
             
             # DB indices: (name, pair, current_step, total_invested, avg_entry_price, target_tp_price, last_exit_price, last_exit_time)
             is_in_trade = trade_data[3] > 0
             current_price = df['close'].iloc[-1]
             
-            # --- SELF-HEALING: Verify State Sync (Fix for Ghost Trades) ---
-            if is_in_trade:
-                 # Check if this is a "Zombie" state (DB says Trade, Exchange says Empty)
-                 if not self.verify_state_sync(bot_id, name, pair, bot_exchange):
-                      is_in_trade = False
-                      logger.warning(f"🩹 Bot {name} Auto-Healed: state reset to IDLE.")
-                      return # Skip this cycle to allow DB update to propagate
-            # -------------------------------------------------------------
+            # Note: Primary state verification happens AFTER open_orders fetch (line ~155)
             
             # --- LOG STATUS ---
             if is_active:
@@ -135,12 +138,44 @@ class BotExecutor:
                 logger.info(f"Bot {name} ({pair}): {status_msg}")
 
 
+            # --- OPTIMIZATION (v0.6.0): Single Fetch Per Cycle ---
+            # Fetch open orders once here and pass to all sub-functions
+            # This allows for robust reconciliation without extra API calls
+            open_orders_snapshot = []
+            try:
+                open_orders_snapshot = bot_exchange.fetch_open_orders(pair) or []
+            except Exception as e:
+                logger.warning(f"Could not fetch open orders for {name}: {e}")
+                # Don't return, allow logic to proceed (carefully)
+
+            # --- ROBUSTNESS: RECONCILE ORDERS ---
+            # Ensure DB state matches Exchange state (Ghost/Stale Order Cleanup)
+            try:
+                from engine.database import log_trade
+                log_trade(bot_id, 'DEBUG_LOG', pair, 0, 0, 0, "CALL_RECONCILE", is_in_trade, 0, "Calling reconcile_orders")
+            except: pass
+            
+            self.reconcile_orders(bot_id, name, pair, is_in_trade, open_orders_snapshot, bot_exchange)
+            
+            try: log_trade(bot_id, 'DEBUG_LOG', pair, 0, 0, 0, "RECONCILE_DONE", is_in_trade, 0, "Reconcile finished")
+            except: pass
+            
+            # --- SELF-HEALING: Verify State Sync (Fix for Ghost Trades) ---
+            if is_in_trade:
+                 # Check if this is a "Zombie" state (DB says Trade, Exchange says Empty)
+                 # Pass basket_start_time to detect recent entries and avoid false ghost detection
+                 basket_start_time = trade_data[8] if len(trade_data) > 8 else 0
+                 if not self.verify_state_sync(bot_id, name, pair, bot_exchange, open_orders_snapshot, basket_start_time):
+                      is_in_trade = False
+                      logger.warning(f"🩹 Bot {name} Auto-Healed: state reset to IDLE.")
+                      return # Skip this cycle to allow DB update to propagate
+            # -------------------------------------------------------------
+
             if not is_in_trade:
                 # Check for pending entry orders (Non-blocking Chase)
                 try:
-                    open_orders = bot_exchange.fetch_open_orders(pair) or []
                     entry_side = 'buy' if direction == 'LONG' else 'sell'
-                    pending = [o for o in open_orders if isinstance(o, dict) and o.get('side') == entry_side and o.get('type') == 'limit']
+                    pending = [o for o in open_orders_snapshot if isinstance(o, dict) and o.get('side') == entry_side and o.get('type') == 'limit']
                     if pending:
                         self.manage_pending_entry(bot_id, name, pair, direction, pending[0], params, bot_exchange)
                         return
@@ -161,6 +196,9 @@ class BotExecutor:
 
                 if can_enter:
                     buy_signal, sell_signal = strategy.check_signals(df)
+                    # DEBUG: Log signal values for troubleshooting
+                    if bot_id == 43:  # Special debug for bot 43
+                        logger.info(f"🔍 BOT 43 SIGNALS: buy={buy_signal}, sell={sell_signal}, price={current_price}, threshold=87000")
                     if direction == 'LONG' and buy_signal:
                         # First-Claim Policy Disabled for Virtual Positioning
                         # We allow multiple bots to trade the same pair independently
@@ -177,9 +215,22 @@ class BotExecutor:
                     is_in_trade = False  # Position was closed
                 else:
                     strategy.last_market_data = df
-                    mission = manage_trade(bot_id, name, pair, direction, params, trade_data, current_price, strategy, bot_exchange)
+                    # DEBUG TRACE
+                    try:
+                         from engine.database import log_trade
+                         log_trade(bot_id, 'DEBUG_LOG', pair, current_price, 0, 0, "CALL_MANAGE", trade_data[2], 0, "Calling manage_trade")
+                    except: pass
+                    
+                    mission = manage_trade(bot_id, name, pair, direction, params, trade_data, current_price, strategy, bot_exchange, open_orders=open_orders_snapshot)
+                    
+                    if mission:
+                        try:
+                             from engine.database import log_trade
+                             log_trade(bot_id, 'DEBUG_LOG', pair, 0, 0, 0, "MISSION_RET", trade_data[2], 0, f"Mission: {mission.get('action')}")
+                        except: pass
+                    
                     if mission and mission.get('action') != 'none':
-                        self.execute_mission(mission, exchange=bot_exchange)
+                        self.execute_mission(mission, exchange=bot_exchange, open_orders_snapshot=open_orders_snapshot)
 
         except (ccxt.BadSymbol, ccxt.ExchangeError) as e:
             if "symbol" in str(e).lower() or "market" in str(e).lower():
@@ -188,9 +239,10 @@ class BotExecutor:
             else:
                 logger.error(f"Exchange error for bot {name}: {e}")
         except Exception as e:
-            logger.error(f"Error processing bot {name}: {e}")
+            import traceback
+            logger.error(f"Error processing bot {name}: {e}\n{traceback.format_exc()}")
 
-    def execute_mission(self, mission, exchange=None):
+    def execute_mission(self, mission, exchange=None, open_orders_snapshot=None):
         if not mission: return
         try:
             action = mission.get('action')
@@ -218,10 +270,14 @@ class BotExecutor:
                     # Use limit order with chase logic for TP - NO market orders unless emergency
                     side = 'sell' if direction == 'LONG' else 'buy'
                     # Skip validation for TP orders - we're closing existing position, MinNotional doesn't apply
+                    # HEDGE MODE: Closing LONG -> side=sell, positionSide=LONG
+                    tp_params = {'reduceOnly': True}
+                    tp_params['positionSide'] = direction # 'LONG' or 'SHORT'
+                    
                     success, _, _ = self._execute_limit_with_chase(
                         bot_id, bot_name, pair, side, qty, 
                         exchange=ex, initial_price=exit_price,
-                        params={'reduceOnly': True},
+                        params=tp_params,
                         skip_validation=True  # TP orders bypass MinNotional check
                     )
                     if success:
@@ -235,7 +291,8 @@ class BotExecutor:
                 tp_price = mission.get('tp_price')
                 tp_qty = mission.get('tp_qty')
                 
-                open_orders = ex.fetch_open_orders(pair) or []
+                # Optimization: Use passed snapshot if available, else fetch
+                open_orders = open_orders_snapshot if open_orders_snapshot is not None else (ex.fetch_open_orders(pair) or [])
                 grid_side = 'buy' if direction == 'LONG' else 'sell'
                 tp_side = 'sell' if direction == 'LONG' else 'buy'
                 
@@ -250,7 +307,7 @@ class BotExecutor:
                 my_grid_orders = [o for o in open_orders if isinstance(o, dict) and o.get('id') in my_grid_order_ids]
                 my_tp_orders = [o for o in open_orders if isinstance(o, dict) and o.get('id') == my_tp_order_id]
                 
-                logger.debug(f"Maintain {bot_name}: Found {len(my_grid_orders)} Grid, {len(my_tp_orders)} TP orders. Target Grid: {grid_price}, Target TP: {tp_price}")
+                logger.info(f"Maintain {bot_name}: OpenOrders={len(open_orders)} | Found MyGrid={len(my_grid_orders)} MyTP={len(my_tp_orders)} | Target Grid={grid_price:.2f} TP={tp_price:.2f}")
 
                 # Fallback: If we don't have order ID tracking yet, use side-based matching (legacy)
                 # This handles bots that were in trade before the fix
@@ -261,8 +318,56 @@ class BotExecutor:
                     if can_enter:
                         # We are the owner (or first claimant), so we might own these untracked orders
                         logger.warning(f"No order IDs tracked for {bot_name}. Using legacy side-based matching.")
-                        my_grid_orders = [o for o in open_orders if isinstance(o, dict) and o.get('side') == grid_side]
-                        my_tp_orders = [o for o in open_orders if isinstance(o, dict) and o.get('side') == tp_side]
+                        
+                        # --- ROBUST MULTI-BOT FIX: Check order ownership before adopting ---
+                        # Get all open orders on the exchange
+                        all_grid_orders = [o for o in open_orders if isinstance(o, dict) and o.get('side') == grid_side]
+                        all_tp_orders = [o for o in open_orders if isinstance(o, dict) and o.get('side') == tp_side]
+                        
+                        # Filter out orders already owned by OTHER bots
+                        from engine.database import get_order_owner
+                        my_grid_orders = []
+                        my_tp_orders = []
+                        
+                        for o in all_grid_orders:
+                            order_id = o.get('id')
+                            owner = get_order_owner(order_id)
+                            if owner is None:
+                                # Unowned order - we can adopt it
+                                my_grid_orders.append(o)
+                            elif owner == bot_id:
+                                # Already ours (shouldn't happen in this branch, but safety check)
+                                my_grid_orders.append(o)
+                            else:
+                                # Owned by another bot - skip it
+                                logger.info(f"🚫 Grid Order {order_id} already owned by Bot {owner}, skipping adoption")
+                        
+                        for o in all_tp_orders:
+                            order_id = o.get('id')
+                            owner = get_order_owner(order_id)
+                            if owner is None:
+                                # Unowned order - we can adopt it
+                                my_tp_orders.append(o)
+                            elif owner == bot_id:
+                                # Already ours
+                                my_tp_orders.append(o)
+                            else:
+                                # Owned by another bot - skip it
+                                logger.info(f"🚫 TP Order {order_id} already owned by Bot {owner}, skipping adoption")
+                        
+                        # Only adopt orders that are truly unowned (legacy orphan orders)
+                        if my_grid_orders:
+                            o = my_grid_orders[0]
+                            step = trade_data[2] if trade_data else 0
+                            save_bot_order(bot_id, 'grid', o['id'], float(o.get('price', 0)), float(o.get('amount', 0)), step)
+                            logger.info(f"💾 Adopted Legacy Grid Order {o['id']} for {bot_name} (previously unowned)")
+                            
+                        if my_tp_orders:
+                            o = my_tp_orders[0]
+                            step = trade_data[2] if trade_data else 0
+                            save_bot_order(bot_id, 'tp', o['id'], float(o.get('price', 0)), float(o.get('amount', 0)), step)
+                            logger.info(f"💾 Adopted Legacy TP Order {o['id']} for {bot_name} (previously unowned)")
+                        # --------------------------------
                     else:
                         # We are a PASSENGER. We do NOT own any legacy orders.
                         # The owner bot is responsible for them.
@@ -274,10 +379,27 @@ class BotExecutor:
                 # --- INDEPENDENT GRID MANAGEMENT ---
                 try:
                     grid_ok = False
+                    valid_grids = []
                     if grid_price and grid_price > 0:
                         for o in my_grid_orders:
-                            if abs(float(o['price']) - grid_price) / grid_price < 0.001: grid_ok = True
-                            else: ex.exchange.cancel_order(o['id'], pair)
+                            # Safety check for None price in order (e.g. market order)
+                            op = float(o.get('price') or 0.0)
+                            # Relaxed tolerance to 0.3% to prevent churn on ATR shifts
+                            if op > 0 and abs(op - grid_price) / grid_price < 0.003: 
+                                valid_grids.append(o)
+                            else: 
+                                try: ex.exchange.cancel_order(o['id'], pair)
+                                except: pass
+                        
+                        if valid_grids:
+                            grid_ok = True
+                            # Cleanup Duplicates
+                            if len(valid_grids) > 1:
+                                logger.info(f"🧹 Found {len(valid_grids)} valid Grids. Keeping first, cleaning duplicates.")
+                                for dup in valid_grids[1:]:
+                                    try: ex.exchange.cancel_order(dup['id'], pair)
+                                    except: pass
+                                    
                         if not grid_ok:
                             logger.info(f"[GRID] Placing Limit Grid Order for {bot_name}: {grid_qty:.4f} @ {grid_price}")
                             if config.DRY_RUN:
@@ -288,10 +410,17 @@ class BotExecutor:
                                 
                                 if not is_valid:
                                     logger.error(f"GRID VALIDATION FAILED for {bot_name}: {err}. (Req: {grid_qty:.6f} @ {grid_price:.4f})")
+                                    try:
+                                        from engine.database import log_trade
+                                        log_trade(bot_id, 'DEBUG_ERR', pair, grid_price, grid_qty, 0, "GRID_VAL_FAIL", 0, 0, str(err))
+                                    except: pass
                                 else:
                                     logger.info(f"[GRID] Validated OK. Placing {grid_side} {s_amt} @ {s_price} (PostOnly)")
                                     # Added metadata for better tracking (clientOrderId removed to fix Binance -1104)
                                     grid_params = {'postOnly': True}
+                                    # HEDGE MODE: Grid (Increase Size) -> positionSide = direction
+                                    grid_params['positionSide'] = direction
+                                    
                                     try:
                                         grid_order = ex.create_order(pair, 'limit', grid_side, s_amt, s_price, params=grid_params)
                                         if grid_order:
@@ -306,20 +435,43 @@ class BotExecutor:
                                             logger.warning(f"Post Only Rejected for {bot_name} at {s_price}. Market moved. Skipping immediate retry.")
                                         else: 
                                             logger.error(f"Grid InvalidOrder: {e}")
-                                            raise e
+                                            # Don't raise, just log
                                     except Exception as e:
                                         logger.error(f"Grid Creation Error: {e}")
-                                        raise e
+                                        try:
+                                            from engine.database import log_trade
+                                            log_trade(bot_id, 'DEBUG_ERR', pair, 0, 0, 0, "GRID_CREATE_EXC", 0, 0, str(e))
+                                        except: pass
                 except Exception as e:
                     logger.error(f"GRID MAINTENANCE FAILED for {bot_name}: {e}")
+                    try:
+                         from engine.database import log_trade
+                         log_trade(bot_id, 'DEBUG_ERR', pair, 0, 0, 0, "GRID_MAIN_FAIL", 0, 0, str(e))
+                    except: pass
                 
                 # --- INDEPENDENT TP MANAGEMENT ---
                 try:
                     tp_ok = False
+                    valid_tps = []
                     if tp_price and tp_price > 0:
                         for o in my_tp_orders:
-                            if abs(float(o['price']) - tp_price) / tp_price < 0.001: tp_ok = True
-                            else: ex.exchange.cancel_order(o['id'], pair)
+                            # Safety check for None price
+                            op = float(o.get('price') or 0.0)
+                            # Relaxed tolerance to 0.3%
+                            if op > 0 and abs(op - tp_price) / tp_price < 0.003: 
+                                valid_tps.append(o)
+                            else: 
+                                try: ex.exchange.cancel_order(o['id'], pair)
+                                except: pass
+                        
+                        if valid_tps:
+                            tp_ok = True
+                            if len(valid_tps) > 1:
+                                logger.info(f"🧹 Found {len(valid_tps)} valid TPs. Keeping first, cleaning duplicates.")
+                                for dup in valid_tps[1:]:
+                                    try: ex.exchange.cancel_order(dup['id'], pair)
+                                    except: pass
+                                    
                         if not tp_ok:
                             logger.info(f"[TP] Placing Limit TP Order for {bot_name}: {tp_qty:.4f} @ {tp_price}")
                             if config.DRY_RUN:
@@ -345,17 +497,18 @@ class BotExecutor:
                                 
                                 if not has_position:
                                     logger.warning(f"[TP] Skipping TP order for {bot_name} - no position on exchange (may have already closed)")
-                                    return
-                                
-                                # Use reduceOnly for safety - prevents opening new positions
-                                # clientOrderId removed to fix Binance -1104
-                                tp_params = {
-                                    'reduceOnly': True
-                                }
-                                tp_order = ex.create_order(pair, 'limit', tp_side, tp_qty, tp_price, params=tp_params)
-                                if tp_order:
-                                    # Save TP order ID for multi-bot tracking
-                                    save_bot_order(bot_id, 'tp', tp_order.get('id'), tp_price, tp_qty, trade_data[2] if trade_data else 0)
+                                    # Continue instead of return to allow Grid check (though we are in TP block)
+                                else:
+                                    # Use reduceOnly for safety - prevents opening new positions
+                                    # clientOrderId removed to fix Binance -1104
+                                    tp_params = {
+                                        'reduceOnly': True,
+                                        'positionSide': direction # HEDGE MODE
+                                    }
+                                    tp_order = ex.create_order(pair, 'limit', tp_side, tp_qty, tp_price, params=tp_params)
+                                    if tp_order:
+                                        # Save TP order ID for multi-bot tracking
+                                        save_bot_order(bot_id, 'tp', tp_order.get('id'), tp_price, tp_qty, trade_data[2] if trade_data else 0)
                 except Exception as e:
                     logger.error(f"TP MAINTENANCE FAILED for {bot_name}: {e}")
 
@@ -365,7 +518,12 @@ class BotExecutor:
                 logger.info(f"[HEDGE] Opening Hedge for {bot_name} at {price}")
                 if config.DRY_RUN: log_trade(bot_id, 'HEDGE_OPEN', pair, price, qty, amount_usd, "DRY_HEDGE", step, 0, "[DRY] Hedge")
                 else:
-                    order = ex.create_order(pair, 'market', side, qty)
+                    # HEDGE MODE: Open Opposite Position
+                    # If Parent is LONG, Hedge side is SELL. positionSide should be SHORT.
+                    hedge_pos_side = 'SHORT' if direction == 'LONG' else 'LONG'
+                    hedge_params = {'positionSide': hedge_pos_side}
+                    
+                    order = ex.create_order(pair, 'market', side, qty, params=hedge_params)
                     if order: log_trade(bot_id, 'HEDGE_OPEN', pair, price, qty, amount_usd, order.get('id'), step, 0, "Hedge Opened")
 
         except Exception as e: logger.error(f"Mission failed for {mission.get('bot_name')}: {e}")
@@ -428,6 +586,10 @@ class BotExecutor:
             ex = exchange or get_thread_exchange(mt)
             if not ex: return # Safety check for failed exchange init
             
+            # Use passed open_orders or fetch if not provided
+            # (In process_bot, we fetch once. In direct calls, we might need to fetch)
+            # But process_market_maker signature doesn't accept open_orders yet.
+            # Ideally we update signature, but for now let's just fetch if needed.
             open_orders = ex.fetch_open_orders(pair) or []
             current_bids = [o for o in open_orders if isinstance(o, dict) and o.get('side') == 'buy']
             current_asks = [o for o in open_orders if isinstance(o, dict) and o.get('side') == 'sell']
@@ -513,6 +675,16 @@ class BotExecutor:
             if skip_validation:
                 params = dict(params) if params else {}
                 params['_skip_validation'] = True
+            
+            # --- HEDGE MODE SUPPORT ---
+            # Automatically inject positionSide if not present
+            if 'positionSide' not in params:
+                 if side == 'buy':
+                     # Long Entry or Short Close? 
+                     # Ideally passed in params, but default to 'LONG' if opening long?
+                     # Actually, caller should pass it. But let's be safe:
+                     pass 
+            
             order = ex.create_order(pair, 'limit', side, s_amt, s_price, params=params)
             if not order: 
                 logger.error(f"Order creation returned None for {name}. Check Exchange logs.")
@@ -570,6 +742,21 @@ class BotExecutor:
 
         # Calculate Qty based on initial price
         qty = amount / price
+        
+        # --- HEDGE MODE PARAMS ---
+        # Determine positionSide
+        pos_side = 'LONG' if side == 'buy' else 'SHORT' # Default One-Way assumption? NO.
+        # We need to receive 'direction' or infer it.
+        # BotState usually has 'direction' (LONG/SHORT).
+        # execute_entry callers pass 'side' (buy/sell).
+        
+        # If this is an ENTRY, and side=buy, it's LONG Open.
+        # If side=sell, it's SHORT Open.
+        # (Assuming execute_entry is only for OPENING positions)
+        if params is None: params = {}
+        if 'positionSide' not in params:
+             # Heuristic: 'buy' -> LONG, 'sell' -> SHORT for *Entry*
+             params['positionSide'] = 'LONG' if side == 'buy' else 'SHORT'
         
         # Execute using Chase Logic (No Market Fallback)
         # Smart Chase: 60s -> 30s -> 10s -> 5s (Loop)
@@ -701,14 +888,30 @@ class BotExecutor:
              interval_idx += 1
         
         if success:
-            self._finalize_entry(bot_id, name, pair, side, amount, fill_price, order_id)
+            self._finalize_entry(bot_id, name, pair, side, amount, fill_price, order_id, exchange=ex)
 
-    def _finalize_entry(self, bot_id, name, pair, side, amount, fill_price, order_id):
+    def _finalize_entry(self, bot_id, name, pair, side, amount, fill_price, order_id, exchange=None):
+        # --- CRITICAL SAFETY: Verify Order Reality ---
+        # Prevent "Ghost Entries" where local logic thinks success but API failed or order is lost.
+        # This stops the infinite Entry -> TP Hit (0.00) loop.
+        try:
+            ex = exchange or self.runner.exchange
+            # We strictly check if the order exists and is actually filled
+            check = ex.fetch_order(order_id, pair)
+            if not check or check.get('status') not in ['closed', 'filled']:
+                 logger.critical(f"👻 GHOST ENTRY BLOCKED: Order {order_id} for {name} is NOT filled on exchange! Status: {check.get('status') if check else 'None'}. DB Update Aborted.")
+                 return
+        except Exception as e:
+             # If fetch fails (e.g. -2013 Order does not exist), this catches it
+             logger.critical(f"👻 GHOST ENTRY BLOCKED: Order {order_id} check failed: {e}. DB Update Aborted.")
+             return
+        # ---------------------------------------------
+
         tp_price = fill_price * (1.015 if side == 'buy' else 0.985)
         update_martingale_step(bot_id, 0, amount, fill_price, tp_price)
         self._record_order(bot_id)
         # Save entry order ID for multi-bot tracking
-        save_bot_order(bot_id, 'entry', order_id, fill_price, amount/fill_price, step=0)
+        save_bot_order(bot_id, 'entry', order_id, fill_price, amount/fill_price, step=0, status='filled')
         log_trade(bot_id, 'BUY' if side == 'buy' else 'SELL', pair, fill_price, amount/fill_price, amount, order_id, 0, 0, f"Entry {name}")
         
         # Claim ownership or become passenger based on First-Claim Policy
@@ -729,9 +932,88 @@ class BotExecutor:
         self._record_order(bot_id)
         log_trade(bot_id, 'DRY_BUY' if side == 'buy' else 'DRY_SELL', pair, price, amount/price, amount, "DRY_RUN", 0, 0, f"Dry Entry {name}")
 
-    def verify_state_sync(self, bot_id, name, pair, exchange):
+    def reconcile_orders(self, bot_id, name, pair, is_in_trade, open_orders_snapshot, exchange):
+        """
+        Robust Reconciliation: Sync DB with Exchange orders.
+        1. Clean up STALE orders (Scanning bot shouldn't have Grid/TP).
+        2. Detect FILLED/CANCELLED orders that DB thinks are Open.
+        """
+        if config.DRY_RUN: return
+
+        try:
+            # 1. Fetch DB Orders (What we THINK we have)
+            from engine.database import update_order_status
+            bot_order_ids = get_bot_order_ids(bot_id)
+            track_grid = bot_order_ids.get('grid_orders', [])
+            track_tp = bot_order_ids.get('tp_order_id')
+            track_entry = bot_order_ids.get('entry_order_id')
+
+            # Build a set of ALL tracked order IDs for this bot
+            db_order_map = {} # {id: type}
+            if track_tp: db_order_map[track_tp] = 'tp'
+            if track_entry: db_order_map[track_entry] = 'entry'
+            for g in track_grid: db_order_map[g['order_id']] = 'grid'
+
+            # 2. Check Exchange Orders (What is ACTUALLY there)
+            exchange_order_ids = set()
+            for o in open_orders_snapshot:
+                if 'id' in o: exchange_order_ids.add(o['id'])
+
+            # 3. SYNC: Detect Ghost Orders (In DB, but Missing on Exchange)
+            for db_id, o_type in db_order_map.items():
+                if db_id not in exchange_order_ids:
+                    # Order is MISSING from snapshot. Could be filled, cancelled, OR API Latency.
+                    # CRITICAL: Do NOT assume closed unless verified.
+                    
+                    try:
+                        # Verify actual status
+                        verified_order = exchange.fetch_order(db_id, pair)
+                        if verified_order:
+                            v_status = verified_order.get('status')
+                            if v_status in ['closed', 'filled', 'canceled', 'cancelled', 'expired', 'rejected']:
+                                logger.debug(f"🧹 Reconcile: Order {db_id} verified {v_status}. Updating DB.")
+                                update_order_status(db_id, 'closed') # Update DB to stop tracking
+                            else:
+                                logger.warning(f"⚠️ Reconcile: Order {db_id} missing from snapshot but verified OPEN on exchange. Latency detected. Keeping in DB.")
+                        else:
+                            # Order not found even by ID? Then it's truly gone.
+                            logger.info(f"🧹 Reconcile: Order {db_id} not found on exchange. Marking closed.")
+                            update_order_status(db_id, 'closed')
+                            
+                    except Exception as e:
+                        logger.warning(f"⚠️ Reconcile: Failed to verify status for missing {o_type} {db_id}: {e}. Keeping DB as OPEN for safety.")
+
+            # 4. ENFORCE: Cleanup Stale Orders (Exchange has it, but State forbids it)
+            if not is_in_trade:
+                # Bot is SCANNING. Should NOT have Grid or TP orders.
+                # Only 'entry' LIMIT orders are allowed (chasing).
+                
+                for o in open_orders_snapshot:
+                    oid = o.get('id')
+                    
+                    # Is this OUR order?
+                    if oid in db_order_map:
+                        o_type = db_order_map[oid]
+                        
+                        if o_type in ['grid', 'tp']:
+                            logger.warning(f"⚠️ STALE ORDER DETECTED: {name} is Scanning, but has {o_type} order {oid}. CANCELLING.")
+                            try:
+                                exchange.exchange.cancel_order(oid, pair)
+                                update_order_status(oid, 'cancelled')
+                            except Exception as e:
+                                logger.error(f"Failed to cancel stale order {oid}: {e}")
+
+        except Exception as e:
+            logger.error(f"Reconciliation Error for {name}: {e}")
+
+
+    def verify_state_sync(self, bot_id, name, pair, exchange, open_orders_snapshot, basket_start_time=0):
         """
         Robustness Check: Detect 'Ghost Trades' where DB says In Trade, but Exchange is Empty.
+        
+        Args:
+            basket_start_time: Timestamp when trade started (used for grace period on new entries)
+        
         Returns: True if state is VALID (or corrected), False if state was INVALID and reset.
         """
         if config.DRY_RUN: return True # Skip for Dry Run
@@ -755,20 +1037,58 @@ class BotExecutor:
                         has_position = True
                         break
             
-            # 2. Fetch Open Orders
-            open_orders = exchange.fetch_open_orders(pair) or []
-            has_orders = len(open_orders) > 0
+            # 2. Use Passed Snapshot
+            has_orders = len(open_orders_snapshot) > 0
             
             # 3. Decision Logic
             if not has_position and not has_orders:
-                # CRITICAL: DB says Trade, Exchange says NOTHING.
-                logger.critical(f"👻 GHOST TRADE DETECTED for {name} ({pair})! DB In-Trade vs Empty Wallet. Auto-Healing...")
+                # --- ROBUST: Grace Period (Latency Protection) ---
+                # API lag can cause a "just filled" order to not yet show in Position.
+                # Check BOTH last fill time AND basket start time for maximum robustness.
+                should_reset = True
+                try:
+                    # Check 1: Last filled order grace period
+                    last_fill = get_last_filled_order(bot_id)
+                    if last_fill and 'timestamp' in last_fill:
+                        ts_str = str(last_fill['timestamp'])
+                        try:
+                            filled_time = float(ts_str)
+                        except (ValueError, TypeError) as e:
+                            logger.debug(f"Failed to parse fill timestamp: {e}")
+                            filled_time = pd.to_datetime(ts_str).timestamp()
+                            
+                        seconds_ago = time.time() - filled_time
+                        
+                        logger.debug(f"Grace Check: Last Fill was {seconds_ago:.1f}s ago (Limit: 120s)")
+
+                        if seconds_ago < 120: 
+                             logger.warning(f"🛡️ Grace Period (Last Fill) Active for {name}: {seconds_ago:.1f}s ago")
+                             should_reset = False
+                    
+                    # Check 2: Basket start time grace period (for new entries)
+                    # This handles cases where position isn't immediately visible after entry
+                    if should_reset and basket_start_time > 0:
+                        seconds_since_start = time.time() - basket_start_time
+                        logger.debug(f"Grace Check: Basket started {seconds_since_start:.1f}s ago (Limit: 120s)")
+                        
+                        if seconds_since_start < 120:
+                            logger.warning(f"🛡️ Grace Period (New Entry) Active for {name}: Started {seconds_since_start:.1f}s ago")
+                            should_reset = False
+                            
+                except Exception as gp_err:
+                     logger.warning(f"Grace check error: {gp_err}")
                 
-                # Force Reset DB State
-                # Using 0 as exit price since no real trade exists
-                reset_bot_after_tp(bot_id, exit_price=0)
-                
-                return False # State was invalid and reset
+                if should_reset:
+                    # CRITICAL: DB says Trade, Exchange says NOTHING.
+                    logger.critical(f"👻 GHOST TRADE DETECTED for {name} ({pair})! DB In-Trade vs Empty Wallet. Auto-Healing...")
+                    
+                    # Force Reset DB State
+                    # Using 0 as exit price since no real trade exists
+                    reset_bot_after_tp(bot_id, exit_price=0, action_label='GHOST_RESET')
+                    
+                    return False # State was invalid and reset
+                else:
+                    return True # Grace period saved it
             
             return True # State is valid (or at least has exchange presence)
             

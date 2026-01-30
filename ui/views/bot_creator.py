@@ -113,184 +113,20 @@ def render_bot_creator_view():
     # This dictionary stores all user selections for the new bot
     bot_config = {}
     
-    with st.expander("📊 ATR Configuration (Flexible)", expanded=True):
-        st.info("💡 Configure ATR for Grid Spacing and Entry Triggers")
-        
-        # Flexible ATR Configuration
-        c_atr1, c_atr2 = st.columns(2)
-        with c_atr1:
-            atr_timeframe = st.selectbox(
-                "ATR Timeframe (Analysis)",
-                ["1m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w"],
-                index=4,
-                key="bot_creator_atr_tf",
-                help="This timeframe is used for the Market Context metrics below and the initial Grid Preview. For actual Bot Execution, confirm settings in 'Risk Management'."
-            )
-        with c_atr2:
-            atr_periods = st.slider(
-                "ATR Lookback Period (candles)",
-                min_value=3,
-                max_value=240,
-                value=14,
-                key="bot_creator_atr_periods"
-            )
-        
-        bot_config['ATR_Timeframe'] = atr_timeframe
-        bot_config['ATRPeriods'] = atr_periods
-        
-        # Calculate ATR
-        try:
-            # Fetch data at ATR timeframe
-            ohlcv_atr = fetch_ohlcv_cached(mode_id, pair if pair else "BTC/USDT", timeframe=atr_timeframe, limit=250)
-            if ohlcv_atr:
-                    df_atr = pd.DataFrame(ohlcv_atr, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                    df_atr['timestamp'] = pd.to_datetime(df_atr['timestamp'], unit='ms')
-                    
-                    # Calculate True Range
-                    tr1 = df_atr['high'] - df_atr['low']
-                    tr2 = (df_atr['high'] - df_atr['close'].shift()).abs()
-                    tr3 = (df_atr['low'] - df_atr['close'].shift()).abs()
-                    true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-                    
-                    if len(true_range) >= atr_periods:
-                        current_atr = float(true_range.iloc[-atr_periods:].mean())
-                        
-                        # Historical ATR for percentile
-                        rolling_atrs = true_range.rolling(window=atr_periods).mean()
-                        atr_history = rolling_atrs.dropna()
-                        
-                        if len(atr_history) >= 10:
-                            percentile = (atr_history < current_atr).sum() / len(atr_history) * 100
-                        else:
-                            percentile = 50
-                        
-                        # Move percentage
-                        last_open = df_atr['open'].iloc[-1]
-                        last_close = df_atr['close'].iloc[-1]
-                        move_pct = (last_close - last_open) / current_atr * 100
-                        
-                        # Display ATR
-                        m1, m2, m3 = st.columns(3)
-                        with m1:
-                            st.metric(f"ATR ({atr_timeframe})", f"{current_atr:.6f}")
-                        with m2:
-                            st.metric("Range Position", f"{move_pct:+.1f}%")
-                        with m3:
-                            st.metric("Vol Percentile", f"{percentile:.0f}%")
-                        
-                        st.caption(f"**Formula:** ATR = Average(True Range of last {atr_periods} {atr_timeframe} candles)")
-                        
-                        # Volatility insight
-                        if percentile > 70:
-                            st.info(f"📈 **High Volatility**: Top {100-percentile:.0f}% percentile")
-                        elif percentile < 30:
-                            st.info(f"📉 **Low Volatility**: Bottom {percentile:.0f}% percentile")
-                        else:
-                            st.info(f"➡️ **Normal Volatility**: {percentile:.0f}% percentile")
-                        
-                        p_atr = current_atr
-                    else:
-                        st.warning(f"Not enough data. Need {atr_periods} candles, have {len(true_range)}")
-                        p_atr = df_atr['close'].iloc[-1] * 0.01
-            else:
-                st.warning("No OHLCV data returned from exchange.")
-                p_atr = 10.0
-        except Exception as e:
-            st.warning(f"ATR Calculation Error: {e}")
-            p_atr = 10.0
+    # Initialize default values that were previously set in the removed block
+    bot_config['ATR_Timeframe'] = '1h'
+    bot_config['ATRPeriods'] = 14
+    
+    # --- Market Context / Analysis (Visual Only) ---
+    # Moved calculation logic to be demand-based or inside the Risk Management section if needed
+    p_atr = 10.0
+    current_price = 0.0
 
-    # --- Flexible Grid System Configuration (NEW) ---
-    st.divider()
-    with st.expander("📐 Flexible Grid System", expanded=False):
-        st.info("💡 Configure step-based grid spacing rules. Apply different strategies for different martingale levels.")
-        
-        # ATR Mode
-        atr_mode = st.radio(
-            "ATR Update Mode",
-            ["dynamic", "locked"],
-            index=0,
-            horizontal=True,
-            help="'dynamic': Recalculate ATR every cycle. 'locked': Capture ATR at first entry and keep it constant."
-        )
-        bot_config['ATRMode'] = atr_mode
-        
-        # Default ATR Grid settings
-        use_atr_grid = st.checkbox("Use ATR Grid Spacing", value=True, help="Enable ATR-based grid spacing instead of fixed $ values.")
-        bot_config['UseATRGrid'] = use_atr_grid
-        
-        if use_atr_grid:
-            c_g1, c_g2 = st.columns(2)
-            with c_g1:
-                atr_grid_factor = st.number_input("Default ATR Multiplier", min_value=0.1, max_value=5.0, step=0.1, value=1.0, help="Grid spacing = ATR × this factor (used when no step rule applies).")
-                bot_config['ATRGridFactor'] = atr_grid_factor
-            with c_g2:
-                base_grid_fixed = st.number_input("Fallback Fixed Grid ($)", min_value=0.1, step=1.0, value=100.0, help="Used when ATR is 0 or UseATRGrid is disabled.")
-                bot_config['base_grid'] = base_grid_fixed
-        
-        # Step-Based Grid Rules
-        st.markdown("### 🎯 Step-Based Grid Rules")
-        st.caption("Define custom grid spacing for specific step ranges. Rules are processed in order.")
-        
-        # Initialize session state for grid rules
-        if 'grid_rules' not in st.session_state:
-            st.session_state.grid_rules = []
-        
-        # Add/Remove rules
-        r_col1, r_col2, r_col3 = st.columns([2, 2, 1])
-        with r_col1:
-            rule_start = st.number_input("Start Step", min_value=1, max_value=20, value=1, key="rule_start")
-        with r_col2:
-            rule_end = st.number_input("End Step", min_value=1, max_value=20, value=4, key="rule_end")
-        with r_col3:
-            rule_type = st.selectbox("Rule Type", ["atr", "fixed"], key="rule_type")
-        
-        if rule_type == "atr":
-            c_r1, c_r2 = st.columns(2)
-            with c_r1:
-                rule_multiplier = st.number_input("ATR Multiplier", min_value=0.1, max_value=5.0, step=0.1, value=1.0, key="rule_mult")
-            with c_r2:
-                if st.button("Add ATR Rule", key="add_atr_rule", use_container_width=True):
-                    st.session_state.grid_rules.append({
-                        "start": rule_start,
-                        "end": rule_end,
-                        "type": "atr",
-                        "multiplier": rule_multiplier
-                    })
-                    st.rerun()
-        else:
-            rule_value = st.number_input("Fixed Spacing ($)", min_value=0.1, step=1.0, value=500.0, key="rule_value")
-            if st.button("Add Fixed Rule", key="add_fixed_rule", use_container_width=True):
-                st.session_state.grid_rules.append({
-                    "start": rule_start,
-                    "end": rule_end,
-                    "type": "fixed",
-                    "value": rule_value
-                })
-                st.rerun()
-        
-        # Display existing rules
-        if st.session_state.grid_rules:
-            st.markdown("**Active Rules:**")
-            for i, rule in enumerate(st.session_state.grid_rules):
-                r_desc = f"Steps {rule['start']}-{rule['end']}: "
-                if rule['type'] == 'atr':
-                    r_desc += f"ATR × {rule['multiplier']}"
-                else:
-                    r_desc += f"Fixed ${rule['value']}"
-                
-                r_col, btn_col = st.columns([3, 1])
-                with r_col:
-                    st.markdown(f"- {r_desc}")
-                with btn_col:
-                    if st.button("🗑️", key=f"del_rule_{i}"):
-                        st.session_state.grid_rules.pop(i)
-                        st.rerun()
-            
-            # Save rules to config
-            bot_config['GridStepRules'] = st.session_state.grid_rules
-        else:
-            st.caption("No custom rules defined. Using default ATR or fixed spacing.")
-            bot_config['GridStepRules'] = []
+
+
+    # REMOVED STANDALONE FLEXIBLE GRID SECTION
+    # Merged into Risk Management below for cleaner UI
+
 
     # --- Configuration Sections ---
     # bot_config is initialized above in the expander
@@ -538,24 +374,107 @@ def render_bot_creator_view():
             
             st.divider()
 
-        with st.expander("Risk Management (Martingale & Grid)", expanded=False):
-            st.subheader("Grid Logic")
-            bot_config['UseATRGrid'] = st.checkbox("Use ATR Dynamic Grid", value=True, help="If OFF, uses fixed 'Base Grid' distance.")
+        with st.expander("Risk Management (Grid & Safety)", expanded=False):
+            st.subheader("Grid Spacing Logic")
             
-            g_col1, g_col2 = st.columns(2)
-            with g_col1:
-                bot_config['ATRGridFactor'] = st.number_input("ATR Grid Factor", value=1.1, step=0.1, help="Multiplier for ATR. < 1.0 = tighter grid.")
+            # Consolidated Grid Logic
+            use_atr_grid = st.checkbox("Use Dynamic ATR Grid", value=True, help="If OFF, uses fixed 'Base Grid' distance for all steps (unless overridden by rules).")
+            bot_config['UseATRGrid'] = use_atr_grid
+            
+            col_grid_main1, col_grid_main2 = st.columns(2)
+            
+            with col_grid_main1:
+                # ATR Configuration
+                st.markdown("##### 📉 ATR Settings")
+                atr_timeframe = st.selectbox(
+                    "ATR Timeframe", 
+                    ["1m", "5m", "15m", "30m", "1h", "4h", "1d"], 
+                    index=4, 
+                    help="Timeframe used to calculate ATR for grid spacing. Lower timeframe = tighter grid."
+                )
+                bot_config['ATR_Timeframe'] = atr_timeframe
+                
+                atr_periods = st.number_input("ATR Periods", value=14, min_value=3, max_value=240, help="Number of candles to calculate average range.")
+                bot_config['ATRPeriods'] = atr_periods
+                
+                atr_mode = st.radio(
+                    "ATR Mode",
+                    ["dynamic", "locked"],
+                    index=0,
+                    horizontal=True,
+                    help="'dynamic': Recalculate ATR every cycle. 'locked': Capture ATR at first entry and keep it constant."
+                )
+                bot_config['ATRMode'] = atr_mode
 
-            with g_col2:
-                if not bot_config['UseATRGrid']:
-                     bot_config['base_grid'] = st.number_input("Fixed Grid Step (Price)", value=100.0, step=10.0, help="Used if ATR Grid is OFF. Absolute price change.")
+            with col_grid_main2:
+                # Spacing Configuration
+                st.markdown("##### 📐 Spacing Settings")
+                
+                # 1. Base Spacing Input
+                if use_atr_grid:
+                    bot_config['ATRGridFactor'] = st.number_input("Base Spacing (ATR Multiplier)", value=1.0, step=0.1, help="Initial grid spacing = ATR × this factor.")
+                    bot_config['base_grid'] = 100.0
                 else:
-                     bot_config['base_grid'] = 100.0 # Default hidden
+                    bot_config['base_grid'] = st.number_input("Base Spacing (Price $)", value=100.0, step=10.0)
+                    bot_config['ATRGridFactor'] = 1.0
+                
+                # 2. Martingale Spacing (Exponential Grid)
+                use_grid_mult = st.checkbox("Enable Exponential Spacing (Martingale Grid)", value=False, help="If checked, the grid spacing changes by a multiplier at each step.")
+                if use_grid_mult:
+                     bot_config['GridMultiplier'] = st.number_input("Spacing Multiplier", value=1.1, step=0.05, min_value=0.1, help="> 1.0 expands grid (classic). < 1.0 tightens grid (aggressive).")
+                else:
+                     bot_config['GridMultiplier'] = 1.0
+
+            st.divider()
             
-            # --- New ATR Timeframe Selector ---
-            if bot_config['UseATRGrid']:
-                bot_config['ATR_Timeframe'] = st.selectbox("ATR Timeframe for Grid", ["1m", "5m", "15m", "1h", "4h", "1d"], index=3, help="Timeframe used to calculate ATR for grid spacing. Lower timeframe = tighter grid.")
-            # ----------------------------------
+            # Advanced Rules Section (Consolidated)
+            st.markdown("##### 🎯 Advanced Step-Based Rules")
+            if st.checkbox("Enable Advanced Step Rules", value=False, help="Define custom spacing for specific step ranges (e.g., Steps 1-3 tight, Steps 4-10 loose)."):
+                
+                # Initialize session state for grid rules
+                if 'grid_rules' not in st.session_state: st.session_state.grid_rules = []
+                
+                # Add/Remove rules
+                r_col1, r_col2, r_col3 = st.columns([2, 2, 2])
+                with r_col1:
+                    rule_start = st.number_input("Start Step", min_value=1, max_value=20, value=1, key="rule_start")
+                    rule_end = st.number_input("End Step", min_value=1, max_value=20, value=4, key="rule_end")
+                with r_col2:
+                    rule_type = st.selectbox("Type", ["atr", "fixed"], key="rule_type")
+                    if rule_type == 'atr':
+                        rule_val = st.number_input("Multiplier", value=1.0, step=0.1, key="rule_val_m")
+                    else:
+                        rule_val = st.number_input("Spacing ($)", value=100.0, step=10.0, key="rule_val_f")
+                with r_col3:
+                    st.write("") # Spacer
+                    st.write("") # Spacer
+                    if st.button("Add Rule", use_container_width=True):
+                        st.session_state.grid_rules.append({
+                            "start": rule_start, "end": rule_end, "type": rule_type, 
+                            "multiplier" if rule_type == 'atr' else "value": rule_val
+                        })
+                        st.rerun()
+
+                # Display existing rules
+                if st.session_state.grid_rules:
+                    st.markdown("**Active Rules:**")
+                    for i, rule in enumerate(st.session_state.grid_rules):
+                        r_desc = f"Steps {rule['start']}-{rule['end']}: "
+                        if rule['type'] == 'atr': r_desc += f"ATR × {rule.get('multiplier', 1.0)}"
+                        else: r_desc += f"Fixed ${rule.get('value', 100)}"
+                        
+                        rc1, rc2 = st.columns([4,1])
+                        with rc1: st.info(r_desc)
+                        with rc2: 
+                            if st.button("❌", key=f"del_rule_{i}"):
+                                st.session_state.grid_rules.pop(i)
+                                st.rerun()
+                    bot_config['GridStepRules'] = st.session_state.grid_rules
+                else:
+                    bot_config['GridStepRules'] = []
+            else:
+                bot_config['GridStepRules'] = []
+
             
         with st.expander("Trade Management (Exit & Hedge)", expanded=False):
             st.subheader("Accelerated Early Exit (Smart Decay)")
@@ -615,16 +534,8 @@ def render_bot_creator_view():
                         st.warning(f"⚠️ ATR Timeframe ({proj_tf}) is lower than Execution Timeframe ({timeframe}). This may cause grid calculation errors. Recommended: ATR TF >= Execution TF.")
                 
                 # Use data from Foundation if available, else default
-                # Fix: Don't overwrite p_atr if it was calculated correctly above and matches timeframe
-                if proj_tf != atr_timeframe:
-                     found_atr = atr_data.get(proj_tf, {}).get('atr')
-                     if found_atr:
-                         p_atr = found_atr
-                     else:
-                         # Fallback: Dynamic 1% instead of 10.0
-                         p_atr = current_price * 0.01
-                # If they match, p_atr is already set from lines 142+, just ensure it's sane
-                elif p_atr <= 0:
+                # Calculated from configured ATR settings
+                if p_atr <= 0:
                      p_atr = current_price * 0.01
                 
                 # Update strat params with full config before calculating

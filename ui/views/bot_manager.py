@@ -526,82 +526,95 @@ def render_edit_form(bot_id):
             config_dict['TakeProfitType'] = 'Percent'
             config_dict['TakeProfitPct'] = new_tp_pct
 
-        # --- NEW: ATR Configuration Section ---
-        st.markdown("#### 📊 ATR Configuration")
-        with st.expander("ATR & Grid Settings", expanded=False):
-            c_atr1, c_atr2 = st.columns(2)
-            with c_atr1:
-                atr_tf = st.selectbox(
-                    "ATR Timeframe",
-                    ["1m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w"],
-                    index=["1m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w"].index(config_dict.get('ATR_Timeframe', '1h'))
-                )
-                config_dict['ATR_Timeframe'] = atr_tf
-            with c_atr2:
-                atr_periods = st.slider(
-                    "ATR Lookback (candles)",
-                    min_value=3,
-                    max_value=240,
-                    value=int(config_dict.get('ATRPeriods', 14))
-                )
-                config_dict['ATRPeriods'] = atr_periods
+        # --- NEW: Risk & Grid Configuration ---
+        st.markdown("#### 🛡️ Risk & Grid Configuration")
+        with st.expander("Grid Spacing & Safety", expanded=False):
+            st.subheader("Grid Spacing Logic")
             
-            # ATR Mode
-            atr_mode = st.radio(
-                "ATR Update Mode",
-                ["dynamic", "locked"],
-                index=0 if config_dict.get('ATRMode', 'dynamic') == 'dynamic' else 1,
-                horizontal=True,
-                help="'dynamic': Recalculate ATR every cycle. 'locked': Capture ATR at first entry and keep it constant."
-            )
-            config_dict['ATRMode'] = atr_mode
-            
-            # ATR Grid Settings
-            use_atr_grid = st.checkbox("Use ATR Grid Spacing", value=config_dict.get('UseATRGrid', False))
+            # Consolidated Grid Logic
+            use_atr_grid = st.checkbox("Use Dynamic ATR Grid", value=config_dict.get('UseATRGrid', False), help="If OFF, uses fixed 'Base Grid' distance.")
             config_dict['UseATRGrid'] = use_atr_grid
             
-            if use_atr_grid:
-                c_g1, c_g2 = st.columns(2)
-                with c_g1:
-                    atr_grid_factor = st.number_input(
-                        "ATR Grid Multiplier",
-                        min_value=0.1,
-                        max_value=5.0,
-                        step=0.1,
-                        value=float(config_dict.get('ATRGridFactor', 1.0))
-                    )
-                    config_dict['ATRGridFactor'] = atr_grid_factor
-                with c_g2:
-                    base_grid_fixed = st.number_input(
-                        "Fallback Fixed Grid ($)",
-                        min_value=0.1,
-                        step=1.0,
-                        value=float(config_dict.get('base_grid', 100.0))
-                    )
-                    config_dict['base_grid'] = base_grid_fixed
-            else:
-                base_grid_fixed = st.number_input(
-                    "Fixed Grid Spacing ($)",
-                    min_value=0.1,
-                    step=1.0,
-                    value=float(config_dict.get('base_grid', 100.0))
-                )
-                config_dict['base_grid'] = base_grid_fixed
+            col_grid_main1, col_grid_main2 = st.columns(2)
             
-            # Grid Step Rules Display
+            with col_grid_main1:
+                # ATR Configuration
+                st.markdown("##### 📉 ATR Settings")
+                current_tf = config_dict.get('ATR_Timeframe', '1h')
+                atr_tf_options = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
+                atr_tf_idx = atr_tf_options.index(current_tf) if current_tf in atr_tf_options else 4
+                
+                atr_tf = st.selectbox(
+                    "ATR Timeframe", 
+                    atr_tf_options, 
+                    index=atr_tf_idx, 
+                    help="Timeframe used to calculate ATR for grid spacing."
+                )
+                config_dict['ATR_Timeframe'] = atr_tf
+                
+                atr_periods = st.number_input(
+                    "ATR Periods", 
+                    value=int(config_dict.get('ATRPeriods', 14)), 
+                    min_value=3, 
+                    max_value=240
+                )
+                config_dict['ATRPeriods'] = atr_periods
+                
+                atr_mode = st.radio(
+                    "ATR Mode",
+                    ["dynamic", "locked"],
+                    index=0 if config_dict.get('ATRMode', 'dynamic') == 'dynamic' else 1,
+                    horizontal=True
+                )
+                config_dict['ATRMode'] = atr_mode
+
+            with col_grid_main2:
+                # Spacing Configuration
+                st.markdown("##### 📐 Spacing Settings")
+                if use_atr_grid:
+                    config_dict['ATRGridFactor'] = st.number_input(
+                        "Base Spacing (ATR Multiplier)", 
+                        value=float(config_dict.get('ATRGridFactor', 1.0)), 
+                        step=0.1
+                    )
+                    config_dict['base_grid'] = 100.0 # Default hidden
+                else:
+                    config_dict['base_grid'] = st.number_input(
+                        "Fixed Grid Price Step", 
+                        value=float(config_dict.get('base_grid', 100.0)), 
+                        step=10.0
+                    )
+                    config_dict['ATRGridFactor'] = 1.0 # Default hidden
+
+                # 2. Martingale Spacing (Exponential Grid)
+                # Check if currently enabled (Multiplier != 1.0)
+                curr_mult = float(config_dict.get('GridMultiplier', 1.0))
+                is_exp_enabled = abs(curr_mult - 1.0) > 0.001
+                use_grid_mult = st.checkbox("Enable Exponential Spacing", value=is_exp_enabled)
+                
+                if use_grid_mult:
+                     # Default to 1.1 if enabling for first time (curr_mult was 1.0)
+                     val_to_show = curr_mult if is_exp_enabled else 1.1
+                     config_dict['GridMultiplier'] = st.number_input("Spacing Multiplier", value=val_to_show, step=0.05, min_value=0.1, help="> 1.0 expands grid. < 1.0 tightens grid.")
+                else:
+                     config_dict['GridMultiplier'] = 1.0
+
+            st.divider()
+            
+            # Advanced Rules Section (Consolidated)
+            st.markdown("##### 🎯 Advanced Step-Based Rules")
             grid_rules = config_dict.get('GridStepRules', [])
+            
             if grid_rules:
-                st.markdown("**📐 Step-Based Grid Rules:**")
+                st.info(f"✅ Active Rules: {len(grid_rules)}")
                 for rule in grid_rules:
                     r_desc = f"Steps {rule['start']}-{rule['end']}: "
-                    if rule['type'] == 'atr':
-                        r_desc += f"ATR × {rule['multiplier']}"
-                    else:
-                        r_desc += f"Fixed ${rule['value']}"
+                    if rule['type'] == 'atr': r_desc += f"ATR × {rule['multiplier']}"
+                    else: r_desc += f"Fixed ${rule['value']}"
                     st.markdown(f"- {r_desc}")
-                st.caption("ℹ️ To modify rules, delete and recreate the bot from Bot Creator.")
+                st.caption("ℹ️ To modify rules, please re-create the bot or edit the JSON config directly if comfortable.")
             else:
-                st.caption("No custom step rules. Using default ATR or fixed spacing.")
+                 st.caption("No custom step rules defined.")
 
         # Math Projection in Editor
         try:
@@ -931,7 +944,9 @@ def render_edit_form(bot_id):
                 'UseATRGrid': bool(config_dict.get('UseATRGrid', True)),
                 'ATRGridFactor': float(config_dict.get('ATRGridFactor', 1.0)),
                 'ATR_Timeframe': config_dict.get('ATR_Timeframe', '1h'),
+                'ATRMode': config_dict.get('ATRMode', 'dynamic'),
                 'base_grid': float(config_dict.get('base_grid', 100.0)),
+                'GridMultiplier': float(config_dict.get('GridMultiplier', 1.0)),
                 
                 # Exit
                 'TakeProfitType': config_dict.get('TakeProfitType', 'USD'),

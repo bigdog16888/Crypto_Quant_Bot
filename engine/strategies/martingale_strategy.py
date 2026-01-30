@@ -94,7 +94,6 @@ class MartingaleStrategy(BaseStrategy):
         self.cci_tf = self.params.get('cci_tf', None)
         self.boll_tf = self.params.get('boll_tf', None)
         self.stoch_tf = self.params.get('stoch_tf', None)
-        self.stoch_tf = self.params.get('stoch_tf', None)
         self.macd_tf = self.params.get('macd_tf', None)
 
         # MA Trigger (Trigger 12)
@@ -407,11 +406,18 @@ class MartingaleStrategy(BaseStrategy):
                     return current_price * 0.01 
         
         # No rule matched - use default behavior
+        base_spacing = 0.0
         if self.use_atr_grid and atr_value > 0:
-            return atr_value * self.atr_grid_factor
+            base_spacing = atr_value * self.atr_grid_factor
+        else:
+            # Final Fallback: 1.0% of current price
+            base_spacing = current_price * 0.01
+
+        # Apply Exponential Grid Spacing (Martingale on Spacing) if triggered
+        # User Logic: Spacing = Base * (Factor ^ Step)
+        grid_multiplier = float(self.params.get('GridMultiplier', 1.0))
         
-        # Final Fallback: 1.0% of current price
-        return current_price * 0.01 
+        return base_spacing * (grid_multiplier ** step)
     
     def lock_atr(self, market_data) -> float:
         """
@@ -426,22 +432,10 @@ class MartingaleStrategy(BaseStrategy):
         """Reset locked ATR when trade closes."""
         self.locked_atr = None
 
-    def calculate_next_grid_price(self, direction: str, current_price: float, avg_entry: float, current_step: int, market_data=None) -> float:
+    def calculate_next_grid_price(self, direction: str, current_price: float, avg_entry: float, current_step: int, market_data=None, last_grid_price=0.0) -> float:
         """
         Calculate next grid order price using flexible step-based rules.
-        
-        Supports:
-        1. ATR Mode: 'locked' (use ATR captured at entry) or 'dynamic' (recalculate each cycle)
-        2. Step-based Rules: Different spacing rules for different step ranges
-           - type: 'atr' with multiplier (e.g., ATR * 1.1)
-           - type: 'fixed' with value (e.g., $500 fixed spacing)
-        
-        Example GridStepRules:
-        [
-            {"start": 1, "end": 4, "type": "atr", "multiplier": 1.0},    # Steps 1-4: 100% ATR
-            {"start": 5, "end": 7, "type": "atr", "multiplier": 1.1},    # Steps 5-7: ATR * 1.1
-            {"start": 8, "end": 10, "type": "fixed", "value": 500}       # Steps 8-10: Fixed $500
-        ]
+        Supports Incremental Anchoring (Last Grid - Spacing).
         """
         next_step = current_step + 1
         
@@ -462,11 +456,22 @@ class MartingaleStrategy(BaseStrategy):
         # Get spacing for this step
         grid_spacing = self._get_grid_spacing_for_step(next_step, atr_value, current_price)
         
+        # Anchor Logic: Prioritize Last Grid Price (Incremental) -> Then Avg Entry -> Then Current
+        anchor_price = last_grid_price
+        if anchor_price is None or anchor_price <= 0:
+             # Fallback to Avg Entry (First Grid Step usually anchors off entry)
+             anchor_price = avg_entry if avg_entry > 0 else current_price
+        
         # Apply direction
         if direction == 'LONG':
-            return current_price - grid_spacing
+            expected_price = anchor_price - grid_spacing
+            # Safety Fix: Ensure next grid is at least 0.1% below current market price
+            # This prevents PostOnly rejection and immediate execution if market dropped fast
+            return min(expected_price, current_price * 0.999)
         else:
-            return current_price + grid_spacing
+            expected_price = anchor_price + grid_spacing
+            # Safety Fix: Ensure next grid is at least 0.1% above current market price for shorts
+            return max(expected_price, current_price * 1.001)
 
     def calculate_projections(self, base_price: float, current_atr: float = None) -> list:
         """

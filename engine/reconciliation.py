@@ -24,6 +24,7 @@ from datetime import datetime
 from .database import (
     get_connection, get_bot_status, get_all_bots, reset_bot_after_tp,
     log_trade, get_bot_order_ids, save_bot_order, update_order_status,
+    import_position_from_exchange,
     DB_PATH
 )
 from .exchange_interface import ExchangeInterface
@@ -138,8 +139,12 @@ class StateReconciler:
         """Get exchange interface for market type"""
         return self.exchanges.get(market_type, self.exchanges['future'])
     
-    def fetch_all_exchange_positions(self) -> Dict[str, ExchangePosition]:
-        """Fetch all positions from all active market types"""
+    def fetch_all_exchange_positions(self) -> Dict[str, List[ExchangePosition]]:
+        """
+        Fetch all positions from all active market types.
+        Returns a dictionary mapping Symbol -> List[ExchangePosition].
+        Supports Hedge Mode (multiple positions per symbol).
+        """
         positions = {}
         
         for mt, ex in self.exchanges.items():
@@ -153,14 +158,17 @@ class StateReconciler:
                 for pos in raw_positions:
                     sym = pos.get('symbol')
                     if sym:
-                        positions[sym] = ExchangePosition(
+                        if sym not in positions:
+                            positions[sym] = []
+                        
+                        positions[sym].append(ExchangePosition(
                             symbol=sym,
                             side=pos.get('side'),
                             size=float(pos.get('contracts', 0) or 0),
                             entry_price=float(pos.get('entryPrice', 0) or 0),
                             mark_price=float(pos.get('markPrice', 0) or 0),
                             unrealized_pnl=float(pos.get('unrealizedPnl', 0) or 0)
-                        )
+                        ))
             except Exception as e:
                 logger.error(f"Failed to fetch {mt} positions: {e}")
         
@@ -404,7 +412,7 @@ class StateReconciler:
                     pair=bot.pair,
                     position_owner=owner_status,
                     action_taken=ReconciliationAction.MARK_TP_HIT,
-                    details="Entry was confirmed, position likely closed while offline. Resetting to IDLE.",
+                    details=f"Offline Close Detected. Expected TP: ${bot.target_tp_price:.2f}. Resetting.",
                     requires_manual_intervention=False
                 )
             else:
@@ -429,7 +437,7 @@ class StateReconciler:
                     pair=bot.pair,
                     position_owner=owner_status,
                     action_taken=ReconciliationAction.CLAIM_POSITION,
-                    details=f"Position detected on exchange. Bot is owner. Importing: {position.size} @ {position.entry_price}",
+                    details=f"Position detected. Bot is owner. Importing: {position.size} @ {position.entry_price}",
                     requires_manual_intervention=False
                 )
             elif owner_status == PositionOwner.PASSENGER:
@@ -440,10 +448,84 @@ class StateReconciler:
                     pair=bot.pair,
                     position_owner=owner_status,
                     action_taken=ReconciliationAction.NO_ACTION,
-                    details="Position exists but another bot is owner. Bot becomes passenger.",
+                    details="Position matches Passenger status. Monitoring only.",
+                    requires_manual_intervention=False
+                )
+            elif owner_status == PositionOwner.NONE:
+                # Bot thinks IDLE, no ownership recorded
+                # But if there's a position on exchange, check if bot should claim it
+                if bot.is_active and position and position.size > 0:
+                    # Bot is active for this pair and there's a position
+                    # This is likely an orphaned position that should be claimed
+                    pair_normalized = bot.pair.replace('/', '').upper()
+                    pos_sym = position.symbol.replace('/', '').upper()
+                    if pair_normalized in pos_sym:
+                        logger.info(f"🔄 {bot.name}: Found position for active bot with no ownership. Claiming...")
+                        return ReconciliationResult(
+                            bot_id=bot.bot_id,
+                            bot_name=bot.name,
+                            pair=bot.pair,
+                            position_owner=PositionOwner.OWNER,  # Claim ownership
+                            action_taken=ReconciliationAction.CLAIM_POSITION,
+                            details=f"Active bot found with position. Claiming: {position.size} @ {position.entry_price}",
+                            requires_manual_intervention=False
+                        )
+                
+                # No matching position or bot not active - truly idle
+                return ReconciliationResult(
+                    bot_id=bot.bot_id,
+                    bot_name=bot.name,
+                    pair=bot.pair,
+                    position_owner=PositionOwner.NONE,
+                    action_taken=ReconciliationAction.NO_ACTION,
+                    details="State synchronized. Bot is IDLE.",
+                    requires_manual_intervention=False
+                )
+            elif owner_status == PositionOwner.ORPHAN:
+                # Position exists but no order matches - this could be:
+                # 1. Ghost trade reset left position open
+                # 2. Bot was reset but exchange still has position
+                # 3. Actual manual trade (rare for bot pairs)
+                # Since bot is active for this pair, try to claim it
+                if bot.is_active and bot.pair.replace('/', '').upper() in position.symbol.replace('/', '').upper():
+                    logger.info(f"🔄 {bot.name}: Found orphaned position for active bot pair. Claiming...")
+                    return ReconciliationResult(
+                        bot_id=bot.bot_id,
+                        bot_name=bot.name,
+                        pair=bot.pair,
+                        position_owner=PositionOwner.OWNER,  # Claim ownership
+                        action_taken=ReconciliationAction.CLAIM_POSITION,
+                        details=f"Orphaned position recovered. Importing: {position.size} @ {position.entry_price}",
+                        requires_manual_intervention=False
+                    )
+                else:
+                    # Truly orphan - no active bot for this pair
+                    logger.warning(f"Orphan position detected for {bot.name} ({bot.pair}). No active bot match. Ignoring.")
+                    return ReconciliationResult(
+                        bot_id=bot.bot_id,
+                        bot_name=bot.name,
+                        pair=bot.pair,
+                        position_owner=PositionOwner.ORPHAN,
+                        action_taken=ReconciliationAction.NO_ACTION,
+                        details="Orphan position detected (Manual/External). Ignoring.",
+                        requires_manual_intervention=False
+                    )
+            elif owner_status == PositionOwner.PASSENGER:
+                # Another bot owns this position
+                return ReconciliationResult(
+                    bot_id=bot.bot_id,
+                    bot_name=bot.name,
+                    pair=bot.pair,
+                    position_owner=owner_status,
+                    action_taken=ReconciliationAction.NO_ACTION,
+                    details="Position matches Passenger status. Monitoring.",
                     requires_manual_intervention=False
                 )
             else:
+# ... (Continuing to execute_action changes below via separate chunk or same block?)
+# I prefer separate chunks if possible, but tool allows one block? 
+# The lines are far apart (400 vs 530). I should use `multi_replace`.
+
                 # Orphan position - likely manual trade
                 logger.warning(f"Orphan position detected for {bot.name} ({bot.pair}). Likely manual trade. Ignoring.")
                 return ReconciliationResult(
@@ -525,35 +607,48 @@ class StateReconciler:
                 reset_bot_after_tp(result.bot_id, exit_price=current_price)
                 log_trade(
                     bot_id=result.bot_id,
-                    action='TP_HIT_OFFLINE',
+                    action='OFFLINE_CLOSE',
                     symbol=result.pair,
                     price=current_price,
                     amount=0,
                     cost_usdc=0,
-                    order_id='OFFLINE_TP',
+                    order_id='OFFLINE_CLOSE',
                     step=0,
                     pnl=0,
-                    notes="TP hit while bot was offline"
+                    notes=result.details
                 )
                 return True
             
             elif result.action_taken == ReconciliationAction.CLAIM_POSITION:
-                logger.info(f"� Claiming position for {result.bot_name}")
-                # Import position from exchange
-                # This requires fetching position details and updating DB
-                # For now, log and require manual review for safety
-                log_trade(
-                    bot_id=result.bot_id,
-                    action='POSITION_IMPORT',
-                    symbol=result.pair,
-                    price=0,
-                    amount=0,
-                    cost_usdc=0,
-                    order_id='IMPORT_CLAIM',
-                    step=0,
-                    pnl=0,
-                    notes=f"Position claimed: {result.details}"
-                )
+                logger.info(f"🎯 Claiming position for {result.bot_name}")
+                
+                # Fetch the position from exchange
+                ex = self.get_exchange(config.MARKET_TYPE)
+                positions = ex.fetch_positions()
+                
+                # Find position for this bot's pair
+                pair_normalized = result.pair.replace('/', '').upper()
+                for pos in positions:
+                    pos_sym = pos.get('symbol', '').replace('/', '').upper()
+                    if pair_normalized in pos_sym:
+                        size = float(pos.get('contracts', 0) or pos.get('size', 0) or 0)
+                        if size != 0:
+                            entry_price = float(pos.get('entryPrice', 0) or pos.get('price', 0) or 0)
+                            if entry_price > 0:
+                                # Import the position
+                                success = import_position_from_exchange(
+                                    bot_id=result.bot_id,
+                                    pair=result.pair,
+                                    position_size=size,
+                                    entry_price=entry_price,
+                                    direction=pos.get('side', 'long')
+                                )
+                                if success:
+                                    logger.info(f"✅ Successfully claimed position for {result.bot_name}")
+                                else:
+                                    logger.error(f"❌ Failed to claim position for {result.bot_name}")
+                            break
+                
                 return True
             
             elif result.action_taken == ReconciliationAction.REQUIRE_MANUAL:
@@ -599,8 +694,38 @@ class StateReconciler:
                 continue
             processed_pairs.add(bot.pair)
             
-            # Get exchange data for this pair
-            position = exchange_positions.get(bot.pair)
+            # Normalize pair logic for robustness
+            # Case: Bot pair "XAU/USDT", Exchange Key "XAU/USDT:USDT" or "XAU/USDT:USDT-230531"
+            
+            # 1. Exact match
+            position_list = exchange_positions.get(bot.pair, [])
+            
+            # 2. Fuzzy match (iterate exchange keys if direct lookup fails)
+            if not position_list:
+                bot_norm = bot.pair.split(':')[0]
+                for p_sym, p_data in exchange_positions.items():
+                    # Check if base parts match (e.g. XAU/USDT == XAU/USDT)
+                    if p_sym.split(':')[0] == bot_norm:
+                        position_list = p_data
+                        # logger.info(f"Fuzzy Matched {bot.pair} to {p_sym}")
+                        break
+            
+            # Find specific position for this bot's direction (Hedge Mode support)
+            position = None
+            target_side = bot.direction.lower() # 'long' or 'short'
+            
+            if position_list:
+                # 1. Try to find exact side match (Hedge Mode)
+                for p in position_list:
+                    if str(p.side).lower() == target_side:
+                        position = p
+                        break
+                
+                # 2. If no exact side match, and only 1 position exists, check if it's 'both' (One-Way Mode)
+                if not position and len(position_list) == 1:
+                    if str(position_list[0].side).lower() in ['both', 'none', target_side]:
+                        position = position_list[0]
+            
             orders = exchange_orders.get(bot.pair, [])
             
             # Get all bots on this pair
@@ -634,12 +759,180 @@ class StateReconciler:
         return results
 
 
+def sync_filled_orders(exchange: ExchangeInterface, bot_states: List[Any]) -> int:
+    """
+    STARTUP ONLY: Check order history for Grid orders that filled while offline.
+    
+    This is called ONCE at bot startup to reconcile any fills that happened
+    while the bot was not running.
+    
+    Returns: Number of filled orders processed.
+    """
+    from engine.database import get_bot_order_ids, update_order_status, get_bot_status
+    
+    logger.info("🔍 Checking order history for offline fills...")
+    fills_processed = 0
+    
+    for bot in bot_states:
+        # FIX: Check ALL bots that have an entry_order_id, even if they think they are IDLE.
+        # This catches the "Crash during Entry" scenario where order filled but DB wasn't updated.
+        bot_order_ids = get_bot_order_ids(bot.bot_id)
+        entry_order_id = bot_order_ids.get('entry_order_id')
+        
+        if not bot.in_trade and not entry_order_id:
+            continue  # Truly idle, nothing to check
+
+        
+        try:
+            # Get tracked orders for this bot
+            bot_order_ids = get_bot_order_ids(bot.bot_id)
+            grid_orders = bot_order_ids.get('grid_orders', [])
+            tp_order_id = bot_order_ids.get('tp_order_id')
+            
+            if not grid_orders and not tp_order_id and not entry_order_id:
+                continue  # No orders to check
+            
+            # Fetch recent closed/filled orders from exchange (last 24h)
+            # This is the ONLY order history API call - done at startup
+            try:
+                # ccxt fetch_orders returns all orders (open + closed)
+                # We filter to closed/filled orders
+                all_orders = exchange.exchange.fetch_orders(bot.pair, limit=50) or []
+                closed_orders = {o['id']: o for o in all_orders if o.get('status') in ['closed', 'filled']}
+            except Exception as e:
+                logger.warning(f"Could not fetch order history for {bot.pair}: {e}")
+                continue
+            
+            # Check if any tracked Grid orders were filled
+            for grid in grid_orders:
+                grid_id = grid.get('order_id')
+                if grid_id in closed_orders:
+                    filled_order = closed_orders[grid_id]
+                    fill_price = float(filled_order.get('average', filled_order.get('price', 0)) or 0)
+                    fill_amount = float(filled_order.get('filled', filled_order.get('amount', 0)) or 0)
+                    fill_step = grid.get('step', 0)
+                    
+                    logger.warning(f"🔄 OFFLINE GRID FILL DETECTED: {bot.name} Grid Step {fill_step} filled @ {fill_price}")
+                    
+                    # Update order status in DB
+                    update_order_status(grid_id, 'filled')
+                    
+                    # Update trade state
+                    current_status = get_bot_status(bot.bot_id)
+                    if current_status:
+                        old_invested = float(current_status[3] or 0)
+                        old_avg = float(current_status[4] or 0)
+                        old_step = int(current_status[2] or 0)
+                        
+                        # Only update if this is a NEW fill (step > current)
+                        if fill_step > old_step:
+                            new_invested = old_invested + (fill_price * fill_amount)
+                            new_avg = (old_avg * old_invested + fill_price * fill_amount * fill_price) / new_invested if new_invested > 0 else fill_price
+                            
+                            # Calculate new TP (simplified - same as entry logic)
+                            direction = bot.direction
+                            if direction == 'LONG':
+                                new_tp = new_avg * 1.015  # 1.5% TP
+                            else:
+                                new_tp = new_avg * 0.985
+                            
+                            # Update DB
+                            from engine.database import update_martingale_step
+                            update_martingale_step(bot.bot_id, fill_step, fill_amount * fill_price, new_avg, new_tp)
+                            
+                            # Log trade
+                            from engine.database import log_trade
+                            log_trade(
+                                bot_id=bot.bot_id,
+                                action='GRID_FILL_OFFLINE',
+                                symbol=bot.pair,
+                                price=fill_price,
+                                amount=fill_amount,
+                                cost_usdc=fill_amount * fill_price,
+                                order_id=grid_id,
+                                step=fill_step,
+                                pnl=0,
+                                notes=f"Grid Step {fill_step} filled while offline"
+                            )
+                            
+                            fills_processed += 1
+            
+            # Check if TP order was filled (backup for reconciliation)
+            if tp_order_id and tp_order_id in closed_orders:
+                logger.info(f"🎯 OFFLINE TP FILL CONFIRMED: {bot.name} TP order {tp_order_id} filled")
+                update_order_status(tp_order_id, 'filled')
+                # Note: Position reconciliation will handle the reset
+
+            # --- STARTUP ENTRY RECOVERY ---
+            # If we are IDLE but our Entry Order is filled, we must adopt the position!
+            if not bot.in_trade and entry_order_id and entry_order_id in closed_orders:
+                filled_entry = closed_orders[entry_order_id]
+                f_price = float(filled_entry.get('average', filled_entry.get('price', 0)) or 0)
+                f_amount = float(filled_entry.get('filled', filled_entry.get('amount', 0)) or 0)
+                
+                if f_amount > 0:
+                    logger.warning(f"🚨 CRASH RECOVERY: Found filled entry for IDLE bot {bot.name}! Recovering state...")
+                    
+                    # 1. Update DB to IN_TRADE
+                    # Calculate initial TP
+                    direction = bot.direction
+                    if direction == 'LONG':
+                        tp = f_price * 1.015
+                    else:
+                        tp = f_price * 0.985
+                        
+                    from engine.database import update_martingale_step, log_trade, save_bot_order
+                    update_martingale_step(bot.bot_id, 0, f_amount * f_price, f_price, tp)
+                    
+                    # 2. Log it
+                    log_trade(
+                        bot_id=bot.bot_id,
+                        action='ENTRY_RECOVERED',
+                        symbol=bot.pair,
+                        price=f_price,
+                        amount=f_amount,
+                        cost_usdc=f_amount * f_price,
+                        order_id=entry_order_id,
+                        step=0,
+                        pnl=0,
+                        notes="Recovered entry from crash"
+                    )
+                    
+                    # 3. Update entry order status
+                    save_bot_order(bot.bot_id, 'entry', entry_order_id, f_price, f_amount, 0, status='filled')
+                    
+                    fills_processed += 1
+            # ------------------------------
+        
+        except Exception as e:
+            logger.error(f"Error checking offline fills for {bot.name}: {e}")
+    
+    logger.info(f"✅ Offline fill check complete. Processed {fills_processed} fills.")
+    return fills_processed
+
+
 def sync_all_bots():
     """
     Main entry point for state synchronization.
     Call this on bot startup and periodically during operation.
+    
+    Performs:
+    1. Offline fill detection (order history check)
+    2. Position reconciliation
+    3. State cleanup
     """
     reconciler = StateReconciler()
+    
+    # Step 0: Get bot states first
+    bot_states = reconciler.get_bot_states()
+    
+    # Step 1: Check for offline fills (STARTUP ONLY - uses order history API)
+    # This ensures we know about any Grid fills before doing position reconciliation
+    if bot_states:
+        ex = reconciler.get_exchange('future')
+        sync_filled_orders(ex, bot_states)
+    
+    # Step 2: Full reconciliation (position + order sync)
     return reconciler.reconcile_all()
 
 
