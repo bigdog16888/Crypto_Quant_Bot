@@ -333,7 +333,7 @@ class BotRunner:
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             # list() forces execution and waits for completion
-            list(executor.map(bot_executor.process_bot, bots))
+            results = list(executor.map(bot_executor.process_bot, bots))
         
         # Ownership reconciliation: Check for owner failover and stale ownerships
         # logger.debug("Starting ownership reconciliation...")
@@ -344,7 +344,12 @@ class BotRunner:
         end_time = time.time()
         BOT_CYCLE_TIME.set(end_time - start_time)
 
-        return True
+        # AGGREGATE SMART POLLING
+        # Find minimum requested sleep time. Default to 10s if no requests.
+        valid_intervals = [r for r in results if isinstance(r, (int, float)) and r > 0]
+        recommended_sleep = min(valid_intervals) if valid_intervals else 10.0
+        
+        return recommended_sleep
 
     def handle_emergency_liquidation(self):
         """
@@ -416,9 +421,18 @@ if __name__ == "__main__":
     with open(PID, "w") as f: f.write(str(os.getpid()))
     failures = 0
     last_heartbeat = 0
+    cycle_sleep = 15.0 # Default fallback
     while runner.running:
         try:
-            if not runner.run_cycle(): break
+            result = runner.run_cycle()
+            if result is False: break
+            
+            # Update sleep time based on smart polling
+            if isinstance(result, (int, float)) and result > 0:
+                cycle_sleep = result
+            else:
+                cycle_sleep = 15.0
+                
             failures = 0
             
             # Heartbeat every 60s to confirm system is alive
@@ -429,8 +443,10 @@ if __name__ == "__main__":
         except Exception as e:
             failures += 1
             logger.error(f"Cycle failed ({failures}): {e}")
+            cycle_sleep = 15.0 # Reset to safe slow polling on error
             if failures >= MAX_CONSECUTIVE_FAILURES: break
-        time.sleep(POLL_INTERVAL_SECONDS)
+            
+        time.sleep(cycle_sleep)
     # === METRICS SERVER STOP ===
     metrics_server.stop()
     if os.path.exists(PID): os.remove(PID)

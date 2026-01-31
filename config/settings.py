@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 class Config:
+    VERSION = "2.1.0"
     # --- Path Configuration (Universal) ---
     ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     

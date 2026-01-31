@@ -74,7 +74,8 @@ class ExchangeInterface:
         # 1. Initialize CCXT
         options = {
             'defaultType': market_type,
-            'adjustForTimeDifference': True,
+            'adjustForTimeDifference': True,  # Auto-sync time with server
+            'recvWindow': 60000,              # Tolerate up to 60s of clock drift
         }
         
         self.exchange = getattr(ccxt, exchange_id)({
@@ -91,7 +92,7 @@ class ExchangeInterface:
             with _demo_trading_lock:
                 global _demo_trading_logged
                 if not _demo_trading_logged:
-                    self.logger.warning("🚀 ENABLING BINANCE DEMO TRADING")
+                    self.logger.warning("ENABLING BINANCE DEMO TRADING")
                     _demo_trading_logged = True
             self.exchange.enable_demo_trading(True)
             
@@ -283,7 +284,7 @@ class ExchangeInterface:
             critical_errors = ['insufficient balance', 'margin is insufficient', 'insufficient funds', 'account has insufficient']
             
             if any(crit in str_e for crit in critical_errors):
-                 self.logger.error(f"❌ CRITICAL ORDER FAILURE: {e}")
+                 self.logger.error(f"CRITICAL ORDER FAILURE: {e}")
                  raise e # Do not mock this!
             
             # if config.TESTNET:

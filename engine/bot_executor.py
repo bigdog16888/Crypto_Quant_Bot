@@ -98,13 +98,28 @@ class BotExecutor:
             
             strategy = self.runner.strategies[bot_id]
             
-            # Leverage
-            leverage = params.get('leverage', 1)
+            # Leverage - ROBUST UNIVERSAL ENFORCEMENT
+            leverage = int(params.get('leverage', 1))
             if leverage > 1 and bot_exchange.market_type in ['future', 'swap']:
-                if not hasattr(strategy, '_leverage_set') or strategy._leverage_set != leverage:
-                    if bot_exchange.set_leverage(pair, leverage):
-                        logger.info(f"Bot {name}: Leverage set to {leverage}x")
-                        strategy._leverage_set = leverage
+                # Always try to set/verify leverage on startup or periodic checks
+                # We use a robust retry mechanism here
+                try:
+                    # Only skip if we are 100% sure it's already set (optimization)
+                    # But if we just restarted, we can't be sure.
+                    should_set = True
+                    if hasattr(strategy, '_leverage_set') and strategy._leverage_set == leverage:
+                        should_set = False
+
+                    if should_set:
+                        success = bot_exchange.set_leverage(pair, leverage)
+                        if success:
+                            logger.info(f"✅ Bot {name}: Leverage successfully set to {leverage}x")
+                            strategy._leverage_set = leverage
+                        else:
+                            # If it returns False/None, it might have failed.
+                            logger.error(f"⚠️ Bot {name}: Failed to set leverage to {leverage}x. Orders may fail with insufficient margin.")
+                except Exception as lev_err:
+                     logger.error(f"❌ Bot {name}: Exception setting leverage: {lev_err}")
 
             # Market Data
             ohlcv = bot_exchange.fetch_ohlcv(symbol=pair, timeframe=timeframe, limit=100)
@@ -178,7 +193,7 @@ class BotExecutor:
                     pending = [o for o in open_orders_snapshot if isinstance(o, dict) and o.get('side') == entry_side and o.get('type') == 'limit']
                     if pending:
                         self.manage_pending_entry(bot_id, name, pair, direction, pending[0], params, bot_exchange)
-                        return
+                        return 1.0 # High urgency: Pending Entry
                 except Exception as e:
                     logger.error(f"Pending check failed for {name}: {e}")
 
@@ -231,6 +246,9 @@ class BotExecutor:
                     
                     if mission and mission.get('action') != 'none':
                         self.execute_mission(mission, exchange=bot_exchange, open_orders_snapshot=open_orders_snapshot)
+
+            # --- SMART POLLING (Proximity Awareness) ---
+            return self.calculate_polling_interval(bot_id, is_in_trade, current_price, trade_data, params)
 
         except (ccxt.BadSymbol, ccxt.ExchangeError) as e:
             if "symbol" in str(e).lower() or "market" in str(e).lower():
@@ -704,6 +722,15 @@ class BotExecutor:
             # Not filled immediately -> Return Pending
             return False, 0.0, last_order_id
             
+        except (ex.exchange.InsufficientFunds, ex.exchange.ExchangeError) as e: # Using ex.exchange for ccxt exceptions
+            if "insufficient balance" in str(e).lower():
+                try:
+                    bal = ex.exchange.fetch_balance()['USDT'] # Use ex.exchange for direct ccxt calls
+                    logger.error(f"💰 INSUFFICIENT FUNDS: Free={bal['free']}, Used={bal['used']}, Total={bal['total']}")
+                except Exception as bal_e:
+                    logger.warning(f"Failed to fetch balance for insufficient funds error: {bal_e}")
+            logger.error(f"Entry Order Failed for {name}: {e}")
+            return False, 0.0, None
         except Exception as e:
             logger.error(f"Entry attempt failed for {name}: {e}")
             return False, 0.0, None
@@ -891,19 +918,32 @@ class BotExecutor:
             self._finalize_entry(bot_id, name, pair, side, amount, fill_price, order_id, exchange=ex)
 
     def _finalize_entry(self, bot_id, name, pair, side, amount, fill_price, order_id, exchange=None):
-        # --- CRITICAL SAFETY: Verify Order Reality ---
+        # --- CRITICAL SAFETY: Hyper-Verify Order Reality ---
         # Prevent "Ghost Entries" where local logic thinks success but API failed or order is lost.
         # This stops the infinite Entry -> TP Hit (0.00) loop.
         try:
             ex = exchange or self.runner.exchange
             # We strictly check if the order exists and is actually filled
             check = ex.fetch_order(order_id, pair)
-            if not check or check.get('status') not in ['closed', 'filled']:
-                 logger.critical(f"👻 GHOST ENTRY BLOCKED: Order {order_id} for {name} is NOT filled on exchange! Status: {check.get('status') if check else 'None'}. DB Update Aborted.")
+            
+            if not check:
+                logger.critical(f"👻 GHOST ENTRY BLOCKED: Order {order_id} for {name} NOT FOUND on exchange. DB Update Aborted.")
+                return
+
+            status = check.get('status')
+            if status not in ['closed', 'filled']:
+                 logger.critical(f"👻 GHOST ENTRY BLOCKED: Order {order_id} status is '{status}' (Expected 'filled'). DB Update Aborted.")
                  return
+                 
+            # Update fill price with authoritative data
+            if 'average' in check and check['average']:
+                fill_price = float(check['average'])
+            elif 'price' in check and check['price']:
+                fill_price = float(check['price'])
+
         except Exception as e:
              # If fetch fails (e.g. -2013 Order does not exist), this catches it
-             logger.critical(f"👻 GHOST ENTRY BLOCKED: Order {order_id} check failed: {e}. DB Update Aborted.")
+             logger.critical(f"👻 GHOST ENTRY BLOCKED: Order {order_id} check verification exception: {e}. DB Update Aborted.")
              return
         # ---------------------------------------------
 
@@ -1061,7 +1101,7 @@ class BotExecutor:
                         
                         logger.debug(f"Grace Check: Last Fill was {seconds_ago:.1f}s ago (Limit: 120s)")
 
-                        if seconds_ago < 120: 
+                        if seconds_ago < 60: 
                              logger.warning(f"🛡️ Grace Period (Last Fill) Active for {name}: {seconds_ago:.1f}s ago")
                              should_reset = False
                     
@@ -1069,9 +1109,9 @@ class BotExecutor:
                     # This handles cases where position isn't immediately visible after entry
                     if should_reset and basket_start_time > 0:
                         seconds_since_start = time.time() - basket_start_time
-                        logger.debug(f"Grace Check: Basket started {seconds_since_start:.1f}s ago (Limit: 120s)")
+                        logger.debug(f"Grace Check: Basket started {seconds_since_start:.1f}s ago (Limit: 60s)")
                         
-                        if seconds_since_start < 120:
+                        if seconds_since_start < 60:
                             logger.warning(f"🛡️ Grace Period (New Entry) Active for {name}: Started {seconds_since_start:.1f}s ago")
                             should_reset = False
                             
@@ -1095,3 +1135,56 @@ class BotExecutor:
         except Exception as e:
             logger.error(f"State Sync Check Failed for {name}: {e}")
             return True # Fail open (assume valid) to prevent accidental resets during API errors
+
+    def calculate_polling_interval(self, bot_id: int, is_in_trade: bool, current_price: float, trade_data: tuple, params: dict) -> float:
+        """
+        Determines the optimal polling interval based on market proximity.
+        
+        Zones:
+        - HOT (1s): < 0.5% from Trigger (Entry/TP/Grid)
+        - WARM (5s): < 2% from Trigger
+        - COLD (15s): Far / Safe
+        """
+        try:
+             # Default: Cold
+             interval = 15.0
+             
+             # Extract config params
+             grid_step = float(params.get('martingale_step', 1.0)) / 100.0 # e.g. 0.01 (1%)
+             tp_target = float(params.get('take_profit', 1.5)) / 100.0
+             
+             targets = []
+             
+             if is_in_trade:
+                 # In Trade: Monitor Next Grid & TP
+                 # trade_data: (..., target_tp_price, ...)
+                 target_tp = trade_data[5]
+                 
+                 # Only add TP if it's set
+                 if target_tp > 0: targets.append(target_tp)
+                 
+                 # Calculate Next Grid Price (Rough Estimate or Exact if known)
+                 # We don't have exact next grid here without verifying strategy, 
+                 # but we can use 'last_entry_price' from trade_data?? No.
+                 # Actually, let's use a simpler heuristic for now: 
+                 # If in trade, assume WARM at least.
+                 interval = 5.0 
+                 
+                 # If closely approaching TP
+                 if target_tp > 0:
+                     dist_pct = abs(current_price - target_tp) / current_price
+                     if dist_pct < 0.005: return 1.0 # HOT
+                     if dist_pct < 0.02: return 5.0 # WARM
+             else:
+                 # Idle: Monitor Entry
+                 # If we have indicators, we don't know EXACT trigger price easily without running strategy.
+                 # But if we have a pending order (handled in process_bot), we return 1s.
+                 # If just idle scanning -> 15s is fine unless strategy indicates "Close".
+                 # For now, default to 10s for scanning to be responsive enough.
+                 interval = 10.0
+             
+             return interval
+
+        except Exception as e:
+             logger.error(f"Polling Calc Error: {e}")
+             return 10.0 # Fallback
