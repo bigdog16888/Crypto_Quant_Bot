@@ -221,50 +221,9 @@ class ExchangeInterface:
                     return getattr(self.exchange, method)(kwargs.get('symbol'), kwargs.get('type'), kwargs.get('side'), kwargs.get('amount'), kwargs.get('price'), {})
                 raise
 
-    def _safe_request(self, method, *args, **kwargs):
-        if not hasattr(self, '_key_logged'):
-            key = str(self.exchange.apiKey)
-            self.logger.info(f"Using API Key: {key[:5]}...")
-            self._key_logged = True
-
-        max_retries = config.MAX_RETRIES
-        delay = config.RETRY_DELAY
-        
-        for attempt in range(max_retries + 1):
-            try:
-                func = getattr(self.exchange, method)
-                
-                # ULTIMATE FIX FOR BINANCE -1104
-                if method == 'create_order':
-                    # Extract core params
-                    symbol = kwargs.get('symbol')
-                    order_type = kwargs.get('type')
-                    side = kwargs.get('side')
-                    amount = kwargs.get('amount')
-                    price = kwargs.get('price')
-                    
-                    # Strip params to the absolute bare minimum
-                    # We ONLY allow functional flags that don't conflict with Binance internals
-                    raw_p = kwargs.get('params', {})
-                    clean_p = {}
-                    if 'reduceOnly' in raw_p: clean_p['reduceOnly'] = raw_p['reduceOnly']
-                    if 'postOnly' in raw_p: clean_p['postOnly'] = raw_p['postOnly']
-                    
-                    # Call CCXT with positional args + cleaned dict
-                    return func(symbol, order_type, side, amount, price, clean_p)
-                
-                return func(*args, **kwargs)
-            
-            except (ccxt.NetworkError, ccxt.RequestTimeout) as e:
-                if attempt < max_retries:
-                    time.sleep(delay * (attempt + 1))
-                    continue
-                raise
-            except Exception as e:
-                if "code\":-1104" in str(e) and method == 'create_order':
-                    self.logger.error(f"🔥 FINAL ATTEMPT at order: params caused -1104. Retrying with EMPTY params.")
-                    return getattr(self.exchange, method)(kwargs.get('symbol'), kwargs.get('type'), kwargs.get('side'), kwargs.get('amount'), kwargs.get('price'), {})
-                raise
+    # _safe_request was a duplicate of _execute_request using the same logic. 
+    # Removed to enforce Single Responsibility Principle.
+    # All methods (create_order, etc) should use the specific _coalesced_request or underlying _execute_request.
 
     def create_order(self, symbol, type, side, amount, price=None, params={}):
         if params is None: params = {}
@@ -273,10 +232,10 @@ class ExchangeInterface:
         if not is_valid:
              self.logger.error(f"Validation failed: {err}")
              # Minimal fallback...
-             return self._safe_request('create_order', symbol=symbol, type=type, side=side, amount=amount, price=price, params=params)
+             return self._execute_request('create_order', symbol=symbol, type=type, side=side, amount=amount, price=price, params=params)
         
         try:
-            return self._safe_request('create_order', symbol=symbol, type=type, side=side, amount=s_amt, price=s_price, params=params)
+            return self._execute_request('create_order', symbol=symbol, type=type, side=side, amount=s_amt, price=s_price, params=params)
         except Exception as e:
             # FIX: Only mock network errors, NOT logic/balance errors
             # "Account has insufficient balance" or "Margin is insufficient" should FAIL hard.

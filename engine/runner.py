@@ -43,25 +43,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("BotRunner")
 
-# Thread-local storage for ExchangeInterface instances
-# This ensures each thread in the ThreadPoolExecutor gets its own exchange connection
-# preventing race conditions on CCXT's internal state (nonce, request signing, etc.)
-thread_local_storage = threading.local()
-
-def get_thread_exchange(market_type='future'):
-    """
-    Get or create a thread-local ExchangeInterface instance.
-    Prevents CCXT concurrency issues.
-    """
-    if not hasattr(thread_local_storage, "exchanges"):
-        thread_local_storage.exchanges = {}
-    
-    if market_type not in thread_local_storage.exchanges:
-        # Create new instance for this thread
-        # Note: This triggers fetch_markets/inject_markets on first use per thread
-        thread_local_storage.exchanges[market_type] = ExchangeInterface(market_type=market_type)
-        
-    return thread_local_storage.exchanges[market_type]
+# Thread-local storage logic moved to bot_executor.py where it is actually used.
+# Runner uses self.exchanges for main-thread operations.
 
 class BotRunner:
     def __init__(self):

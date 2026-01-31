@@ -212,8 +212,7 @@ class BotExecutor:
                 if can_enter:
                     buy_signal, sell_signal = strategy.check_signals(df)
                     # DEBUG: Log signal values for troubleshooting
-                    if bot_id == 43:  # Special debug for bot 43
-                        logger.info(f"🔍 BOT 43 SIGNALS: buy={buy_signal}, sell={sell_signal}, price={current_price}, threshold=87000")
+                    # (Removed hardcoded debug)
                     if direction == 'LONG' and buy_signal:
                         # First-Claim Policy Disabled for Virtual Positioning
                         # We allow multiple bots to trade the same pair independently
