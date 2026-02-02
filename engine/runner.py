@@ -5,6 +5,7 @@ import sys
 import os
 from concurrent.futures import ThreadPoolExecutor
 import threading
+from logging.handlers import RotatingFileHandler
 
 # Add root to sys.path to ensure module resolution
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -32,14 +33,24 @@ from config.constants import (
     STABLECOINS
 )
 
-# Configure logging
+# Configure logging with rotation (Max 50MB, keep 5 backups)
+log_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+log_file = config.PATHS["LOG_FILE"]
+
+rotating_handler = RotatingFileHandler(
+    log_file, 
+    maxBytes=50 * 1024 * 1024, # 50MB
+    backupCount=5,
+    encoding='utf-8'
+)
+rotating_handler.setFormatter(log_formatter)
+
+stream_handler = logging.StreamHandler()
+stream_handler.setFormatter(log_formatter)
+
 logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL),
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(config.PATHS["LOG_FILE"]),
-        logging.StreamHandler()
-    ]
+    handlers=[rotating_handler, stream_handler]
 )
 logger = logging.getLogger("BotRunner")
 
@@ -128,11 +139,9 @@ class BotRunner:
             # 2. Bulk fetch positions from exchange to know truth
             has_position_map = {}
             try:
-                # Use exchange_interface wrapper method if available, or direct ccxt
-                # fetch_positions() returns all open positions
-                all_positions = self.exchange.exchange.fetch_positions()
+                # Use exchange_interface wrapper method for batching
+                all_positions = self.exchange.fetch_positions()
                 for p in all_positions:
-                    # Binance returns contracts or size
                     size = float(p.get('contracts', 0) or p.get('size', 0) or 0)
                     if size != 0:
                         has_position_map[p['symbol']] = True
@@ -155,22 +164,26 @@ class BotRunner:
         # logger.debug("Ownership reconciliation finished.")
 
 
-    def _calculate_unrealized_pnl(self) -> float:
+    def _calculate_unrealized_pnl(self, exchange_snapshot=None) -> float:
         """Calculates total unrealized PnL across all active market types."""
         total_unrealized_pnl = 0.0
-        active_market_types = set()
         
-        # Get market types from currently available exchanges
-        for mt in self.exchanges.keys():
-             active_market_types.add(mt)
-             
+        # If snapshot provided, use it
+        if exchange_snapshot:
+            for mt, data in exchange_snapshot.items():
+                positions = data.get('positions', [])
+                for p in positions:
+                    total_unrealized_pnl += float(p.get('unrealizedPnl', 0.0) or 0.0)
+            return total_unrealized_pnl
+
+        # Fallback (Manual fetch)
+        active_market_types = set(self.exchanges.keys())
         for mt in active_market_types:
             try:
                 ex = self.exchanges[mt]
                 all_positions = ex.fetch_positions()
                 for p in all_positions:
-                    pnl = float(p.get('unrealizedPnl', 0.0) or 0.0)
-                    total_unrealized_pnl += pnl
+                    total_unrealized_pnl += float(p.get('unrealizedPnl', 0.0) or 0.0)
             except Exception as e:
                 logger.warning(f"Failed to fetch positions for PnL calculation in {mt}: {e}")
                 
@@ -205,11 +218,10 @@ class BotRunner:
             logger.error(f"Failed to initialize safety baseline: {e}")
             self.initial_equity = 0.0
 
-    def check_circuit_breaker(self):
+    def check_circuit_breaker(self, exchange_snapshot=None):
         """
         Global Circuit Breaker: Checks if account equity has dropped below safe limits.
         """
-        # Skip circuit breaker entirely if NO_API_MODE (no balance to check)
         if getattr(config, 'NO_API_MODE', False):
             return
             
@@ -217,33 +229,40 @@ class BotRunner:
             return
 
         try:
-            # Only check active market types
-            active_bots_raw = self.get_active_bots()
-            active_bots = [b for b in active_bots_raw if b[9] == 1]
-            active_market_types = set()
-            for bot in active_bots:
-                config_json = bot[5]
-                config_dict = json.loads(config_json) if config_json else {}
-                active_market_types.add(config_dict.get('market_type', config.MARKET_TYPE))
-            
-            if not active_market_types:
-                active_market_types.add(config.MARKET_TYPE)
-
             total_stablecoin = 0.0
             balance_fetch_success = False
-            for mt in active_market_types:
-                if mt in self.exchanges:
-                    try:
-                        balance = self.exchanges[mt].fetch_balance()
-                        if balance:
-                            total_stablecoin += self._calculate_stablecoin_balance(balance)
-                            balance_fetch_success = True
-                    except Exception: pass
+
+            # Prepare active bots for cost calculation
+            active_bots_raw = self.get_active_bots()
+            active_bots = [b for b in active_bots_raw if b[9] == 1]
+
+            # Use snapshot if available
+            if exchange_snapshot:
+                for mt, data in exchange_snapshot.items():
+                    balance = data.get('balance')
+                    if balance:
+                        total_stablecoin += self._calculate_stablecoin_balance(balance)
+                        balance_fetch_success = True
+            else:
+                # Fallback to manual fetch
+                active_market_types = set()
+                for bot in active_bots:
+                    config_dict = json.loads(bot[5]) if bot[5] else {}
+                    active_market_types.add(config_dict.get('market_type', config.MARKET_TYPE))
+                
+                if not active_market_types: active_market_types.add(config.MARKET_TYPE)
+
+                for mt in active_market_types:
+                    if mt in self.exchanges:
+                        try:
+                            balance = self.exchanges[mt].fetch_balance()
+                            if balance:
+                                total_stablecoin += self._calculate_stablecoin_balance(balance)
+                                balance_fetch_success = True
+                        except Exception: pass
             
-            # BUG FIX: If balance fetch failed (auth error), don't trigger circuit breaker
-            # Just log and skip this check cycle
             if not balance_fetch_success:
-                logger.warning("Circuit breaker check skipped - balance fetch failed (auth/API error)")
+                logger.warning("Circuit breaker check skipped - balance fetch failed")
                 return
                 
             invested_cost = 0.0
@@ -252,7 +271,30 @@ class BotRunner:
                 if t_data and len(t_data) > 3 and t_data[3] > 0:
                     invested_cost += float(t_data[3])
             
-            unrealized_pnl = self._calculate_unrealized_pnl()
+            # Unrealized PnL from snapshot/cache
+            unrealized_pnl = 0.0
+            if exchange_snapshot:
+                for mt, data in exchange_snapshot.items():
+                    positions = data.get('positions', [])
+                    for p in positions:
+                        unrealized_pnl += float(p.get('unrealizedPnl', 0.0) or 0.0)
+            else:
+                # Fallback to manual fetch
+                active_market_types = set()
+                for bot in active_bots:
+                    config_dict = json.loads(bot[5]) if bot[5] else {}
+                    active_market_types.add(config_dict.get('market_type', config.MARKET_TYPE))
+                
+                if not active_market_types: active_market_types.add(config.MARKET_TYPE)
+
+                for mt in active_market_types:
+                    if mt in self.exchanges:
+                        try:
+                            positions = self.exchanges[mt].fetch_positions()
+                            for p in positions:
+                                unrealized_pnl += float(p.get('unrealizedPnl', 0.0) or 0.0)
+                        except: pass
+            
             current_equity = total_stablecoin + invested_cost + unrealized_pnl
             
             # Log for debugging
@@ -290,8 +332,41 @@ class BotRunner:
     def run_cycle(self):
         start_time = time.time() # Start timing
 
+        start_time = time.time()
         self.orders_this_cycle = 0
-        self.check_circuit_breaker()
+        
+        # 1. Global Optimization: Fetch Snapshots once per cycle
+        # This fills the ExchangeInterface internal generic cache
+        exchange_snapshot = {}
+        try:
+            bots = self.get_active_bots()
+            active_market_types = set()
+            for bot in bots:
+                config_json = bot[5]
+                cfg = json.loads(config_json) if config_json else {}
+                active_market_types.add(cfg.get('market_type', config.MARKET_TYPE))
+            
+            if not active_market_types: active_market_types.add(config.MARKET_TYPE)
+
+            for mt in active_market_types:
+                if mt in self.exchanges:
+                    ex = self.exchanges[mt]
+                    # These calls are now cached for 3s
+                    snap_pos = ex.fetch_positions()
+                    snap_bal = ex.fetch_balance()
+                    snap_orders = ex.fetch_open_orders() # Bulk fetch all open orders
+                    
+                    exchange_snapshot[mt] = {
+                        'positions': snap_pos,
+                        'balance': snap_bal,
+                        'open_orders': snap_orders
+                    }
+        except Exception as e:
+            logger.warning(f"Failed to pre-fetch cycle snapshot: {e}")
+
+        # 2. Safety Checks (using snapshots)
+        self.check_circuit_breaker(exchange_snapshot=exchange_snapshot)
+        
         if os.path.exists(config.PATHS["EMERGENCY_FILE"]):
             self.handle_emergency_liquidation()
             self.running = False
@@ -300,23 +375,17 @@ class BotRunner:
             self.running = False
             return False
 
-        bots = self.get_active_bots()
+        # 3. Process Bots
+        # Update workers size
+        max_workers = min(len(bots) + 2, 20)
         
-        # Reuse BotExecutor instance instead of creating new one each cycle
-        # This saves strategy instance creation overhead
         if not hasattr(self, '_bot_executor') or self._bot_executor is None:
             self._bot_executor = BotExecutor(self)
         bot_executor = self._bot_executor
 
-        # Parallel Execution: Process bots in concurrent threads
-        # Dynamically size workers: min(active_bots + 2, 20)
-        # +2 provides headroom for async tasks without starving bots
-        num_bots = len(bots)
-        max_workers = min(num_bots + 2, 20)
-
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # list() forces execution and waits for completion
-            results = list(executor.map(bot_executor.process_bot, bots))
+            # Process bots using the primed cache
+            results = list(executor.map(lambda b: bot_executor.process_bot(b, exchange_snapshot=exchange_snapshot), bots))
         
         # Ownership reconciliation: Check for owner failover and stale ownerships
         # logger.debug("Starting ownership reconciliation...")

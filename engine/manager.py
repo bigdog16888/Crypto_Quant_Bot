@@ -184,6 +184,7 @@ def manage_trade(bot_id, bot_name, pair, direction, settings, trade_data, curren
     """
     import logging
     from engine.database import get_bot_order_ids
+    from engine.exchange_interface import normalize_symbol
     logger = logging.getLogger("TradeManager")
 
     # Safety unpack (handle cases where tuple length varies during migration)
@@ -219,6 +220,17 @@ def manage_trade(bot_id, bot_name, pair, direction, settings, trade_data, curren
         has_my_tp = any(o.get('id') == my_tp_id for o in open_orders) if my_tp_id else False
         # Check: Does MY Grid order exist?
         has_my_grid = any(o.get('id') in my_grid_ids for o in open_orders) if my_grid_ids else False
+        
+        # Scenario: TP exists but ID mismatch (unlikely but possible if re-placed by hand)
+        # We perform a "fallback" check by price/side if ID isn't found
+        if not has_my_tp and not settings.get('MaximizeProfit', False):
+            tp_side = 'sell' if direction == 'LONG' else 'buy'
+            has_my_tp = any(
+                normalize_symbol(o.get('symbol')) == normalize_symbol(pair) and 
+                o.get('side') == tp_side and 
+                abs(float(o.get('price') or 0) - target_tp_price) / target_tp_price < 0.001 
+                for o in open_orders
+            )
 
         # If EITHER is missing, we need to maintain (re-place) orders.
         # Note: TP might be intentionally 0 if MaximizeProfit is active (trailing stop mode).
@@ -231,6 +243,37 @@ def manage_trade(bot_id, bot_name, pair, direction, settings, trade_data, curren
     except Exception as e:
         logger.error(f"Error checking bot order IDs for {bot_name}: {e}")
         force_maintain = True # Err on side of caution
+
+    # --- SELF-HEALING: Fix 0.00 Target TP (v0.6.3) ---
+    # If bot is in trade but Target TP is 0 (and not using Trailing Stop), we must recalculate it.
+    if current_step >= 0 and target_tp_price <= 0 and not settings.get('MaximizeProfit', False):
+        try:
+            logger.warning(f"🚑 Self-Healing: Detected 0.00 Target TP for {bot_name}. Recalculating...")
+            
+            # Recalculate based on strategy settings
+            tp_type = settings.get('TakeProfitType', 'USD')
+            healed_tp = 0.0
+            
+            if tp_type == 'Percent':
+                tp_pct = settings.get('TakeProfitPct', 1.0) / 100.0
+                healed_tp = avg_entry_price * (1.0 + tp_pct) if direction == 'LONG' else avg_entry_price * (1.0 - tp_pct)
+            else:
+                target_usd = settings.get('TakeProfitBase', 10.0)
+                # Estimate qty
+                est_qty = total_invested / avg_entry_price if avg_entry_price > 0 else 0
+                if est_qty > 0:
+                    dist = target_usd / est_qty
+                    healed_tp = avg_entry_price + dist if direction == 'LONG' else avg_entry_price - dist
+            
+            if healed_tp > 0:
+                # Update DB immediately
+                from engine.database import update_trade_tp_price
+                update_trade_tp_price(bot_id, healed_tp)
+                target_tp_price = healed_tp # Use valid TP for this cycle
+                logger.info(f"✅ Self-Healing: Restored Target TP to {healed_tp:.4f}")
+                
+        except Exception as e:
+            logger.error(f"Self-Healing Failed: {e}")
 
     # 1. Check Take Profit
     effective_tp = target_tp_price

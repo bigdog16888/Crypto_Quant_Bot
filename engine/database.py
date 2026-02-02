@@ -334,29 +334,17 @@ def update_martingale_step(bot_id, next_step, added_investment, new_avg_price, n
     # If step 0 (Entry), set start time if not set
     current_time = int(time.time())
     
-    if next_step == 0:
-        # Reset start time on fresh entry
-        cursor.execute('''
-            UPDATE trades
-            SET current_step = ?,
-                total_invested = total_invested + ?,
-                avg_entry_price = ?,
-                target_tp_price = ?,
-                entry_confirmed = 1,
-                basket_start_time = ?
-            WHERE bot_id = ?
-        ''', (next_step, added_investment, new_avg_price, new_tp_price, current_time, bot_id))
-    else:
-        # Standard update
-        cursor.execute('''
-            UPDATE trades
-            SET current_step = ?,
-                total_invested = total_invested + ?,
-                avg_entry_price = ?,
-                target_tp_price = ?,
-                entry_confirmed = 1
-            WHERE bot_id = ?
-        ''', (next_step, added_investment, new_avg_price, new_tp_price, bot_id))
+    # Reset start time on every entry/step to give a fresh decay window
+    cursor.execute('''
+        UPDATE trades
+        SET current_step = ?,
+            total_invested = total_invested + ?,
+            avg_entry_price = ?,
+            target_tp_price = ?,
+            entry_confirmed = 1,
+            basket_start_time = ?
+        WHERE bot_id = ?
+    ''', (next_step, added_investment, new_avg_price, new_tp_price, current_time, bot_id))
     
     conn.commit()
     # Note: No conn.close() - using thread-local connection
@@ -932,19 +920,22 @@ def update_order_status(order_id, status, filled_price=None):
     conn = get_connection()
     cursor = conn.cursor()
     
-    if filled_price:
-        cursor.execute('''
-            UPDATE bot_orders 
-            SET status = ?, filled_at = ?
-            WHERE order_id = ?
-        ''', (status, int(time.time()), order_id))
+    if filled_price is not None:
+        cursor.execute("UPDATE bot_orders SET status = ?, filled_at = ?, price = ? WHERE order_id = ?", 
+                      (status, int(time.time()), filled_price, order_id))
     else:
-        cursor.execute('''
-            UPDATE bot_orders 
-            SET status = ?
-            WHERE order_id = ?
-        ''', (status, order_id))
-    
+        cursor.execute("UPDATE bot_orders SET status = ? WHERE order_id = ?", (status, order_id))
+        
+    conn.commit()
+
+def update_trade_tp_price(bot_id: int, new_tp_price: float):
+    """
+    Updates the target TP price in the trades table.
+    Used for syncing Early Exit decay or dynamic TP adjustments.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE trades SET target_tp_price = ? WHERE bot_id = ?", (new_tp_price, bot_id))
     conn.commit()
 
 def get_bots_by_order_id(order_id):

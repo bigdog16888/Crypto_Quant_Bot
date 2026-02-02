@@ -27,7 +27,7 @@ from .database import (
     import_position_from_exchange,
     DB_PATH
 )
-from .exchange_interface import ExchangeInterface
+from .exchange_interface import ExchangeInterface, normalize_symbol
 from config.settings import config
 
 logger = logging.getLogger("StateReconciliation")
@@ -48,6 +48,7 @@ class ReconciliationAction(Enum):
     RESET_TO_IDLE = "reset_to_idle"
     CANCEL_ORDERS = "cancel_orders"
     MARK_TP_HIT = "mark_tp_hit"
+    REPAIR_ORDERS = "repair_orders"
     REQUIRE_MANUAL = "require_manual"
 
 
@@ -164,9 +165,9 @@ class StateReconciler:
                         positions[sym].append(ExchangePosition(
                             symbol=sym,
                             side=pos.get('side'),
-                            size=float(pos.get('contracts', 0) or 0),
-                            entry_price=float(pos.get('entryPrice', 0) or 0),
-                            mark_price=float(pos.get('markPrice', 0) or 0),
+                            size=float(pos.get('contracts', 0) or pos.get('size', 0) or 0),
+                            entry_price=float(pos.get('entryPrice', 0) or pos.get('price', 0) or 0),
+                            mark_price=float(pos.get('markPrice', 0) or pos.get('price', 0) or 0),
                             unrealized_pnl=float(pos.get('unrealizedPnl', 0) or 0)
                         ))
             except Exception as e:
@@ -429,17 +430,23 @@ class StateReconciler:
         
         # Scenario 2: Bot thinks IDLE, Exchange HAS position
         if not bot.in_trade and position and position.size > 0:
-            if owner_status == PositionOwner.OWNER:
-                # This bot SHOULD own the position - claim it
-                return ReconciliationResult(
-                    bot_id=bot.bot_id,
-                    bot_name=bot.name,
-                    pair=bot.pair,
-                    position_owner=owner_status,
-                    action_taken=ReconciliationAction.CLAIM_POSITION,
-                    details=f"Position detected. Bot is owner. Importing: {position.size} @ {position.entry_price}",
-                    requires_manual_intervention=False
-                )
+            # Standardize symbol match
+            pair_norm = normalize_symbol(bot.pair)
+            pos_norm = normalize_symbol(position.symbol)
+            
+            if pair_norm == pos_norm:
+                if owner_status == PositionOwner.OWNER:
+                    # This bot SHOULD own the position - claim it
+                    return ReconciliationResult(
+                        bot_id=bot.bot_id,
+                        bot_name=bot.name,
+                        pair=bot.pair,
+                        position_owner=owner_status,
+                        action_taken=ReconciliationAction.CLAIM_POSITION,
+                        details=f"Position detected. Bot is owner. Importing: {position.size} @ {position.entry_price}",
+                        requires_manual_intervention=False
+                    )
+                # ... (rest of logic handles orphaned recovery)
             elif owner_status == PositionOwner.PASSENGER:
                 # Another bot owns this position
                 return ReconciliationResult(
@@ -651,6 +658,12 @@ class StateReconciler:
                 
                 return True
             
+            elif result.action_taken == ReconciliationAction.REPAIR_ORDERS:
+                logger.info(f"🩹 Repairing orders for {result.bot_name}")
+                # This will be handled in the next bot processing cycle 
+                # by manage_trade seeing force_maintain=True
+                return True
+
             elif result.action_taken == ReconciliationAction.REQUIRE_MANUAL:
                 logger.critical(f"🚨 MANUAL INTERVENTION REQUIRED: {result.details}")
                 return True
@@ -700,14 +713,12 @@ class StateReconciler:
             # 1. Exact match
             position_list = exchange_positions.get(bot.pair, [])
             
-            # 2. Fuzzy match (iterate exchange keys if direct lookup fails)
+            # 2. Fuzzy match (standardized)
             if not position_list:
-                bot_norm = bot.pair.split(':')[0]
+                bot_norm = normalize_symbol(bot.pair)
                 for p_sym, p_data in exchange_positions.items():
-                    # Check if base parts match (e.g. XAU/USDT == XAU/USDT)
-                    if p_sym.split(':')[0] == bot_norm:
+                    if normalize_symbol(p_sym) == bot_norm:
                         position_list = p_data
-                        # logger.info(f"Fuzzy Matched {bot.pair} to {p_sym}")
                         break
             
             # Find specific position for this bot's direction (Hedge Mode support)

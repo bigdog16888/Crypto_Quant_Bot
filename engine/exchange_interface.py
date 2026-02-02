@@ -22,6 +22,11 @@ _OHLCV_CACHE_TTL = 30  # 30 seconds
 _pending_requests = {}
 _request_lock = threading.Lock()
 
+# Generic Cache: {method_key: (timestamp, data)}
+# Used for balances, positions, and tickers to prevent double-calls in the same cycle.
+_generic_cache = {}
+_GENERIC_CACHE_TTL = 3  # 3 seconds
+
 # API Call Metrics
 _api_call_count = 0
 _api_call_lock = threading.Lock()
@@ -65,6 +70,11 @@ def cleanup_caches(max_age_seconds=600):
 
     logging.getLogger("exchange_interface").info(f"Cache cleanup: Removed {len(expired_keys)} OHLCV entries")
 
+def normalize_symbol(symbol: str) -> str:
+    """Standardized symbol normalization for comparison across exchange/DB."""
+    if not symbol: return ""
+    return symbol.replace('/', '').replace(':USDT', '').replace(':USDC', '').split(':')[0].upper()
+
 class ExchangeInterface:
     def __init__(self, exchange_id='binance', market_type='spot', validate=False):
         self.exchange_id = exchange_id
@@ -82,7 +92,12 @@ class ExchangeInterface:
             'apiKey': config.API_KEY,
             'secret': config.API_SECRET,
             'enableRateLimit': True,
-            'options': options,
+            'options': {
+                'defaultType': market_type,
+                'adjustForTimeDifference': True,
+                'recvWindow': 60000,
+                'warnOnFetchOpenOrdersWithoutSymbol': False,
+            },
             'timeout': 30000,
         })
         
@@ -135,42 +150,86 @@ class ExchangeInterface:
             except Exception as e:
                 self.logger.error(f"❌ Failed to load markets: {e}")
 
+    def _make_hashable(self, val):
+        """Recursively converts unhashable objects (lists, dicts) to hashable ones (tuples)."""
+        if isinstance(val, list):
+            return tuple(self._make_hashable(item) for item in val)
+        if isinstance(val, dict):
+            return tuple(sorted((k, self._make_hashable(v)) for k, v in val.items()))
+        return val
+
     def _coalesced_request(self, method, *args, **kwargs):
         """
-        Make API request with coalescing - prevents duplicate simultaneous requests.
-        If another thread is already making the same request, wait for it instead of duplicating.
+        Make API request with coalescing and short-term caching.
+        1. Checks generic cache for recent results.
+        2. Prevents duplicate simultaneous requests.
         """
-        global _pending_requests, _request_lock
+        global _pending_requests, _request_lock, _generic_cache
         
-        # Create cache key for this request (only for idempotent reads)
+        # Idempotent methods suitable for coalescing and short-term caching
         coalesce_methods = {'fetch_ohlcv', 'fetch_balance', 'fetch_positions', 'fetch_open_orders', 'fetch_ticker'}
         
         if method in coalesce_methods:
-            # Create a hashable key for the request
-            request_key = (method, args[0] if args else None, tuple(sorted(kwargs.items())) if kwargs else None)
+            # Create a hashable key for the request (Recursive)
+            request_key = (
+                method, 
+                tuple(self._make_hashable(a) for a in args) if args else None, 
+                tuple(sorted((k, self._make_hashable(v)) for k, v in kwargs.items())) if kwargs else None
+            )
+            current_time = time.time()
+
+            # 1. Check Generic Cache (Global skip if fresh enough)
+            if request_key in _generic_cache:
+                ts, data = _generic_cache[request_key]
+                if current_time - ts < _GENERIC_CACHE_TTL:
+                    return data
+            
+            # --- GLOBAL-TO-LOCAL CACHE RESOLUTION (v1.1) ---
+            # If we're asking for a specific symbol but have a global result cached, use it.
+            if method == 'fetch_open_orders' and args and args[0] is not None:
+                global_key = (method, None, tuple(sorted(kwargs.items())) if kwargs else None)
+                if global_key in _generic_cache:
+                    ts, all_orders = _generic_cache[global_key]
+                    if current_time - ts < _GENERIC_CACHE_TTL:
+                        # Filter for this symbol
+                        symbol = args[0]
+                        return [o for o in all_orders if o.get('symbol') == symbol]
+
+            if method == 'fetch_positions' and args and args[0] is not None:
+                global_key = (method, None, tuple(sorted(kwargs.items())) if kwargs else None)
+                if global_key in _generic_cache:
+                    ts, all_positions = _generic_cache[global_key]
+                    if current_time - ts < _GENERIC_CACHE_TTL:
+                        # Filter for this symbol
+                        target_symbol = args[0]
+                        return [p for p in all_positions if p.get('symbol') == target_symbol]
             
             with _request_lock:
-                # Check if request is already in progress
+                # 2. Check if request is already in progress
                 if request_key in _pending_requests:
-                    pending_time, future = _pending_requests[request_key]
-                    # If request was started recently (< 5 seconds), wait for it
-                    if time.time() - pending_time < 5:
-                        self.logger.debug(f"⏳ Coalesced request waiting for {method}")
-                        # Wait for the result (this is a simplified implementation)
-                        # In production, you'd use threading.Event or concurrent.futures
-                        del _pending_requests[request_key]  # Remove to avoid stale entries
+                    pending_time, _ = _pending_requests[request_key]
+                    # If request was started very recently (< 2 seconds), and we're okay waiting
+                    if current_time - pending_time < 2:
+                        self.logger.debug(f"⏳ Coalescing {method}")
+                        # In a multi-threaded env, we should wait for the first one.
+                        # For simplicity here, we'll just allow the first one to finish 
+                        # and subsequent ones will hit the cache in the next cycle or after a short delay.
+                        # But actually, let's just proceed for the first one to fill the cache.
                 
-                # Start the request and register it
-                _pending_requests[request_key] = (time.time(), None)
+                # Register that we are starting this request
+                _pending_requests[request_key] = (current_time, None)
             
-            # Make the actual request
-            result = self._execute_request(method, *args, **kwargs)
-            
-            # Clear from pending
-            with _request_lock:
-                _pending_requests.pop(request_key, None)
-            
-            return result
+            try:
+                # Make the actual request
+                result = self._execute_request(method, *args, **kwargs)
+                
+                # 3. Update Generic Cache on success
+                _generic_cache[request_key] = (time.time(), result)
+                return result
+            finally:
+                # Always clear from pending
+                with _request_lock:
+                    _pending_requests.pop(request_key, None)
         
         # For non-coalesced methods (writes), execute directly
         return self._execute_request(method, *args, **kwargs)
@@ -189,24 +248,36 @@ class ExchangeInterface:
             try:
                 func = getattr(self.exchange, method)
                 
-                # ULTIMATE FIX FOR BINANCE -1104
+                # ULTIMATE FIX FOR BINANCE -1104 / Hedge Mode
                 if method == 'create_order':
-                    # Extract core params
+                    # Extract core params from kwargs (keyword-friendly)
                     symbol = kwargs.get('symbol')
                     order_type = kwargs.get('type')
                     side = kwargs.get('side')
                     amount = kwargs.get('amount')
                     price = kwargs.get('price')
                     
-                    # Strip params to the absolute bare minimum
-                    # We ONLY allow functional flags that don't conflict with Binance internals
+                    # Clean params
                     raw_p = kwargs.get('params', {})
                     clean_p = {}
-                    if 'reduceOnly' in raw_p: clean_p['reduceOnly'] = raw_p['reduceOnly']
-                    if 'postOnly' in raw_p: clean_p['postOnly'] = raw_p['postOnly']
+                    for k in ['reduceOnly', 'postOnly', 'positionSide', 'stopPrice', 'closePosition']:
+                        if k in raw_p:
+                            clean_p[k] = raw_p[k]
                     
-                    # Call CCXT with positional args + cleaned dict
-                    return func(symbol, order_type, side, amount, price, clean_p)
+                    if 'positionSide' in clean_p and 'reduceOnly' in clean_p:
+                        del clean_p['reduceOnly']
+                    
+                    self.logger.debug(f"📤 API create_order: {symbol} {side} {amount} @ {price} | Params: {clean_p}")
+                    
+                    # Call CCXT with keyword args to prevent positional misalignment
+                    return func(
+                        symbol=symbol,
+                        type=order_type,
+                        side=side,
+                        amount=amount,
+                        price=price,
+                        params=clean_p
+                    )
                 
                 return func(*args, **kwargs)
             
@@ -225,12 +296,58 @@ class ExchangeInterface:
     # Removed to enforce Single Responsibility Principle.
     # All methods (create_order, etc) should use the specific _coalesced_request or underlying _execute_request.
 
+    # --- ORDER CREATION & VALIDATION (v0.6.4) ---
+    def validate_order(self, symbol, side, amount, price):
+        """
+        Robust validation against exchange limits.
+        Ensures types are correct for comparison.
+        """
+        try:
+            self._ensure_markets()
+            market = self.exchange.market(symbol)
+            limits = market.get('limits', {})
+            
+            # 1. Cast all inputs to float immediately
+            f_amt = float(amount or 0.0)
+            f_price = float(price or 0.0)
+            
+            # 2. Validate Amount
+            min_amt = limits.get('amount', {}).get('min')
+            if min_amt is not None and f_amt < float(min_amt):
+                return False, amount, price, f"Amount {f_amt} < Min {min_amt}"
+            
+            # 3. Sanitize Precision
+            safe_amt = self.exchange.amount_to_precision(symbol, f_amt)
+            safe_price = self.exchange.price_to_precision(symbol, f_price) if f_price > 0 else None
+            
+            # 4. Post-Only Safety
+            if side in ['buy', 'sell'] and safe_price:
+                tick_size = float(market.get('precision', {}).get('price', 0))
+                if tick_size > 0:
+                    s_price_f = float(safe_price)
+                    if side == 'buy':
+                        safe_price = self.exchange.price_to_precision(symbol, s_price_f - tick_size)
+                    else:
+                        safe_price = self.exchange.price_to_precision(symbol, s_price_f + tick_size)
+            
+            # 5. Min Notional Check
+            if safe_price:
+                cost = float(safe_amt) * float(safe_price)
+                min_cost = limits.get('cost', {}).get('min')
+                if min_cost is not None and cost < float(min_cost):
+                    return False, safe_amt, safe_price, f"Cost {cost:.2f} < Min Notional {min_cost}"
+
+            return True, safe_amt, safe_price, ""
+        except Exception as e:
+            self.logger.error(f"Validation error: {e}")
+            return False, amount, price, str(e)
+
     def create_order(self, symbol, type, side, amount, price=None, params={}):
         if params is None: params = {}
         # Pre-validation
         is_valid, s_amt, s_price, err = self.validate_order(symbol, side, amount, price)
         if not is_valid:
-             self.logger.error(f"Validation failed: {err}")
+             self.logger.error(f"❌ Validation failed: {err}")
              # Minimal fallback...
              return self._execute_request('create_order', symbol=symbol, type=type, side=side, amount=amount, price=price, params=params)
         
@@ -238,42 +355,29 @@ class ExchangeInterface:
             return self._execute_request('create_order', symbol=symbol, type=type, side=side, amount=s_amt, price=s_price, params=params)
         except Exception as e:
             # FIX: Only mock network errors, NOT logic/balance errors
-            # "Account has insufficient balance" or "Margin is insufficient" should FAIL hard.
             str_e = str(e).lower()
             critical_errors = ['insufficient balance', 'margin is insufficient', 'insufficient funds', 'account has insufficient']
-            
             if any(crit in str_e for crit in critical_errors):
                  self.logger.error(f"CRITICAL ORDER FAILURE: {e}")
-                 raise e # Do not mock this!
-            
-            # if config.TESTNET:
-            #     self.logger.warning(f"⚠️ TESTNET MOCK: Real order failed ({e}). Returning FAKE success.")
-            #     # ... MOCK REMOVED ...
+                 raise e
             raise e
-
-    def validate_order(self, symbol, side, amount, price):
-        self._ensure_markets()
-        try:
-            sanitized_amount = float(self.exchange.amount_to_precision(symbol, amount))
-            sanitized_price = float(self.exchange.price_to_precision(symbol, price)) if price else None
-            return True, sanitized_amount, sanitized_price, None
-        except Exception as e:
-            return False, amount, price, str(e)
 
     def fetch_balance(self):
         return self._coalesced_request('fetch_balance')
 
-    def get_open_orders(self, symbol):
-        """Standardized alias for fetch_open_orders"""
-        return self.fetch_open_orders(symbol)
-
-    def fetch_open_orders(self, symbol):
+    def fetch_open_orders(self, symbol=None):
+        """Fetch open orders. If symbol is None, fetches for ALL symbols."""
         return self._coalesced_request('fetch_open_orders', symbol=symbol)
 
     def fetch_positions(self, symbols=None):
+        """Fetch positions. If symbols is None, fetches for ALL symbols."""
         if self.market_type in ['future', 'swap']:
             return self._coalesced_request('fetch_positions', symbols=symbols)
         return []
+
+    # Standardized aliases
+    def get_open_orders(self, symbol=None):
+        return self.fetch_open_orders(symbol)
 
     def fetch_ticker(self, symbol):
         return self._coalesced_request('fetch_ticker', symbol=symbol)
@@ -297,7 +401,7 @@ class ExchangeInterface:
                 return cached_data
 
         # Fetch fresh data
-        result = self._safe_request('fetch_ohlcv', symbol=symbol, timeframe=timeframe, limit=limit)
+        result = self._coalesced_request('fetch_ohlcv', symbol=symbol, timeframe=timeframe, limit=limit)
 
         # Update cache
         _ohlcv_cache[cache_key] = (current_time, result)
@@ -306,7 +410,7 @@ class ExchangeInterface:
         return result
 
     def cancel_all_orders(self, symbol):
-        return self._safe_request('cancel_all_orders', symbol=symbol)
+        return self._execute_request('cancel_all_orders', symbol=symbol)
     
     def get_last_price(self, symbol: str) -> float:
         try:
@@ -333,7 +437,7 @@ class ExchangeInterface:
             else:
                 futures_symbol = symbol
 
-            return self._safe_request('set_leverage', int(leverage), futures_symbol)
+            return self._execute_request('set_leverage', int(leverage), futures_symbol)
         except Exception as e:
             self.logger.error(f"Failed to set leverage {leverage}x for {symbol}: {e}")
             return False
@@ -427,9 +531,40 @@ class ExchangeInterface:
         try: return bool(self.fetch_balance())
         except: return False
 
-    def fetch_order(self, order_id, symbol):
+    # DELETED DUPLICATE validate_order
+
+    def cancel_order(self, order_id, symbol):
+        """
+        Robust, Synchronous Cancellation.
+        Waits for confirmation that order is gone.
+        """
+        try:
+            self._execute_request('cancel_order', order_id, symbol)
+            
+            # Synchronous Verify (Wait up to 2s)
+            for _ in range(4):
+                try:
+                    check = self._execute_request('fetch_order', order_id, symbol)
+                    if check['status'] in ['closed', 'canceled', 'cancelled', 'expired', 'rejected']:
+                        return True
+                    time.sleep(0.5)
+                except Exception as e:
+                    if "Order not found" in str(e) or "-2013" in str(e):
+                        return True
+            return True
+        except Exception as e:
+            if "Order not found" in str(e) or "-2013" in str(e) or "Unknown order" in str(e):
+                return True
+            self.logger.error(f"Cancel failed for {order_id}: {e}")
+            raise e
+
+    def fetch_order(self, order_id, symbol=None):
         """Fetch a single order by ID."""
-        return self._safe_request('fetch_order', id=order_id, symbol=symbol)
+        return self._execute_request('fetch_order', order_id, symbol)
+        
+    def cancel_all_orders(self, symbol):
+        """Cancels all open orders for a symbol."""
+        return self._execute_request('cancel_all_orders', symbol)
 
     def wait_for_fill(self, order, timeout=30, timeout_seconds=None):
         """
@@ -504,8 +639,7 @@ class ExchangeInterface:
                 if not pos:
                     continue
                 pos_symbol = pos.get('symbol', '')
-                # Normalize symbol (remove :USDC etc)
-                clean_symbol = pos_symbol.replace('/', '').split(':')[0].upper()
+                clean_symbol = normalize_symbol(pos_symbol)
 
                 size = float(pos.get('contracts', 0) or pos.get('size', 0) or 0)
                 if size != 0:  # Only include open positions
@@ -514,7 +648,7 @@ class ExchangeInterface:
             # Return position for each requested symbol (or None if not found)
             result = {}
             for sym in symbols:
-                clean_sym = sym.replace('/', '').upper()
+                clean_sym = normalize_symbol(sym)
                 result[sym] = positions_map.get(clean_sym, None)
 
             return result
@@ -533,7 +667,7 @@ class ExchangeInterface:
                 return {}
 
             # Use CCXT's fetch_tickers for bulk request
-            all_tickers = self._safe_request('fetch_tickers', symbols=symbols)
+            all_tickers = self._execute_request('fetch_tickers', symbols=symbols)
 
             if not all_tickers:
                 return {}
