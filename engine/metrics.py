@@ -4,7 +4,8 @@ import socketserver
 import time
 import json
 import logging
-from engine.database import get_all_bots, get_bot_pnl_summary
+import pandas as pd
+from engine.database import get_all_bots, get_bot_pnl_summary, get_connection
 from config.settings import config
 from prometheus_client import CollectorRegistry, Gauge, generate_latest
 
@@ -113,3 +114,44 @@ class MetricsServer(threading.Thread):
 # but I must add it to `requirements.txt` next. 
 # Alternatively, I could implement the Prometheus exposition format manually, but that is complex.
 # Relying on `prometheus_client` is the standard and professional way.
+
+def export_trade_history(format='csv') -> str:
+    """
+    Exports the entire trade history to a CSV string.
+    Returns None if no data.
+    """
+    try:
+        conn = get_connection()
+        query = """
+            SELECT 
+                th.timestamp, 
+                b.name as bot_name, 
+                th.symbol, 
+                th.action, 
+                th.price, 
+                th.amount, 
+                th.pnl, 
+                th.notes 
+            FROM trade_history th
+            LEFT JOIN bots b ON th.bot_id = b.id
+            ORDER BY th.timestamp DESC
+        """
+        df = pd.read_sql_query(query, conn)
+        
+        if df.empty:
+            return None
+            
+        # Convert timestamp to readable date
+        df['datetime'] = pd.to_datetime(df['timestamp'], unit='s')
+        
+        # Reorder columns
+        cols = ['datetime', 'bot_name', 'symbol', 'action', 'price', 'amount', 'pnl', 'notes']
+        df = df[cols]
+        
+        if format == 'csv':
+            return df.to_csv(index=False)
+            
+        return None
+    except Exception as e:
+        logger.error(f"Export failed: {e}")
+        return None

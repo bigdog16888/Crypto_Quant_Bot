@@ -8,6 +8,7 @@ import threading
 # Local imports
 from engine.database import get_bot_status, update_martingale_step, log_trade, reset_bot_after_tp, deactivate_bot, get_bot_params, save_bot_order, get_bot_order_ids, get_last_filled_order
 from engine.strategies.martingale_strategy import MartingaleStrategy
+from engine.risk_manager import check_daily_loss_limit
 from engine.manager import manage_trade
 from engine.bot_management import check_and_execute_stops
 from engine.ownership import claim_ownership, check_first_claim_policy
@@ -17,6 +18,7 @@ from config.constants import (
     MAX_ORDERS_PER_CYCLE,
     MAX_ORDERS_PER_BOT_DAILY,
 )
+from engine.exceptions import InsufficientFundsError, OrderNotFoundError, APIError, NetworkError
 
 # Configure logger specific to this file
 logger = logging.getLogger("BotExecutor")
@@ -61,6 +63,7 @@ class BotExecutor:
         
         # DEBUG TRACE: ENTRY
         try:
+            logger.error(f"ENTERING PROCESS_BOT for {name}")
             log_trade(bot_id, 'DEBUG_LOG', pair, 0, 0, 0, "PROC_ENTRY", 0, 0, "Enter process_bot")
         except Exception:
             pass  # Silently fail logging - don't block bot execution
@@ -80,6 +83,15 @@ class BotExecutor:
             # Do NOT use self.exchanges in threads!
             bot_exchange = get_thread_exchange(market_type)
             if not bot_exchange: return
+            
+            # --- PHASE 10.2: Risk Management (Daily Loss Limit) ---
+            # Check safely (e.g., limit = 50.0 means max $50 loss)
+            # We configure this in bot params? Or global system params?
+            # For now, let's assume valid param 'daily_loss_limit' in bot config
+            limit = float(params.get('daily_loss_limit', 0.0))
+            if limit > 0 and check_daily_loss_limit(limit, bot_id):
+                 logger.warning(f"🛑 Bot {name} HIT DAILY LOSS LIMIT (${limit}). Skipping processing.")
+                 return # Skip this cycle
 
             if not is_active:
                 if bot_id in self.runner.strategies:
@@ -105,25 +117,33 @@ class BotExecutor:
             leverage = int(params.get('leverage', 1))
             if leverage > 1 and bot_exchange.market_type in ['future', 'swap']:
                 # Always try to set/verify leverage on startup or periodic checks
-                # We use a robust retry mechanism here
                 try:
-                    # Only skip if we are 100% sure it's already set (optimization)
-                    # But if we just restarted, we can't be sure.
-                    should_set = True
-                    if hasattr(strategy, '_leverage_set') and strategy._leverage_set == leverage:
-                        should_set = False
+                    # 1. Check if we need to Verify
+                    should_check = True
+                    if hasattr(strategy, '_leverage_verified') and strategy._leverage_verified == leverage:
+                        should_check = False
+                        
+                    if should_check:
+                         # 2. Verify Current Real Leverage (Calculated or Explicit)
+                         real_lev = bot_exchange.calculate_real_leverage(pair)
+                         
+                         if real_lev is None or real_lev != leverage:
+                              logger.info(f"⚙️ Bot {name}: Leverage Adjustment Needed (Target: {leverage}x, Actual: {real_lev}x)")
+                              success = bot_exchange.set_leverage(pair, leverage)
+                              if success:
+                                  logger.info(f"✅ Bot {name}: Leverage successfully set to {leverage}x")
+                                  strategy._leverage_verified = leverage
+                              else:
+                                  logger.error(f"⚠️ Bot {name}: Failed to set leverage to {leverage}x. Orders may fail.")
+                         else:
+                              # Already correct
+                              if not hasattr(strategy, '_leverage_verified'):
+                                   logger.info(f"✅ Bot {name}: Leverage Verified at {real_lev}x")
+                              strategy._leverage_verified = leverage
 
-                    if should_set:
-                        success = bot_exchange.set_leverage(pair, leverage)
-                        if success:
-                            logger.info(f"✅ Bot {name}: Leverage successfully set to {leverage}x")
-                            strategy._leverage_set = leverage
-                        else:
-                            # If it returns False/None, it might have failed.
-                            logger.error(f"⚠️ Bot {name}: Failed to set leverage to {leverage}x. Orders may fail with insufficient margin.")
                 except Exception as lev_err:
                      logger.error(f"❌ Bot {name}: Exception setting leverage: {lev_err}")
-
+                     
             # Market Data
             ohlcv = bot_exchange.fetch_ohlcv(symbol=pair, timeframe=timeframe, limit=100)
             if not ohlcv: 
@@ -163,8 +183,8 @@ class BotExecutor:
             try:
                 if exchange_snapshot and market_type in exchange_snapshot:
                     all_snap_orders = exchange_snapshot[market_type].get('open_orders', [])
-                    # Filter for THIS specific pair
-                    open_orders_snapshot = [o for o in all_snap_orders if o.get('symbol') == pair]
+                    # Filter for THIS specific pair using normalized comparison
+                    open_orders_snapshot = [o for o in all_snap_orders if normalize_symbol(o.get('symbol')) == normalize_symbol(pair)]
                     # logger.debug(f"[{name}] Using snapshotted open orders (Found {len(open_orders_snapshot)})")
                 else:
                     open_orders_snapshot = bot_exchange.fetch_open_orders(pair) or []
@@ -322,13 +342,34 @@ class BotExecutor:
                 grid_side = 'buy' if direction == 'LONG' else 'sell'
                 tp_side = 'sell' if direction == 'LONG' else 'buy'
                 
-                # --- MULTI-BOT ORDER IDENTIFICATION ---
+                # --- DB ID TRACKING (Legacy/Fallback) ---
                 bot_order_ids = get_bot_order_ids(bot_id)
                 my_tp_order_id = bot_order_ids.get('tp_order_id')
                 my_grid_order_ids = [o.get('order_id') for o in bot_order_ids.get('grid_orders', []) if o.get('type') == 'grid']
+
+                # --- TAG-AWARE ORDER IDENTIFICATION (Phase 7/8 Robustness) ---
+                tag_prefix = f"CQB_{bot_id}_"
+                my_grid_orders = []
+                my_tp_orders = []
                 
-                my_grid_orders = [o for o in open_orders if isinstance(o, dict) and o.get('id') in my_grid_order_ids]
-                my_tp_orders = [o for o in open_orders if isinstance(o, dict) and o.get('id') == my_tp_order_id]
+                for o in open_orders:
+                    if not isinstance(o, dict): continue
+                    oid = o.get('id')
+                    client_oid = o.get('clientOrderId', '')
+                    
+                    # 1. Match by Tag (Source of Truth)
+                    if client_oid.startswith(tag_prefix):
+                        if '_TP_' in client_oid:
+                            my_tp_orders.append(o)
+                        elif '_GRID_' in client_oid:
+                            my_grid_orders.append(o)
+                        continue
+                    
+                    # 2. Match by DB ID (Fallback)
+                    if oid == my_tp_order_id:
+                        my_tp_orders.append(o)
+                    elif oid in my_grid_order_ids:
+                        my_grid_orders.append(o)
                 
                 logger.info(f"Maintain {bot_name}: OpenOrders={len(open_orders)} | Found MyGrid={len(my_grid_orders)} MyTP={len(my_tp_orders)} | Target Grid={grid_price:.2f} TP={tp_price:.2f}")
 
@@ -384,9 +425,17 @@ class BotExecutor:
                                             final_price = float(ex.exchange.price_to_precision(pair, final_price))
                                     
                                     g_params = {'postOnly': True} # No positionSide to allow flipping
-                                    placed_order = ex.create_order(pair, 'limit', grid_side, s_amt, final_price, params=g_params)
+                                    placed_order = ex.create_order(pair, 'limit', grid_side, s_amt, final_price, params=g_params, bot_id=bot_id, order_type='GRID')
                                     if placed_order: break
                                     
+                                except InsufficientFundsError as e:
+                                    logger.error(f"💰 Insufficient Funds for Grid: {e}")
+                                    break # Do not retry, funds won't appear instantly
+                                
+                                except APIError as e:
+                                    logger.error(f"❌ Grid API Error: {e}")
+                                    break
+
                                 except ccxt.InvalidOrder as e:
                                     if "-5022" in str(e): # PostOnly rejection
                                         logger.warning(f"⚠️ Grid PostOnly rejected (-5022). Retrying with offset (Attempt {attempt+1}/3)")
@@ -445,20 +494,25 @@ class BotExecutor:
                             # Validate
                             is_valid, s_amt, s_price, err = ex.validate_order(pair, tp_side, tp_qty, tp_price)
                             if is_valid:
-                                new_tp = ex.create_order(pair, 'limit', tp_side, s_amt, s_price, params=tp_params)
-                                if new_tp:
-                                    nid = new_tp.get('id')
-                                    nprice = float(new_tp.get('price') or s_price)
-                                    logger.info(f"✅ TP Order Placed: {nid} @ {nprice}")
-                                    
-                                    # SAVE ORDER
-                                    save_bot_order(bot_id, 'tp', nid, nprice, s_amt, trade_data[2] if trade_data else 0)
-                                    
-                                    # --- FEEDBACK LOOP: Sync DB with Exchange Reality ---
-                                    from engine.database import update_trade_tp_price
-                                    update_trade_tp_price(bot_id, nprice)
-                                    logger.info(f"🔄 DB Synced: Target TP updated to {nprice}")
-                                    # ----------------------------------------------------
+                                try:
+                                    new_tp = ex.create_order(pair, 'limit', tp_side, s_amt, s_price, params=tp_params, bot_id=bot_id, order_type='TP')
+                                    if new_tp:
+                                        nid = new_tp.get('id')
+                                        nprice = float(new_tp.get('price') or s_price)
+                                        logger.info(f"✅ TP Order Placed: {nid} @ {nprice}")
+                                        
+                                        # SAVE ORDER
+                                        save_bot_order(bot_id, 'tp', nid, nprice, s_amt, trade_data[2] if trade_data else 0)
+                                        
+                                        # --- FEEDBACK LOOP: Sync DB with Exchange Reality ---
+                                        from engine.database import update_trade_tp_price
+                                        update_trade_tp_price(bot_id, nprice)
+                                        logger.info(f"🔄 DB Synced: Target TP updated to {nprice}")
+                                        # ----------------------------------------------------
+                                except InsufficientFundsError as e:
+                                    logger.error(f"💰 Insufficient Funds for TP: {e}")
+                                except APIError as e:
+                                    logger.error(f"❌ TP API Error: {e}")
                             else:
                                 logger.error(f"❌ TP Invalid: {err}")
 
@@ -476,8 +530,34 @@ class BotExecutor:
                     hedge_pos_side = 'SHORT' if direction == 'LONG' else 'LONG'
                     hedge_params = {}
                     
-                    order = ex.create_order(pair, 'market', side, qty, params=hedge_params)
+                    order = ex.create_order(pair, 'market', side, qty, params=hedge_params, bot_id=bot_id, order_type='HEDGE')
                     if order: log_trade(bot_id, 'HEDGE_OPEN', pair, price, qty, amount_usd, order.get('id'), step, 0, "Hedge Opened")
+
+                    order = ex.create_order(pair, 'market', side, qty, params=hedge_params, bot_id=bot_id, order_type='HEDGE')
+                    if order: log_trade(bot_id, 'HEDGE_OPEN', pair, price, qty, amount_usd, order.get('id'), step, 0, "Hedge Opened")
+
+            elif action == 'reduce_position':
+                factor = mission.get('factor', 0.5)
+                direction = mission.get('direction')
+                current_qty = mission.get('current_qty', 0.0)
+                reason = mission.get('reason', 'Drawdown')
+                
+                reduce_qty = current_qty * factor
+                side = 'sell' if direction == 'LONG' else 'buy'
+                
+                logger.info(f"⚠️ [REDUCE] Reducing {bot_name} by {factor*100}% ({reduce_qty:.4f}) due to {reason}")
+                
+                if config.DRY_RUN:
+                     logger.info(f"[DRY] Would reduce position by {reduce_qty}")
+                else:
+                     ex = exchange or self.runner.exchange
+                     # Market Close of portion
+                     # standard reduceOnly=True if supported, or just close side
+                     params = {'reduceOnly': True} if ex.market_type == 'future' else {}
+                     
+                     order = ex.create_order(pair, 'market', side, reduce_qty, params=params, bot_id=bot_id, order_type='REDUCE')
+                     if order: 
+                         logger.info(f"✅ Reduction Order Placed: {order.get('id')}")
 
         except Exception as e: logger.error(f"Mission failed for {mission.get('bot_name')}: {e}")
 
@@ -633,7 +713,7 @@ class BotExecutor:
             # Removed automatic positionSide injection to support independent flipping
             # positionSide should only be passed in 'params' if explicitly wanted.
             
-            order = ex.create_order(pair, 'limit', side, s_amt, s_price, params=params)
+            order = ex.create_order(pair, 'limit', side, s_amt, s_price, params=params, bot_id=bot_id, order_type='LIMIT')
             if not order: 
                 logger.error(f"Order creation returned None for {name}. Check Exchange logs.")
                 return False, 0.0, None
@@ -652,15 +732,14 @@ class BotExecutor:
             # Not filled immediately -> Return Pending
             return False, 0.0, last_order_id
             
-        except (ex.exchange.InsufficientFunds, ex.exchange.ExchangeError) as e: # Using ex.exchange for ccxt exceptions
-            if "insufficient balance" in str(e).lower():
-                try:
-                    bal = ex.exchange.fetch_balance()['USDT'] # Use ex.exchange for direct ccxt calls
-                    logger.error(f"💰 INSUFFICIENT FUNDS: Free={bal['free']}, Used={bal['used']}, Total={bal['total']}")
-                except Exception as bal_e:
-                    logger.warning(f"Failed to fetch balance for insufficient funds error: {bal_e}")
-            logger.error(f"Entry Order Failed for {name}: {e}")
+        except InsufficientFundsError as e:
+            logger.error(f"💰 INSUFFICIENT FUNDS for {name}: {e}")
             return False, 0.0, None
+
+        except APIError as e:
+            logger.error(f"❌ Exchange API Error for {name}: {e}")
+            return False, 0.0, None
+
         except Exception as e:
             logger.error(f"Entry attempt failed for {name}: {e}")
             return False, 0.0, None
@@ -792,7 +871,7 @@ class BotExecutor:
              order_params['postOnly'] = True
              
              try:
-                 order = ex.create_order(pair, 'limit', side, qty, target_price, params=order_params)
+                 order = ex.create_order(pair, 'limit', side, qty, target_price, params=order_params, bot_id=bot_id, order_type='ENTRY')
                  if order:
                      order_id = order['id']
                      
@@ -962,6 +1041,39 @@ class BotExecutor:
                                 update_order_status(oid, 'cancelled')
                             except Exception as e:
                                 logger.error(f"Failed to cancel stale order {oid}: {e}")
+
+            # 5. ENFORCE: Prune "Zombie" Orders (In-Trade, but order is untracked)
+            # Scenario: Bot placed a new Grid order, but the OLD Grid order wasn't cancelled due to timeout.
+            # Result: Bot has 2+ Grid orders. We must kill the old ones (Zombies).
+            if is_in_trade:
+                for o in open_orders_snapshot:
+                    oid = o.get('id')
+                    client_oid = o.get('clientOrderId', '')
+                    
+                    # If this order is NOT in our active tracking list
+                    if oid not in db_order_map:
+                        # Identify Owner: 1. By Tag (Phase 7) or 2. By DB Lookup
+                        owner_id = None
+                        if client_oid.startswith('CQB_'):
+                            try:
+                                # Extract bot_id from tag: CQB_{bot_id}_{type}_{uuid}
+                                parts = client_oid.split('_')
+                                if len(parts) >= 2:
+                                    owner_id = int(parts[1])
+                            except: pass
+                        
+                        if owner_id is None:
+                            from engine.database import get_order_owner
+                            owner_id = get_order_owner(oid)
+                        
+                        if owner_id == bot_id:
+                            logger.warning(f"🧟 ZOMBIE ORDER DETECTED: {name} has untracked order {oid} ({o.get('type')}). Tag: {client_oid}. Pruning.")
+                            try:
+                                exchange.exchange.cancel_order(oid, pair)
+                                from engine.database import update_order_status
+                                update_order_status(oid, 'cancelled')
+                            except Exception as e:
+                                logger.error(f"Failed to prune zombie {oid}: {e}")
 
         except Exception as e:
             logger.error(f"Reconciliation Error for {name}: {e}")

@@ -448,7 +448,7 @@ def render_bot_creator_view():
                 with r_col3:
                     st.write("") # Spacer
                     st.write("") # Spacer
-                    if st.button("Add Rule", use_container_width=True):
+                    if st.button("Add Rule", width='stretch'):
                         st.session_state.grid_rules.append({
                             "start": rule_start, "end": rule_end, "type": rule_type, 
                             "multiplier" if rule_type == 'atr' else "value": rule_val
@@ -582,7 +582,7 @@ def render_bot_creator_view():
                             plot_bgcolor='rgba(0,0,0,0)',
                             font=dict(color='#1f2328')
                         )
-                        st.plotly_chart(fig, use_container_width=True)
+                        st.plotly_chart(fig, width='stretch')
                     # ----------------------------------
 
                     st.success(f"📈 Simulated Martingale Grid based on current price: **{current_price:,.2f}**")

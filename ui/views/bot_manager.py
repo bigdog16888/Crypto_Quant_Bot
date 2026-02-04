@@ -40,7 +40,6 @@ def fetch_ohlcv_cached(market_type, symbol, timeframe):
 # ------------------------
 
 def render_bot_manager_view():
-    print("DEBUG: Entering Bot Manager")
     st.header("🤖 Bot Manager")
     st.caption("📊 Manage existing bots: Toggle Status, Edit Settings, or Delete.")
 
@@ -50,9 +49,7 @@ def render_bot_manager_view():
     from config.settings import config
     
     # Fetch Data
-    print("DEBUG: Fetching bots...")
     bots = get_all_bots()
-    print(f"DEBUG: Found {len(bots)} bots")
     
     if not bots:
         st.info("No bots found. Go to 'Bot Creator' to deploy one.")
@@ -73,10 +70,11 @@ def render_bot_manager_view():
     
     st.divider()
 
-    editing_bot_id = st.session_state.get('editing_bot_id')
+    cols[7].markdown("**🔧 Action**")
+    
+    st.divider()
 
     for bot in bots:
-        print(f"DEBUG: Processing bot {bot[1]}")
         # Note: update engine/database.py get_all_bots to return these if not already
         # Current get_all_bots returns: b.id, b.name, b.pair, b.is_active, b.strategy_type, t.total_invested, t.current_step
         # We need t.avg_entry_price, t.target_tp_price as well.
@@ -344,8 +342,7 @@ def render_bot_manager_view():
         with row_cols[7]:
             col1, col2 = st.columns(2)
             if col1.button("✏️ Edit", key=f"edit_{b_id}", help=f"Edit {name} settings"):
-                st.session_state['editing_bot_id'] = b_id
-                st.rerun()
+                render_edit_form(b_id)
 
             if col2.button("🗑️ Delete", key=f"del_{b_id}", help=f"Delete {name}"):
                 if delete_bot(b_id):
@@ -354,10 +351,9 @@ def render_bot_manager_view():
         
         st.divider()
 
-        # Edit Form (Appears below or as a modal equivalent)
-    if editing_bot_id:
-        render_edit_form(editing_bot_id)
+        st.divider()
 
+@st.dialog("Edit Bot Settings")
 def render_edit_form(bot_id):
     from config.settings import config  # Import config for this function
     
@@ -714,7 +710,7 @@ def render_edit_form(bot_id):
                         plot_bgcolor='rgba(0,0,0,0)',
                         font=dict(color='#1f2328')
                     )
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width='stretch')
                 # -------------------------------
 
                 st.caption(f"Simulated levels starting at: **{curr_p:,.2f}**")
@@ -850,6 +846,17 @@ def render_edit_form(bot_id):
                         config_dict[f'pat_{idx}_tf'] = c_p3.selectbox(f"TF ##{idx}", ["1m","5m","15m","1h","4h","1d"], index=["1m","5m","15m","1h","4h","1d"].index(config_dict.get(f'pat_{idx}_tf', "5m")))
                         config_dict[f'pat_{idx}_count'] = c_p4.number_input(f"Count ##{idx}", min_value=1, value=int(config_dict.get(f'pat_{idx}_count', 3)))
 
+            st.markdown("#### Advanced Filters (Phase 10)")
+            af1, af2, af3, af4 = st.columns(4)
+            with af1:
+                config_dict['UseMTFConfluence'] = st.checkbox("MTF Trend Filter", value=config_dict.get('UseMTFConfluence', False))
+            with af2:
+                config_dict['MTF_Timeframe'] = st.selectbox("MTF TF", ["1h","4h","1d","1w"], index=["1h","4h","1d","1w"].index(config_dict.get('MTF_Timeframe', "4h")))
+            with af3:
+                config_dict['MTF_MA_Period'] = st.number_input("MTF MA Period", value=int(config_dict.get('MTF_MA_Period', 50)))
+            with af4:
+                config_dict['mode_correlation'] = st.selectbox("Correlation", [0, 1, 2], index=int(config_dict.get('mode_correlation', 0)), format_func=lambda x: {0: "OFF", 1: "Positive (>0.7)", 2: "Negative (< -0.7)"}[x])
+
         st.markdown("#### Risk Management")
         rm1, rm2, rm3 = st.columns(3)
         with rm1:
@@ -862,12 +869,20 @@ def render_edit_form(bot_id):
                 )
                 config_dict['ATR_Timeframe'] = atr_tf_risk
         with rm2:
-            config_dict['ATRGridFactor'] = st.number_input("ATR Factor", value=float(config_dict.get('ATRGridFactor', 1.0)))
+                config_dict['ATRGridFactor'] = st.number_input("ATR Factor", value=float(config_dict.get('ATRGridFactor', 1.0)))
         with rm3:
+            config_dict['daily_loss_limit'] = st.number_input("Daily Loss Limit ($)", value=float(config_dict.get('daily_loss_limit', 0.0)), help="Pause bot if daily realized loss exceeds this amount.")
+
+        rm_r1, rm_r2 = st.columns(2)
+        with rm_r1:
+            config_dict['MaxDrawdownPct'] = st.number_input("Max Drawdown (%)", value=float(config_dict.get('MaxDrawdownPct', 0.0)), help="Trigger partial close if drawdown exceeds this %.")
+        with rm_r2:
             if not config_dict.get('UseATRGrid'):
                 config_dict['base_grid'] = st.number_input("Fixed Step", value=float(config_dict.get('base_grid', 100.0)))
             else:
                 pass
+            
+            config_dict['UseVolSizing'] = st.checkbox("Volatility Position Sizing", value=config_dict.get('UseVolSizing', False), help="Adjusts lot size based on ATR (High Vol = Smaller Size).")
 
         st.markdown("#### Advanced Exit & Hedge Settings")
         col_ee1, col_ee2, col_ee3, col_ee4 = st.columns(4)
@@ -948,6 +963,17 @@ def render_edit_form(bot_id):
                 'base_grid': float(config_dict.get('base_grid', 100.0)),
                 'GridMultiplier': float(config_dict.get('GridMultiplier', 1.0)),
                 
+                # Phase 10
+                'UseVolSizing': bool(config_dict.get('UseVolSizing', False)),
+                'UseMTFConfluence': bool(config_dict.get('UseMTFConfluence', False)),
+                'MTF_Timeframe': config_dict.get('MTF_Timeframe', '4h'),
+                'MTF_MA_Period': int(config_dict.get('MTF_MA_Period', 50)),
+                'mode_correlation': int(config_dict.get('mode_correlation', 0)),
+                
+                # Phase 10.2 Risk
+                'daily_loss_limit': float(config_dict.get('daily_loss_limit', 0.0)),
+                'MaxDrawdownPct': float(config_dict.get('MaxDrawdownPct', 0.0)),
+                
                 # Exit
                 'TakeProfitType': config_dict.get('TakeProfitType', 'USD'),
                 'TakeProfitBase': float(config_dict.get('TakeProfitBase', 10.0)),
@@ -972,7 +998,6 @@ def render_edit_form(bot_id):
             # Call Update
             if update_bot(bot_id, new_name, new_pair, new_direction, float(config_dict.get('rsi_level', 30)), new_mm, new_base, new_strat, new_conf):
                 st.success("✅ Bot updated successfully!")
-                st.session_state['editing_bot_id'] = None
                 st.rerun()
             else:
                 st.error("❌ Failed to update bot.")
@@ -980,5 +1005,4 @@ def render_edit_form(bot_id):
             st.error(f"❌ Error Saving: {e}")
 
     if st.button("❌ Cancel", key=f"btn_cancel_{bot_id}"):
-        st.session_state['editing_bot_id'] = None
         st.rerun()

@@ -120,10 +120,19 @@ def iATRPercentile(high: Series, low: Series, close: Series, period: int = 14, l
     """Alias for atr_percentile to match engine calls."""
     return atr_percentile(high, low, close, period, lookback)
 
+def correlation(series_a: Series, series_b: Series, period: int = 14) -> float:
+    """
+    Calculates rolling correlation between two series.
+    Returns the last correlation coefficient (-1.0 to 1.0).
+    """
+    if len(series_a) != len(series_b):
+        # Align lengths? Or assume aligned index?
+        # For simplicity, assume aligned or use common index
+        pass
+        
+    corr_series = series_a.rolling(window=period).corr(series_b)
     
-    current_atr = atr_val.iloc[-1]
-    history = atr_val.iloc[-period_lookback:]
-    
-    # Percentile calculation: (count of values < current) / total
-    percentile = (history < current_atr).sum() / len(history) * 100
-    return float(percentile)
+    if corr_series.empty or pd.isna(corr_series.iloc[-1]):
+        return 0.0
+        
+    return float(corr_series.iloc[-1])

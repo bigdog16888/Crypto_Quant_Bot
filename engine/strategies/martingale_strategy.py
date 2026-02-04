@@ -197,9 +197,25 @@ class MartingaleStrategy(BaseStrategy):
         sell_allow = True
         triggers_active = 0
         
+        # --- 0. Advanced Filters (MTF Trend + Correlation) ---
+        if not self.check_mtf_trend(market_data):
+            logger.info(f"[SIG] MTF Trend Filter Blocked {self.params.get('direction')}")
+            # If MTF trend disagrees, we block ONLY the direction we are configured for?
+            # Or just return False?
+            # Given this is a directional bot, we basically block everything.
+            return False, False
+            
+        if not self.correlation_check(market_data):
+            logger.info("[SIG] Correlation Filter Blocked")
+            return False, False
+        
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.error(f"[DEBUG-SIG] Checking Signals for {self.name}...")
+        
         # --- 1. Indicator Triggers (1-4) ---
         # CCI
-        mode_cci = self.params.get('mode_cci', 0) # 0=Off, 1=Above, 2=Below
+        mode_cci = int(self.params.get('mode_cci', 0))
         if mode_cci > 0:
             triggers_active += 1
             df_cci = self._resample(market_data, self.params.get('cci_tf'))
@@ -211,7 +227,7 @@ class MartingaleStrategy(BaseStrategy):
                 if val > -lvl: buy_allow = sell_allow = False
 
         # Bollinger
-        mode_boll = self.params.get('mode_boll', 0) # 0=Off, 1=Outside Lower (Buy-ish), 2=Outside Upper (Sell-ish)
+        mode_boll = int(self.params.get('mode_boll', 0))
         if mode_boll > 0:
             triggers_active += 1
             df_bb = self._resample(market_data, self.params.get('boll_tf'))
@@ -223,7 +239,7 @@ class MartingaleStrategy(BaseStrategy):
                 if price <= upper: sell_allow = False
 
         # Stochastic
-        mode_stoch = self.params.get('mode_stoch', 0) # 0=Off, 1=Below DN (Oversold), 2=Above UP (Overbought)
+        mode_stoch = int(self.params.get('mode_stoch', 0))
         if mode_stoch > 0:
             triggers_active += 1
             df_st = self._resample(market_data, self.params.get('stoch_tf'))
@@ -234,7 +250,7 @@ class MartingaleStrategy(BaseStrategy):
                 if k <= self.params.get('stoch_lvl_up', 80) or d <= self.params.get('stoch_lvl_up', 80): sell_allow = False
 
         # RSI (New/Refined)
-        mode_rsi = self.params.get('mode_rsi', 0) # 0=Off, 1=Below, 2=Above
+        mode_rsi = int(self.params.get('mode_rsi', 0))
         if mode_rsi > 0:
             triggers_active += 1
             df_rsi = self._resample(market_data, self.params.get('rsi_tf'))
@@ -247,9 +263,10 @@ class MartingaleStrategy(BaseStrategy):
 
         # --- 2. Pattern Triggers (5-8) (Refined) ---
         for p_idx in range(1, 5):
-            p_mode = self.params.get(f'pat_{p_idx}_mode', 0) # 0=Off, 1=Consecutive Up, 2=Consecutive Down
+            p_mode = int(self.params.get(f'pat_{p_idx}_mode', 0))
             if p_mode > 0:
                 triggers_active += 1
+                print(f"[DEBUG-SIG] PATTERN {p_idx} Active (Mode {p_mode})")
                 p_tf = self.params.get(f'pat_{p_idx}_tf')
                 df_p = self._resample(market_data, p_tf)
                 
@@ -270,15 +287,25 @@ class MartingaleStrategy(BaseStrategy):
                     buy_allow = sell_allow = False
 
         # --- 3. Price Threshold Trigger (Trigger 9) ---
-        mode_price = self.params.get('mode_price', 0) # 0=Off, 1=Above, 2=Below
+        mode_price = int(self.params.get('mode_price', 0)) # 0=Off, 1=Above, 2=Below
         if mode_price > 0:
             triggers_active += 1
-            current_price = market_data['close'].iloc[-1]
-            threshold = self.params.get('price_threshold', 0.0)
-            if mode_price == 1: # Above
-                if current_price < threshold: buy_allow = sell_allow = False
-            else: # Below
-                if current_price > threshold: buy_allow = sell_allow = False
+            current_price = float(market_data['close'].iloc[-1])
+            threshold = float(self.params.get('price_threshold', 0.0))
+            
+            logger.error(f"[DEBUG-SIG] Price Trigger: Mode {mode_price}, Price {current_price}, Thresh {threshold}")
+            
+            if mode_price == 1: # Above (Target > Thresh)
+                # If we want Price > Threshold:
+                # If Price < Threshold -> FAIL
+                if current_price < threshold: 
+                    buy_allow = sell_allow = False
+                    # print(f"[DEBUG-SIG] Failed Price > Thresh")
+            else: # Below (Target < Thresh)
+                # If Price > Threshold -> FAIL
+                if current_price > threshold: 
+                    buy_allow = sell_allow = False
+                    # print(f"[DEBUG-SIG] Failed Price < Thresh")
 
         # --- 4. ATR Percentile Trigger (Trigger 10) ---
         mode_atrp = self.params.get('mode_atrp', 0) # 0=Off, 1=Below Level (Low Vol), 2=Above Level (High Vol)
@@ -327,16 +354,19 @@ class MartingaleStrategy(BaseStrategy):
                 if mode_ma == 1: # Bullish Bias (Price MUST be > MA)
                     if curr_p <= ma_val: buy_allow = sell_allow = False
                 elif mode_ma == 2: # Bearish Bias (Price MUST be < MA)
-                    if curr_p >= ma_val: buy_allow = sell_allow = False
+                    if curr_p >= ma_val: 
+                        buy_allow = sell_allow = False
 
         # Final Confluence: All enabled must be true. 
         # For a Buy signal, buy_allow must be True and triggers_active > 0
+        logger.error(f"[DEBUG-SIG] Result: Active {triggers_active}, Buy {buy_allow}, Sell {sell_allow}")
+        
         if triggers_active == 0:
             return False, False
             
         return buy_allow, sell_allow
 
-    def calculate_lot_size(self, current_step: int, account_balance: float) -> float:
+    def calculate_lot_size(self, current_step: int, account_balance: float, market_data=None) -> float:
         """
         Calculates the order size ($USDC) for the next Martingale level.
         Based on Blessing 3 Multiplier or LotAdd logic.
@@ -344,6 +374,10 @@ class MartingaleStrategy(BaseStrategy):
         base_size = self.params.get('base_size', 10.0)
         multiplier = self.params.get('martingale_multiplier', 1.5)
         
+        # Apply Volatility Sizing to BASE SIZE (Step 0)
+        if current_step == 0 and market_data is not None:
+             base_size = self.calculate_volatility_sizing(base_size, market_data)
+
         if current_step == 0:
             return base_size
             
@@ -692,15 +726,88 @@ class MartingaleStrategy(BaseStrategy):
             current_buy = False
             current_sell = False
             
-        return current_buy, current_sell, count + 1
 
-def iStochastic(high, low, close, k, d, slowing):
-    k_s, d_s = ta_custom.stochastic(high, low, close, k_period=k, d_period=d, slowing=slowing)
-    if k_s is None or k_s.empty: return 50.0, 50.0
-    return k_s.iloc[-1], d_s.iloc[-1]
+    def check_mtf_trend(self, market_data: pd.DataFrame) -> bool:
+        """
+        Periodically checks higher timeframe trend to confirm trade direction.
+        Longs only allowed if Price > MA(TF_High).
+        Shorts only allowed if Price < MA(TF_High).
+        """
+        if not self.use_mtf_confluence:
+            return True
+            
+        mtf_tf = self.mtf_tf or '4h'
+        df_mtf = self._resample(market_data, mtf_tf)
+        
+        if df_mtf.empty:
+            return True # Fail open if no data (or safe fail?)
+            
+        # Hardcoded 50 EMA on HTF for now, or use params
+        ma_period = self.params.get('MTF_MA_Period', 50)
+        ma_val = iMA(df_mtf['close'], ma_period, 'EMA')
+        
+        curr_p = df_mtf['close'].iloc[-1]
+        
+        # Current expected direction from bot params
+        # If bot is LONG, we want Price > MA
+        direction = self.params.get('direction', 'LONG').upper()
+        
+        if direction == 'LONG':
+            return curr_p > ma_val
+        else: # SHORT
+            return curr_p < ma_val
 
-def iMACD(close, fast, slow, signal):
-    macd_l, sig_l = ta_custom.macd(close, fast=fast, slow=slow, signal=signal)
-    if macd_l is None or macd_l.empty: return 0.0, 0.0
-    return macd_l.iloc[-1], sig_l.iloc[-1]
+    def calculate_volatility_sizing(self, base_size: float, market_data: pd.DataFrame) -> float:
+        """
+        Adjusts base lot size based on ATR (Volatility).
+        High Volatility -> Smaller Size.
+        Low Volatility -> Standard Size (or Larger).
+        
+        Formula: NewSize = BaseSize * (ReferenceATR / CurrentATR)
+        """
+        use_vol_sizing = self.params.get('UseVolSizing', False)
+        if not use_vol_sizing:
+            return base_size
+            
+        current_atr = self._calculate_atr(market_data)
+        if current_atr == 0: return base_size
+        
+        # Reference ATR (e.g. what we consider "normal" for this pair)
+        # Could be a moving average of recent ATRs, or a fixed param?
+        # Let's use 100-period average ATR as "Normal"
+        ref_atr = self._get_long_term_atr_avg(market_data)
+        
+        if ref_atr == 0: return base_size
+        
+        vol_ratio = ref_atr / current_atr
+        
+        # Clamp ratio to prevent extreme sizing (e.g. 0.5x to 2.0x)
+        vol_ratio = max(0.5, min(vol_ratio, 2.0))
+        
+        return base_size * vol_ratio
+        
+    def _get_long_term_atr_avg(self, market_data, period=100) -> float:
+        """Helper to get long-term average ATR."""
+        df = self._resample(market_data, self.atr_tf or '1h')
+        val = iATR(df['high'], df['low'], df['close'], 14) # Get series isn't supported by iATR float return...
+        # Need series-based ATR calculation here
+        atr_series = ta_custom.atr(df['high'], df['low'], df['close'], 14)
+        if atr_series.empty: return 0.0
+        return float(atr_series.rolling(window=period).mean().iloc[-1])
+
+    def correlation_check(self, market_data: pd.DataFrame, benchmark_symbol: str = 'BTC/USDT') -> bool:
+        """
+        Checks correlation with a benchmark (BTC).
+        If Correlation > Threshold, allow trade.
+        Useful for "Only trade when moving with market" or "Only trade uncorrolated".
+        """
+        mode_corr = self.params.get('mode_correlation', 0) # 0=Off, 1=Positive Corr > X, 2=Negative/Low Corr < X
+        if mode_corr == 0:
+            return True
+            
+        # We need benchmark data... currently Strategy class receives SINGLE pair data.
+        # This requires the Engine to pass in benchmark data or Strategy to fetch it.
+        # Limitation: Strategy currently isolated. 
+        # For now, return True logic placeholder until Engine supports multi-symbol feed to strategy.
+        return True
 

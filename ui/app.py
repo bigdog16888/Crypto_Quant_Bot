@@ -16,11 +16,10 @@ from config.settings import config
 from ui.views.monitor import render_monitor_view
 from ui.views.bot_creator import render_bot_creator_view
 from ui.views.bot_manager import render_bot_manager_view
+from ui.views.analytics import render_analytics_view
 
 # Load environment variables
 load_dotenv()
-
-# Page configuration
 st.set_page_config(
     page_title="Crypto Quant Bot",
     page_icon="🤖",
@@ -489,7 +488,7 @@ with st.sidebar:
     # Using radio for explicit page selection
     selected_page = st.radio(
         "Go to", 
-        ["📊 Live Monitor", "🏗️ Bot Creator", "🛠️ Bot Manager"], 
+        ["📊 Live Monitor", "🏗️ Bot Creator", "🛠️ Bot Manager", "📈 Analytics"], 
         index=0,
         label_visibility="collapsed"
     )
@@ -514,3 +513,6 @@ with main_container:
 
     elif selected_page == "🛠️ Bot Manager":
         render_bot_manager_view()
+
+    elif selected_page == "📈 Analytics":
+        render_analytics_view()

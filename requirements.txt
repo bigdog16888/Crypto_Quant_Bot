@@ -1,7 +1,35 @@
-streamlit
-ccxt
-# pandas_ta
-python-dotenv
+# Python Dependencies for Crypto Quant Bot v0.9.0
 
-plotly
-prometheus-client
+# Core Framework
+streamlit>=1.30.0
+
+# Exchange Integration
+ccxt>=4.0.0
+
+# Data Processing & Analysis
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Visualization
+plotly>=5.18.0
+
+# Metrics & Monitoring
+prometheus-client>=0.19.0
+
+# WebSocket Support
+websockets>=12.0
+
+# Environment Management
+python-dotenv>=1.0.0
+
+# HTTP Requests (for verification scripts)
+requests>=2.31.0
+
+# Optional: Technical Analysis
+# pandas_ta>=0.3.14b  # Uncomment if using pandas_ta instead of custom indicators
+
+# Development Dependencies (optional)
+# pytest>=7.4.0
+# playwright>=1.40.0
+# black>=23.0.0
+# flake8>=6.0.0

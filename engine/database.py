@@ -219,6 +219,23 @@ def init_db():
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_bot_orders_bot ON bot_orders(bot_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_bot_orders_order_id ON bot_orders(order_id)')
         
+        # Migration for Write-Ahead Logging (Phase 3) columns
+        try:
+            cursor.execute('SELECT client_order_id FROM bot_orders LIMIT 1')
+        except sqlite3.OperationalError:
+            cursor.execute('ALTER TABLE bot_orders ADD COLUMN client_order_id TEXT')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_bot_orders_client_id ON bot_orders(client_order_id)')
+            conn.commit()
+            logger.info("Migration: Added client_order_id column to bot_orders")
+        
+        try:
+            cursor.execute('SELECT updated_at FROM bot_orders LIMIT 1')
+        except sqlite3.OperationalError:
+            cursor.execute('ALTER TABLE bot_orders ADD COLUMN updated_at INTEGER DEFAULT 0')
+            cursor.execute('ALTER TABLE bot_orders ADD COLUMN notes TEXT')
+            conn.commit()
+            logger.info("Migration: Added updated_at, notes columns to bot_orders")
+        
         # Trade history table: Permanent log of all trades for post-mortem analysis
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS trade_history (
@@ -245,6 +262,19 @@ def init_db():
         # Index for faster queries by bot activation status
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_bots_active ON bots(is_active)')
 
+        # Notifications table (Phase 9.3)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS notifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL NOT NULL,
+                type TEXT NOT NULL,
+                message TEXT NOT NULL,
+                bot_id INTEGER,
+                is_read BOOLEAN DEFAULT 0
+            ) 
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_notifications_read ON notifications(is_read)')
+
         conn.commit()
     except Exception as e:
         # Handle WinError 233 (Pipe broken) or database locked - non-fatal
@@ -265,6 +295,46 @@ def init_db():
         logger.info(f"Database initialized at {DB_PATH}")
     except Exception: 
         pass
+
+def add_notification(type, message, bot_id=None):
+    """Adds a new notification to the database."""
+    try:
+        conn = get_connection()
+        conn.execute(
+            "INSERT INTO notifications (timestamp, type, message, bot_id) VALUES (?, ?, ?, ?)",
+            (time.time(), type, message, bot_id)
+        )
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Failed to add notification: {e}")
+
+def get_unread_notifications(limit=10):
+    """Fetches unread notifications."""
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, timestamp, type, message, bot_id FROM notifications WHERE is_read = 0 ORDER BY timestamp DESC LIMIT ?",
+            (limit,)
+        )
+        return cursor.fetchall()
+    except Exception as e:
+        logger.error(f"Failed to fetch notifications: {e}")
+        return []
+
+def mark_notifications_read(notification_ids):
+    """Marks specified notifications as read."""
+    if not notification_ids: return
+    try:
+        conn = get_connection()
+        placeholders = ','.join('?' * len(notification_ids))
+        conn.execute(
+            f"UPDATE notifications SET is_read = 1 WHERE id IN ({placeholders})",
+            notification_ids
+        )
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Failed to mark notifications read: {e}")
 
 def add_bot(name, pair, direction, rsi_limit, martingale_multiplier, base_size, strategy_type="Martingale", config_dict=None):
     """Adds a new bot and initializes its trade state."""
@@ -927,6 +997,173 @@ def update_order_status(order_id, status, filled_price=None):
         cursor.execute("UPDATE bot_orders SET status = ? WHERE order_id = ?", (status, order_id))
         
     conn.commit()
+
+# ============================================
+# WRITE-AHEAD LOGGING (Phase 3) - Professional Order Management
+# ============================================
+
+def save_pending_order(bot_id, order_type, client_order_id, price, amount, step=0):
+    """
+    Insert a PENDING order record BEFORE making API call.
+    This is the Write-Ahead pattern - if we crash after API call but before DB update,
+    we can recover by checking clientOrderId on exchange during startup.
+    
+    Args:
+        client_order_id: The CQB_{bot_id}_{type}_{uuid} tag we'll send to exchange.
+        
+    Returns:
+        The DB row ID of the pending order (for later confirmation).
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute('''
+            INSERT INTO bot_orders (bot_id, step, order_type, order_id, price, amount, status, created_at, client_order_id)
+            VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+        ''', (bot_id, step, order_type, None, price, amount, int(time.time()), client_order_id))
+        
+        conn.commit()
+        return cursor.lastrowid
+    except Exception as e:
+        logger.error(f"Failed to save pending order for bot {bot_id}: {e}")
+        return None
+
+
+def confirm_order(pending_id, actual_order_id):
+    """
+    Confirm a pending order AFTER API call succeeds.
+    Updates the record with actual exchange order_id and status='open'.
+    
+    Args:
+        pending_id: The DB row ID from save_pending_order().
+        actual_order_id: The order ID returned by exchange.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute('''
+            UPDATE bot_orders 
+            SET order_id = ?, status = 'open', updated_at = ?
+            WHERE id = ?
+        ''', (actual_order_id, int(time.time()), pending_id))
+        conn.commit()
+        logger.debug(f"✅ Confirmed order: DB#{pending_id} -> Exchange#{actual_order_id}")
+    except Exception as e:
+        logger.error(f"Failed to confirm order DB#{pending_id}: {e}")
+
+
+def fail_order(pending_id, error_msg=None):
+    """
+    Mark a pending order as FAILED after API call fails.
+    This prevents orphan pending records from accumulating.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute('''
+            UPDATE bot_orders 
+            SET status = 'failed', updated_at = ?, notes = ?
+            WHERE id = ?
+        ''', (int(time.time()), error_msg or 'API call failed', pending_id))
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Failed to mark order DB#{pending_id} as failed: {e}")
+
+
+def close_order_in_db(order_id):
+    """
+    Mark an order as closed/filled in the database.
+    Used by WebSocket event handler when order is filled.
+    
+    Args:
+        order_id: Exchange order ID (not DB row ID)
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute('''
+            UPDATE bot_orders 
+            SET status = 'closed', updated_at = ?
+            WHERE order_id = ?
+        ''', (int(time.time()), str(order_id)))
+        conn.commit()
+        if cursor.rowcount > 0:
+            logger.debug(f"✅ Closed order in DB: {order_id}")
+    except Exception as e:
+        logger.error(f"Failed to close order {order_id} in DB: {e}")
+
+
+def cleanup_pending_orders(exchange):
+    """
+    Startup cleanup: Check all 'pending' orders and reconcile with exchange.
+    - If order exists on exchange (matched by clientOrderId): Confirm it.
+    - If order does not exist: Mark as failed/closed.
+    
+    Args:
+        exchange: ExchangeInterface instance to verify orders.
+        
+    Returns:
+        dict with counts of confirmed, failed, cleaned orders.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    stats = {'confirmed': 0, 'failed': 0, 'total': 0}
+    
+    try:
+        # Find all pending orders
+        cursor.execute('''
+            SELECT id, bot_id, order_type, client_order_id, price, amount
+            FROM bot_orders 
+            WHERE status = 'pending'
+        ''')
+        pending = cursor.fetchall()
+        stats['total'] = len(pending)
+        
+        if not pending:
+            return stats
+        
+        logger.info(f"🔄 WAL Cleanup: Found {len(pending)} pending orders from previous session.")
+        
+        # Fetch all open orders from exchange
+        try:
+            ex_orders = exchange.exchange.fetch_open_orders()
+        except:
+            ex_orders = []
+        
+        # Build lookup by clientOrderId
+        ex_by_client_id = {}
+        for o in ex_orders:
+            cid = o.get('clientOrderId', '')
+            if cid:
+                ex_by_client_id[cid] = o
+        
+        # Reconcile each pending order
+        for row in pending:
+            db_id, bot_id, order_type, client_id, price, amount = row
+            
+            if client_id in ex_by_client_id:
+                # Order EXISTS on exchange - confirm it
+                actual_order = ex_by_client_id[client_id]
+                confirm_order(db_id, actual_order['id'])
+                stats['confirmed'] += 1
+                logger.info(f"   ✅ Recovered pending {order_type} order for bot {bot_id} -> Exchange#{actual_order['id']}")
+            else:
+                # Order NOT on exchange - mark failed
+                fail_order(db_id, 'Not found on exchange during startup reconciliation')
+                stats['failed'] += 1
+                logger.warning(f"   ❌ Pending {order_type} order for bot {bot_id} not found on exchange. Marked failed.")
+        
+        return stats
+        
+    except Exception as e:
+        logger.error(f"WAL Cleanup failed: {e}")
+        return stats
+
 
 def update_trade_tp_price(bot_id: int, new_tp_price: float):
     """

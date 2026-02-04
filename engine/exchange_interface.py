@@ -3,6 +3,7 @@ import time
 import logging
 import math
 import threading
+from engine.exceptions import InsufficientFundsError, OrderNotFoundError, APIError, NetworkError
 from config.settings import config
 
 # ============================================
@@ -30,6 +31,21 @@ _GENERIC_CACHE_TTL = 3  # 3 seconds
 # API Call Metrics
 _api_call_count = 0
 _api_call_lock = threading.Lock()
+
+# Per-Symbol Order Lock: Prevents race conditions when multiple bots trade same symbol
+# In One-Way mode, Binance provisionally locks margin during order processing
+# Multiple simultaneous orders on same symbol can fail with "insufficient balance"
+_symbol_order_locks = {}
+_symbol_locks_lock = threading.Lock()  # Meta-lock for creating per-symbol locks
+
+def get_symbol_lock(symbol: str) -> threading.Lock:
+    """Get or create a lock for a specific symbol."""
+    global _symbol_order_locks
+    normalized = normalize_symbol(symbol)
+    with _symbol_locks_lock:
+        if normalized not in _symbol_order_locks:
+            _symbol_order_locks[normalized] = threading.Lock()
+        return _symbol_order_locks[normalized]
 
 # Module-level flags to prevent repeated logging
 _demo_trading_logged = False
@@ -257,40 +273,65 @@ class ExchangeInterface:
                     amount = kwargs.get('amount')
                     price = kwargs.get('price')
                     
-                    # Clean params
+                    # Clean params while preserving important ones like clientOrderId
                     raw_p = kwargs.get('params', {})
-                    clean_p = {}
-                    for k in ['reduceOnly', 'postOnly', 'positionSide', 'stopPrice', 'closePosition']:
-                        if k in raw_p:
-                            clean_p[k] = raw_p[k]
+                    clean_p = raw_p.copy()
                     
+                    # Fix BINANCE -1104 / Position Side Conflict
+                    # In Hedge mode, positionSide is used. In One-Way, reduceOnly is used.
+                    # Providing both can cause -1104.
                     if 'positionSide' in clean_p and 'reduceOnly' in clean_p:
+                        self.logger.debug(f"⚠️ Conflict: Both positionSide and reduceOnly provided. Removing reduceOnly.")
                         del clean_p['reduceOnly']
                     
-                    self.logger.debug(f"📤 API create_order: {symbol} {side} {amount} @ {price} | Params: {clean_p}")
+                    self.logger.debug(f"📤 API create_order: {symbol} {side} {amount} @ {price} | Params: {list(clean_p.keys())}")
+
                     
                     # Call CCXT with keyword args to prevent positional misalignment
-                    return func(
-                        symbol=symbol,
-                        type=order_type,
-                        side=side,
-                        amount=amount,
-                        price=price,
-                        params=clean_p
-                    )
+                    try:
+                        return func(
+                            symbol=symbol,
+                            type=order_type,
+                            side=side,
+                            amount=amount,
+                            price=price,
+                            params=clean_p
+                        )
+                    except Exception as e:
+                        # Log raw response if available
+                        raw_error = getattr(e, 'response', 'No response')
+                        self.logger.error(f"❌ API Order Error: {e} | Raw: {raw_error}")
+                        
+                        # Map to Standard Exceptions
+                        err_msg = str(e).lower()
+                        if 'insufficient balance' in err_msg or 'account has insufficient' in err_msg:
+                            raise InsufficientFundsError(f"Insufficient funds for {symbol} {side}: {e}")
+                        elif 'order not found' in err_msg or 'unknown order' in err_msg:
+                            raise OrderNotFoundError(f"Order not found: {e}")
+                        elif 'network' in err_msg or 'timeout' in err_msg:
+                            raise NetworkError(f"Network error: {e}")
+                        else:
+                            raise APIError(f"Exchange API Error: {e}")
                 
                 return func(*args, **kwargs)
             
             except (ccxt.NetworkError, ccxt.RequestTimeout) as e:
                 if attempt < max_retries:
+                    self.logger.warning(f"⚠️ Network error on {method} (Attempt {attempt+1}/{max_retries}): {e}")
                     time.sleep(delay * (attempt + 1))
                     continue
-                raise
+                raise NetworkError(f"Persistent Network Error: {e}")
+
+            except (InsufficientFundsError, OrderNotFoundError, APIError) as e:
+                # Re-raise standard exceptions immediately (no retry for logic errors)
+                raise e
             except Exception as e:
                 if "code\":-1104" in str(e) and method == 'create_order':
                     self.logger.error(f"🔥 FINAL ATTEMPT at order: params caused -1104. Retrying with EMPTY params.")
                     return getattr(self.exchange, method)(kwargs.get('symbol'), kwargs.get('type'), kwargs.get('side'), kwargs.get('amount'), kwargs.get('price'), {})
-                raise
+                
+                # Map generic CCXT errors to APIError
+                raise APIError(f"Generic Exchange Error: {e}")
 
     # _safe_request was a duplicate of _execute_request using the same logic. 
     # Removed to enforce Single Responsibility Principle.
@@ -342,8 +383,28 @@ class ExchangeInterface:
             self.logger.error(f"Validation error: {e}")
             return False, amount, price, str(e)
 
-    def create_order(self, symbol, type, side, amount, price=None, params={}):
+    def create_order(self, symbol, type, side, amount, price=None, params={}, bot_id=None, order_type=None):
+        """
+        Create an order with optional bot tagging for reconciliation.
+        Uses per-symbol locking to prevent race conditions in One-Way mode.
+        
+        Args:
+            bot_id: If provided, tags order with clientOrderId for tracking.
+            order_type: Type of order (e.g., 'ENTRY', 'TP', 'GRID') for the tag.
+        """
         if params is None: params = {}
+        
+        # === BOT ORDER TAGGING (Phase 2: clientOrderId) ===
+        # Tag format: CQB_{bot_id}_{type}_{short_uuid}
+        # This allows us to identify bot orders during reconciliation.
+        if bot_id is not None:
+            import uuid
+            short_uuid = str(uuid.uuid4())[:8]
+            o_type_tag = order_type or 'ORDER'
+            client_order_id = f"CQB_{bot_id}_{o_type_tag}_{short_uuid}"
+            params['clientOrderId'] = client_order_id
+            self.logger.debug(f"🏷️ Tagged order with clientOrderId: {client_order_id}")
+        
         # Pre-validation
         is_valid, s_amt, s_price, err = self.validate_order(symbol, side, amount, price)
         if not is_valid:
@@ -351,8 +412,14 @@ class ExchangeInterface:
              # Minimal fallback...
              return self._execute_request('create_order', symbol=symbol, type=type, side=side, amount=amount, price=price, params=params)
         
+        # === PER-SYMBOL LOCK (Prevents "insufficient balance" race condition) ===
+        # In One-Way mode, Binance provisionally locks margin during order processing.
+        # Multiple bots on same symbol racing to place orders causes false rejections.
+        symbol_lock = get_symbol_lock(symbol)
+        
         try:
-            return self._execute_request('create_order', symbol=symbol, type=type, side=side, amount=s_amt, price=s_price, params=params)
+            with symbol_lock:
+                return self._execute_request('create_order', symbol=symbol, type=type, side=side, amount=s_amt, price=s_price, params=params)
         except Exception as e:
             # FIX: Only mock network errors, NOT logic/balance errors
             str_e = str(e).lower()
@@ -441,6 +508,54 @@ class ExchangeInterface:
         except Exception as e:
             self.logger.error(f"Failed to set leverage {leverage}x for {symbol}: {e}")
             return False
+
+    def calculate_real_leverage(self, symbol: str, position_data: dict = None) -> int:
+        """
+        Robustly determines the actual effective leverage of a position.
+        Handles cases where 'leverage' field is missing (Testnet) by calculating from margin.
+        
+        Args:
+            symbol (str): The trading pair (e.g. BTC/USDT)
+            position_data (dict, optional): Existing position data if available.
+            
+        Returns:
+            int: The leverage value (e.g. 20) or None if undetermined.
+        """
+        try:
+            # 1. Get Position Data
+            if not position_data:
+                positions = self.fetch_positions()
+                norm_target = normalize_symbol(symbol)
+                for p in positions:
+                    if normalize_symbol(p.get('symbol')) == norm_target:
+                        position_data = p
+                        break
+            
+            if not position_data:
+                return None
+                
+            # 2. explicit Check
+            explicit_lev = position_data.get('leverage')
+            if explicit_lev is not None:
+                try:
+                    return int(float(explicit_lev))
+                except: pass
+                
+            # 3. Calculation Fallback (Notional / Initial Margin)
+            # info field contains raw exchange response
+            info = position_data.get('info', {})
+            notional = float(info.get('notional', 0))
+            init_margin = float(info.get('positionInitialMargin', 0))
+            
+            if init_margin > 0:
+                calc_lev = round(abs(notional) / init_margin)
+                return int(calc_lev)
+                
+            return None
+            
+        except Exception as e:
+            self.logger.error(f"Failed to calculate real leverage for {symbol}: {e}")
+            return None
 
     def get_min_order_usd(self, symbol: str, price: float = 0.0) -> float:
         try:
@@ -710,3 +825,40 @@ class ExchangeInterface:
         global _api_call_count
         with _api_call_lock:
             _api_call_count = 0
+
+def cleanup_caches():
+    """
+    Prunes expired entries from module-level caches to prevent memory leaks.
+    Should be called periodically (e.g., every 60s) by the runner.
+    """
+    global _ohlcv_cache, _pending_requests, _generic_cache
+    
+    now = time.time()
+    
+    # 1. Cleanup OHLCV Cache
+    # Structure: {key: (timestamp, data)}
+    count_ohlcv = 0
+    keys_to_del = [k for k, v in _ohlcv_cache.items() if now - v[0] > _OHLCV_CACHE_TTL]
+    for k in keys_to_del:
+        del _ohlcv_cache[k]
+        count_ohlcv += 1
+        
+    # 2. Cleanup Generic Cache
+    count_generic = 0
+    keys_to_del = [k for k, v in _generic_cache.items() if now - v[0] > _GENERIC_CACHE_TTL]
+    for k in keys_to_del:
+        del _generic_cache[k]
+        count_generic += 1
+
+    # 3. Cleanup Pending Requests (Stuck futures)
+    count_pending = 0
+    with _request_lock:
+        # 60s timeout for any API call is huge, but safe
+        keys_to_del = [k for k, v in _pending_requests.items() if now - v[0] > 60] 
+        for k in keys_to_del:
+            del _pending_requests[k]
+            count_pending += 1
+
+    if count_ohlcv > 0 or count_generic > 0 or count_pending > 0:
+        pass
+        # logging.getLogger("ExchangeInterface").debug(f"🧹 Cache Cleanup: OHLCV={count_ohlcv}, Generic={count_generic}, Pending={count_pending}")

@@ -4,13 +4,46 @@
 # Python Bytecode
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 
 # Databases
 *.db
+*.db-shm
+*.db-wal
 
 # Logs
 logs/*.log
+*.log
+engine.log
+engine_runner_debug.log
+startup_error.log
+
+# Runtime files
+*.pid
+engine.pid
 
 # IDEs
 .vscode/
 .idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test cache
+.pytest_cache/
+.coverage
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/

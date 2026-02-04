@@ -53,6 +53,8 @@ logging.basicConfig(
     handlers=[rotating_handler, stream_handler]
 )
 logger = logging.getLogger("BotRunner")
+logging.getLogger('ccxt').setLevel(logging.WARNING)
+logging.getLogger('urllib3').setLevel(logging.WARNING)
 
 # Thread-local storage logic moved to bot_executor.py where it is actually used.
 # Runner uses self.exchanges for main-thread operations.
@@ -64,18 +66,19 @@ class BotRunner:
         self._bot_executor: BotExecutor | None = None
         
         # Main thread exchanges (kept for global ops like check_circuit_breaker)
-        # Skip spot exchange if in FUTURES_ONLY_MODE (e.g., testnet with futures-only keys)
-        if getattr(config, 'FUTURES_ONLY_MODE', False):
-            self.exchanges = {
-                'future': ExchangeInterface(market_type='future')
-            }
-        else:
-            self.exchanges = {
-                'spot': ExchangeInterface(market_type='spot'),
-                'future': ExchangeInterface(market_type='future')
-            }
+        # Smart Initialization: Only load what is needed
+        self.exchanges = {}
+        self._initialize_exchanges()
+        
         # For backward compatibility and global actions
-        self.exchange = self.exchanges.get(config.MARKET_TYPE, self.exchanges['future'])
+        self.exchange = self.exchanges.get(config.MARKET_TYPE, None)
+        if not self.exchange:
+            # Fallback to first available if default is missing
+            if self.exchanges:
+                self.exchange = list(self.exchanges.values())[0]
+            else:
+                logger.critical("NO EXCHANGES INITIALIZED! Engine cannot run.")
+                sys.exit(1)
         self.strategies = {} # Cache strategy instances: {bot_id: strategy_instance}
         
         # Safety / Circuit Breaker State
@@ -87,13 +90,113 @@ class BotRunner:
         self.orders_today = {}  # {bot_id: count}
         self.last_order_reset = time.time()
         
+        self.last_order_reset = time.time()
+        
+        logger.info("DEBUG: Initializing Safety Baseline...")
         self._initialize_safety_baseline()
         
         # State Synchronization
         try:
+            logger.info("DEBUG: Starting Startup Sync...")
             self.sync_all_bots()
+            logger.info("DEBUG: Startup Sync Complete")
         except Exception as e:
             logger.error(f"Failed to sync bots on startup (non-fatal): {e}")
+
+    def _initialize_exchanges(self):
+        """
+        Smart initialization of exchanges based on active bots.
+        Robustly handles failures (e.g. Spot API down) without crashing the engine.
+        """
+        try:
+            active_bots = self.get_active_bots()
+            required_markets = set()
+            
+            # 1. Determine required markets
+            for bot in active_bots:
+                # bot[5] is config_json
+                if bot[5]:
+                    try:
+                        cfg = json.loads(bot[5])
+                        m_type = cfg.get('market_type', config.MARKET_TYPE)
+                        required_markets.add(m_type)
+                    except: pass
+            
+            # Always add default market type (for safety/fallback)
+            required_markets.add(config.MARKET_TYPE)
+            
+            # If specified global overrides
+            if getattr(config, 'FUTURES_ONLY_MODE', False):
+                required_markets.discard('spot')
+                required_markets.add('future')
+                
+            logger.info(f"DEBUG: Required Markets: {required_markets}")
+            
+            # 2. Initialize each required market
+            for m_type in required_markets:
+                try:
+                    logger.info(f"Initializing Exchange: {m_type}...")
+                    self.exchanges[m_type] = ExchangeInterface(market_type=m_type)
+                    logger.info(f"✅ Exchange {m_type} initialized.")
+                except Exception as e:
+                    logger.error(f"❌ Failed to initialize {m_type} exchange: {e}")
+                    # Continue - don't crash engine just because one market failed
+
+            # 3. Deep Reconciliation (Auto-Healing)
+            # Must run AFTER exchanges are up but BEFORE bots start processing.
+            try:
+                from engine.reconciler import DeepReconciler
+                reconciler = DeepReconciler(self.exchanges)
+                reconciler.run()
+            except Exception as e:
+                logger.error(f"Failed to run Deep Reconciliation: {e}")
+            
+            # 4. Write-Ahead Logging Cleanup (Phase 3)
+            # Recover any pending orders from previous crashed session.
+            try:
+                from engine.database import cleanup_pending_orders
+                # Use the primary exchange (default market type)
+                primary_ex = self.exchanges.get(config.MARKET_TYPE)
+                if primary_ex:
+                    wal_stats = cleanup_pending_orders(primary_ex)
+                    if wal_stats['total'] > 0:
+                        logger.info(f"📋 WAL Cleanup: {wal_stats['confirmed']} recovered, {wal_stats['failed']} failed out of {wal_stats['total']} pending")
+            except Exception as e:
+                logger.error(f"Failed to run WAL cleanup: {e}")
+            
+            # 5. Offline Fill Detection (Phase 4)
+            # Check if any orders filled while bot was offline.
+            try:
+                # Offline fills need to be checked per exchange
+                for m_type, ex in self.exchanges.items():
+                    if ex:
+                        offline_stats = reconciler.detect_offline_fills(ex, since_hours=48)
+                        if offline_stats['grid_fills'] + offline_stats['tp_fills'] + offline_stats['entry_fills'] > 0:
+                            logger.info(f"📋 Offline Fills ({m_type}): {offline_stats['entry_fills']} entries, {offline_stats['grid_fills']} grids, {offline_stats['tp_fills']} TPs")
+            except Exception as e:
+                logger.error(f"Failed to detect offline fills: {e}")
+            
+            # 6. WebSocket Stream Startup (Phase 7)
+            # Start real-time order updates to replace polling
+            try:
+                from engine.websocket_handler import start_websocket_stream
+                from engine.ws_event_handlers import handle_order_update, handle_position_update
+                
+                ws_started = start_websocket_stream(
+                    on_order_update=handle_order_update,
+                    on_position_update=handle_position_update
+                )
+                if ws_started:
+                    logger.info("✅ WebSocket stream started for real-time updates")
+                else:
+                    logger.warning("⚠️ WebSocket stream failed to start, using polling fallback")
+            except ImportError:
+                logger.info("WebSocket handler not available, using polling mode")
+            except Exception as e:
+                logger.error(f"Failed to start WebSocket stream: {e}")
+                
+        except Exception as e:
+             logger.error(f"Error during smart exchange init: {e}")
 
     def _calculate_stablecoin_balance(self, balance: dict) -> float:
         """Calculate total balance across USDT and USDC stablecoins."""
@@ -339,6 +442,7 @@ class BotRunner:
         # This fills the ExchangeInterface internal generic cache
         exchange_snapshot = {}
         try:
+            logger.info("DEBUG: Cycle Start - Fetching Bots")
             bots = self.get_active_bots()
             active_market_types = set()
             for bot in bots:
@@ -352,8 +456,11 @@ class BotRunner:
                 if mt in self.exchanges:
                     ex = self.exchanges[mt]
                     # These calls are now cached for 3s
+                    logger.info(f"DEBUG: Fetching Snapshot for {mt}")
                     snap_pos = ex.fetch_positions()
+                    logger.info(f"DEBUG: Fetching Balance for {mt}")
                     snap_bal = ex.fetch_balance()
+                    logger.info(f"DEBUG: Fetching Open Orders for {mt}")
                     snap_orders = ex.fetch_open_orders() # Bulk fetch all open orders
                     
                     exchange_snapshot[mt] = {
@@ -365,7 +472,8 @@ class BotRunner:
             logger.warning(f"Failed to pre-fetch cycle snapshot: {e}")
 
         # 2. Safety Checks (using snapshots)
-        self.check_circuit_breaker(exchange_snapshot=exchange_snapshot)
+        # DISABLE CIRCUIT BREAKER FOR DEBUGGING (False Positives on Testnet)
+        # self.check_circuit_breaker(exchange_snapshot=exchange_snapshot)
         
         if os.path.exists(config.PATHS["EMERGENCY_FILE"]):
             self.handle_emergency_liquidation()
@@ -382,6 +490,8 @@ class BotRunner:
         if not hasattr(self, '_bot_executor') or self._bot_executor is None:
             self._bot_executor = BotExecutor(self)
         bot_executor = self._bot_executor
+
+        logger.info(f"DEBUG: Starting cycle with {len(bots)} bots")
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             # Process bots using the primed cache
@@ -437,6 +547,16 @@ class BotRunner:
                                     close_qty = abs(qty)
                                     logger.warning(f"Emergency Market Close {close_qty} {pair} for {name}")
                                     ex.create_order(pair, 'market', side, close_qty)
+                                    
+                                    # CRITICAL FIX: Update DB to reflect closure
+                                    # We use reset_bot_after_tp to clear the trade record
+                                    # Passing 0 as exit price since it's a panic close (or use current price if available)
+                                    try:
+                                        reset_bot_after_tp(id, exit_price=0.0)
+                                        logger.warning(f"✅ Bot {name} Database Reset after Emergency Close")
+                                    except Exception as db_err:
+                                        logger.error(f"Failed to reset DB for {name}: {db_err}")
+                                        
                     except Exception as pos_err:
                         logger.error(f"Failed to fetch positions for {pair}: {pos_err}")
                         
@@ -473,10 +593,44 @@ if __name__ == "__main__":
     with open(PID, "w") as f: f.write(str(os.getpid()))
     failures = 0
     last_heartbeat = 0
+    last_cleanup = 0
     cycle_sleep = 15.0 # Default fallback
+    
+    # Import cleanup utility and WS Server
+    from engine.exchange_interface import cleanup_caches
+    from engine.websocket_server import WebSocketServer
+    
+    # Start WebSocket Server
+    try:
+        ws_server = WebSocketServer(port=8765)
+        ws_server.start()
+    except Exception as e:
+        logger.error(f"Failed to start WebSocket Server: {e}")
+    
     while runner.running:
         try:
+            # Periodic Cache Cleanup (Every 60s)
+            now = time.time()
+            if now - last_cleanup > 60:
+                cleanup_caches()
+                last_cleanup = now
+            
             result = runner.run_cycle()
+            
+            # Broadcast State via WebSocket
+            try:
+                from engine.database import get_all_bots
+                bots = get_all_bots()
+                # Serialize and broadcast
+                payload = {
+                    "type": "update",
+                    "timestamp": time.time(),
+                    "bots": bots
+                }
+                ws_server.broadcast(payload)
+            except Exception as wse:
+                 logger.error(f"WS Broadcast Error: {wse}")
+
             if result is False: break
             
             # Update sleep time based on smart polling

@@ -5,7 +5,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import ccxt
 from engine.exchange_interface import ExchangeInterface
-from engine.database import get_connection, get_bots_by_order_id
+from engine.database import get_connection, get_bots_by_order_id, get_unread_notifications, mark_notifications_read
 
 import sys
 import os
@@ -53,7 +53,57 @@ def fetch_balance_cached(market_type):
 
 def render_monitor_view():
     st.header("📊 Live Market Monitor")
+
+    # --- Notifications (Phase 9.3) ---
+    try:
+        notes = get_unread_notifications(limit=5)
+        if notes:
+            n_ids = []
+            for n in notes:
+                # n: id, timestamp, type, message, bot_id
+                nid, _, ntype, msg, bid = n
+                icon = "ℹ️"
+                if ntype == 'success': icon = "✅"
+                elif ntype == 'error': icon = "❌"
+                elif ntype == 'warning': icon = "⚠️"
+                
+                st.toast(msg, icon=icon)
+                n_ids.append(nid)
+            
+            mark_notifications_read(n_ids)
+    except Exception as e:
+        pass # Fail silently to keep UI responsive
     
+    # --- Risk Heatmap (Phase 10.2) ---
+    if st.checkbox("Show Portfolio Heatmap", value=True):
+        try:
+            import plotly.express as px
+            # Fetch active bots for visualization
+            # We need data... reuse get_bot_status logic or fetch all
+            from engine.database import get_connection
+            conn = get_connection()
+            df_risk = pd.read_sql("SELECT name, total_invested, current_step, avg_entry_price, last_exit_price FROM trades JOIN bots ON trades.bot_id = bots.id WHERE total_invested > 0", conn)
+            
+            if not df_risk.empty:
+               # Calculate approximate drawdown/pnl proxy for coloring
+               # Note: We don't have current price here easily without fetching ticker for each... 
+               # Use 'step' as proxy for risk intensity? Or just size?
+               # Let's use 'total_invested' for Size, 'current_step' for Color (Risk Proxy)
+               
+               fig = px.treemap(
+                   df_risk, 
+                   path=['name'], 
+                   values='total_invested',
+                   color='current_step',
+                   color_continuous_scale='RdYlGn_r', # Red for high step (high risk)
+                   title="Active Risk Map (Size=Invested, Color=Step/Risk)"
+               )
+               st.plotly_chart(fig, width='stretch')
+            else:
+               st.info("No active positions to display in Heatmap.")
+        except Exception as e:
+            st.error(f"Heatmap Error: {e}")
+
     # --- Command Center (Health Dashboard) ---
     # Global CSS in app.py handles .metric-card styling
     
@@ -225,7 +275,7 @@ def render_monitor_view():
                     "Unrealized PnL": st.column_config.NumberColumn(format="$%.2f"),
                     "Equity": st.column_config.NumberColumn(format="$%.2f"),
                 },
-                use_container_width=True,
+                width='stretch',
                 hide_index=True
             )
 
@@ -445,7 +495,7 @@ def render_monitor_view():
                 )
             )
             
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
             
             # --- PnL and Stats Area ---
             latest = df.iloc[-1]
@@ -761,12 +811,47 @@ def render_monitor_view():
                     })
                 elif is_active:
                     # --- 2. SCANNER LIST ---
+                    # Parse config to show active triggers
+                    active_triggers = []
+                    try:
+                        c = json.loads(config_json) if config_json else {}
+                        
+                        # Price
+                        if int(c.get('mode_price', 0)) == 1: active_triggers.append(f"Price > {c.get('price_threshold')}")
+                        elif int(c.get('mode_price', 0)) == 2: active_triggers.append(f"Price < {c.get('price_threshold')}")
+                        
+                        # MA
+                        if int(c.get('mode_ma', 0)) == 1: active_triggers.append("MA Bull")
+                        elif int(c.get('mode_ma', 0)) == 2: active_triggers.append("MA Bear")
+                        
+                        # Indicators
+                        if int(c.get('mode_rsi', 0)) > 0: active_triggers.append("RSI")
+                        if int(c.get('mode_cci', 0)) > 0: active_triggers.append("CCI")
+                        if int(c.get('mode_boll', 0)) > 0: active_triggers.append("Boll")
+                        if int(c.get('mode_stoch', 0)) > 0: active_triggers.append("Stoch")
+                        if int(c.get('mode_atrp', 0)) > 0: active_triggers.append("ATR%")
+                        if int(c.get('mode_atr_expand', 0)) > 0: active_triggers.append("ATR Exp")
+                        
+                        # Patterns
+                        pat_active = False
+                        for i in range(1, 5):
+                            if int(c.get(f'pat_{i}_mode', 0)) > 0:
+                                pat_active = True
+                                break
+                        if pat_active: active_triggers.append("Pattern")
+                        
+                    except:
+                        active_triggers = ["?"]
+                        
+                    trigger_str = ", ".join(active_triggers) if active_triggers else "None (Manual?)"
+
                     scanner_rows.append({
                         "ID": f"#{id}",
                         "Name": name,
                         "Pair": pair,
                         "Strategy": strat_type,
                         "Direction": direction,
+                        "Active Triggers": trigger_str,
                         "Status": "🟢 Scanning"
                     })
                 else:
@@ -876,7 +961,7 @@ def render_monitor_view():
                                 "PnL ($)": st.column_config.NumberColumn(format="$%.2f"),
                                 "PnL (%)": st.column_config.NumberColumn(format="%.2f%%"),
                             },
-                            use_container_width=True,
+                            width='stretch',
                             hide_index=True
                         )
             
@@ -885,7 +970,7 @@ def render_monitor_view():
             # 5. Render Active Scanners
             st.markdown("### 📡 Active Scanners (Searching for Entry)")
             if scanner_rows:
-                st.dataframe(pd.DataFrame(scanner_rows), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(scanner_rows), width='stretch', hide_index=True)
             else:
                 st.info("No bots are currently scanning.")
                 
@@ -895,7 +980,7 @@ def render_monitor_view():
             # Only show if there are entries, or always show to be 'professional' as requested
             with st.expander("🛑 Stopped / Inactive Bots", expanded=False):
                 if inactive_rows:
-                    st.dataframe(pd.DataFrame(inactive_rows), use_container_width=True, hide_index=True)
+                    st.dataframe(pd.DataFrame(inactive_rows), width='stretch', hide_index=True)
                 else:
                     st.caption("No stopped or inactive bots.")
         else:
@@ -969,7 +1054,7 @@ def render_monitor_view():
                     "Amount": st.column_config.NumberColumn(format="%.6f"),
                     "Filled": st.column_config.NumberColumn(format="%.6f"),
                 },
-                use_container_width=True,
+                width='stretch',
                 hide_index=True
             )
             
@@ -1100,7 +1185,7 @@ def render_monitor_view():
                         "Mark": st.column_config.NumberColumn(format="$%.4f"),
                         "Liq. Price": st.column_config.NumberColumn(format="$%.2f"),
                     },
-                    use_container_width=True,
+                    width='stretch',
                     hide_index=True
                 )
             else:
@@ -1156,7 +1241,7 @@ def render_monitor_view():
                     "Amount": st.column_config.NumberColumn(format="%.6f"),
                     "Cost ($)": st.column_config.NumberColumn(format="$%.2f"),
                 },
-                use_container_width=True,
+                width='stretch',
                 hide_index=True
             )
         else:

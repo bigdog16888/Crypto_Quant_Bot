@@ -175,266 +175,293 @@ def _check_trailing_stop(bot_id, bot_name, direction, current_price, target_tp_p
              
     return tp_hit, is_trailing_exit
 
+def _calculate_expected_tp(avg_entry_price, direction, total_invested, settings):
+    """Recalculates what TP price SHOULD be based on current settings."""
+    tp_type = settings.get('TakeProfitType', 'USD')
+    if tp_type == 'Percent':
+        tp_pct = settings.get('TakeProfitPct', 1.0) / 100.0
+        return avg_entry_price * (1.0 + tp_pct) if direction == 'LONG' else avg_entry_price * (1.0 - tp_pct)
+    
+    target_usd = settings.get('TakeProfitBase', 10.0)
+    est_qty = total_invested / avg_entry_price if avg_entry_price > 0 else 0
+    if est_qty > 0:
+        dist = target_usd / est_qty
+        return avg_entry_price + dist if direction == 'LONG' else avg_entry_price - dist
+    return 0.0
+
+def _find_bot_orders(bot_id, pair, direction, open_orders, target_tp_price, settings, logger):
+    """
+    Identifies THIS bot's TP and Grid orders on the exchange.
+    Uses Phase 7 Tags (clientOrderId) as the source of truth, falls back to DB IDs and Price.
+    """
+    from engine.strategies.martingale_strategy import MartingaleStrategy
+    from engine.risk_manager import check_drawdown_reduction
+    from engine.bot_management import check_and_execute_stops
+    
+    bot_order_ids = get_bot_order_ids(bot_id)
+    db_tp_id = bot_order_ids.get('tp_order_id')
+    db_grid_ids = [o.get('order_id') for o in bot_order_ids.get('grid_orders', []) if o.get('status') == 'open']
+
+    has_my_tp = False
+    my_tp_order = None
+    has_my_grid = False
+    my_grid_ids = []
+
+    # TAG PREFIX: CQB_{bot_id}_
+    tag_prefix = f"CQB_{bot_id}_"
+
+    for o in open_orders:
+        oid = o.get('id')
+        client_oid = o.get('clientOrderId', '')
+        
+        # 1. PRIMARY: Match by Tag (Phase 7)
+        if client_oid.startswith(tag_prefix):
+            if '_TP_' in client_oid:
+                has_my_tp = True
+                my_tp_order = o
+            elif '_GRID_' in client_oid:
+                has_my_grid = True
+                my_grid_ids.append(oid)
+            elif '_ENTRY_' in client_oid:
+                # Entries don't block maintenance (they lead to it)
+                pass
+            continue
+
+        # 2. SECONDARY: Match by DB ID
+        if oid == db_tp_id:
+            has_my_tp = True
+            my_tp_order = o
+        elif oid in db_grid_ids:
+            has_my_grid = True
+            my_grid_ids.append(oid)
+
+    # 3. TERTIARY: Match by Price/Side (Legacy Phase 6 Support)
+    if not has_my_tp and not settings.get('MaximizeProfit', False) and target_tp_price > 0:
+        tp_side = 'sell' if direction == 'LONG' else 'buy'
+        for o in open_orders:
+            # Skip if already identified or owned by another bot (has a CQB tag)
+            if o.get('clientOrderId', '').startswith('CQB_'): continue
+            
+            if (normalize_symbol(o.get('symbol')) == normalize_symbol(pair) and 
+                o.get('side') == tp_side and 
+                abs(float(o.get('price') or 0) - target_tp_price) / target_tp_price < 0.001):
+                has_my_tp = True
+                my_tp_order = o
+                break
+                
+    return has_my_tp, my_tp_order, has_my_grid, my_grid_ids
+
+def _detect_config_drift(bot_name, direction, avg_entry_price, total_invested, has_my_tp, my_tp_order, has_my_grid, my_grid_ids, open_orders, settings, logger):
+    """Phase 6: Detects if exchange orders match current bot config."""
+    config_changed = False
+    reasons = []
+
+    # TP Drift Check
+    if has_my_tp and my_tp_order and not settings.get('MaximizeProfit', False):
+        current_tp_price = float(my_tp_order.get('price', 0) or 0)
+        expected_tp = _calculate_expected_tp(avg_entry_price, direction, total_invested, settings)
+        
+        if expected_tp > 0 and current_tp_price > 0:
+            drift = abs(expected_tp - current_tp_price) / expected_tp * 100
+            if drift > 0.1:
+                config_changed = True
+                reasons.append(f"TP {current_tp_price:.2f}→{expected_tp:.2f}")
+
+    # Grid Drift Check
+    if has_my_grid and my_grid_ids:
+        my_grid_order = next((o for o in open_orders if o.get('id') in my_grid_ids), None)
+        if my_grid_order:
+            current_grid_price = float(my_grid_order.get('price', 0) or 0)
+            spacing = float(settings.get('GridSpacing', 1.0)) / 100.0
+            expected_grid = avg_entry_price * (1.0 + spacing) if direction != 'LONG' else avg_entry_price * (1.0 - spacing)
+            
+            if expected_grid > 0 and current_grid_price > 0:
+                drift = abs(expected_grid - current_grid_price) / expected_grid * 100
+                if drift > 0.5:
+                    config_changed = True
+                    reasons.append(f"Grid {current_grid_price:.2f}→{expected_grid:.2f}")
+
+    if config_changed:
+        logger.info(f"📝 Config Change Detected for {bot_name}: {', '.join(reasons)}")
+    
+    return config_changed
+
+def _perform_tp_self_healing(bot_id, bot_name, direction, avg_entry_price, total_invested, current_step, target_tp_price, settings, logger):
+    """Restores Target TP if it becomes 0.00 (Self-Healing)."""
+    if current_step >= 0 and target_tp_price <= 0 and not settings.get('MaximizeProfit', False):
+        try:
+            logger.warning(f"🚑 Self-Healing: Restored Target TP for {bot_name}...")
+            healed_tp = _calculate_expected_tp(avg_entry_price, direction, total_invested, settings)
+            if healed_tp > 0:
+                from engine.database import update_trade_tp_price
+                update_trade_tp_price(bot_id, healed_tp)
+                return healed_tp
+        except Exception as e:
+            logger.error(f"Self-Healing Failed: {e}")
+    return target_tp_price
+
 def manage_trade(bot_id, bot_name, pair, direction, settings, trade_data, current_price, strategy, exchange_interface, open_orders=None):
-    """
-    Core trade management logic called by the runner.
-    trade_data: (name, pair, current_step, total_invested, avg_entry_price, target_tp_price, last_exit_price, last_exit_time, basket_start_time)
-    open_orders: Pre-fetched list of open orders from exchange (passed from process_bot for efficiency and consistency).
-    Returns: dict with missions for the runner to execute (e.g. {'action': 'TP', 'price': ...})
-    """
+    """Refactored core trade management logic."""
     import logging
-    from engine.database import get_bot_order_ids
-    from engine.exchange_interface import normalize_symbol
+    from engine.risk_manager import check_drawdown_reduction
     logger = logging.getLogger("TradeManager")
 
-    # Safety unpack (handle cases where tuple length varies during migration)
-    if len(trade_data) >= 8:
-        # Compatibility unpacking
-        # (name, pair, current_step, total_invested, avg_entry_price, target_tp_price, last_exit_price, last_exit_time, *basket_start)
-        _, _, _current_step, _total_invested, _avg_entry_price, _target_tp_price, _, _ = trade_data[:8]
-        
-        # Enforce type safety to prevent NoneType crashes in Logic
-        current_step = int(_current_step) if _current_step is not None else 0
-        total_invested = float(_total_invested) if _total_invested is not None else 0.0
-        avg_entry_price = float(_avg_entry_price) if _avg_entry_price is not None else 0.0
-        target_tp_price = float(_target_tp_price) if _target_tp_price is not None else 0.0
-    else:
-        return {'action': 'none'}
+    # 1. Unpack & Validate Trade Data
+    if len(trade_data) < 8: return {'action': 'none'}
+    _, _, current_step, total_invested, avg_entry_price, target_tp_price, _, _ = trade_data[:8]
     
-    # --- STRUCTURAL FIX (v0.6.1): Use Passed Snapshot & Strict ID Matching ---
-    # REMOVED duplicate fetch_open_orders call (was lines 203-214).
-    # Use pre-fetched `open_orders` for consistency.
-    # Check for THIS bot's orders using tracked IDs, not generic side matching.
+    current_step = int(current_step or 0)
+    total_invested = float(total_invested or 0.0)
+    avg_entry_price = float(avg_entry_price or 0.0)
+    target_tp_price = float(target_tp_price or 0.0)
+
+    # 2. Identify Bot Orders on Exchange
     force_maintain = False
     try:
         if open_orders is None:
-            # Fallback if not passed (e.g., direct call for testing)
             open_orders = exchange_interface.fetch_open_orders(pair) or []
-            logger.warning(f"manage_trade: open_orders not passed for {bot_name}, fetching (suboptimal).")
-
-        bot_order_ids = get_bot_order_ids(bot_id)
-        my_tp_id = bot_order_ids.get('tp_order_id')
-        my_grid_ids = [o.get('order_id') for o in bot_order_ids.get('grid_orders', []) if o.get('status') == 'open']
-
-        # Check: Does MY TP order exist on exchange?
-        has_my_tp = any(o.get('id') == my_tp_id for o in open_orders) if my_tp_id else False
-        # Check: Does MY Grid order exist?
-        has_my_grid = any(o.get('id') in my_grid_ids for o in open_orders) if my_grid_ids else False
-        
-        # Scenario: TP exists but ID mismatch (unlikely but possible if re-placed by hand)
-        # We perform a "fallback" check by price/side if ID isn't found
-        if not has_my_tp and not settings.get('MaximizeProfit', False):
-            tp_side = 'sell' if direction == 'LONG' else 'buy'
-            has_my_tp = any(
-                normalize_symbol(o.get('symbol')) == normalize_symbol(pair) and 
-                o.get('side') == tp_side and 
-                abs(float(o.get('price') or 0) - target_tp_price) / target_tp_price < 0.001 
-                for o in open_orders
-            )
-
-        # If EITHER is missing, we need to maintain (re-place) orders.
-        # Note: TP might be intentionally 0 if MaximizeProfit is active (trailing stop mode).
-        if not settings.get('MaximizeProfit', False):
-            force_maintain = not has_my_tp
-        force_maintain = force_maintain or not has_my_grid
-        
-        if force_maintain:
-            logger.info(f"🔧 Force Maintain for {bot_name}: My TP Found={has_my_tp}, My Grid Found={has_my_grid}")
-    except Exception as e:
-        logger.error(f"Error checking bot order IDs for {bot_name}: {e}")
-        force_maintain = True # Err on side of caution
-
-    # --- SELF-HEALING: Fix 0.00 Target TP (v0.6.3) ---
-    # If bot is in trade but Target TP is 0 (and not using Trailing Stop), we must recalculate it.
-    if current_step >= 0 and target_tp_price <= 0 and not settings.get('MaximizeProfit', False):
-        try:
-            logger.warning(f"🚑 Self-Healing: Detected 0.00 Target TP for {bot_name}. Recalculating...")
             
-            # Recalculate based on strategy settings
-            tp_type = settings.get('TakeProfitType', 'USD')
-            healed_tp = 0.0
-            
-            if tp_type == 'Percent':
-                tp_pct = settings.get('TakeProfitPct', 1.0) / 100.0
-                healed_tp = avg_entry_price * (1.0 + tp_pct) if direction == 'LONG' else avg_entry_price * (1.0 - tp_pct)
-            else:
-                target_usd = settings.get('TakeProfitBase', 10.0)
-                # Estimate qty
-                est_qty = total_invested / avg_entry_price if avg_entry_price > 0 else 0
-                if est_qty > 0:
-                    dist = target_usd / est_qty
-                    healed_tp = avg_entry_price + dist if direction == 'LONG' else avg_entry_price - dist
-            
-            if healed_tp > 0:
-                # Update DB immediately
-                from engine.database import update_trade_tp_price
-                update_trade_tp_price(bot_id, healed_tp)
-                target_tp_price = healed_tp # Use valid TP for this cycle
-                logger.info(f"✅ Self-Healing: Restored Target TP to {healed_tp:.4f}")
-                
-        except Exception as e:
-            logger.error(f"Self-Healing Failed: {e}")
-
-    # 1. Check Take Profit
-    effective_tp = target_tp_price
-    
-    # Early Exit Decay Logic
-    if settings.get('UseEarlyExit', False) and len(trade_data) > 8:
-        basket_start_time = trade_data[8]
-        if basket_start_time > 0:
-            import time
-            from datetime import datetime
-            
-            start_dt = datetime.fromtimestamp(basket_start_time)
-            now_dt = datetime.fromtimestamp(time.time())
-            
-            effective_tp = calculate_early_exit_decay(
-                basket_start_time=start_dt,
-                current_time=now_dt,
-                total_orders=current_step + 1,
-                initial_tp=target_tp_price,
-                break_even=avg_entry_price,
-                settings=settings
-            )
-            
-            if effective_tp < target_tp_price * 0.999:
-                logger.debug(f"EE: {bot_name} TP decayed from {target_tp_price} to {effective_tp}")
-
-    # --- TRAILING PROFIT LOGIC (Replaces Moving Profit) ---
-    maximize_profit = settings.get('MaximizeProfit', False)
-    tp_hit = False
-    is_trailing_exit = False
-    
-    if maximize_profit:
-        tp_hit, is_trailing_exit = _check_trailing_stop(
-            bot_id, bot_name, direction, current_price, 
-            target_tp_price, avg_entry_price, settings, logger
+        has_my_tp, my_tp_order, has_my_grid, my_grid_ids = _find_bot_orders(
+            bot_id, pair, direction, open_orders, target_tp_price, settings, logger
         )
 
-    # Standard TP Trigger (Only if NOT optimizing profit)
-    else:
-        if direction == 'LONG':
-            if current_price >= effective_tp: tp_hit = True
-        else:
-            if current_price <= effective_tp: tp_hit = True
+        # 3. Detect Config Drift (Phase 6)
+        config_changed = _detect_config_drift(
+            bot_name, direction, avg_entry_price, total_invested, 
+            has_my_tp, my_tp_order, has_my_grid, my_grid_ids, open_orders, settings, logger
+        )
         
+        # 4. Mandatory Sync Checks
+        if not settings.get('MaximizeProfit', False) and not has_my_tp: force_maintain = True
+        if not has_my_grid: force_maintain = True
+        if config_changed: force_maintain = True
+
+    except Exception as e:
+        logger.error(f"Sync error for {bot_name}: {e}")
+        force_maintain = True
+
+    # 5. Take Profit Calculation (EE & Self-Healing)
+    target_tp_price = _perform_tp_self_healing(
+        bot_id, bot_name, direction, avg_entry_price, total_invested, current_step, target_tp_price, settings, logger
+    )
+    
+    effective_tp = target_tp_price
+    if settings.get('UseEarlyExit', False) and len(trade_data) > 8:
+        import time
+        from datetime import datetime
+        start_dt = datetime.fromtimestamp(trade_data[8])
+        now_dt = datetime.fromtimestamp(time.time())
+        effective_tp = calculate_early_exit_decay(
+            start_dt, now_dt, current_step + 1, target_tp_price, avg_entry_price, settings
+        )
+
+    # 6. Evaluate TP Trigger
+    tp_hit = False
+    is_trailing_exit = False
+    if settings.get('MaximizeProfit', False):
+        tp_hit, is_trailing_exit = _check_trailing_stop(
+            bot_id, bot_name, direction, current_price, target_tp_price, avg_entry_price, settings, logger
+        )
+    else:
+        if direction == 'LONG': tp_hit = (current_price >= effective_tp)
+        else: tp_hit = (current_price <= effective_tp)
+
+    # 7. Execute TP Mission
     if tp_hit:
-        reason = "Trailing Stop" if is_trailing_exit else "Take Profit Target"
-        logger.info(f"{reason} Hit for {bot_name}! Signal to close at {current_price}")
         est_qty = total_invested / avg_entry_price if avg_entry_price > 0 else 0
         pnl = (current_price - avg_entry_price) * est_qty if direction == 'LONG' else (avg_entry_price - current_price) * est_qty
         
-        # CLEAR Locked ATR on exit
+        # Cleanup metadata
         try:
              from engine.database import update_bot_config_value
              update_bot_config_value(bot_id, 'locked_atr', None)
         except: pass
         
         return {
-            'action': 'tp_hit',
-            'bot_id': bot_id, 'bot_name': bot_name, 'pair': pair,
-            'direction': direction, 'exit_price': current_price,
-            'qty': est_qty, 'pnl': pnl, 'current_step': current_step,
-            'avg_entry_price': avg_entry_price, 'total_invested': total_invested
+            'action': 'tp_hit', 'bot_id': bot_id, 'bot_name': bot_name, 'pair': pair,
+            'direction': direction, 'exit_price': current_price, 'qty': est_qty, 'pnl': pnl, 
+            'current_step': current_step, 'avg_entry_price': avg_entry_price, 'total_invested': total_invested
         }
 
-    # 2. Check Next Martingale Grid Order
+    # 8. Grid Maintenance
     max_steps = int(settings.get('max_steps', 10))
-    grid_mission_active = current_step < max_steps
-    
-    # Initialize defaults to prevent UnboundLocalError on exception
+    grid_active = current_step < max_steps
     grid_price, grid_qty, grid_step, grid_amount_usd = None, 0, 0, 0
-    next_order_price, new_avg, new_tp = 0, avg_entry_price, 0
+    new_avg, new_tp = avg_entry_price, 0
 
-    try:
-        if grid_mission_active:
-            # Fetch Last Grid Price for Incremental Calculation
-            # (Allows Spacing from Last Order instead of Avg)
-            last_grid_price = 0.0
-            try:
-                from engine.database import get_last_filled_order
-                last_fill = get_last_filled_order(bot_id)
-                if last_fill: last_grid_price = float(last_fill['price'])
-            except Exception as e:
-                logger.warning(f"Failed to fetch last grid price: {e}")
-
-            # Load locked ATR from settings (persistence)
+    if grid_active:
+        try:
+            # Persistent ATR
             saved_atr = settings.get('locked_atr')
-            if saved_atr:
-                strategy.locked_atr = float(saved_atr)
+            if saved_atr: strategy.locked_atr = float(saved_atr)
 
-            next_order_price = strategy.calculate_next_grid_price(
+            # Last Fill Check (Incremental Spacing)
+            last_p = 0.0
+            from engine.database import get_last_filled_order
+            last_f = get_last_filled_order(bot_id)
+            if last_f: last_p = float(last_f['price'])
+
+            grid_price = strategy.calculate_next_grid_price(
                 direction, current_price, avg_entry_price, current_step, 
-                strategy.last_market_data if hasattr(strategy, 'last_market_data') else None,
-                last_grid_price=last_grid_price
+                getattr(strategy, 'last_market_data', None), last_grid_price=last_p
             )
             
-            # Persist Locked ATR if newly locked
+            # Persist ATR
             if strategy.locked_atr and strategy.locked_atr != saved_atr:
                 from engine.database import update_bot_config_value
                 update_bot_config_value(bot_id, 'locked_atr', strategy.locked_atr)
-                logger.info(f"🔒 Locked ATR for {bot_name}: {strategy.locked_atr:.4f}")
             
-            next_step = current_step + 1
-            added_investment = strategy.calculate_lot_size(next_step, 0)
-            new_total = total_invested + added_investment
-            new_avg = (avg_entry_price * total_invested + next_order_price * added_investment) / new_total
+            grid_step = current_step + 1
+            grid_amount_usd = strategy.calculate_lot_size(grid_step, 0, market_data=getattr(strategy, 'last_market_data', None))
+            grid_qty = grid_amount_usd / grid_price if grid_price > 0 else 0
             
-            logger.info(f"DEBUG_GRID: Step {next_step} | Price: {next_order_price} | Qty: {added_investment/next_order_price:.4f} | ATR: {strategy.locked_atr}")
+            new_total = total_invested + grid_amount_usd
+            new_avg = (avg_entry_price * total_invested + grid_price * grid_amount_usd) / new_total
+            new_tp = _calculate_expected_tp(new_avg, direction, new_total, settings)
 
-            try:
-                from engine.database import log_trade
-                log_trade(bot_id, 'DEBUG_LOG', pair, next_order_price, 0, 0, "GRID_CALC", next_step, 0, f"Grid Calc: {next_order_price:.4f}")
-            except: pass
-            
-            grid_price, grid_qty, grid_step, grid_amount_usd = next_order_price, added_investment / next_order_price, next_step, added_investment
-        else:
-            next_order_price, new_avg = 0, avg_entry_price
-            grid_price, grid_qty, grid_step, grid_amount_usd = None, 0, 0, 0
+        except Exception as e:
+            logger.error(f"Grid calculation error for {bot_name}: {e}")
 
-        # Calculate TP
-        tp_type = settings.get('TakeProfitType', 'USD')
-        if tp_type == 'Percent':
-            tp_pct = settings.get('TakeProfitPct', 1.0) / 100.0
-            new_tp = new_avg * (1.0 + tp_pct) if direction == 'LONG' else new_avg * (1.0 - tp_pct)
-        else:
-            target_usd = settings.get('TakeProfitBase', 10.0)
-            est_qty = total_invested / avg_entry_price if avg_entry_price > 0 else 0
-            if grid_mission_active: 
-                hypo_total = total_invested + strategy.calculate_lot_size(current_step + 1, 0)
-                est_qty = hypo_total / new_avg
-            if est_qty > 0:
-                dist = target_usd / est_qty
-                new_tp = new_avg + dist if direction == 'LONG' else new_avg - dist
-            else: new_tp = 0
+    # 9. Check Hedge
+    drawdown_pc = 0.0
+    if avg_entry_price > 0:
+        if direction == 'LONG': drawdown_pc = (avg_entry_price - current_price) / avg_entry_price * 100
+        else: drawdown_pc = (current_price - avg_entry_price) / avg_entry_price * 100
 
-        # MISSION: MAINTAIN ORDERS
-        # If force_maintain is True (orders missing on exchange), we trigger the mission
-        
-        tp_limit_price = effective_tp
-        # If Trailing Profit is active, we do NOT want a physical Limit TP order.
-        # We handle exit via the "Smart Chase" trigger in Logic Block 1.
-        if settings.get('MaximizeProfit', False):
-            tp_limit_price = 0.0
-            
+    hedge_trigger = check_hedge_entry(drawdown_pc, current_step, settings)
+    if hedge_trigger:
+        hedge_size = total_invested * hedge_trigger.get('size_mult', 1.0)
+        logger.warning(f"🛡️ Bot {bot_name} - HEDGE TRIGGERED! Size: ${hedge_size} at {current_price}")
         return {
-            'action': 'maintain_orders',
-            'bot_id': bot_id, 'bot_name': bot_name, 'pair': pair,
-            'direction': direction, 'current_price': current_price,
-            'grid_price': grid_price, 'grid_step': grid_step,
-            'grid_amount_usd': grid_amount_usd, 'grid_qty': grid_qty,
-            'tp_price': tp_limit_price,
-            'tp_qty': total_invested / avg_entry_price if avg_entry_price > 0 else 0,
-            'future_avg': new_avg, 'future_tp': new_tp
+            'action': 'hedge_open', 'bot_id': bot_id, 'bot_name': bot_name, 'pair': pair,
+            'direction': direction, 'price': current_price, 'amount_usd': hedge_size,
+            'qty': hedge_size / current_price if current_price > 0 else 0,
+            'step': current_step, 'drawdown_pct': drawdown_pc
         }
+        
+    # 9b. Check Drawdown Reduction (Phase 10.2)
+    dd_limit = float(settings.get('MaxDrawdownPct', 0.0))
+    if dd_limit > 0:
+        dd_red_action = check_drawdown_reduction(drawdown_pc, dd_limit)
+        if dd_red_action:
+             return {
+                'action': 'reduce_position', 'bot_id': bot_id, 'bot_name': bot_name, 'pair': pair,
+                'direction': direction, 'factor': dd_red_action['factor'], 
+                'reason': dd_red_action['reason'], 'current_qty': total_invested / avg_entry_price if avg_entry_price > 0 else 0
+             }
 
-            
-    except Exception as e:
-        logger.error(f"Error checking grid for {bot_name}: {e}")
-        try:
-            from engine.database import log_trade
-            log_trade(bot_id, 'DEBUG_ERR', pair, 0, 0, 0, "GRID_CALC_ERR", current_step, 0, str(e))
-        except: pass
+    # 10. Final Mission Dispatch
+    return {
+        'action': 'maintain_orders',
+        'bot_id': bot_id, 'bot_name': bot_name, 'pair': pair,
+        'direction': direction, 'current_price': current_price,
+        'grid_price': grid_price, 'grid_step': grid_step,
+        'grid_amount_usd': grid_amount_usd, 'grid_qty': grid_qty,
+        'tp_price': 0.0 if settings.get('MaximizeProfit') else effective_tp,
+        'tp_qty': total_invested / avg_entry_price if avg_entry_price > 0 else 0,
+        'future_avg': new_avg, 'future_tp': new_tp
+    }
+
 
     # 3. Check Hedge
     drawdown_pc = 0.0
