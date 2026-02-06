@@ -56,6 +56,19 @@ def handle_order_update(event: Dict):
         bot_id = int(parts[1])
         order_type = parts[2]  # ENTRY, TP, GRID
         
+        # FUNDAMENTAL SAFETY CHECK: Is Bot Active?
+        # If we process a fill for an inactive bot, we might trigger new orders (Grid/TP)
+        from engine.database import get_connection
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT is_active FROM bots WHERE id = ?", (bot_id,))
+        row = cursor.fetchone()
+        conn.close()
+        
+        if not row or not row[0]:
+            logger.warning(f"⛔ WS IGNORING Event for INACTIVE Bot {bot_id} (ClientID: {client_id})")
+            return
+        
         if status == 'FILLED':
             _handle_order_filled(bot_id, order_type, event)
         elif status == 'CANCELED':
@@ -114,10 +127,10 @@ def _handle_order_filled(bot_id: int, order_type: str, event: Dict):
                 
                 update_martingale_step(
                     bot_id, 
-                    step=current_step + 1,
-                    total_invested=new_invested,
-                    avg_entry_price=new_avg
-                )
+                    current_step + 1,
+                    new_invested,
+                    new_avg,
+                    new_avg * 1.015  # Recalculate TP
                 )
                 log_trade(bot_id, 'WS_GRID_FILL', symbol, avg_price, filled_qty, 0, "GRID", current_step + 1)
                 add_notification('info', f"📉 Grid Fill for {symbol} (Step {current_step+1})", bot_id)
@@ -130,10 +143,10 @@ def _handle_order_filled(bot_id: int, order_type: str, event: Dict):
         try:
             update_martingale_step(
                 bot_id,
-                step=0,
-                total_invested=avg_price * filled_qty,
-                avg_entry_price=avg_price
-            )
+                0,
+                avg_price * filled_qty,
+                avg_price,
+                avg_price * 1.015  # Initial TP
             )
             log_trade(bot_id, 'WS_ENTRY_FILL', symbol, avg_price, filled_qty, 0, "ENTRY")
             add_notification('info', f"🚀 Entry Fill for {symbol}", bot_id)

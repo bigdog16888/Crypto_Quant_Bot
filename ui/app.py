@@ -53,7 +53,7 @@ st.markdown("""
         --shadow-sm: 0 1px 3px rgba(31, 35, 40, 0.12);
         --shadow-md: 0 3px 6px rgba(140, 149, 159, 0.15);
     }
-
+    
     /* Main App Background */
     .stApp {
         background-color: var(--bg-color);
@@ -81,7 +81,7 @@ st.markdown("""
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
         font-weight: 600;
     }
-
+    
     /* --- TABS --- */
     .stTabs [data-baseweb="tab-list"] {
         gap: 8px;
@@ -104,7 +104,7 @@ st.markdown("""
         background-color: var(--card-bg);
         color: var(--accent-color);
         border: 1px solid var(--border-color);
-        border-bottom: 1px solid var(--card-bg); /* Blend with container */
+        border-bottom: 1px solid var(--card-bg);
         position: relative;
         top: 1px;
     }
@@ -139,7 +139,7 @@ st.markdown("""
     /* --- METRICS --- */
     div[data-testid="stMetricValue"] {
         font-size: 1.8rem;
-        color: var(--text-primary) !important; /* Force black/dark */
+        color: var(--text-primary) !important;
         font-weight: 600;
     }
     
@@ -148,7 +148,6 @@ st.markdown("""
         font-size: 0.9rem;
     }
     
-    /* Specific fix for metric deltas to ensure they are visible */
     [data-testid="stMetricDelta"] {
         background-color: rgba(0,0,0,0.03);
         padding: 2px 6px;
@@ -244,7 +243,7 @@ st.markdown("""
 
     /* Monitor View: Status Ribbon */
     .status-ribbon {
-        background-color: #ffffff; /* Explicit white to pop from grey bg */
+        background-color: #ffffff;
         border-left: 4px solid var(--accent-color);
         padding: 15px 25px;
         margin-bottom: 25px;
@@ -282,7 +281,7 @@ st.markdown("""
         text-align: center;
         transition: all 0.2s ease;
         box-shadow: var(--shadow-sm);
-        cursor: pointer; /* Implies interactive */
+        cursor: pointer;
     }
     
     .strat-card:hover {
@@ -309,7 +308,6 @@ st.markdown("""
     }
     </style>
     """, unsafe_allow_html=True)
-
 
 
 # Sidebar - Global Settings
@@ -485,14 +483,19 @@ else:
 with st.sidebar:
     st.markdown("---")
     st.subheader("Navigation")
-    # Using radio for explicit page selection
-    selected_page = st.radio(
-        "Go to", 
-        ["📊 Live Monitor", "🏗️ Bot Creator", "🛠️ Bot Manager", "📈 Analytics"], 
-        index=0,
-        label_visibility="collapsed"
-    )
-
+    
+    # Handle auto-navigation requests from other views
+    if '_nav_to_monitor' in st.session_state and st.session_state['_nav_to_monitor']:
+        selected_page = "📊 Live Monitor"
+        del st.session_state['_nav_to_monitor']
+    else:
+        selected_page = st.radio(
+            "Go to", 
+            ["📊 Live Monitor", "🏗️ Bot Creator", "🛠️ Bot Manager", "📈 Analytics"], 
+            index=0,
+            label_visibility="collapsed"
+        )
+    
 # Render ONLY the selected page
 # Use containers to ensure clean DOM separation between views
 main_container = st.container()

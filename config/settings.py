@@ -28,6 +28,7 @@ class Config:
         API_SECRET = os.getenv("BINANCE_API_SECRET", "")
 
     DRY_RUN = os.getenv("DRY_RUN", "False").lower() == "true"
+    TRADING_ENABLED = os.getenv("TRADING_ENABLED", "True").lower() == "true"
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
     # Support both SPOT (for USDC pairs) and FUTURES (for USDT pairs)

@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 
 sys.path.append(os.getcwd())
 
-from engine.reconciliation import StateReconciler, PositionOwner, ReconciliationAction
+from engine.reconciler import StateReconciler, PositionOwner, ReconciliationAction
 
 class MockBot:
     def __init__(self, bot_id, name, pair, in_trade):
@@ -21,7 +21,7 @@ class MockPosition:
         self.entry_price = entry_price
 
 class TestOrphanLogic(unittest.TestCase):
-    @patch('engine.reconciliation.logger')
+    @patch('engine.reconciler.logger')
     def test_reconcile_bot_orphan(self, mock_logger):
         reconciler = StateReconciler()
         

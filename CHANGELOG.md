@@ -1,5 +1,36 @@
 # Changelog - Crypto Quant Bot
 
+## [0.9.1] - 2026-02-05
+
+### 🛡️ Major Stability & Self-Healing Update
+This release addresses critical production issues regarding order duplication and bot "amnesia" (state desync), introducing the first fundamental self-healing capabilities to the core engine.
+
+### ✨ New Features
+
+#### Phase 11: Fundamental Self-Healing (Smart Adoption)
+- **DeepReconciler Upgrade** (`engine/reconciler.py`)
+  - Added `_reconcile_positions()`: Automatically detects orphan positions on the exchange (where Bot state is IDLE but Position exists).
+  - New **Smart Adoption** logic: Validates ownership of orphan positions via local `bot_orders` history before re-adoption.
+  - Automatically restores DB state (Step, Investment, Entry) upon detection, allowing the bot to resume managing the trade without manual intervention.
+  
+#### Deterministic Order IDs V2 (`engine/bot_executor.py`)
+- **Robust ID Generation**: Replaced random/time-based ID components with strictly deterministic indices.
+- **Forced Integer Casting**: Hardened `_gen_id_v2` to prevent hexadecimal string pollution in Client Order IDs, ensuring reliable exchange de-duplication.
+- **System-Wide Alignment**: Applied V2 IDs across Entry, TP, and Grid order types.
+
+### 🧹 Maintenance & Sanitation
+- **Database Purge**: Removed ~89,000 redundant `DEBUG_LOG` entries from `trade_history` to restore UI performance and history clarity.
+- **Legacy Order Migration**: Automated logic to identify and cancel legacy non-deterministic orders, allowing the bots to replace them with conformant V2 orders.
+- **Diagnostics Cleanup**: Purged over 8 development/diagnostic scripts from the root directory to sanitize the production environment.
+
+### 🐛 Bug Fixes
+- **The "Amnesia" Bug**: Resolved issue where cancelling malformed orders caused bots to permanently lose track of active positions.
+- **Order Spam/Time Bug**: Fixed generation of new IDs every second which caused the exchange to accept multiple duplicate orders.
+- **Grid ID Corruption**: Fixed a bug where `grid_step` was being incorrectly cast, leading to malformed IDs that UI filters would ignore.
+
+---
+
+
 ## [0.9.0] - 2026-02-04
 
 ### 🎉 Major Release: Advanced Analytics & Risk Management

@@ -1,7 +1,18 @@
-    def execute_entry(self, bot_id, name, pair, side, amount, price=None, params={}):
         """
         Place the first order and initialize the trade in DB.
         """
+        # DEFENSE IN DEPTH: Check if bot is active
+        from engine.database import get_connection
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT is_active FROM bots WHERE id = ?", (bot_id,))
+        row = cursor.fetchone()
+        conn.close()
+        
+        if not row or not row[0]:
+             logger.error(f"⛔ STOP: Refusing ENTRY for inactive bot {bot_id} ({name})")
+             return
+
         logger.info(f"[ENTRY] Bot: {name} | Side: {side} | Amount: ${amount}")
         
         # Validated Create Order

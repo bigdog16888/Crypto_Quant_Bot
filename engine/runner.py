@@ -16,7 +16,7 @@ from engine.strategies.martingale_strategy import MartingaleStrategy
 from engine.manager import manage_trade
 from engine.bot_executor import BotExecutor
 from engine.metrics import MetricsServer, BOT_CYCLE_TIME
-from engine.reconciliation import sync_all_bots
+from engine.reconciler import sync_all_bots
 from engine.ownership import (
     init_ownership_tables, OwnershipState, OwnershipEvent,
     claim_ownership, become_passenger, handle_position_closed,
@@ -92,6 +92,9 @@ class BotRunner:
         
         self.last_order_reset = time.time()
         
+        # LAYER 3 FIX: Cycle counter for periodic reconciliation
+        self.cycle_count = 0
+        
         logger.info("DEBUG: Initializing Safety Baseline...")
         self._initialize_safety_baseline()
         
@@ -100,8 +103,24 @@ class BotRunner:
             logger.info("DEBUG: Starting Startup Sync...")
             self.sync_all_bots()
             logger.info("DEBUG: Startup Sync Complete")
+
+            # --- FUNDAMENTAL FIX: CLEANUP INACTIVE TRADES ---
+            # Ensure no database zombies exist from previous crashes
+            try:
+                from engine.database import check_and_fix_integrity
+                check_and_fix_integrity()
+            except Exception as e:
+                logger.error(f"Startup integrity check failed: {e}")
+
         except Exception as e:
             logger.error(f"Failed to sync bots on startup (non-fatal): {e}")
+        
+        # Safe Monitor Mode: Disable execution if flag is False
+        self.trading_enabled = getattr(config, 'TRADING_ENABLED', False)
+        if not self.trading_enabled:
+            logger.warning("🛡️ SAFE MONITOR MODE ACTIVE: Trading logic will run but orders are BLOCKED.")
+        else:
+            logger.info("🚀 TRADING MODE ACTIVE: Full order execution enabled.")
 
     def _initialize_exchanges(self):
         """
@@ -142,12 +161,13 @@ class BotRunner:
                     logger.error(f"❌ Failed to initialize {m_type} exchange: {e}")
                     # Continue - don't crash engine just because one market failed
 
-            # 3. Deep Reconciliation (Auto-Healing)
+            # 3. Deep Reconciliation (Auto-Healing & Smart Adoption)
             # Must run AFTER exchanges are up but BEFORE bots start processing.
+            from engine.reconciler import DeepReconciler
+            reconciler = None
             try:
-                from engine.reconciler import DeepReconciler
                 reconciler = DeepReconciler(self.exchanges)
-                reconciler.run()
+                reconciler.run() # Triggers Phase 6 Smart Adoption
             except Exception as e:
                 logger.error(f"Failed to run Deep Reconciliation: {e}")
             
@@ -168,13 +188,15 @@ class BotRunner:
             # Check if any orders filled while bot was offline.
             try:
                 # Offline fills need to be checked per exchange
-                for m_type, ex in self.exchanges.items():
-                    if ex:
-                        offline_stats = reconciler.detect_offline_fills(ex, since_hours=48)
-                        if offline_stats['grid_fills'] + offline_stats['tp_fills'] + offline_stats['entry_fills'] > 0:
-                            logger.info(f"📋 Offline Fills ({m_type}): {offline_stats['entry_fills']} entries, {offline_stats['grid_fills']} grids, {offline_stats['tp_fills']} TPs")
+                if reconciler:
+                    for m_type, ex in self.exchanges.items():
+                        if ex:
+                            offline_stats = reconciler.detect_offline_fills(ex, since_hours=48)
+                            if offline_stats['grid_fills'] + offline_stats['tp_fills'] + offline_stats['entry_fills'] > 0:
+                                logger.info(f"📋 Offline Fills ({m_type}): {offline_stats['entry_fills']} entries, {offline_stats['grid_fills']} grids, {offline_stats['tp_fills']} TPs")
             except Exception as e:
                 logger.error(f"Failed to detect offline fills: {e}")
+
             
             # 6. WebSocket Stream Startup (Phase 7)
             # Start real-time order updates to replace polling
@@ -241,16 +263,21 @@ class BotRunner:
 
             # 2. Bulk fetch positions from exchange to know truth
             has_position_map = {}
-            try:
-                # Use exchange_interface wrapper method for batching
-                all_positions = self.exchange.fetch_positions()
-                for p in all_positions:
-                    size = float(p.get('contracts', 0) or p.get('size', 0) or 0)
-                    if size != 0:
-                        has_position_map[p['symbol']] = True
-            except Exception as e:
-                logger.error(f"Reconciliation halted: Failed to fetch positions: {e}")
+            if self.exchange:
+                try:
+                    # Use exchange_interface wrapper method for batching
+                    all_positions = self.exchange.fetch_positions()
+                    for p in all_positions:
+                        size = float(p.get('contracts', 0) or p.get('size', 0) or 0)
+                        if size != 0:
+                            has_position_map[p['symbol']] = True
+                except Exception as e:
+                    logger.error(f"Reconciliation halted: Failed to fetch positions: {e}")
+                    return
+            else:
+                logger.warning("No default exchange initialized. Skipping position fetch for ownership reconciliation.")
                 return
+
 
             # 3. Reconcile each pair
             for pair in pairs:
@@ -441,9 +468,11 @@ class BotRunner:
         # 1. Global Optimization: Fetch Snapshots once per cycle
         # This fills the ExchangeInterface internal generic cache
         exchange_snapshot = {}
+        bots = []
         try:
             logger.info("DEBUG: Cycle Start - Fetching Bots")
             bots = self.get_active_bots()
+
             active_market_types = set()
             for bot in bots:
                 config_json = bot[5]
@@ -497,6 +526,24 @@ class BotRunner:
             # Process bots using the primed cache
             results = list(executor.map(lambda b: bot_executor.process_bot(b, exchange_snapshot=exchange_snapshot), bots))
         
+        # ============================================================
+        # LAYER 3 FIX: Periodic Position Reconciliation
+        # ============================================================
+        # Runs every ~60 cycles (~5 minutes at 5s intervals)
+        # Catches any state desyncs that slipped through Layers 1 and 2
+        # ============================================================
+        self.cycle_count += 1
+        if self.cycle_count % 60 == 0:
+            try:
+                from engine.reconciler import StateReconciler
+                reconciler = StateReconciler(self.exchanges)
+                for mt, ex in self.exchanges.items():
+                    if ex:
+                        reconciler._reconcile_positions(mt, ex)
+                logger.info("🔄 Periodic position reconciliation complete")
+            except Exception as e:
+                logger.warning(f"Periodic reconciliation failed: {e}")
+        
         # Ownership reconciliation: Check for owner failover and stale ownerships
         # logger.debug("Starting ownership reconciliation...")
         self._reconcile_ownership()
@@ -526,6 +573,10 @@ class BotRunner:
             mt = config_dict.get('market_type', config.MARKET_TYPE)
             ex = self.exchanges.get(mt, self.exchange)
             
+            if not ex:
+                logger.error(f"Cannot liquidate {name}: No exchange interface available")
+                continue
+
             try:
                 ex.cancel_all_orders(pair)
                 
@@ -561,6 +612,7 @@ class BotRunner:
                         logger.error(f"Failed to fetch positions for {pair}: {pos_err}")
                         
             except Exception as e: logger.error(f"Cleanup failed for {name}: {e}")
+
 
 if __name__ == "__main__":
     init_db()
@@ -601,6 +653,7 @@ if __name__ == "__main__":
     from engine.websocket_server import WebSocketServer
     
     # Start WebSocket Server
+    ws_server = None
     try:
         ws_server = WebSocketServer(port=8765)
         ws_server.start()
@@ -618,18 +671,20 @@ if __name__ == "__main__":
             result = runner.run_cycle()
             
             # Broadcast State via WebSocket
-            try:
-                from engine.database import get_all_bots
-                bots = get_all_bots()
-                # Serialize and broadcast
-                payload = {
-                    "type": "update",
-                    "timestamp": time.time(),
-                    "bots": bots
-                }
-                ws_server.broadcast(payload)
-            except Exception as wse:
-                 logger.error(f"WS Broadcast Error: {wse}")
+            if ws_server:
+                try:
+                    from engine.database import get_all_bots
+                    bots = get_all_bots()
+                    # Serialize and broadcast
+                    payload = {
+                        "type": "update",
+                        "timestamp": time.time(),
+                        "bots": bots
+                    }
+                    ws_server.broadcast(payload)
+                except Exception as wse:
+                     logger.error(f"WS Broadcast Error: {wse}")
+
 
             if result is False: break
             

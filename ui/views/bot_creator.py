@@ -39,6 +39,38 @@ def fetch_ohlcv_cached(market_type, symbol, timeframe, limit=100):
     except Exception: return []
 # ------------------------------------
 
+def validate_bot_config(name, pair, base_size, martingale_multiplier):
+    """Validate bot configuration before submission."""
+    errors = []
+    warnings = []
+    
+    # Required field validation
+    if not name or len(name.strip()) == 0:
+        errors.append("Bot Name is required")
+    
+    if not pair:
+        errors.append("Trading Pair is required")
+    
+    # Numeric validation
+    try:
+        if float(base_size) <= 0:
+            errors.append("Base Order Size must be greater than 0")
+        elif float(base_size) < 5:
+            warnings.append(f"Base Order Size ${base_size} is below recommended minimum ($5)")
+    except (ValueError, TypeError):
+        errors.append("Base Order Size must be a valid number")
+    
+    try:
+        if float(martingale_multiplier) <= 1:
+            errors.append("Martingale Multiplier must be greater than 1")
+        elif float(martingale_multiplier) > 10:
+            warnings.append(f"Martingale Multiplier {martingale_multiplier}x is very aggressive")
+    except (ValueError, TypeError):
+        errors.append("Martingale Multiplier must be a valid number")
+    
+    return errors, warnings
+
+
 def render_bot_creator_view():
     st.header("🏗️ Strategy & Bot Creator")
     st.caption("Configure and launch new trading bots with advanced martingale and confluence logic.")
@@ -603,10 +635,28 @@ def render_bot_creator_view():
         except Exception as e:
             st.error(f"Projection Error: {e}")
         # ------------------------------
-
-        submitted = st.form_submit_button("Deploy Bot", type="primary")
+        
+        # Validation feedback
+        errors, warnings = validate_bot_config(name, pair, base_size, martingale_multiplier)
+        
+        # Display warnings inline
+        for warning in warnings:
+            st.warning(f"⚠️ {warning}")
+        
+        submitted = st.form_submit_button(
+            "Deploy Bot", 
+            type="primary",
+            disabled=len(errors) > 0
+        )
+        
+        # Show errors if button is disabled
+        if len(errors) > 0:
+            for error in errors:
+                st.error(f"🚫 {error}")
+            if submitted:
+                st.info("Please fix the errors above before deploying.")
     
-    if submitted:
+    if submitted and len(errors) == 0:
         if not name:
             st.error("🚨 Bot Name is required.")
         else:
@@ -638,5 +688,14 @@ def render_bot_creator_view():
             if bot_id:
                 st.success(f"Bot '{name}' deployed successfully! (ID: {bot_id})")
                 st.info(f"Deployed on {market_type} - {pair} using {strategy_type} ({timeframe})")
+                
+                # Navigate to Monitor button
+                col_nav1, col_nav2 = st.columns([1, 4])
+                with col_nav1:
+                    if st.button("📊 View in Monitor", type="primary", use_container_width=True):
+                        st.session_state['_nav_to_monitor'] = True
+                        st.rerun()
+                with col_nav2:
+                    st.caption("Go to Live Monitor to see your bot running")
             else:
                 st.error(f"Failed to deploy bot. Name '{name}' might already exist.")

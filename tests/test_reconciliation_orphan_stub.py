@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 
 sys.path.append(os.getcwd())
 
-from engine.reconciliation import StateReconciler, PositionOwner, ReconciliationAction, ReconciliationResult
+from engine.reconciler import StateReconciler, PositionOwner, ReconciliationAction, ReconciliationResult
 
 class MockBot:
     def __init__(self, bot_id, name, pair, in_trade):
@@ -50,7 +50,7 @@ class TestOrphanLogic(unittest.TestCase):
         # I need to mock determine_position_ownership or just pass the 'owner_status' correctly if reconcile_bot calculates it.
         pass
 
-    @patch('engine.reconciliation.logger')
+    @patch('engine.reconciler.logger')
     def test_reconcile_bot_orphan(self, mock_logger):
         reconciler = StateReconciler()
         

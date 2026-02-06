@@ -158,6 +158,13 @@ class ExchangeInterface:
                 self.exchange.load_markets()
                 self.markets_loaded = True
                 
+                # Sync clock with exchange server (prevents -1021 timestamp errors)
+                try:
+                    self.exchange.load_time_difference()
+                    self.logger.debug("✅ Time synced with exchange server")
+                except Exception as ts_err:
+                    self.logger.warning(f"⚠️ Time sync failed (will retry): {ts_err}")
+                
                 # Update cache
                 _markets_cache[cache_key] = self.exchange.markets
                 _markets_cache_timestamp[cache_key] = current_time
@@ -398,6 +405,26 @@ class ExchangeInterface:
         # Tag format: CQB_{bot_id}_{type}_{short_uuid}
         # This allows us to identify bot orders during reconciliation.
         if bot_id is not None:
+            # FUNDAMENTAL SAFETY: Is Bot Active?
+            try:
+                # Local import to prevent circular dependency
+                from engine.database import get_connection
+                conn = get_connection()
+                cursor = conn.cursor()
+                cursor.execute("SELECT is_active FROM bots WHERE id = ?", (bot_id,))
+                row = cursor.fetchone()
+                # We don't close conn here if it's thread-local, but for safety in this scope:
+                # proper usage of get_connection usually doesn't require explicit close if pooled, 
+                # but let's be safe and just fetch.
+                
+                if not row or not row[0]:
+                    self.logger.critical(f"⛔ API BLOCKED: Attempted create_order for INACTIVE bot {bot_id}")
+                    return None
+            except Exception as e:
+                self.logger.error(f"Failed to verify bot active status in create_order: {e}")
+                # Fail open or closed? Closed is safer for zombies.
+                return None
+
             import uuid
             short_uuid = str(uuid.uuid4())[:8]
             o_type_tag = order_type or 'ORDER'

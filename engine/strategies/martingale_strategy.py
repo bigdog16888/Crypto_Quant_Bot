@@ -805,9 +805,56 @@ class MartingaleStrategy(BaseStrategy):
         if mode_corr == 0:
             return True
             
-        # We need benchmark data... currently Strategy class receives SINGLE pair data.
-        # This requires the Engine to pass in benchmark data or Strategy to fetch it.
-        # Limitation: Strategy currently isolated. 
-        # For now, return True logic placeholder until Engine supports multi-symbol feed to strategy.
-        return True
+        # Check if benchmark data is available in market_data
+        # For now, check if 'symbol' column exists or if we have multi-pair data
+        has_benchmark = (
+            isinstance(market_data, pd.DataFrame) and 
+            'symbol' in market_data.columns and 
+            benchmark_symbol in market_data['symbol'].values
+        )
+        
+        if not has_benchmark:
+            logger.warning(
+                f"[CORRELATION] Correlation filtering enabled (mode={mode_corr}) but benchmark data "
+                f"({benchmark_symbol}) not available in market_data. "
+                f"Returning True. Note: This feature requires Engine to pass multi-symbol data."
+            )
+            return True
+        
+        # Calculate correlation with benchmark
+        try:
+            pair_data = market_data[market_data['symbol'] == self.params.get('symbol', '')]['close']
+            benchmark_data = market_data[market_data['symbol'] == benchmark_symbol]['close']
+            
+            if len(pair_data) == 0 or len(benchmark_data) == 0:
+                logger.warning("[CORRELATION] Missing price data for correlation calculation")
+                return True
+            
+            # Align timestamps and calculate correlation of returns
+            returns = pair_data.pct_change().dropna()
+            benchmark_returns = benchmark_data.pct_change().dropna()
+            
+            # Align the series
+            common_idx = returns.index.intersection(benchmark_returns.index)
+            if len(common_idx) < 10:  # Need at least 10 data points
+                logger.warning("[CORRELATION] Insufficient overlapping data points")
+                return True
+                
+            correlation = returns.loc[common_idx].corr(benchmark_returns.loc[common_idx])
+            threshold = self.params.get('correlation_threshold', 0.5)
+            
+            if mode_corr == 1:  # Positive correlation > X
+                allow = correlation > threshold
+            elif mode_corr == 2:  # Negative/low correlation < X  
+                allow = correlation < threshold
+            else:
+                allow = True
+                
+            logger.info(f"[CORRELATION] Pair={self.params.get('symbol')[:10]} benchmark={benchmark_symbol} "
+                       f"corr={correlation:.3f} threshold={threshold} mode={mode_corr} → {'ALLOW' if allow else 'BLOCK'}")
+            return allow
+            
+        except Exception as e:
+            logger.error(f"[CORRELATION] Error calculating correlation: {e}")
+            return True  # Don't block trades on calculation error
 

@@ -356,10 +356,38 @@ def check_first_claim_policy(bot_id: int, pair: str) -> tuple[bool, Optional[int
         - If can_claim is True: This bot can become owner
         - If can_claim is False: existing_owner_id is the current owner
     """
-    # ALLOW MULTI-BOT TRADING (Virtual Positioning)
-    # We no longer block multiple bots on the same pair.
-    # Each bot manages its own virtual position.
-    return True, None, "Multi-bot allowed"
+    """
+    Check if a bot can claim ownership of a pair.
+    
+    Returns:
+        (can_claim, existing_owner_id, message)
+        - If can_claim is True: This bot can become owner
+        - If can_claim is False: existing_owner_id is the current owner
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    # Check if ANY bot currently owns this pair
+    cursor.execute('''
+        SELECT bot_id, is_owner FROM bot_ownership_state 
+        WHERE pair = ? AND is_owner = 1 AND state IN ('owner', 'pending_tp')
+    ''', (pair,))
+    
+    row = cursor.fetchone()
+    conn.close()
+    
+    # If no owner exists, this bot can claim it
+    if not row:
+        return True, None, "No existing owner"
+        
+    existing_owner_id = row[0]
+    
+    # If THIS bot is already the owner, it can proceed
+    if existing_owner_id == bot_id:
+        return True, bot_id, "Already owner"
+        
+    # Otherwise, another bot owns it -> BLOCK
+    return False, existing_owner_id, f"Pair owned by Bot {existing_owner_id}"
 
     # Legacy strict locking logic (disabled)
     # conn = get_connection()
