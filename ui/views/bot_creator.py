@@ -13,7 +13,7 @@ from engine.exchange_interface import ExchangeInterface
 @st.cache_resource(ttl=3600, show_spinner=False)
 def get_exchange_instance(market_type):
     """Singleton provider for ExchangeInterface to reuse connections."""
-    return ExchangeInterface(market_type=market_type, validate=False)
+    return ExchangeInterface(market_type=market_type)
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_symbols_cached(market_type, quote_asset):
@@ -398,6 +398,17 @@ def render_bot_creator_view():
                 bot_config['ma_tf'] = st.selectbox("MA Timeframe", ["1m","5m","15m","1h","4h","1d"], index=3, key="create_ma_tf", help="Timeframe for the Moving Average (e.g. 1h or 4h for trend).")
             with ma_c4:    
                 bot_config['ma_type'] = st.selectbox("MA Type", ["SMA", "EMA"], index=0, key="create_ma_type")
+
+            st.divider()
+            st.markdown("**Trigger 13: MTF Trend Confluence**")
+            mtf_c1, mtf_c2, mtf_c3 = st.columns(3)
+            with mtf_c1:
+                use_mtf = st.checkbox("Use MTF Confluence", value=False, help="If enabled, requires Higher Timeframe trend alignment (Price > MA on HTF).")
+                bot_config['UseMTFConfluence'] = use_mtf
+            with mtf_c2:
+                bot_config['MTF_Timeframe'] = st.selectbox("MTF Timeframe", ["1h", "4h", "1d"], index=1, disabled=not use_mtf, key="create_mtf_tf")
+            with mtf_c3:
+                bot_config['MTF_MA_Period'] = st.number_input("MTF MA Period", value=50, min_value=10, disabled=not use_mtf, key="create_mtf_ma")
             
             temp_strat.params.update(bot_config)
 
@@ -636,29 +647,18 @@ def render_bot_creator_view():
             st.error(f"Projection Error: {e}")
         # ------------------------------
         
-        # Validation feedback
+        submitted = st.form_submit_button("Deploy Bot", type="primary")
+
+    if submitted:
         errors, warnings = validate_bot_config(name, pair, base_size, martingale_multiplier)
         
-        # Display warnings inline
         for warning in warnings:
             st.warning(f"⚠️ {warning}")
-        
-        submitted = st.form_submit_button(
-            "Deploy Bot", 
-            type="primary",
-            disabled=len(errors) > 0
-        )
-        
-        # Show errors if button is disabled
+
         if len(errors) > 0:
             for error in errors:
                 st.error(f"🚫 {error}")
-            if submitted:
-                st.info("Please fix the errors above before deploying.")
-    
-    if submitted and len(errors) == 0:
-        if not name:
-            st.error("🚨 Bot Name is required.")
+            st.info("Please fix the errors above before deploying.")
         else:
             bot_config['timeframe'] = timeframe
             
@@ -670,8 +670,6 @@ def render_bot_creator_view():
                 
             bot_config['market_type'] = 'spot' if mode_id == 'spot' else 'futures'
             
-            # Explicitly mapping all required positional arguments as keywords
-            # matches engine\database.py definition
             bot_id = add_bot(
                 name=name,
                 pair=pair,
@@ -683,16 +681,13 @@ def render_bot_creator_view():
                 config_dict=bot_config
             )
 
-
-
             if bot_id:
                 st.success(f"Bot '{name}' deployed successfully! (ID: {bot_id})")
                 st.info(f"Deployed on {market_type} - {pair} using {strategy_type} ({timeframe})")
                 
-                # Navigate to Monitor button
                 col_nav1, col_nav2 = st.columns([1, 4])
                 with col_nav1:
-                    if st.button("📊 View in Monitor", type="primary", use_container_width=True):
+                    if st.button("📊 View in Monitor", type="primary", width="stretch"):
                         st.session_state['_nav_to_monitor'] = True
                         st.rerun()
                 with col_nav2:

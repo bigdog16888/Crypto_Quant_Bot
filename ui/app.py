@@ -403,18 +403,33 @@ with st.sidebar:
     else:
         st.success(f"Monitoring Running (PID: {pid})")
         if st.button("🛑 Stop Monitoring"):
-            with open(STOP_FILE, "w") as f:
-                f.write("stop")
-            st.warning("Stop signal sent. Waiting for shutdown...")
-            
-            # Simple spin-wait for feedback
-            for _ in range(10):
-                if not os.path.exists(PID_FILE):
-                    break
-                time.sleep(1)
+            try:
+                with open(STOP_FILE, "w") as f:
+                    f.write("stop")
+                st.info("Stop signal sent. Waiting for graceful shutdown...")
+
+                # More robust waiting logic
+                with st.spinner("Waiting for engine to terminate..."):
+                    shutdown_success = False
+                    for i in range(30):  # Wait up to 30 seconds
+                        is_running, _ = is_engine_running()
+                        if not is_running:
+                            shutdown_success = True
+                            break
+                        time.sleep(1)
                 
-            st.success("Stopped!")
-            st.rerun()
+                if shutdown_success:
+                    st.success("✅ Engine stopped gracefully!")
+                    if os.path.exists(PID_FILE): # Cleanup just in case
+                        os.remove(PID_FILE)
+                else:
+                    st.error("Engine did not stop in time. Consider Force Kill.")
+
+                time.sleep(1)
+                st.rerun()
+
+            except Exception as e:
+                st.error(f"Failed to send stop signal: {e}")
         
         if st.button("💀 Force Kill Monitoring", type="secondary"):
             if pid is None:

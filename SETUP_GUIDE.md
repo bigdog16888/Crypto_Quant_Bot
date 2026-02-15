@@ -2,6 +2,16 @@
 
 This guide explains how to set up the Crypto Quant Bot on multiple computers with different `.env` files (API keys) but shared code.
 
+## ⚠️ CRITICAL NOTICE: BINANCE TESTNET DEPRECATED
+The Binance Futures Testnet/Sandbox is no longer supported by the CCXT library used by this bot.
+**You must use LIVE Binance Futures API keys to run this software.**
+
+To test safely:
+1. Set `DRY_RUN=True` in your `.env` file. This simulates trading without sending orders to the exchange.
+2. Only set `DRY_RUN=False` when you are ready to trade real funds.
+
+## 1. Prerequisites
+
 ## Overview
 
 | Component | Shared? | Why |
@@ -83,7 +93,6 @@ python resume_session.py
 # ✅ Python Environment
 # ✅ Configuration
 # ✅ Database
-# ✅ Ownership System
 ```
 
 ## Usage
@@ -173,28 +182,6 @@ copy crypto_bot.db crypto_bot.db.backup
 
 # Reinitialize
 python -c "from engine.database import init_db; init_db()"
-```
-
-### Ownership state issues
-
-```bash
-# Reset ownership state (keeps bots and trades)
-python -c "
-from engine.ownership import init_ownership_tables
-init_ownership_tables()
-print('Ownership tables reset')
-"
-
-# Full reset (WARNING: loses ownership history)
-python -c "
-from engine.database import get_connection
-conn = get_connection()
-conn.execute('DELETE FROM bot_ownership_state')
-conn.execute('DELETE FROM bot_ownership_history')
-conn.commit()
-conn.close()
-print('All ownership data deleted')
-"
 ```
 
 ## Best Practices

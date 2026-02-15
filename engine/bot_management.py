@@ -48,7 +48,7 @@ def close_position(bot_id: int, close_pct: float = 100.0, reason: str = "Manual 
     if not status:
         return {'success': False, 'error': 'Could not get bot status'}
     
-    total_invested = status[3]
+    total_invested = status['total_invested']
     if total_invested <= 0:
         return {'success': False, 'error': 'No position to close'}
     
@@ -204,8 +204,12 @@ def check_and_execute_stops(bot_id: int, exchange_interface=None) -> Optional[Di
     if not status:
         return None
     
-    # status: (name, pair, current_step, total_invested, avg_entry_price, target_tp_price, ...)
-    name, pair, step, total_invested, avg_entry_price = status[0], status[1], status[2], status[3], status[4]
+    # status: dict with keys 'name', 'pair', 'current_step', 'total_invested', 'avg_entry_price', ...
+    name = status['name']
+    pair = status['pair']
+    step = status['current_step']
+    total_invested = status['total_invested']
+    avg_entry_price = status['avg_entry_price']
     
     if total_invested <= 0:
         return None  # No position, no stops to check
@@ -302,9 +306,16 @@ def get_position_summary(bot_id: int) -> Dict[str, Any]:
     market_type = config_dict.get('market_type', 'future')
     
     exchange = ExchangeInterface(market_type=market_type)
-    current_price = exchange.get_last_price(pair) if (pair := status[1]) else 0
+    current_price = exchange.get_last_price(pair) if (pair := status['pair']) else 0
     
-    name, pair, step, total_invested, avg_entry_price, target_tp = status[0], status[1], status[2], status[3], status[4], status[5]
+    # status: dict
+    name = status['name']
+    pair = status['pair']
+    step = status['current_step']
+    total_invested = status['total_invested']
+    avg_entry_price = status['avg_entry_price']
+    target_tp = status['target_tp_price']
+    
     direction = params[2]
     
     # Calculate PnL

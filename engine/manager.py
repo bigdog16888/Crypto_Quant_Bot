@@ -313,7 +313,10 @@ def manage_trade(bot_id, bot_name, pair, direction, settings, trade_data, curren
 
     # 1. Unpack & Validate Trade Data
     if len(trade_data) < 8: return {'action': 'none'}
-    _, _, current_step, total_invested, avg_entry_price, target_tp_price, _, _ = trade_data[:8]
+    current_step = trade_data['current_step']
+    total_invested = trade_data['total_invested']
+    avg_entry_price = trade_data['avg_entry_price']
+    target_tp_price = trade_data['target_tp_price']
     
     current_step = int(current_step or 0)
     total_invested = float(total_invested or 0.0)
@@ -351,10 +354,10 @@ def manage_trade(bot_id, bot_name, pair, direction, settings, trade_data, curren
     )
     
     effective_tp = target_tp_price
-    if settings.get('UseEarlyExit', False) and len(trade_data) > 8:
+    if settings.get('UseEarlyExit', False) and trade_data.get('basket_start_time', 0) > 0:
         import time
         from datetime import datetime
-        start_dt = datetime.fromtimestamp(trade_data[8])
+        start_dt = datetime.fromtimestamp(trade_data['basket_start_time'])
         now_dt = datetime.fromtimestamp(time.time())
         effective_tp = calculate_early_exit_decay(
             start_dt, now_dt, current_step + 1, target_tp_price, avg_entry_price, settings
@@ -512,10 +515,10 @@ def emergency_close_all(exchange_interface, bots_in_trouble):
         bot_id, pair = bot
         logger.info(f"Closing all for Bot {bot_id} on {pair}")
         
-        # Cancel all open orders for this pair
+        # Cancel all open orders for this bot on this pair
         try:
-            exchange_interface.exchange.cancel_all_orders(pair)
-            logger.info(f"All orders canceled for {pair}")
+            exchange_interface.cancel_orders_by_bot_id(bot_id, pair)
+            logger.info(f"Orders for Bot {bot_id} canceled for {pair}")
         except Exception as e:
             logger.error(f"Failed to cancel orders for {pair}: {e}")
             

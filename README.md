@@ -1,214 +1,90 @@
-# 🤖 Professional Multi-Bot Crypto Trading System
+# 🤖 Crypto Quant Bot (v1.2.0)
 
-**Version 0.9.0** - Advanced Analytics & Risk Management Release
+A professional-grade, multi-bot algorithmic trading system designed for **Binance Futures (USDT/USDC)**. It features a robust **Virtual Position Manager** that allows multiple bots to trade the same pair independently (e.g., Hedging Long/Short) without conflict.
 
-A professional-grade quantitative trading platform built for extreme precision, robust risk management, and live market resilience.
+## 🌟 Key Features
 
-## 🚀 Key Features
+*   **Virtual Position System:** Each bot tracks its own position logic (`trades` table) while the engine reconciles with the exchange.
+*   **Hybrid Raw Mode:** Bypasses CCXT limitations on Binance Demo/Testnet by using raw signed requests for critical private data.
+*   **Auto-Healing:** The system detects orphans and mismatched states, automatically correcting them.
+*   **Real-Time UI:** Streamlit dashboard with **Auto-Refresh**, Live Charts, Parallel Data Fetching, and Portfolio Heatmaps.
+*   **One-Way & Hedge Mode Support:** Fully compatible with Binance's One-Way and Hedge modes.
 
-### 📊 Phase 10: Advanced Features (New in v0.9.0)
+---
 
-#### Strategy Enhancements
-- **Multi-Timeframe Trend Analysis**: Confirm trend across multiple timeframes before entry
-- **Volatility-Based Position Sizing**: Automatically adjust lot sizes based on ATR (lower size in high volatility)
-- **Correlation Filtering**: Avoid correlated pairs to reduce portfolio risk
-- **Enhanced Indicators**: RSI, EMA, ATR, CCI, Correlation analysis
+## 🚀 Quick Start
 
-#### Risk Management
-- **Daily Loss Limits**: Automatically pause trading if daily loss threshold is exceeded
-- **Drawdown Protection**: Partial position closing when unrealized loss exceeds configured percentage
-- **Portfolio Heatmap**: Visual risk distribution across all active positions
-- **Real-time Risk Metrics**: Win Rate, Profit Factor, Expectancy calculations
+### 1. Prerequisites
+*   Python 3.10+
+*   Binance Futures Account (Testnet or Mainnet)
+*   API Key & Secret
 
-#### Analytics Dashboard
-- **Performance Metrics**: Comprehensive view of Win Rate, Profit Factor, Total PnL
-- **Equity Curve**: Visual representation of account growth over time
-- **Trade History Export**: Download complete trade journal as CSV for external analysis
-- **Per-Bot Performance**: Breakdown of profitability by individual bot
-
-### 🛡️ Institutional-Grade Safety
-- **Circuit Breaker**: Global "Kill Switch" monitors total account equity. If drawdown exceeds 50%, it locks the engine and prevents further losses.
-- **Exchange Validation**: Pre-validates every order against live `MinNotional`, `MinQty`, and `StepSize` rules to prevent API bans.
-- **State Recovery**: Auto-syncs database with exchange on startup. Detects "Ghost Trades" (TP hit while offline) and "Orphaned Orders".
-- **Network Resilience**: Automatic retry logic with exponential backoff for unstable connections.
-
-### 🎯 11-Trigger Entry Confluence
-- **Multi-Switch Logic**: Combine up to 11 triggers (Indicators, Patterns, Volatility). A trade only opens if **ALL** enabled switches align.
-- **Volatility Awareness**: "Market State" trigger filters entries based on historical volatility percentile (e.g., "Only trade when vol is > 80%").
-- **Indicator-Aware Patterns**: Detect consecutive patterns not just on Price, but on RSI or CCI values.
-
-### 📊 Professional UI & Risk Math
-- **Automated Hedge Executor**: Locks net exposure via counter-orders when grid depth is reached.
-- **Realistic Projections**: Real-time risk calculator including **0.15% Fee & Slippage** simulation.
-- **Accelerated Early Exit**: Smart decay logic reduces profit targets over time to exit stale trades at Break Even.
-- **4-Page Navigation**: Live Monitor, Bot Creator, Bot Manager, Analytics
-
-## 🔄 Multi-Bot Support
-
-**Multiple bots can trade the same pair/direction safely!**
-
-Each bot tracks its own exchange order IDs:
-```
-Exchange shows: 1 TP order @ 94000
-DB tracks:      Bot A → Order ID 12345
-                Bot B → Order ID 67890
-
-When Bot A cancels "its" TP → Only Order ID 12345 is cancelled
-Bot B's order (67890) is UNTOUCHED ✓
-```
-
-**What Gets Tracked:**
-- Entry order IDs
-- TP order IDs  
-- Grid order IDs
-
-**Display Shows:**
-- Which bot owns each order
-- Bot vs Manual order breakdown
-- Total positions with per-bot composition
-
-## 🎛️ Default Configuration
-
-| Parameter | Default | Notes |
-|-----------|---------|-------|
-| Leverage | 20x | Futures only, spot is 1x |
-| Martingale Multiplier | 1.8 | Safety factor per step |
-| Take Profit | 1.5% | Percentage mode |
-| ATR Grid Factor | 1.1 | Dynamic grid spacing |
-| ATR Timeframe | 1h | Base for grid calculation |
-| Max Drawdown | 0% (disabled) | Trigger partial close |
-| Daily Loss Limit | 0% (disabled) | Pause trading for the day |
-
-## 🛠️ Technical Stack
-- **Engine**: Python / CCXT (Robust Runner with Circuit Breakers)
-- **Frontend**: Streamlit (Professional Light Theme, Isolated Keys)
-- **Database**: SQLite (State-aware, Sync-capable)
-- **Analytics**: Pandas, Plotly, Prometheus Metrics
-- **Indicators**: Custom TA library with ATR-based Volatility Analysis
-- **WebSocket**: Real-time updates on port 8765
-
-## 🚦 Getting Started
-
-### 1. Installation
+### 2. Installation
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/Crypto_Quant_Bot.git
+# Clone repository
+git clone <repo_url>
 cd Crypto_Quant_Bot
 
 # Install dependencies
 pip install -r requirements.txt
 ```
 
-### 2. Configuration
-Create a `.env` file based on `.env.example`:
+### 3. Configuration
+Create a `.env` file in the root directory:
 ```ini
-BINANCE_API_KEY=your_key
-BINANCE_API_SECRET=your_secret
-DRY_RUN=True  # Set to False for Live Trading
-TESTNET=False # Set to True for Binance Testnet
-GLOBAL_STOP_LOSS_PCT=50.0
+# --- EXCHANGE SETTINGS ---
+# Set both to True for Demo Trading
+# Set both to False for Mainnet (Real Money)
+TESTNET=True
+DEMO_TRADING=True
+
+BINANCE_API_KEY=your_api_key
+BINANCE_API_SECRET=your_api_secret
+
+# --- SYSTEM SETTINGS ---
+MARKET_TYPE=future
 ```
 
-### 3. Run the Platform
+### 4. Running the Bot
+**Step 1: Start the Trading Engine**
+This runs the backend logic (orders, websocket, risk management).
 ```bash
-# Start the UI
-streamlit run ui/app.py
-
-# The engine will auto-start from the UI sidebar
-# Or manually: python -m engine.runner
+run_bot.bat
+# OR
+python engine/runner.py
 ```
 
-### 4. Workflow
-1. **Configure API**: Enter your Binance API credentials in the sidebar (or use `.env`).
-2. **Start Engine**: Click "▶️ Start Monitoring" in the sidebar.
-3. **Create Bot**: Use the **Bot Creator** to build a strategy (e.g., "RSI Dip Buyer + Volatility Filter").
-4. **Analyze Risk**: Check the **ATR Planning Foundation** and **Risk Projection** tables.
-5. **Deploy**: Activate the bot. The **Runner** handles validation, safety, and execution.
-6. **Monitor**: Watch the **Live Monitor** for active trades, positions, and logs.
-7. **Analyze**: Review performance in the **Analytics** tab.
-
-## 📁 Project Structure
-
-```
-Crypto_Quant_Bot/
-├── config/              # Configuration files
-│   ├── settings.py      # Global settings
-│   └── strategies.json  # Strategy definitions
-├── engine/              # Core trading engine
-│   ├── runner.py        # Main bot executor
-│   ├── bot_executor.py  # Individual bot logic
-│   ├── exchange_interface.py  # CCXT wrapper
-│   ├── database.py      # SQLite operations
-│   ├── metrics.py       # Prometheus metrics & export
-│   ├── indicators.py    # Technical indicators
-│   └── strategies/      # Strategy implementations
-├── ui/                  # Streamlit frontend
-│   ├── app.py           # Main entry point
-│   └── views/           # Page components
-│       ├── monitor.py   # Live monitoring
-│       ├── bot_creator.py  # Bot creation wizard
-│       ├── bot_manager.py  # Bot editing/management
-│       └── analytics.py    # Performance analytics
-├── tests/               # Test suite
-├── tools/               # Utility scripts
-├── .env.example         # Environment template
-├── requirements.txt     # Python dependencies
-└── README.md            # This file
-```
-
-## 📚 Documentation
-
-- **[CHANGELOG.md](CHANGELOG.md)** - Detailed version history
-- **[SETUP_GUIDE.md](SETUP_GUIDE.md)** - Comprehensive setup instructions
-- **[AI_INSTRUCTIONS.md](AI_INSTRUCTIONS.md)** - Development guidelines
-
-## 🐛 Troubleshooting
-
-### App Won't Start
+**Step 2: Launch the Dashboard**
+Open the web interface to monitor and control bots.
 ```bash
-# Check if port 8501 is already in use
-netstat -ano | findstr :8501  # Windows
-lsof -i :8501                 # Linux/Mac
-
-# Kill existing process and restart
 streamlit run ui/app.py
 ```
-
-### P/L Shows But No Exchange Position
-This is a **state mismatch** between DB and Exchange. Run:
-```bash
-python -m engine.runner  # Restart triggers sync
-```
-
-### ATR Values Look Wrong
-3d and 5d ATR are calculated using √n scaling:
-- 3d ATR = 1d ATR × 1.732
-- 5d ATR = 1d ATR × 2.236
-
-### Engine Not Responding
-Check the engine logs:
-```bash
-# View recent logs
-tail -n 100 engine.log  # Linux/Mac
-Get-Content engine.log -Tail 100  # Windows PowerShell
-```
-
-## 🔒 Security Notes
-
-- **Never commit `.env` file** - It contains your API keys
-- **Use Testnet first** - Set `TESTNET=True` for testing
-- **Start with DRY_RUN** - Set `DRY_RUN=True` to simulate orders
-- **API Permissions**: Only enable "Futures Trading" and "Read" permissions (no withdrawals)
-
-## 🎯 Roadmap
-
-- [ ] Backtesting engine integration
-- [ ] Telegram notifications
-- [ ] Multi-exchange support (Bybit, OKX)
-- [ ] Advanced order types (Trailing Stop, OCO)
-- [ ] Machine learning signal integration
 
 ---
 
-**v0.9.0** - Advanced Analytics & Risk Management Release  
-*Built with precision. Deployed with confidence.*
+## 🖥️ UI Dashboard Guide
+
+*   **📊 Live Monitor:**
+    *   **Overview Tab:** Global PnL, Total Equity, and Asset Breakdown.
+    *   **Live Charts Tab:** Real-time OHLCV charts for active pairs.
+    *   **Orders & History Tab:** View **Open Orders** (instantly fetched from DB) and **Recent Activity Log**.
+    *   **Auto-Refresh:** Toggle "⚡ Auto-Refresh" for 15s updates.
+*   **🏗️ Bot Creator:** Visually configure and launch new strategies (Martingale, Grid, etc.).
+*   **🛠️ Bot Manager:** Edit, Stop, or Delete existing bots.
+*   **📈 Analytics:** View historical performance, win rates, and equity curves.
+
+---
+
+## 🔧 Architecture & Troubleshooting
+
+See `HANDOFF.md` for a deep dive into the system architecture and detailed debugging steps.
+
+### Common Fixes
+*   **System Slow?** Enable "Auto-Refresh" in the UI only when needed. The Dashboard now uses **parallel fetching** for speed.
+*   **Orders not showing?** The UI prioritizes the **Database** for speed. Click "Force Sync" if you suspect a mismatch.
+*   **API Errors?** If using Demo/Testnet, ensure `TESTNET=True` in `.env`. The system uses specific overrides for the `demo-fapi` endpoints to prevent `-2008` and `-2015` errors.
+
+---
+
+## ⚠️ Disclaimer
+This software is for educational purposes. Cryptocurrency trading involves high risk. The authors are not responsible for any financial losses incurred while using this bot.

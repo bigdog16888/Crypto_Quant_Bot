@@ -32,7 +32,7 @@ class TestOrphanLogic(unittest.TestCase):
         # Scenario: Bot IDLE (in_trade=False), Position EXISTS, Bot NOT owner
         ownership = {} 
         
-        # Call reconcile_bot
+        # Call reconcile_bot with default params
         result = reconciler.reconcile_bot(bot, position, orders, ownership)
         
         # Verify result

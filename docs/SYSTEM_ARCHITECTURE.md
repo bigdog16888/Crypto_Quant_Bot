@@ -9,201 +9,24 @@
 
 ---
 
-## Multi-Bot Position Management
+## 1. Multi-Bot Position Management: The Virtual Position Manager
 
 ### The Problem
-When multiple bots trade the same pair (e.g., 5 bots all on BTC/USDT), the exchange returns **one aggregate position**, not separate positions per bot:
+When multiple bots trade the same pair (e.g., 5 bots all on BTC/USDT), the exchange returns **one aggregate position**, not separate positions per bot. A naive bot, seeing an aggregate position that doesn't match its internal state, could incorrectly assume its trade was closed or modified, leading to catastrophic errors.
 
-```
-Exchange View:
-  Position: 1.5 BTC LONG @ $43,250 (combined position)
+### The Solution: Virtual Positions & Order Isolation
 
-Your Bots:
-  Bot A: Think they own 0.5 BTC
-  Bot B: Think they own 0.5 BTC  
-  Bot C: Think they own 0.5 BTC
-  Bot D: Think they own 0.5 BTC (waiting to enter)
-  Bot E: Think they own 0.5 BTC (waiting to enter)
-```
+The system uses a **Virtual Position Manager** to solve this. The core principles are:
 
-### The Solution: First-Claim Ownership Policy
+1.  **The Database is the Source of Truth:** The bot's internal `trades` table is the absolute source of truth for its position. The aggregate net position shown on the exchange is considered **irrelevant** for determining an individual bot's status.
+2.  **Order Isolation via `clientOrderId`:** Every order sent to the exchange is tagged with a unique, deterministic prefix: `CQB_{bot_id}_`. For example, `CQB_42_TP_0` is the Take Profit order for Bot 42. This allows the system to distinguish which bot owns which order.
+3.  **Bot-Specific Logic:** A bot determines its own state by looking for *its own* orders on the exchange. Global actions are forbidden; for example, `cancel_all_orders()` is replaced by `cancel_orders_by_bot_id()`.
 
-The system uses **Order ID tracking** and a complete **Ownership State Machine** to manage multi-bot positions:
-
-1. **Order IDs**: Every order placed by a bot is tracked in `bot_orders` table
-2. **First Claim**: The bot that places the **first entry order** on a pair becomes the "owner"
-3. **Passengers**: Other bots on the same pair become "passengers" - they monitor but don't manage the position
-4. **Ownership Transfer**: Only the owner can modify/close the position
-
-```
-Ownership Hierarchy:
-  ┌─────────────────────────────────────────┐
-  │         BTC/USDT Position               │
-  │         1.5 BTC LONG @ $43,250          │
-  └─────────────────────────────────────────┘
-                    │
-        ┌───────────┴───────────┐
-        │                       │
-   ┌────▼────┐            ┌─────▼─────┐
-   │ BOT A   │            │ Bot B     │
-   │ OWNER   │            │ PASSENGER │
-   │ 0.5 BTC │            │ 0.5 BTC   │
-   └─────────┘            └───────────┘
-        │
-   Manages position
-   Places/closes orders
-   Others follow passively
-```
-
-### How It Works
-
-1. **Bot A enters first**:
-   - Places entry order → Order ID saved to `bot_orders` table
-   - Order fills → Bot A calls `claim_ownership()`
-   - Bot A becomes OWNER, DB updated: `total_invested`, `avg_entry_price`, etc.
-   - Ownership recorded in `bot_ownership_state` table
-
-2. **Bot B sees position**:
-   - Calls `check_first_claim_policy()` → Bot A already owns!
-   - Bot B becomes PASSENGER via `become_passenger()`
-   - Bot B only monitors, doesn't place orders
-
-3. **Position Closure**:
-   - When OWNER closes position (TP hit or manual)
-   - `handle_position_closed()` called
-   - ALL bots (owner + passengers) reset to CLOSED
-   - Next entry restarts ownership cycle
+This architecture allows multiple independent trading strategies (bots) to run on the **same trading pair** simultaneously without interfering with each other. Each bot is, in effect, the "owner" of its own virtual position.
 
 ---
 
-## Ownership State Machine
-
-### States
-| State | Meaning | Can Place Orders? |
-|-------|---------|-------------------|
-| `IDLE` | No position, waiting for entry signal | Yes (entry) |
-| `PENDING_ENTRY` | Entry order placed, waiting for fill | No |
-| `OWNER` | Has position, manages it (places TP/grid) | Yes (TP/Grid) |
-| `PASSENGER` | Monitors owner's position only | No |
-| `PENDING_TP` | TP order placed, waiting for hit | No |
-| `CLOSED` | Position closed, in cooldown | No |
-
-### State Transitions
-
-```
-┌─────────┐     ENTRY_SIGNAL      ┌───────────────┐
-│  IDLE   │────────────────────▶  │ PENDING_ENTRY │
-└─────────┘                       └───────────────┘
-      │                                 │
-      │ ENTRY_FILLED                    │ ENTRY_FILLED
-      ▼                                 ▼
-┌─────────┐     OWNER_CLAIMED    ┌───────────────┐
-│ CLOSED  │◀─────────────────────│    OWNER      │◀─────┐
-└─────────┘                       └───────────────┘      │
-      ▲                                 │               │
-      │                                 │ PASSENGER     │ OWNER_GONE
-      │                                 ▼               │
-      │                         ┌───────────────┐       │
-      └─────────────────────────│  PASSENGER    │───────┘
-            COOLDOWN_COMPLETE   └───────────────┘
-                                      │
-                                      │ TP_HIT/STOP_HIT/MANUAL_CLOSE
-                                      ▼
-                               ┌───────────────┐
-                               │    CLOSED     │
-                               └───────────────┘
-```
-
-### Events
-| Event | Triggered When |
-|-------|----------------|
-| `ENTRY_SIGNAL` | Strategy gives entry signal |
-| `ENTRY_FILLED` | Entry order is filled on exchange |
-| `OWNER_CLAIMED` | First bot to enter claims ownership |
-| `PASSENGER_JOINED` | Bot joins as passenger (another owns pair) |
-| `TP_HIT` | Take profit order is hit |
-| `STOP_HIT` | Stop loss is hit |
-| `MANUAL_CLOSE` | User manually closes position |
-| `OWNER_GONE` | Owner disappears/crashes (failover) |
-| `COOLDOWN_COMPLETE` | Re-entry cooldown period ends |
-
-### Owner Failover
-If the OWNER crashes or disappears:
-1. `check_owner_failover()` is called during reconciliation
-2. Oldest PASSENGER (by `basket_start_time`) is promoted to new OWNER
-3. New owner must place new TP order (old one was on crashed bot)
-
-### Database Tables
-
-```sql
--- Current ownership state per bot
-CREATE TABLE bot_ownership_state (
-    bot_id PRIMARY KEY,
-    state TEXT NOT NULL,           -- IDLE, OWNER, PASSENGER, CLOSED, etc.
-    is_owner INTEGER,              -- 1 if owner, 0 if passenger
-    pair TEXT,
-    position_size REAL,
-    avg_entry_price REAL,
-    target_tp_price REAL,
-    basket_start_time INTEGER,
-    entry_order_id TEXT,
-    tp_order_id TEXT,
-    owner_id INTEGER,              -- For passengers: who owns the pair
-    last_updated INTEGER
-);
-
--- Complete audit trail
-CREATE TABLE bot_ownership_history (
-    id PRIMARY KEY AUTOINCREMENT,
-    bot_id INTEGER,
-    pair TEXT,
-    previous_state TEXT,
-    new_state TEXT,
-    event TEXT,
-    details TEXT,
-    timestamp INTEGER
-);
-```
-
-### Key Functions
-
-```python
-from engine.ownership import (
-    # Ownership checks
-    check_first_claim_policy(bot_id, pair) -> (can_claim, existing_owner_id, message)
-    
-    # State transitions
-    claim_ownership(bot_id, name, pair, entry_order_id, entry_price, amount, tp_price)
-    become_passenger(bot_id, name, pair, entry_order_id, entry_price, amount, tp_price, owner_id)
-    handle_position_closed(bot_id, pair, close_type, exit_price)
-    
-    # Reconciliation
-    check_owner_failover(pair) -> new_owner_id or None
-    reconcile_pair(pair, exchange_position_exists) -> dict with actions taken
-    get_pair_ownership(pair) -> PairOwnership object
-    get_ownership_state(bot_id) -> BotOwnership object
-    
-    # History
-    get_ownership_history(bot_id, limit) -> list of OwnershipRecord
-    get_all_active_ownerships() -> list of PairOwnership
-)
-
-from engine.runner import (
-    # Called in _finalize_entry() after entry fills
-    _finalize_entry(bot_id, name, pair, side, amount, fill_price, order_id)
-        → Calls claim_ownership() or become_passenger()
-    
-    # Called each cycle
-    _reconcile_ownership()
-        → Calls reconcile_pair() for all active pairs
-        → Handles owner failover
-        → Cleans up stale ownership records
-)
-```
-
----
-
-## System Persistence
+## 2. System Persistence
 
 ### The Problem
 The bot runs as a Python process on your local computer. If you:
@@ -342,7 +165,7 @@ Cause: Position opened while bot was offline (manual trade or other bot)
 Action:
   1. Check if this bot's Order ID matches exchange orders
   2. If YES (this bot owns it): Claim position, continue trading
-  3. If NO (another bot owns it): Become passenger, monitor only
+  3. If NO (another bot owns it): Ignore it (Virtual Position logic)
   4. If NO match at all: Flag as ORPHAN, require manual review
 ```
 
@@ -352,8 +175,7 @@ Cause: Normal state
 
 Action:
   1. Verify Order ID ownership
-  2. If OWNER: Continue normal operation
-  3. If PASSENGER: Monitor only, don't place orders
+  2. Continue normal operation
 ```
 
 #### Scenario D: Orphan position detected

@@ -82,6 +82,19 @@ def handle_order_update(event: Dict):
         logger.error(f"Error handling order update: {e}")
 
 
+# Module-level set to track notified order fills (prevents duplicates)
+_notified_fills = set()
+_notified_fills_max_size = 10000  # Prevent unbounded growth
+_notified_fills_timestamps = {} # For rate limiting specific notification types
+
+def _cleanup_notified_fills():
+    """Cleanup notified fills set if it grows too large."""
+    global _notified_fills
+    if len(_notified_fills) > _notified_fills_max_size:
+        # Keep most recent 50%, clear old ones
+        logger.info(f"🧹 Cleaning up notified_fills set (size: {len(_notified_fills)})")
+        _notified_fills = set(list(_notified_fills)[-5000:])
+
 def _handle_order_filled(bot_id: int, order_type: str, event: Dict):
     """Process a filled order - update trade state."""
     from engine.database import (
@@ -97,6 +110,15 @@ def _handle_order_filled(bot_id: int, order_type: str, event: Dict):
     symbol = event.get('symbol')
     
     logger.info(f"🎯 WS FILL: Bot {bot_id} {order_type} filled @ {avg_price} (PnL: ${realized_pnl:.2f})")
+    logger.info(f"🔍 [DIAG-NOTIFICATION] About to add notification for {order_type} fill")
+    
+    # DEDUPLICATION: Check if we already notified for this order
+    notification_key = f"{bot_id}_{order_id}_{order_type}"
+    if notification_key in _notified_fills:
+        logger.debug(f"⏭️ Skipping duplicate notification for {notification_key}")
+        return
+    _notified_fills.add(notification_key)
+    _cleanup_notified_fills()  # Periodic cleanup
     
     if order_type == 'TP':
         # Take Profit hit - reset bot
@@ -116,9 +138,9 @@ def _handle_order_filled(bot_id: int, order_type: str, event: Dict):
             from engine.database import get_bot_status
             trade_data = get_bot_status(bot_id)
             if trade_data:
-                current_step = trade_data[2] if len(trade_data) > 2 else 0
-                current_invested = float(trade_data[3]) if len(trade_data) > 3 else 0
-                current_avg = float(trade_data[4]) if len(trade_data) > 4 else avg_price
+                current_step = trade_data.get('current_step', 0)
+                current_invested = float(trade_data.get('total_invested', 0))
+                current_avg = float(trade_data.get('avg_entry_price', 0)) or avg_price
                 
                 # Calculate new average
                 added_value = avg_price * filled_qty
@@ -149,7 +171,18 @@ def _handle_order_filled(bot_id: int, order_type: str, event: Dict):
                 avg_price * 1.015  # Initial TP
             )
             log_trade(bot_id, 'WS_ENTRY_FILL', symbol, avg_price, filled_qty, 0, "ENTRY")
-            add_notification('info', f"🚀 Entry Fill for {symbol}", bot_id)
+            # RATE LIMITING: Check if we just notified for this bot/symbol
+            # This prevents the "Entry Fill" flood if the WS stream replays or loops
+            import time
+            current_time = time.time()
+            fill_key = f"ENTRY_FILL_{bot_id}_{symbol}"
+            last_fill_time = _notified_fills_timestamps.get(fill_key, 0)
+            
+            if (current_time - last_fill_time) > 10.0: # Only notify once per 10 seconds for same bot/symbol entry
+                add_notification('info', f"🚀 Entry Fill for {symbol}", bot_id)
+                _notified_fills_timestamps[fill_key] = current_time
+            else:
+                logger.debug(f"Combinator: Skipping duplicate Entry Fill notification for {symbol} (Time delta: {current_time - last_fill_time:.2f}s)")
         except Exception as e:
             logger.error(f"Failed to process Entry fill for bot {bot_id}: {e}")
     

@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 import time
 import logging
@@ -18,7 +17,6 @@ def get_daily_realized_pnl(bot_id: int | None = None) -> float:
     Otherwise, calculates for the entire account (all bots).
     """
     try:
-        # Start of day (UTC)
         now = datetime.utcnow()
         start_of_day = datetime(now.year, now.month, now.day)
         start_ts = start_of_day.timestamp()
@@ -53,7 +51,6 @@ def get_unrealized_pnl(bot_id: Optional[int] = None, exchange: Any = None, excha
         unrealized_pnl = 0.0
         
         if bot_id is not None:
-            # 1. Get bot's pair and market type from DB
             conn = get_connection()
             cursor = conn.cursor()
             cursor.execute("SELECT pair, config FROM bots WHERE id = ?", (bot_id,))
@@ -66,7 +63,6 @@ def get_unrealized_pnl(bot_id: Optional[int] = None, exchange: Any = None, excha
             market_type = cfg.get('market_type', config.MARKET_TYPE)
             target_norm = normalize_symbol(pair)
             
-            # 2. Check snapshot first
             if exchange_snapshot and market_type in exchange_snapshot:
                 positions = exchange_snapshot[market_type].get('positions', [])
                 for p in positions:
@@ -74,20 +70,16 @@ def get_unrealized_pnl(bot_id: Optional[int] = None, exchange: Any = None, excha
                         unrealized_pnl += float(p.get('unrealizedPnl', 0.0) or 0.0)
                 return unrealized_pnl
             
-            # 3. Fallback to existing exchange or create temporary one
             ex = exchange
             if ex is None or ex.market_type != market_type:
                 ex = ExchangeInterface(market_type=market_type)
             
-            # 4. Fetch positions and filter by pair
             positions = ex.fetch_positions()
             for p in positions:
                 if normalize_symbol(p.get('symbol', '')) == target_norm:
                     unrealized_pnl += float(p.get('unrealizedPnl', 0.0) or 0.0)
             
         else:
-            # Entire Account PnL
-            # 1. Check snapshot first (covers all market types in snapshot)
             if exchange_snapshot:
                 for mt in exchange_snapshot:
                     positions = exchange_snapshot[mt].get('positions', [])
@@ -95,13 +87,11 @@ def get_unrealized_pnl(bot_id: Optional[int] = None, exchange: Any = None, excha
                         unrealized_pnl += float(p.get('unrealizedPnl', 0.0) or 0.0)
                 return unrealized_pnl
                 
-            # 2. Use provided exchange if available
             if exchange:
                 positions = exchange.fetch_positions()
                 for p in positions:
                     unrealized_pnl += float(p.get('unrealizedPnl', 0.0) or 0.0)
             else:
-                # 3. Fallback: Fetch positions for the default market type
                 ex = ExchangeInterface(market_type=config.MARKET_TYPE)
                 positions = ex.fetch_positions()
                 for p in positions:
@@ -122,15 +112,11 @@ def check_daily_loss_limit(limit_amount: float, bot_id: Optional[int] = None, ex
     if limit_amount <= 0:
         return False
         
-    # 1. Get Realized PnL from DB
     realized_pnl = get_daily_realized_pnl(bot_id)
-    
-    # 2. Get Unrealized PnL (from Snapshot or Exchange)
     unrealized_pnl = get_unrealized_pnl(bot_id, exchange, exchange_snapshot)
     
     total_pnl = realized_pnl + unrealized_pnl
     
-    # Logic: If total PnL is -60 and Limit is 50, then -60 <= -50 is True -> Stop.
     if total_pnl <= -abs(limit_amount):
         logger.warning(f"Daily loss limit hit for {'bot ' + str(bot_id) if bot_id else 'account'}: "
                        f"Realized=${realized_pnl:.2f}, Unrealized=${unrealized_pnl:.2f}, "

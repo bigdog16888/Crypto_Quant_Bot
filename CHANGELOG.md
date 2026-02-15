@@ -1,5 +1,63 @@
 # Changelog - Crypto Quant Bot
 
+## [1.0.1] - 2026-02-12
+
+### Critical Fixes
+-   **Data Corruption Purge (Phantom Trades)**: Identified and resolved a severe database corruption where bots were attempting to manage trades with stale entry prices (~$27k BTC) in a ~$96k market. This discrepancy caused all generated orders to be rejected by the exchange, triggering a perpetual "Ghost Bot" reset loop. Executed a surgical database repair to reset these corrupted trades to IDLE, allowing the bots to resume valid trading at current market prices.
+-   **Naked Position Auto-Healing**: Fixed a critical bug where bots with open positions but missing orders were incorrectly flagged as "Ghost Bots" and reset to IDLE. The system now verifies if a position exists on the exchange before resetting.
+-   **Virtual Position Integrity**: Verified that the "Ghost" detection logic correctly handles "Net Zero" scenarios (e.g., Long 1 BTC + Short 1 BTC = 0 Net) by prioritizing the presence of bot-specific orders (`CQB_{bot_id}_` prefix) over raw exchange position size.
+
+### Improvements
+-   **Exchange Data Parsing**: Confirmed `fetch_positions` logic in `exchange_interface.py` correctly parses `contracts` vs `size` to ensure accurate position tracking across different exchange API formats.
+-   **Logging**: Added explicit `[SNAPSHOT-DEBUG]` logs to trace position data flow from API to Bot Runner to Executor.
+
+### Technical Details
+-   Modified `verify_state_sync` in `engine/bot_executor.py` to check `positions_snapshot` for active contracts before declaring a Ghost.
+-   Updated `fetch_positions` in `engine/exchange_interface.py` to ensure robust parsing of position data.
+
+---
+
+## [1.0.0] - 2026-02-12
+
+### 🛡️ Fundamental Multi-Bot Isolation
+This release completes the multi-bot architecture by achieving full operational isolation. Bots now operate in their own virtual sandboxes, preventing cross-bot interference that previously caused order wipedowns and state resets.
+
+### 🚀 Major Improvements
+- **Scoped Order Cancellation**: Replaced all global `cancel_all_orders(pair)` calls with bot-specific `cancel_orders_by_bot_id(bot_id, pair)`. This ensures that repricing logic in one bot never cancels the grid or TP orders of another bot on the same pair.
+- **Aggregate One-Way Reconciliation**: Refactored the `reconciler.py` to handle shared physical positions. It now sums the virtual positions of all active bots for a pair and compares the aggregate size against the exchange position, eliminating false "SIZE MISMATCH" errors in One-Way mode.
+- **WebSocket Event Robustness**: Fixed a critical `KeyError` in `ws_event_handlers.py` by correcting dictionary key access for database results. This prevents the real-time stream from crashing upon order fills.
+- **Ghost Fix Loop Elimination**: Resolved an issue where `basket_start_time` was not correctly initialized in the database, causing the self-healing system to incorrectly identify and reset active trades as "ghosts."
+
+### 🐛 Bug Fixes
+- **WebSocket Handler**: Corrected dictionary access in `_handle_order_filled` and `_handle_order_canceled`.
+- **Database Integrity**: Updated `update_martingale_step` to properly initialize `basket_start_time` on initial trade entry.
+- **Exchange Safety**: Increased default `base_size` to $150 to ensure all orders clear the Binance USDC Testnet minimum notional hurdles.
+
+---
+
+## [0.9.2] - 2026-02-09
+
+
+### 🛡️ Critical Infrastructure & State Recovery
+This release focuses on restoring fundamental system integrity after detecting a "Ghost Fleet" scenario (DB showing trades that didn't exist on exchange) and unblocking trading operations.
+
+### 🐛 Critical Bug Fixes
+- **Ghost Fleet Exorcism**: Detected and repaired 11 bots stuck in "IN TRADE" state with no actual exchange positions. Created `emergency_reset_db.py` to force-align DB with reality (Clean Slate).
+- **The "Invisible Wall" (Margin Mode)**: Resolved persistent "Insufficient Funds" errors despite ample wallet balance.
+  - **Cause**: Pairs were stuck in **Isolated Margin** mode with 0 allocated funds.
+  - **Fix**: Forced `BTC/USDC` and `XAU/USDT` to **CROSS MARGIN** mode via API, unlocking the main wallet for trading.
+- **State Synchronization**: Implemented `StateManager` (Singleton) as the Single Source of Truth to prevent future desynchronization between DB, Memory, and Exchange.
+
+### ✨ New Features
+- **MTF Trend Confluence**: Added UI toggle for Multi-Timeframe Trend filtering (Bot Creator & Manager).
+- **Dynamic Leverage Verification**: Enhanced `BotExecutor` to automatically verify and enforce 20x leverage on startup (confirmed working without hardcoding).
+
+### 🛠️ Technical Improvements
+- **Self-Healing**: Unblocked built-in self-healing mechanisms by fixing symbol normalization issues (`BTC/USDC` vs `BTC/USDC:USDC`).
+- **Playwright Verification**: Verified UI dashboard availability via headless browser tests.
+
+---
+
 ## [0.9.1] - 2026-02-05
 
 ### 🛡️ Major Stability & Self-Healing Update

@@ -22,7 +22,7 @@ def get_exchange_instance(market_type):
     """
     Singleton provider for ExchangeInterface to reuse connections.
     """
-    return ExchangeInterface(market_type=market_type, validate=False)
+    return ExchangeInterface(market_type=market_type)
 
 @st.cache_data(ttl=15, show_spinner=False)
 def fetch_last_price_cached(market_type, symbol):
@@ -70,11 +70,8 @@ def render_bot_manager_view():
     
     st.divider()
 
-    cols[7].markdown("**🔧 Action**")
-    
-    st.divider()
-
     for bot in bots:
+
         # Note: update engine/database.py get_all_bots to return these if not already
         # Current get_all_bots returns: b.id, b.name, b.pair, b.is_active, b.strategy_type, t.total_invested, t.current_step
         # We need t.avg_entry_price, t.target_tp_price as well.
@@ -94,10 +91,10 @@ def render_bot_manager_view():
         
         # Targets Column
         with row_cols[5]:
-            status_data = get_bot_status(b_id) # (name, pair, current_step, total_invested, avg_entry_price, target_tp_price)
+            status_data = get_bot_status(b_id)  # Returns dict: {avg_entry_price, target_tp_price, ...}
             if status_data and total_invested > 0:
-                be = status_data[4]
-                tp = status_data[5]
+                be = status_data.get('avg_entry_price', 0)
+                tp = status_data.get('target_tp_price', 0)
                 
                 # Fetch current price for Next Order calc and PnL Badge
                 try:
@@ -153,6 +150,10 @@ def render_bot_manager_view():
                             
                             # Determine source based on timeframe
                             market_data = df_1d if 'd' in target_tf else df_1h
+                        
+                        # FALBACK: If OHLCV failed, try to construct minimal DF from current price
+                        if market_data.empty and curr_price > 0:
+                             market_data = pd.DataFrame([{'close': curr_price, 'high': curr_price*1.01, 'low': curr_price*0.99}], index=[0])
                     
                     next_order = strat.calculate_next_grid_price(raw_params[2], curr_price, be, step, market_data)
                     
@@ -351,9 +352,8 @@ def render_bot_manager_view():
         
         st.divider()
 
-        st.divider()
-
 @st.dialog("Edit Bot Settings")
+
 def render_edit_form(bot_id):
     from config.settings import config  # Import config for this function
     
@@ -369,8 +369,10 @@ def render_edit_form(bot_id):
     name, pair, direction, rsi_limit, martingale_multiplier, base_size, strategy_type, config_json = params
     config_dict = json.loads(config_json) if config_json else {}
     
+    current_quote = "USDT"
     if pair and '/' in pair:
         current_quote = pair.split('/')[1]
+
 
     # --- Market Configuration (Per-Bot) ---
     # KEPT OUTSIDE FORM for dynamic updates
@@ -823,7 +825,8 @@ def render_edit_form(bot_id):
                 config_dict['mode_atrp'] = st.selectbox("Volatility Context", [0, 1, 2], index=int(config_dict.get('mode_atrp', 0)), format_func=lambda x: {0: "OFF", 1: "Below (Quiet)", 2: "Above (Extreme)"}[x], help="Compares current volatility to historical levels.")
                 pa1, pa2 = st.columns(2)
                 config_dict['atrp_level'] = pa1.number_input("Lookback Level %", value=float(config_dict.get('atrp_level', 50.0)))
-                config_dict['atrp_tf'] = pa2.selectbox("ATR TF", ["15m","1h","4h","1d"], index=1)
+                config_dict['atrp_tf'] = pa2.selectbox("ATR TF", ["15m","1h","4h","1d"], index=1, key=f"atrp_tf_select_{bot_id}")
+
 
             st.markdown("#### Trigger 11: ATR Expansion (Current Move vs Range)")
             e_col1, e_col2, e_col3 = st.columns(3)
@@ -846,16 +849,18 @@ def render_edit_form(bot_id):
                         config_dict[f'pat_{idx}_tf'] = c_p3.selectbox(f"TF ##{idx}", ["1m","5m","15m","1h","4h","1d"], index=["1m","5m","15m","1h","4h","1d"].index(config_dict.get(f'pat_{idx}_tf', "5m")))
                         config_dict[f'pat_{idx}_count'] = c_p4.number_input(f"Count ##{idx}", min_value=1, value=int(config_dict.get(f'pat_{idx}_count', 3)))
 
-            st.markdown("#### Advanced Filters (Phase 10)")
+            st.markdown("#### Advanced Filters & MTF Trend")
             af1, af2, af3, af4 = st.columns(4)
             with af1:
-                config_dict['UseMTFConfluence'] = st.checkbox("MTF Trend Filter", value=config_dict.get('UseMTFConfluence', False))
+                use_mtf = st.checkbox("MTF Trend Filter", value=bool(config_dict.get('UseMTFConfluence', False)))
+                config_dict['UseMTFConfluence'] = use_mtf
             with af2:
-                config_dict['MTF_Timeframe'] = st.selectbox("MTF TF", ["1h","4h","1d","1w"], index=["1h","4h","1d","1w"].index(config_dict.get('MTF_Timeframe', "4h")))
+                config_dict['MTF_Timeframe'] = st.selectbox("MTF Timeframe", ["1h","4h","1d","1w"], index=["1h","4h","1d","1w"].index(config_dict.get('MTF_Timeframe', "4h")), disabled=not use_mtf)
             with af3:
-                config_dict['MTF_MA_Period'] = st.number_input("MTF MA Period", value=int(config_dict.get('MTF_MA_Period', 50)))
+                config_dict['MTF_MA_Period'] = st.number_input("MTF MA Period", value=int(config_dict.get('MTF_MA_Period', 50)), disabled=not use_mtf)
             with af4:
                 config_dict['mode_correlation'] = st.selectbox("Correlation", [0, 1, 2], index=int(config_dict.get('mode_correlation', 0)), format_func=lambda x: {0: "OFF", 1: "Positive (>0.7)", 2: "Negative (< -0.7)"}[x])
+
 
         st.markdown("#### Risk Management")
         rm1, rm2, rm3 = st.columns(3)
@@ -865,8 +870,10 @@ def render_edit_form(bot_id):
                 atr_tf_risk = st.selectbox(
                     "ATR TF", 
                     ["1m", "5m", "15m", "1h", "4h", "1d"], 
-                    index=["1m", "5m", "15m", "1h", "4h", "1d"].index(config_dict.get('ATR_Timeframe', '1h'))
+                    index=["1m", "5m", "15m", "1h", "4h", "1d"].index(config_dict.get('ATR_Timeframe', '1h')),
+                    key=f"risk_atr_tf_{bot_id}"
                 )
+
                 config_dict['ATR_Timeframe'] = atr_tf_risk
         with rm2:
                 config_dict['ATRGridFactor'] = st.number_input("ATR Factor", value=float(config_dict.get('ATRGridFactor', 1.0)))

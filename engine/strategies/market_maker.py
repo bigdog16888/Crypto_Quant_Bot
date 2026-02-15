@@ -1,77 +1,94 @@
+from typing import Optional, Tuple
+from .base import BaseStrategy
+import pandas as pd
 import logging
-import time
-from engine.strategies.base import BaseStrategy
+
+logger = logging.getLogger(__name__)
 
 class MarketMakerStrategy(BaseStrategy):
     """
-    Spread-based Market Maker with Inventory Skew.
-    
-    Logic:
-    1. Calculate Mid Price (or Fair Value).
-    2. Calculate Bid/Ask based on Target Spread.
-    3. Apply Inventory Skew:
-       - If Long: Shift quotes DOWN (easier to sell, harder to buy).
-       - If Short: Shift quotes UP (easier to buy, harder to sell).
-    4. Reconcile:
-       - Only replace orders if price moves beyond `reprice_threshold`.
+    Standard Market Making Strategy.
+    Provides liquidity on both sides (Bid/Ask) around the mid-price.
+    Adjusts quotes based on inventory skew to manage risk.
     """
-    def __init__(self, name, params):
-        super().__init__(name, params)
-        self.logger = logging.getLogger(f"MM_{name}")
+    def __init__(self, name: str = "MarketMaker", params: Optional[dict] = None):
+        super().__init__(name, params if params is not None else {})
         
-        # --- Strategy Parameters ---
-        self.spread_pct = float(params.get('spread_pct', 0.002))       # 0.2% spread
-        self.skew_factor = float(params.get('skew_factor', 0.0))       # Price shift per unit of inventory
-        self.order_size = float(params.get('order_size', 0.01))        # Base order size
-        self.max_inventory = float(params.get('max_inventory', 1.0))   # Max position size
-        self.reprice_threshold = float(params.get('reprice_threshold', 0.001)) # 0.1% move needed to update
+        self.params: dict = params if params is not None else {}
+        
+        # Core MM Parameters
+        self.spread_pct = float(self.params.get('spread_pct', 0.2)) / 100.0  # Total spread
+        self.order_size = float(self.params.get('order_size', 10.0))         # Base order size USD
+        self.reprice_threshold = float(self.params.get('reprice_threshold', 0.001)) # 0.1% move triggers reprice
+        
+        # Inventory Management
+        self.inventory_target = float(self.params.get('inventory_target', 0.0))
+        self.skew_factor = float(self.params.get('skew_factor', 1.0)) # Aggressiveness of skew
         
         # State
-        self.last_bid_price = 0.0
-        self.last_ask_price = 0.0
+        self.last_bid = 0.0
+        self.last_ask = 0.0
 
-    def calculate_quotes(self, mid_price, current_inventory):
+    def check_signals(self, df: pd.DataFrame) -> Tuple[bool, bool]:
         """
-        Derives ideal Bid and Ask prices.
+        Market Maker is always active unless paused.
+        Returns True, True to indicate 'Active' state for both sides.
+        Actual quote placement is handled by process_market_maker in Executor.
         """
-        # 1. Base Spread
-        half_spread = (mid_price * self.spread_pct) / 2
+        # We could add trend filters here to pause MM against strong trends
+        return True, True
+
+    def calculate_quotes(self, current_price: float, current_inventory: float) -> Tuple[float, float]:
+        """
+        Calculates ideal Bid and Ask prices based on current price and inventory.
         
-        # 2. Inventory Skew
-        # Example: Holding 0.5 BTC. Skew Factor 10. 
-        # Shift = 0.5 * 10 = 5 USDT.
-        # Prices shift DOWN by 5 USDT.
-        skew_adjustment = current_inventory * self.skew_factor
-        
-        ideal_bid = mid_price - half_spread - skew_adjustment
-        ideal_ask = mid_price + half_spread - skew_adjustment
-        
-        # 3. Sanity Checks
-        if ideal_bid >= ideal_ask:
-            # Spread inverted due to massive skew? Reset to min spread.
-            ideal_bid = mid_price - half_spread
-            ideal_ask = mid_price + half_spread
+        Logic:
+        - Base Mid Price = current_price
+        - Skew = (Target - Inventory) * SkewFactor
+        - Skewed Mid = Mid * (1 + Skew)
+        - Bid = Skewed Mid * (1 - Spread/2)
+        - Ask = Skewed Mid * (1 + Spread/2)
+        """
+        if current_price <= 0:
+            return 0.0, 0.0
             
+        # Inventory Skew Logic
+        # If Inventory > Target (Too Long) -> Lower quotes to encourage selling (Sell cheaper, Buy lower)
+        # If Inventory < Target (Too Short) -> Raise quotes to encourage buying (Buy higher, Sell higher)
+        
+        # Normalize inventory deviation (simple linear model for now)
+        # Assuming inventory is in USD value. 
+        # A deviation of $1000 might shift price by 0.01% * skew_factor
+        
+        inventory_diff = self.inventory_target - current_inventory
+        
+        # Skew calculation (simplified)
+        # Example: Target 0, Inv +1000. Diff -1000.
+        # We want to lower price.
+        # Shift basis points = (Diff / OrderSize) * SkewFactor * 0.0001
+        
+        # Protect against div by zero
+        safe_order_size = self.order_size if self.order_size > 0 else 10.0
+        
+        skew_bps = (inventory_diff / safe_order_size) * self.skew_factor * 0.0005
+        
+        # Clamp skew to prevent wild pricing (max +/- 5% shift)
+        skew_bps = max(-0.05, min(skew_bps, 0.05))
+        
+        skewed_mid = current_price * (1 + skew_bps)
+        
+        half_spread = self.spread_pct / 2.0
+        
+        ideal_bid = skewed_mid * (1 - half_spread)
+        ideal_ask = skewed_mid * (1 + half_spread)
+        
+        # Sanity check: Ensure Bid < Ask
+        if ideal_bid >= ideal_ask:
+            # Fallback to unskewed
+            ideal_bid = current_price * (1 - half_spread)
+            ideal_ask = current_price * (1 + half_spread)
+            
+        self.last_bid = ideal_bid
+        self.last_ask = ideal_ask
+        
         return ideal_bid, ideal_ask
-
-    def calculate_lot_size(self, current_step: int, account_balance: float) -> float:
-        """
-        Returns the order size for market making.
-        Market makers typically use fixed size, not martingale.
-        """
-        return self.order_size
-    
-    def calculate_grid_distance(self, current_step: int, market_data) -> float:
-        """
-        Market makers don't use traditional grid.
-        Returns spread as the effective "distance".
-        """
-        return self.spread_pct
-
-    def check_signals(self, market_data):
-        """
-        Market Makers don't use 'signals' like directional bots.
-        They run a continuous loop. This method is kept for compatibility
-        but returns None. The runner should call `execute_mm_logic`.
-        """
-        return False, False

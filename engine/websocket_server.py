@@ -24,17 +24,24 @@ class WebSocketServer(threading.Thread):
         try:
             self.loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self.loop)
+            logger.debug(f"[WSS_LOOP] Event loop created and set in thread {self.name}")
             
             start_server = websockets.serve(self.handler, self.host, self.port)
             logging.info(f"WebSocket Server starting on ws://{self.host}:{self.port}")
             
             self.loop.run_until_complete(start_server)
             logging.info("WebSocket Server LISTENING")
+            logger.debug(f"[WSS_LOOP] Event loop running forever in thread {self.name}")
             self.loop.run_forever()
         except Exception as e:
             logging.error(f"WebSocket Server crashed: {e}")
+            logger.error(f"[WSS_LOOP] Loop stopped due to error in thread {self.name}")
         finally:
-            if self.loop: self.loop.close()
+            if self.loop:
+                if not self.loop.is_closed():
+                    logger.debug(f"[WSS_LOOP] Closing loop in thread {self.name}")
+                    self.loop.close()
+                logger.debug(f"[WSS_LOOP] Loop status: {self.loop.is_running()}, {self.loop.is_closed()}")
 
     async def handler(self, websocket):
         """Handle new connections."""
@@ -51,7 +58,9 @@ class WebSocketServer(threading.Thread):
 
     def broadcast(self, message: dict):
         """Thread-safe broadcast method."""
-        if not self.loop or not self.running: return
+        if not self.loop or not self.running or not self.loop.is_running():
+            logger.debug(f"[WSS_BROADCAST] Skipping broadcast: loop running={self.loop.is_running() if self.loop else 'N/A'}, running flag={self.running}")
+            return
         
         if self.clients:
             json_msg = json.dumps(message)
