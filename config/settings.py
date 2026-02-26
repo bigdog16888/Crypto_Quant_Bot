@@ -33,11 +33,17 @@ class Config:
         self.ATR_TIMEFRAME = os.getenv("ATR_TIMEFRAME", "1h")
         self.ATR_PERIODS = int(os.getenv("ATR_PERIODS", 14))
 
-        self.METRICS_PORT = int(os.getenv("METRICS_PORT", 8000))
+        self.METRICS_PORT = int(os.getenv("METRICS_PORT", 9090))
 
         self.GLOBAL_STOP_LOSS_PCT = float(os.getenv("GLOBAL_STOP_LOSS_PCT", 50.0))
         self.MAX_RETRIES = int(os.getenv("MAX_RETRIES", 3))
         self.RETRY_DELAY = int(os.getenv("RETRY_DELAY", 2))
+        
+        # 🛡️ SAFETY TOGGLE: Allow user to disable auto-cancellation of zombie orders
+        self.AUTO_FIX_ZOMBIES = os.getenv("AUTO_FIX_ZOMBIES", "True").lower() == "true"
+        
+        # 🛡️ SAFETY TOGGLE: Strict Cleanup (True = Kill Manual Orders, False = Protect Them)
+        self.STRICT_CLEANUP = os.getenv("STRICT_CLEANUP", "False").lower() == "true"
 
         self.ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         self.PATHS = {

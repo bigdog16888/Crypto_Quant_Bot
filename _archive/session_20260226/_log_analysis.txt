@@ -1,0 +1,6 @@
+=== REMAINING WARNINGS/ERRORS (by frequency) ===
+
+[x   5] 2026-02-21 13:59:28,762 - IntegrityEnforcer - WARNING - 🗑️ ORPHAN ORDER DETECTED: Bot 10012 Order 273596998 (grid). Cancelling.
+
+[x   1] 2026-02-21 13:59:29,199 - WSServer - WARNING - WebSocket Server could not bind (port in use?): [Errno 10048] error while attempting to bind on address ('0.0.0.0', 8765): 一次只能用一個通訊端位址 (通訊協定/網路位址/連接埠)。
+

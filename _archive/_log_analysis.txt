@@ -1,0 +1,40 @@
+=== REMAINING WARNINGS/ERRORS (by frequency) ===
+
+[x 152] 2026-02-20 20:40:01,406 - ExchangeInterface.future - ERROR - Raw API Error 400: {"code":-2019,"msg":"Margin is insufficient."}
+
+[x 152] 2026-02-20 20:40:01,407 - ExchangeInterface.future - ERROR - Order Placement Failed: Raw order placement returned empty response
+
+[x  43] 2026-02-20 20:40:01,407 - BotExecutor - ERROR - ❌ Recovered_Bot_10012: Error maintaining Grid: Raw order placement returned empty response
+
+[x  43] 2026-02-20 20:40:01,675 - BotExecutor - ERROR - ❌ Recovered_Bot_10004: Error maintaining Grid: Raw order placement returned empty response
+
+[x  26] 2026-02-20 20:40:01,826 - BotExecutor - ERROR - ❌ Recovered_Bot_10010: Error maintaining Grid: Raw order placement returned empty response
+
+[x  23] 2026-02-20 20:40:01,462 - BotExecutor - ERROR - ❌ Recovered_Bot_10009: Error maintaining Grid: Raw order placement returned empty response
+
+[x  17] 2026-02-20 20:41:00,678 - BotExecutor - ERROR - ❌ Recovered_Bot_10013: Error maintaining Grid: Raw order placement returned empty response
+
+[x  15] 2026-02-20 20:40:08,864 - IntegrityEnforcer - WARNING - 🗑️ ORPHAN ORDER DETECTED: Bot 10005 Order 272331704 (grid). Cancelling.
+
+[x   5] 2026-02-20 20:41:45,536 - BotExecutor - WARNING - 👻 Recovered_Bot_10008: Found 1 GHOST orders while SCANNING (Invested=0.0). Purging...
+
+[x   3] 2026-02-20 20:44:32,152 - IntegrityEnforcer - WARNING - 🗑️ ORPHAN ORDER DETECTED: Bot 10008 Order 12416283439 (entry). Cancelling.
+
+[x   1] 2026-02-20 20:42:24,315 - BotExecutor - WARNING - 👻 Recovered_Bot_10007: Found 1 GHOST orders while SCANNING (Invested=0.0). Purging...
+
+[x   1] 2026-02-20 20:42:27,407 - StateReconciliation - WARNING - ⚠️ NOTIONAL DEVIATION on BTCUSDC: Virtual=$86142.91 vs Physical=$84847.68 (Delta=$1295.23). NO ACTION TAKEN.
+
+[x   1] 2026-02-20 20:42:27,407 - StateReconciliation - WARNING - ⚠️ [NET-MISMATCH] BTCUSDC: Virtual Net=$85870.46, Physical Net=$84847.68. Diff=$1022.78 (Virtual is too LONG). Checking for ghosts...
+
+[x   1] 2026-02-20 20:42:27,407 - StateReconciliation - WARNING - ⚠️ [NET-SUM-FLAG] Bot Recovered_Bot_10004 (ID 10004) is LONG $9343.37 with no open orders. Contributes to net error. Flagging only — NO RESET.
+
+[x   1] 2026-02-20 20:42:27,407 - StateReconciliation - WARNING - ⚠️ [NET-SUM-FLAG] Bot Recovered_Bot_10005 (ID 10005) is LONG $404.02 with no open orders. Contributes to net error. Flagging only — NO RESET.
+
+[x   1] 2026-02-20 20:42:27,407 - StateReconciliation - WARNING - ⚠️ [NET-SUM-FLAG] Bot Recovered_Bot_10012 (ID 10012) is LONG $76259.30 with no open orders. Contributes to net error. Flagging only — NO RESET.
+
+[x   1] 2026-02-20 20:42:27,407 - StateReconciliation - WARNING - ⚠️ NOTIONAL DEVIATION on BTCUSDT: Virtual=$76298.77 vs Physical=$76430.59 (Delta=$131.82). NO ACTION TAKEN.
+
+[x   1] 2026-02-20 20:42:27,409 - StateReconciliation - WARNING - ⚠️ [NET-MISMATCH] BTCUSDT: Virtual Net=$76298.77, Physical Net=$76430.59. Diff=$-131.82 (Virtual is too SHORT). Checking for ghosts...
+
+[x   1] 2026-02-20 20:42:27,412 - IntegrityEnforcer - WARNING - ⚠️ SIZE DISCREPANCY: BTCUSDT LONG Phys=$76430.59 Virt=$76298.77 (+$131.82 untracked). NO ACTION TAKEN.
+

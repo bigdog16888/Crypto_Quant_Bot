@@ -1,7 +1,7 @@
 # Crypto Quant Bot: Unified Documentation
 
-**Version:** 1.0.0 (Fundamental Multi-Bot Isolation)  
-**Status:** Production Ready, High Stability
+**Version:** 1.3.0 (Stabilized Engine & Recovery v2.1)  
+**Status:** Highly Stable, Auto-Healing Active
 
 This document provides a unified, comprehensive overview of the Crypto Quant Bot, its architecture, setup, and operational best practices. It consolidates the key information from over 20 separate markdown files.
 
@@ -167,3 +167,22 @@ The bot has recently undergone a fundamental stabilization phase to ensure multi
 
 ---
 This unified document was last updated on 2026-02-12.
+
+## 6. Database Architecture & Concurrency (Added 2026-02-17)
+The system uses **SQLite** in **WAL (Write-Ahead Logging)** mode for high-performance concurrency.
+-   **File**: `crypto_bot.db` in the root directory.
+-   **Concurrency**: 
+    -   `runner.py` writes to the DB using `isolation_level=None` and `BEGIN IMMEDIATE` transactions to prevent locking issues.
+    -   Streamlit UI reads from the DB in a separate process.
+    -   WAL mode allows simultaneous readers and one writer without blocking.
+-   **Tables**:
+    -   `bots`: Configuration and state.
+    -   `trades`: Active trade tracking (Virtual Positions).
+    -   `active_positions`: Snapshot of valid physical exchange positions (Synced every cycle).
+    -   `bot_orders`: Log of all orders placed by bots.
+
+### Troubleshooting "Empty Wallet"
+If the UI reports "Exchange wallet is empty", it means the `active_positions` table is empty.
+This checks:
+1.  Check `engine.log` for `✅ Active Positions Synced: X`.
+2.  If Synced > 0 but UI is empty, ensure `runner.py` is running and `crypto_bot.db-wal` exists.

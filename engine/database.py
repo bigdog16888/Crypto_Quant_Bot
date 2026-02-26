@@ -5,6 +5,8 @@ import json
 import time
 import logging
 import uuid
+import shutil
+import datetime
 from typing import List, Dict, Any, Tuple
 
 # Setup logger
@@ -36,8 +38,8 @@ def get_connection():
     
     if need_new_connection:
         _local.connection = sqlite3.connect(DB_PATH, timeout=30.0)
-        # Enable WAL mode for better concurrent read/write performance
-        _local.connection.execute("PRAGMA journal_mode=WAL")
+        # ENABLE WAL MODE for concurrency safety - DISABLED for Windows Stability
+        _local.connection.execute("PRAGMA journal_mode=DELETE")
         _local.connection.execute("PRAGMA busy_timeout=30000")
     
     return _local.connection
@@ -57,12 +59,40 @@ def get_starting_equity():
     row = cursor.fetchone()
     return float(row[0]) if row else 10000.0
 
+def backup_database():
+    """Creates a timestamped backup of the database before modification."""
+    if not os.path.exists(DB_PATH):
+        return
+        
+    try:
+        backup_dir = os.path.join(BASE_DIR, "backups")
+        os.makedirs(backup_dir, exist_ok=True)
+        
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_name = f"crypto_bot_backup_{timestamp}.db"
+        backup_path = os.path.join(backup_dir, backup_name)
+        
+        # Use shutil for safe copy
+        shutil.copy2(DB_PATH, backup_path)
+        logger.info(f"✅ Database backed up to: {backup_path}")
+        
+        # Cleanup old backups (keep last 10)
+        backups = sorted([os.path.join(backup_dir, f) for f in os.listdir(backup_dir) if f.endswith('.db')], key=os.path.getmtime)
+        while len(backups) > 10:
+            os.remove(backups.pop(0))
+            
+    except Exception as e:
+        logger.error(f"❌ Database backup failed: {e}")
+
 def init_db():
     """Initializes the database schema and performs necessary migrations."""
+    # 1. Perform Safety Backup
+    backup_database()
+
     conn = None
     try:
         conn = sqlite3.connect(DB_PATH, timeout=60.0)
-        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA journal_mode=DELETE")
         conn.execute("PRAGMA busy_timeout=60000")
         cursor = conn.cursor()
         
@@ -263,6 +293,22 @@ def init_db():
             )
         ''')
 
+        # --- FUNDAMENTAL FIX: TRACEABILITY LOG ---
+        # Reconciliation logs table (v2.1.0 Fundamental Architecture)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS reconciliation_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER,
+                bot_id INTEGER,
+                pair TEXT,
+                action TEXT,
+                details TEXT,
+                proof_order_id TEXT,
+                FOREIGN KEY (bot_id) REFERENCES bots (id)
+            )
+        """)
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_recon_logs_bot ON reconciliation_logs(bot_id)')
+
         # FUNDAMENTAL FIX: Clear stale active positions on startup
         # This prevents the UI from showing "Green" (Synced) against old data before the first poll cycle
         cursor.execute('DELETE FROM active_positions')
@@ -373,7 +419,7 @@ def add_bot(name, pair, direction, rsi_limit, martingale_multiplier, base_size, 
     conn = get_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("INSERT INTO bots (name, pair, direction, rsi_limit, martingale_multiplier, base_size, strategy_type, config) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (name, pair, direction.upper(), rsi_limit, martingale_multiplier, base_size, strategy_type, config_json))
+        cursor.execute("INSERT INTO bots (name, pair, direction, rsi_limit, martingale_multiplier, base_size, strategy_type, config, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Scanning')", (name, pair, direction.upper(), rsi_limit, martingale_multiplier, base_size, strategy_type, config_json))
         bot_id = cursor.lastrowid
         cursor.execute('INSERT INTO trades (bot_id) VALUES (?)', (bot_id,))
         conn.commit()
@@ -420,7 +466,8 @@ def get_bot_status(bot_id):
                COALESCE(t.last_exit_price, 0) as last_exit_price,
                COALESCE(t.last_exit_time, 0) as last_exit_time,
                COALESCE(t.basket_start_time, 0) as basket_start_time,
-               b.direction, b.is_active
+               b.direction, b.is_active,
+               COALESCE(t.entry_confirmed, 0) as entry_confirmed
         FROM bots b 
         LEFT JOIN trades t ON b.id = t.bot_id 
         WHERE b.id = ?
@@ -441,18 +488,15 @@ def get_bot_status(bot_id):
         'last_exit_time': row[8],
         'basket_start_time': row[9],
         'direction': row[10],
-        'is_active': row[11]
+        'is_active': row[11],
+        'entry_confirmed': row[12]
     }
 
-    # --- SAFETY GUARD: Prevent Phantom/Corrupted State Usage ---
-    # Relaxed for modern market conditions and Short triggers
+    # --- SAFETY GUARD: Log suspicious entry prices but do NOT wipe state ---
+    # Previously this wiped bot state when avg_entry < $10,000 for BTC pairs,
+    # but this caused infinite re-entry loops when fills set intermediate prices.
     if result['pair'] and 'BTC' in result['pair'] and result['avg_entry_price'] > 0 and result['avg_entry_price'] < 10000:
-        logger.critical(f"🛡️ SAFETY GUARD: Bot {result['name']} has CORRUPTED Entry Price (${result['avg_entry_price']:.2f}). Forcing IDLE state override.")
-        result['total_invested'] = 0
-        result['avg_entry_price'] = 0
-        result['current_step'] = 0
-        result['entry_order_id'] = None
-        result['tp_order_id'] = None
+        logger.warning(f"⚠️ SAFETY NOTICE: Bot {result['name']} has low Entry Price (${result['avg_entry_price']:.2f}). May be mid-fill. NOT wiping state.")
         
     return result
 
@@ -471,8 +515,31 @@ def update_bot(bot_id, name, pair, direction, rsi_limit, martingale_multiplier, 
         logger.error(f"Error updating bot {bot_id}: {e}")
         return False
 
+# --- FUNDAMENTAL FIX: DATA VALIDATION LAYER ---
+def validate_trade_data(bot_id, step, invested, avg_price):
+    """
+    Validates trade data before writing to DB.
+    Blocks 'nonsense' data that causes PnL explosions ($9M error).
+    """
+    # 1. Price Floor: BTC/XAU cannot reasonably be < $10.0
+    if avg_price > 0 and avg_price < 10.0:
+        logger.critical(f"🛡️ VALIDATION BLOCKED: Bot {bot_id} attempted to save impossible avg_price={avg_price}. REJECTING.")
+        return False
+    
+    # 2. Logic Mismatch: Cannot have invested $>0$ with step 0 (or vice versa in some strategies)
+    if invested < 0:
+        logger.critical(f"🛡️ VALIDATION BLOCKED: Bot {bot_id} has negative invested amount: {invested}")
+        return False
+        
+    return True
+
 def update_martingale_step(bot_id, step, total_invested, avg_price, tp_price):
     """Updates or inserts the trade state for a specific bot (UPSERT logic)."""
+    
+    # --- FUNDAMENTAL FIX: PRE-WRITE VALIDATION ---
+    if not validate_trade_data(bot_id, step, total_invested, avg_price):
+        return False
+
     conn = None
     try:
         conn = get_connection()
@@ -490,10 +557,9 @@ def update_martingale_step(bot_id, step, total_invested, avg_price, tp_price):
                     total_invested = ?, 
                     avg_entry_price = ?, 
                     target_tp_price = ?,
-                    entry_confirmed = 1,
-                    basket_start_time = CASE WHEN basket_start_time = 0 THEN ? ELSE basket_start_time END
+                    entry_confirmed = 1
                 WHERE bot_id = ?
-            """, (step, total_invested, avg_price, tp_price, int(time.time()), bot_id))
+            """, (step, total_invested, avg_price, tp_price, bot_id))
             logger.debug(f"✅ Updated trade state for bot {bot_id}: step={step}, invested={total_invested}, avg_price={avg_price}")
         else:
             # INSERT new record
@@ -558,7 +624,7 @@ def reset_bot_after_tp(bot_id, exit_price, direction=None, action_label='TP_HIT'
             else:
                 pnl = (avg_entry_price - exit_price) * est_qty
         log_trade(bot_id, action_label, pair, exit_price, total_invested / avg_entry_price if avg_entry_price > 0 else 0, total_invested, step=current_step, pnl=pnl, notes=notes)
-        cursor.execute("UPDATE trades SET current_step = 0, total_invested = 0, avg_entry_price = 0, target_tp_price = 0, last_exit_price = ?, last_exit_time = ?, basket_start_time = 0, entry_confirmed = 0, entry_order_id = NULL, tp_order_id = NULL, bot_position_id = NULL, close_type = ? WHERE bot_id = ?", (exit_price, int(time.time()), action_label, bot_id))
+        cursor.execute("UPDATE trades SET current_step = 0, total_invested = 0, avg_entry_price = 0, target_tp_price = 0, last_exit_price = ?, last_exit_time = ?, basket_start_time = ?, entry_confirmed = 0, entry_order_id = NULL, tp_order_id = NULL, bot_position_id = NULL, close_type = ? WHERE bot_id = ?", (exit_price, int(time.time()), int(time.time()), action_label, bot_id))
         cursor.execute("UPDATE bot_orders SET status = 'auto_closed', updated_at = ? WHERE bot_id = ? AND status = 'open'", (int(time.time()), bot_id))
         cursor.execute("UPDATE bots SET status='Scanning' WHERE id = ?", (bot_id,))
         conn.commit()
@@ -571,30 +637,70 @@ def reset_bot_after_tp(bot_id, exit_price, direction=None, action_label='TP_HIT'
 def check_and_fix_integrity():
     """
     Sanitizes the database state on startup (or periodically).
-    Fixes 'Zombie' (In Trade but 0 invested) and 'Ghost' (Scanning but invested) states.
+    Fixes 'Zombie', 'Ghost', and 'Corrupted' (invalid prices) states.
     """
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT b.id, b.name, b.status, t.total_invested FROM bots b LEFT JOIN trades t ON b.id = t.bot_id WHERE b.is_active = 1")
+    
+    # 0. Fix Corrupted Data (The $9M PnL Bug)
+    # Wipe any trade with impossible entry prices
+    cursor.execute("SELECT bot_id, name, avg_entry_price FROM trades t JOIN bots b ON t.bot_id = b.id WHERE avg_entry_price > 0 AND avg_entry_price < 10.0")
+    corrupted = cursor.fetchall()
+    for bid, bname, bprice in corrupted:
+        logger.critical(f"☢️ DATA INTEGRITY ALERT: Bot {bname} (ID {bid}) has CORRUPTED entry price ${bprice}. Wiping trade state to prevent PnL explosion.")
+        cursor.execute("UPDATE trades SET current_step=0, total_invested=0, avg_entry_price=0, entry_confirmed=0 WHERE bot_id=?", (bid,))
+        cursor.execute("UPDATE bots SET status='Scanning' WHERE id=?", (bid,))
+
+    cursor.execute("SELECT b.id, b.name, b.status, t.total_invested, t.entry_order_id FROM bots b LEFT JOIN trades t ON b.id = t.bot_id WHERE b.is_active = 1")
     rows = cursor.fetchall()
     
-    fixed_count = 0
+    # Also clear stale trade data for inactive bots to avoid confusing the reconciler
+    cursor.execute("""
+        UPDATE trades SET total_invested=0, current_step=0, avg_entry_price=0, entry_confirmed=0, entry_order_id=NULL, tp_order_id=NULL
+        WHERE bot_id IN (SELECT id FROM bots WHERE is_active=0)
+          AND (total_invested > 0 OR current_step > 0 OR entry_order_id IS NOT NULL)
+    """)
+    inactive_cleared = cursor.rowcount
+    if inactive_cleared > 0:
+        logger.warning(f"⚠️ [INTEGRITY] Cleared stale trade data for {inactive_cleared} inactive bots.")
+    
+    fixed_count = len(corrupted)
     for row in rows:
-        bot_id, name, status, invested = row
+        bot_id, name, status, invested, entry_order_id = row
         invested = invested or 0
         
         # Case 1: Zombie State (Active Status but No Money)
-        # Status "IN TRADE" (or similar) but invested is 0
-        if status and status.upper() in ['IN TRADE', 'TRADING'] and invested <= 0:
-            logger.warning(f"🔧 Integrity Fix: Bot {name} (ID {bot_id}) is '{status}' but has $0 invested. Resetting to 'Scanning'.")
-            cursor.execute("UPDATE bots SET status='Scanning' WHERE id=?", (bot_id,))
-            fixed_count += 1
+        # Status "IN TRADE" (or similar) but invested is 0 AND NO pending entry order exists
+        if status and status.upper() in ['IN TRADE', 'TRADING', '🔴 IN TRADE'] and invested <= 0:
+            if entry_order_id:
+                pass # Legitimately waiting for an entry fill, do NOT reset.
+            else:
+                logger.warning(f"🔧 Integrity Fix: Bot {name} (ID {bot_id}) is '{status}' but has $0 invested and no entry_order_id. Resetting to 'Scanning'.")
+                cursor.execute("UPDATE bots SET status='Scanning' WHERE id=?", (bot_id,))
+                fixed_count += 1
             
         # Case 2: Ghost State (Scanning Status but Money trapped)
         # Status "Scanning" but invested > 0
-        elif status and status.upper() == 'SCANNING' and invested > 1.0: # Ignore dust < $1
-            logger.warning(f"🔧 Integrity Fix: Bot {name} (ID {bot_id}) is '{status}' but has ${invested:.2f} invested. Updating to 'IN TRADE'.")
-            cursor.execute("UPDATE bots SET status='IN TRADE' WHERE id=?", (bot_id,))
+        # FLAG-ONLY: Don't auto-promote — let reconciler decide with evidence.
+        # Auto-promoting fights ghost-bust and causes cascade loops.
+        elif status and (status.upper() == 'SCANNING' or status.upper() == '🟢 SCANNING') and invested > 1.0: # Ignore dust < $1
+            logger.warning(f"⚠️ [FLAG-ONLY] Bot {name} (ID {bot_id}) is '{status}' but has ${invested:.2f} invested. NOT auto-promoting — reconciler will handle.")
+
+        # Case 3: Stuck Stopped (Active bot with 'Stopped' status)
+        elif status and status.upper() == '⚪ STOPPED' and invested > 1.0:
+            logger.warning(f"🔧 Integrity Fix: Bot {name} (ID {bot_id}) is 'Stopped' but has ${invested:.2f} invested. Resetting trade to 0.")
+            cursor.execute("UPDATE trades SET current_step=0, total_invested=0, avg_entry_price=0, entry_confirmed=0 WHERE bot_id=?", (bot_id,))
+            fixed_count += 1
+            
+        # Case 4: REMOVED (Fundamental VPS handle via evidence-based reconciler)
+        # is_active=1 but status is still 'Stopped'/'STOPPED' from before toggle fix
+        elif status and status.upper() == 'STOPPED':
+            if invested > 1.0:
+                logger.warning(f"🔧 Integrity Fix: Bot {name} (ID {bot_id}) is active but status='Stopped' with ${invested:.2f} invested. Updating to 'IN TRADE'.")
+                cursor.execute("UPDATE bots SET status='IN TRADE' WHERE id=?", (bot_id,))
+            else:
+                logger.warning(f"🔧 Integrity Fix: Bot {name} (ID {bot_id}) is active but status='Stopped'. Updating to 'Scanning'.")
+                cursor.execute("UPDATE bots SET status='Scanning' WHERE id=?", (bot_id,))
             fixed_count += 1
 
     # Also fix any legacy "Waiting for Signal" rows to "Scanning" standard
@@ -602,7 +708,24 @@ def check_and_fix_integrity():
     
     # Fix any bots with NULL status
     cursor.execute("UPDATE bots SET status='Scanning' WHERE status IS NULL OR status = ''")
+
+    # Fix any bots with 'futures' market_type in config → canonical 'future'
+    cursor.execute("SELECT id, config FROM bots WHERE config LIKE '%\"market_type\": \"futures\"%' OR config LIKE '%\"market_type\":\"futures\"%'")
+    for row in cursor.fetchall():
+        bot_id_fix, config_json = row
+        if config_json:
+            try:
+                cfg = json.loads(config_json)
+                if cfg.get('market_type') == 'futures':
+                    cfg['market_type'] = 'future'
+                    cursor.execute("UPDATE bots SET config = ? WHERE id = ?", (json.dumps(cfg), bot_id_fix))
+                    logger.warning(f"🔧 Integrity Fix: Bot ID {bot_id_fix} config market_type 'futures' → 'future'.")
+                    fixed_count += 1
+            except: pass
     
+    # Removed the dangerous "Clear stale order IDs for zero-invested rows" block,
+    # because our new Surgical Lock pattern relies on setting invested=0 and entry_order_id.
+
     conn.commit()
     if fixed_count > 0:
         logger.info(f"✅ DB Integrity Check: Fixed {fixed_count} bot states.")
@@ -671,29 +794,56 @@ def import_position_from_exchange(bot_id: int, pair: str, position_size: float, 
         # Fallback if runner isn't available (e.g., standalone script)
         tp_price = float(entry_price) * 1.015 if direction.upper() == 'LONG' else float(entry_price) * 0.985
 
-    calculated_step = 0
-    if base_size > 0 and multiplier > 1 and total_invested > base_size:
-        import math
-        try:
-            calculated_step = round(math.log(total_invested / base_size) / math.log(multiplier))
-        except: pass
+    # 🚀 FIX: Always set step=1 for adopted positions.
+    # The old forensic math (log estimation) produced wildly inflated steps.
+    # Step progression should ONLY happen via order fill events, not guessing.
+    calculated_step = 1
     try:
         # Check if record exists (UPSERT logic)
         cursor.execute("SELECT current_step FROM trades WHERE bot_id = ?", (bot_id,))
         exists = cursor.fetchone()
         
         if exists:
-            # UPDATE existing record
-            cursor.execute("UPDATE trades SET current_step=?, total_invested=?, avg_entry_price=?, target_tp_price=?, basket_start_time=?, entry_confirmed=1 WHERE bot_id=?", 
-                           (max(0, calculated_step), total_invested, float(entry_price), tp_price, int(time.time()), bot_id))
+            existing_step = exists[0] or 0
+            # If bot already has a step, preserve it — don't overwrite
+            use_step = existing_step if existing_step > 0 else calculated_step
+            # Do NOT overwrite basket_start_time with time.time(), as it severs the link to past historical orders.
+            # Instead, set it to 0 (allow all history) or preserve it if valid. Here we set it to 0 to be safe for adoption.
+            cursor.execute("UPDATE trades SET current_step=?, total_invested=?, avg_entry_price=?, target_tp_price=?, basket_start_time=0, entry_confirmed=1 WHERE bot_id=?", 
+                           (use_step, total_invested, float(entry_price), tp_price, bot_id))
             logger.debug(f"import_position_from_exchange: UPDATED bot {bot_id}")
         else:
             # INSERT new record
+            # We don't overwrite basket_start_time to now if we are adopting, ideally we'd find the oldest order, 
+            # but to be safe we can use 0 to allow all history, or trust the exchange order time if we had it.
+            # Using 0 ensures that reconciler can see ALL historical orders for this bot until a new TP resets it.
             cursor.execute("""
                 INSERT INTO trades (bot_id, current_step, total_invested, avg_entry_price, target_tp_price, basket_start_time, entry_confirmed)
-                VALUES (?, ?, ?, ?, ?, ?, 1)
-            """, (bot_id, max(0, calculated_step), total_invested, float(entry_price), tp_price, int(time.time())))
+                VALUES (?, ?, ?, ?, ?, 0, 1)
+            """, (bot_id, calculated_step, total_invested, float(entry_price), tp_price))
             logger.debug(f"import_position_from_exchange: INSERTED bot {bot_id}")
+            
+        # --- FUNDAMENTAL ARCHITECTURE FIX: EVIDENCE-PROOF ADOPTION ---
+        # The Reconciler demands cryptographic proof of legal ownership.
+        # We must generate an iron-clad fill record, or it will be wiped as a "Ghost".
+        evidence_cid = f"CQB_{bot_id}_ADOPT_{int(time.time())}"
+        cursor.execute("""
+            INSERT INTO bot_orders (
+                bot_id, step, order_type, order_id, price, amount, 
+                status, created_at, updated_at, client_order_id, notes
+            ) VALUES (?, ?, 'adoption', ?, ?, ?, 'filled', ?, ?, ?, ?)
+        """, (
+            bot_id, 
+            calculated_step, 
+            evidence_cid,            # Use CID as Exchange ID to guarantee uniqueness 
+            float(entry_price), 
+            abs(float(position_size)), 
+            int(time.time()), 
+            int(time.time()), 
+            evidence_cid, 
+            "Native Position Adoption (Evidence)"
+        ))
+        logger.debug(f"import_position_from_exchange: GENERATED EVIDENCE for bot {bot_id} ({evidence_cid})")
         
         conn.commit()
         return True
@@ -707,27 +857,85 @@ def get_all_bots():
     cursor = conn.cursor()
     cursor.execute("SELECT b.id, b.name, b.pair, b.is_active, b.strategy_type, COALESCE(t.total_invested, 0), COALESCE(t.current_step, 0) FROM bots b LEFT JOIN trades t ON b.id = t.bot_id")
     bots = cursor.fetchall()
-    logger.critical(f"🔍 [GET_ALL_BOTS] Query returned {len(bots)} bots from DB.")
-    for bot in bots:
-        logger.critical(f"   - DB Bot Raw: ID={bot[0]}, Name={bot[1]}, Active={bot[3]}")
+    logger.debug(f"[GET_ALL_BOTS] Query returned {len(bots)} bots from DB.")
     return bots
 
 def toggle_bot_active(bot_id, new_status):
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute('UPDATE bots SET is_active = ? WHERE id = ?', (1 if new_status else 0, bot_id))
+    if new_status:
+        cursor.execute("UPDATE bots SET is_active = 1, status = 'Scanning' WHERE id = ?", (bot_id,))
+    else:
+        cursor.execute("UPDATE bots SET is_active = 0 WHERE id = ?", (bot_id,))
     conn.commit()
+
+from typing import List, Dict
+def update_active_positions(positions: List[Dict]):
+    """
+    Populates the active_positions table for UI visibility.
+    Accepts CCXT-formatted position objects.
+    Uses explicit transaction logic to prevent race conditions.
+    """
+    conn = get_connection()
+    # Enforce isolation
+    conn.isolation_level = None 
+    cursor = conn.cursor()
+    
+    timestamp = int(time.time())
+    
+    try:
+        cursor.execute("BEGIN TRANSACTION")
+        cursor.execute("DELETE FROM active_positions")
+        
+        for p in positions:
+            # Handle standard CCXT structure
+            pair = p.get('symbol', 'Unknown')
+            # Handle potential string values for numeric fields
+            raw_size = p.get('contracts', 0) or p.get('info', {}).get('positionAmt', 0)
+            size = float(raw_size)
+            price = float(p.get('entryPrice', 0) or 0)
+            side = p.get('side', 'long').upper() # 'long' or 'short'
+            
+            if abs(size) > 0:
+                # Store absolute size, side determines direction
+                cursor.execute("""
+                    INSERT INTO active_positions (bot_id, pair, side, size, entry_price, last_checked)
+                    VALUES (0, ?, ?, ?, ?, ?)
+                """, (pair, side, abs(size), price, timestamp))
+                
+        cursor.execute("COMMIT")
+    except Exception as e:
+        cursor.execute("ROLLBACK")
+        logger.error(f"Failed to update active_positions table: {e}")
+    finally:
+        conn.close()
 
 def delete_bot(bot_id):
     conn = get_connection()
     cursor = conn.cursor()
     try:
+        # SAFETY CHECK 1: Check for Active Trade
+        cursor.execute("SELECT total_invested FROM trades WHERE bot_id = ?", (bot_id,))
+        trade = cursor.fetchone()
+        if trade and trade[0] > 0:
+            logger.warning(f"⚠️ BLOCKED DELETION: Bot {bot_id} has active trade (${trade[0]}). Close position first.")
+            return False
+
+        # SAFETY CHECK 2: Check for Open Orders
+        cursor.execute("SELECT COUNT(*) FROM bot_orders WHERE bot_id = ? AND status='open'", (bot_id,))
+        open_orders = cursor.fetchone()[0]
+        if open_orders > 0:
+            logger.warning(f"⚠️ BLOCKED DELETION: Bot {bot_id} has {open_orders} open orders. Cancel them first.")
+            return False
+
+        # Proceed with deletion if safe
         cursor.execute('DELETE FROM trade_history WHERE bot_id = ?', (bot_id,))
         cursor.execute('DELETE FROM trades WHERE bot_id = ?', (bot_id,))
         cursor.execute('DELETE FROM bots WHERE id = ?', (bot_id,))
         conn.commit()
         return True
     except Exception as e:
+        logger.error(f"Error deleting bot {bot_id}: {e}")
         return False
 
 def confirm_order(db_id, exchange_order_id):
@@ -766,14 +974,36 @@ def cleanup_pending_orders(exchange):
         return {'total': len(pending)}
     except: return {'total': 0}
 
+# Module-level counter for consecutive empty snapshots (prevents permanent stale data)
+_EMPTY_SNAP_COUNTER = 0
+_EMPTY_SNAP_THRESHOLD = 3  # Allow clearing after 3 consecutive empty snapshots
+
 def update_active_positions_snapshot(positions: list):
     """
     Updates the active_positions table with the latest snapshot from the exchange.
     This provides the UI with a real-time view of 'Physical Reality'.
     """
+    global _EMPTY_SNAP_COUNTER
     conn = None
     try:
         conn = get_connection()
+        
+        # SAFETY LATCH v2: Consecutive-miss counter
+        # Protects against transient API failures wiping real data,
+        # but allows clearing after sustained empty responses (position genuinely closed).
+        if not positions or len(positions) == 0:
+             current_count = conn.execute("SELECT COUNT(*) FROM active_positions").fetchone()[0]
+             if current_count > 0:
+                 _EMPTY_SNAP_COUNTER += 1
+                 if _EMPTY_SNAP_COUNTER < _EMPTY_SNAP_THRESHOLD:
+                     logger.warning(f"⚠️ [SAFETY-LATCH] Empty snapshot {_EMPTY_SNAP_COUNTER}/{_EMPTY_SNAP_THRESHOLD}. Keeping {current_count} existing positions.")
+                     return
+                 else:
+                     logger.info(f"✅ [SAFETY-LATCH] {_EMPTY_SNAP_COUNTER} consecutive empty snapshots. Clearing {current_count} stale positions.")
+                     _EMPTY_SNAP_COUNTER = 0
+        else:
+            _EMPTY_SNAP_COUNTER = 0  # Reset on non-empty snapshot
+        
         # Use a transaction to ensure atomicity
         conn.execute("BEGIN IMMEDIATE")
         
@@ -784,7 +1014,10 @@ def update_active_positions_snapshot(positions: list):
             raw_symbol = p.get('symbol', 'UNKNOWN')
             # Normalize symbol to match DB format (BTCUSDC -> BTC/USDC)
             # This is critical for the UI to match Virtual vs Physical
-            if raw_symbol.endswith('USDC'):
+            if '/' in raw_symbol:
+                 # Already normalized (e.g. BTC/USDC from ExchangeInterface)
+                 symbol = raw_symbol
+            elif raw_symbol.endswith('USDC'):
                 symbol = f"{raw_symbol[:-4]}/USDC"
             elif raw_symbol.endswith('USDT'):
                 symbol = f"{raw_symbol[:-4]}/USDT"
@@ -798,7 +1031,7 @@ def update_active_positions_snapshot(positions: list):
             if amount != 0:
                 # We use bot_id=0 to represent 'Physical Exchange' (no specific bot owner implied here)
                 conn.execute("""
-                    INSERT INTO active_positions (bot_id, pair, side, size, entry_price, last_checked)
+                    INSERT OR REPLACE INTO active_positions (bot_id, pair, side, size, entry_price, last_checked)
                     VALUES (0, ?, ?, ?, ?, ?)
                 """, (symbol, side, amount, entry_price, int(time.time())))
         
@@ -887,6 +1120,69 @@ def close_bot_position(bot_id, close_type='MANUAL', close_price=0.0, close_pct=1
     except Exception as e:
         logger.error(f"Error in close_bot_position for bot {bot_id}: {e}")
         return {'success': False, 'error': str(e)}
+
+
+def accumulate_trade_fill(bot_id: int, added_invested: float, added_qty: float, avg_price: float, new_step: int, tp_price: float, is_entry: bool = False):
+    """
+    Atomically accumulates a fill into the trade state using SQL math.
+    Prevents race conditions where simultaneous fills overwrite each other in Python.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        # Check if record exists
+        cursor.execute("SELECT total_invested FROM trades WHERE bot_id = ?", (bot_id,))
+        row = cursor.fetchone()
+        
+        if row:
+            # ATOMIC UPDATE: 
+            # 1. total_invested = current + added
+            # 2. avg_entry_price = (old_avg * old_invested + added_invested) / (new_total_invested)
+            # 3. current_step = If ENTRY, exact step. Else, max(current_step, new_step)
+            
+            cursor.execute("""
+                UPDATE trades 
+                SET total_invested = total_invested + ?,
+                    avg_entry_price = CASE 
+                        WHEN (total_invested + ?) > 0 
+                        THEN (avg_entry_price * total_invested + ? * ?) / (total_invested + ?)
+                        ELSE ? 
+                    END,
+                    current_step = CASE 
+                        WHEN ? THEN ? 
+                        WHEN ? > current_step THEN ? 
+                        ELSE current_step 
+                    END,
+                    target_tp_price = ?,
+                    entry_confirmed = 1
+                WHERE bot_id = ?
+            """, (
+                added_invested, 
+                added_invested, avg_price, added_invested, added_invested, 
+                avg_price, # Fallback for ELSE case
+                is_entry, new_step,
+                new_step, new_step,
+                tp_price,
+                bot_id
+            ))
+        else:
+            # FIRST ENTRY: Insert new record
+            cursor.execute("""
+                INSERT INTO trades (bot_id, current_step, total_invested, avg_entry_price, target_tp_price, entry_confirmed, basket_start_time)
+                VALUES (?, ?, ?, ?, ?, 1, ?)
+            """, (bot_id, new_step, added_invested, avg_price, tp_price, int(time.time())))
+            
+        # Fix 2: Sync bots.status → 'IN TRADE' immediately on fill
+        # The WebSocket handler calls this; bots.status must match trades.total_invested.
+        cursor.execute("UPDATE bots SET status='IN TRADE' WHERE id=?", (bot_id,))
+        conn.commit()
+        logger.info(f"✅ [ATOMIC-accumulate] Bot {bot_id} trade updated: +${added_invested:.2f} (new step: {new_step}, status→IN TRADE)")
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"❌ [ATOMIC-FAIL] Failed to accumulate fill for bot {bot_id}: {e}")
+        raise
+    finally:
+        conn.close()
 
 def get_bot_position_id(bot_id):
     conn = get_connection()
@@ -1022,6 +1318,36 @@ def get_bot_pnl_summary(bot_id):
             'win_rate': 0.0
         }
 
+def log_reconciliation(bot_id, pair, action, details, proof_order_id=None):
+    """Logs a structural reconciliation decision for auditing."""
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO reconciliation_logs (timestamp, bot_id, pair, action, details, proof_order_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (int(time.time()), bot_id, pair, action, details, proof_order_id))
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Failed to log reconciliation: {e}")
+
+def get_recent_reconciliations(limit=10):
+    """Fetches recent reconciliation decisions."""
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT rl.timestamp, b.name, rl.pair, rl.action, rl.details, rl.proof_order_id
+            FROM reconciliation_logs rl
+            JOIN bots b ON rl.bot_id = b.id
+            ORDER BY rl.timestamp DESC
+            LIMIT ?
+        """, (limit,))
+        return cursor.fetchall()
+    except Exception as e:
+        logger.error(f"Failed to fetch reconciliation logs: {e}")
+        return []
+
 def log_trade(bot_id, action, symbol, price, amount, cost_usdc, order_id="UNKNOWN", step=0, notes="", pnl=0.0):
     try:
         conn = get_connection()
@@ -1048,11 +1374,38 @@ def get_trade_history(bot_id=None, limit=100):
     else: c.execute("SELECT * FROM trade_history ORDER BY timestamp DESC LIMIT ?", (limit,))
     return c.fetchall()
 
-def save_bot_order(bot_id, order_type, exchange_order_id, price, amount, step, status='open', client_order_id=None):
+# NOTE: import_position_from_exchange is defined earlier (L765) — correct version with full schema.
+# NOTE: update_bot_display_status is defined earlier (L728) — correct version with error handling.
+        
+def update_order_status(order_id, status, bot_id=None):
+    """Updates the status of an order in bot_orders."""
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        
+        # If bot_id represents a stronger filter, use it
+        if bot_id:
+            cursor.execute("""
+                UPDATE bot_orders 
+                SET status = ?, updated_at = ?
+                WHERE order_id = ? AND bot_id = ?
+            """, (status, int(time.time()), str(order_id), bot_id))
+        else:
+            cursor.execute("""
+                UPDATE bot_orders 
+                SET status = ?, updated_at = ?
+                WHERE order_id = ?
+            """, (status, int(time.time()), str(order_id)))
+            
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Failed to update order status {order_id}: {e}")
+
+def save_bot_order(bot_id, order_type, exchange_order_id, price, amount, step, status='open', client_order_id=None, notes=None):
     conn = get_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("INSERT INTO bot_orders (bot_id, step, order_type, order_id, price, amount, status, created_at, client_order_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (bot_id, step, order_type, exchange_order_id, price, amount, status, int(time.time()), client_order_id))
+        cursor.execute("INSERT INTO bot_orders (bot_id, step, order_type, order_id, price, amount, status, created_at, client_order_id, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (bot_id, step, order_type, exchange_order_id, price, amount, status, int(time.time()), client_order_id, notes))
         
         # CRITICAL FIX: Also update trades table so get_bot_order_ids() / Guardian can see them.
         # Previously only bot_orders was written, but Guardian reads trades.entry_order_id/tp_order_id.
@@ -1067,14 +1420,7 @@ def save_bot_order(bot_id, order_type, exchange_order_id, price, amount, step, s
         logger.error(f"Failed to save bot order: {e}")
         return False
 
-def update_order_status(order_id, status, bot_id=None):
-    """Updates the status of an order in the database."""
-    conn = get_connection()
-    if bot_id:
-        conn.execute("UPDATE bot_orders SET status = ? WHERE order_id = ? AND bot_id = ?", (status, order_id, bot_id))
-    else:
-        conn.execute("UPDATE bot_orders SET status = ? WHERE order_id = ?", (status, order_id))
-    conn.commit()
+# NOTE: update_order_status is defined earlier (L1393) — correct version with updated_at timestamp.
 
 def close_order_in_db(order_id):
     try:
@@ -1119,16 +1465,38 @@ def get_last_filled_order(bot_id):
     except: pass
     return None
 
+# Module-level counter for update_full_snapshot (separate from update_active_positions_snapshot)
+_FULL_SNAP_EMPTY_COUNTER = 0
+
 def update_full_snapshot(trade_updates: List[Dict[str, Any]], physical_positions: List[Dict[str, Any]]):
     """
     Atomically updates both the virtual (trades) and physical (active_positions) state.
     This is the fundamental fix to prevent UI race conditions.
     """
+    global _FULL_SNAP_EMPTY_COUNTER
     conn = None
     try:
         conn = get_connection()
         # check if there are active connect before attempting to connect
         if not conn: return
+        
+        # SAFETY LATCH v2: Consecutive-miss counter
+        # Protects against transient API failures, but allows clearing after sustained empty responses.
+        if not physical_positions or len(physical_positions) == 0:
+             current_count = conn.execute("SELECT COUNT(*) FROM active_positions").fetchone()[0]
+             if current_count > 0:
+                 _FULL_SNAP_EMPTY_COUNTER += 1
+                 if _FULL_SNAP_EMPTY_COUNTER < _EMPTY_SNAP_THRESHOLD:
+                     logger.warning(f"⚠️ [SAFETY-LATCH] Empty snapshot {_FULL_SNAP_EMPTY_COUNTER}/{_EMPTY_SNAP_THRESHOLD}. Keeping {current_count} existing positions.")
+                     return
+                 else:
+                     logger.info(f"✅ [SAFETY-LATCH] {_FULL_SNAP_EMPTY_COUNTER} consecutive empty snapshots. Clearing {current_count} stale positions.")
+                     _FULL_SNAP_EMPTY_COUNTER = 0
+        else:
+            _FULL_SNAP_EMPTY_COUNTER = 0  # Reset on non-empty snapshot
+        
+        # FIX: Ensure we control the transaction explicitly
+        conn.isolation_level = None
         conn.execute("BEGIN IMMEDIATE")
         
         # 1. Update Virtual Positions
@@ -1141,36 +1509,74 @@ def update_full_snapshot(trade_updates: List[Dict[str, Any]], physical_positions
                 ON CONFLICT(bot_id) DO UPDATE SET
                     total_invested = excluded.total_invested,
                     avg_entry_price = excluded.avg_entry_price,
-                    entry_confirmed = excluded.entry_confirmed,
-                    basket_start_time = CASE WHEN basket_start_time = 0 THEN ? ELSE basket_start_time END
+                    entry_confirmed = excluded.entry_confirmed
                 WHERE bot_id = ?
-            """, (bot_id, update['total_invested'], update['avg_entry_price'], update['entry_confirmed'], update['basket_start_time'], int(time.time()), bot_id))
+            """, (bot_id, update['total_invested'], update['avg_entry_price'], update['entry_confirmed'], update['basket_start_time'], bot_id))
+
+        # Note: The empty-snapshot check is now handled by the consecutive-miss counter above.
+        # If we reach here with empty positions, the counter already approved the clear.
 
         # 2. Update Physical Positions
         conn.execute("DELETE FROM active_positions")
+        # print("DEBUG: Active Positions Deleted")
+        
         for p in physical_positions:
-            # Symbol normalization logic from previous fixes
+            # Robust Symbol Normalization
             raw_symbol = p.get('symbol', 'UNKNOWN')
-            if raw_symbol.endswith('USDC'): symbol = f"{raw_symbol[:-4]}/USDC"
-            elif raw_symbol.endswith('USDT'): symbol = f"{raw_symbol[:-4]}/USDT"
-            else: symbol = raw_symbol
+            # Handle CCXT Linear format: "BTC/USDT:USDT" -> "BTC/USDT"
+            if ':' in raw_symbol:
+                clean_symbol = raw_symbol.split(':')[0]
+            else:
+                clean_symbol = raw_symbol
             
-            amount = float(p.get('contracts', 0))
+            # Ensure standard slash format if missing (e.g. BTCUSDT -> BTC/USDT - rare in CCXT but possible)
+            if '/' not in clean_symbol:
+                 # Fallback assumption, risky but better than nothing
+                 if clean_symbol.endswith('USDT'): clean_symbol = f"{clean_symbol[:-4]}/USDT"
+                 elif clean_symbol.endswith('USDC'): clean_symbol = f"{clean_symbol[:-4]}/USDC"
+            
+            symbol = clean_symbol
+            
+            # Use 'contracts' (futures) or 'amount' (spot) or 'size'
+            amount = float(p.get('contracts', 0) or p.get('amount', 0) or p.get('size', 0) or 0)
             side = 'LONG' if amount > 0 else 'SHORT'
-            entry_price = float(p.get('entryPrice', 0))
+            entry_price = float(p.get('entryPrice', 0) or 0)
+            
+            # print(f"DEBUG: Processing {symbol} Amount: {amount}")
             
             if amount != 0:
                 # We use bot_id=0 to represent 'Physical Exchange' (no specific bot owner implied here)
-                conn.execute("""
-                    INSERT INTO active_positions (bot_id, pair, side, size, entry_price, last_checked)
-                    VALUES (0, ?, ?, ?, ?, ?)
-                """, (symbol, side, amount, entry_price, int(time.time())))
+                try:
+                    conn.execute("""
+                        INSERT OR REPLACE INTO active_positions (bot_id, pair, side, size, entry_price, last_checked)
+                        VALUES (0, ?, ?, ?, ?, ?)
+                    """, (symbol, side, abs(amount), entry_price, int(time.time())))
+                    # print(f"DEBUG: Inserted {symbol}")
+                except Exception as insert_err:
+                    logger.error(f"❌ INSERT FAILED for {symbol}: {insert_err}")
+                    # print(f"DEBUG: Insert Failed: {insert_err}")
         
         conn.commit()
-        logger.info("✅ Transactional snapshot update complete.")
+        # WAL Checkpoint removed (DELETE Mode)
+        # conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        
+        # logger.info(f"✅ Transactional snapshot update complete. Physical positions written: {len(physical_positions)}")
+        
+        # 🚀 DEBUG: Self-Verify
+        try:
+            chk = conn.execute("SELECT COUNT(*) FROM active_positions").fetchone()[0]
+            st = os.stat(DB_PATH)
+            print(f"DEBUG DB: Post-Commit Check -> {chk} rows in {DB_PATH} | Size: {st.st_size} | Inode: {st.st_ino}")
+        except: pass
+
     except Exception as e:
         logger.error(f"Failed to execute transactional snapshot update: {e}")
         if conn:
             try:
                 conn.rollback()
+            except: pass
+    finally:
+        if conn:
+            try:
+                conn.close()
             except: pass

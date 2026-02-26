@@ -24,65 +24,62 @@ class WebSocketServer(threading.Thread):
         try:
             self.loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self.loop)
-            logger.debug(f"[WSS_LOOP] Event loop created and set in thread {self.name}")
-            
-            start_server = websockets.serve(self.handler, self.host, self.port)
-            logging.info(f"WebSocket Server starting on ws://{self.host}:{self.port}")
-            
-            self.loop.run_until_complete(start_server)
-            logging.info("WebSocket Server LISTENING")
-            logger.debug(f"[WSS_LOOP] Event loop running forever in thread {self.name}")
-            self.loop.run_forever()
+            logger.debug(f"[WSS_LOOP] Event loop created in thread {self.name}")
+            self.loop.run_until_complete(self._serve())
         except Exception as e:
-            logging.error(f"WebSocket Server crashed: {e}")
-            logger.error(f"[WSS_LOOP] Loop stopped due to error in thread {self.name}")
+            logger.warning(f"WebSocket Server unavailable: {e}")
         finally:
-            if self.loop:
-                if not self.loop.is_closed():
-                    logger.debug(f"[WSS_LOOP] Closing loop in thread {self.name}")
-                    self.loop.close()
-                logger.debug(f"[WSS_LOOP] Loop status: {self.loop.is_running()}, {self.loop.is_closed()}")
+            if self.loop and not self.loop.is_closed():
+                self.loop.close()
+
+    async def _serve(self):
+        """Start the server and run forever."""
+        try:
+            async with websockets.serve(self.handler, self.host, self.port):
+                logger.info(f"WebSocket Server LISTENING on ws://{self.host}:{self.port}")
+                await asyncio.Future()  # run forever
+        except OSError as e:
+            # Port already in use or other socket error — non-fatal
+            logger.warning(f"WebSocket Server could not bind (port in use?): {e}")
+        except Exception as e:
+            logger.warning(f"WebSocket Server stopped: {e}")
 
     async def handler(self, websocket):
         """Handle new connections."""
         self.clients.add(websocket)
         try:
-            # Keep connection open and handle incoming messages (if any)
             async for message in websocket:
-                # We can handle control messages from UI here (e.g. "subscribe")
-                pass
+                pass  # Handle control messages from UI if needed
         except websockets.exceptions.ConnectionClosed:
             pass
         finally:
-            self.clients.remove(websocket)
+            self.clients.discard(websocket)
 
     def broadcast(self, message: dict):
         """Thread-safe broadcast method."""
         if not self.loop or not self.running or not self.loop.is_running():
-            logger.debug(f"[WSS_BROADCAST] Skipping broadcast: loop running={self.loop.is_running() if self.loop else 'N/A'}, running flag={self.running}")
             return
         
         if self.clients:
             json_msg = json.dumps(message)
-            # Schedule the broadcast in the event loop
-            asyncio.run_coroutine_threadsafe(self._broadcast_async(json_msg), self.loop)
+            try:
+                asyncio.run_coroutine_threadsafe(self._broadcast_async(json_msg), self.loop)
+            except Exception as e:
+                logger.debug(f"[WSS_BROADCAST] Failed to schedule async broadcast: {e}")
 
     async def _broadcast_async(self, message):
-        if not self.clients: return
-        # websockets.broadcast is available in newer versions, else iterate
-        # But websockets 10+ has broadcast helper. 
-        # For safety/compat, let's just iterate.
+        if not self.clients:
+            return
         to_remove = set()
         for client in self.clients:
             try:
                 await client.send(message)
             except Exception:
                 to_remove.add(client)
-        
         for client in to_remove:
             self.clients.discard(client)
 
     def stop(self):
         self.running = False
-        if self.loop:
+        if self.loop and self.loop.is_running():
             self.loop.call_soon_threadsafe(self.loop.stop)

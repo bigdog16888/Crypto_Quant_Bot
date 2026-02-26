@@ -1,0 +1,100 @@
+2026-02-21 16:45:57,179 - BotExecutor - INFO - 🔍 [MISSION-FLOW] Bot Recovered_Bot_10011: action='maintain_orders' | TradingEnabled=True
+2026-02-21 16:46:03,029 - BotExecutor - INFO - 🔍 [MISSION-FLOW] Bot Recovered_Bot_10011: action='maintain_orders' | TradingEnabled=True
+2026-02-21 16:46:09,577 - BotExecutor - INFO - 🔍 [MISSION-FLOW] Bot Recovered_Bot_10011: action='maintain_orders' | TradingEnabled=True
+2026-02-21 16:46:16,097 - BotExecutor - INFO - 🔍 [MISSION-FLOW] Bot Recovered_Bot_10011: action='maintain_orders' | TradingEnabled=True
+2026-02-21 16:46:22,916 - BotExecutor - INFO - 🔍 [MISSION-FLOW] Bot Recovered_Bot_10011: action='maintain_orders' | TradingEnabled=True
+2026-02-21 16:46:28,918 - BotExecutor - INFO - 🔍 [MISSION-FLOW] Bot Recovered_Bot_10011: action='maintain_orders' | TradingEnabled=True
+2026-02-21 16:46:35,375 - BotExecutor - INFO - 🔍 [MISSION-FLOW] Bot Recovered_Bot_10011: action='maintain_orders' | TradingEnabled=True
+2026-02-21 16:46:41,803 - BotExecutor - INFO - 🔍 [MISSION-FLOW] Bot Recovered_Bot_10011: action='maintain_orders' | TradingEnabled=True
+2026-02-21 16:46:48,580 - BotExecutor - INFO - 🔍 [MISSION-FLOW] Bot Recovered_Bot_10011: action='maintain_orders' | TradingEnabled=True
+2026-02-21 16:46:55,027 - BotExecutor - INFO - 🔍 [MISSION-FLOW] Bot Recovered_Bot_10011: action='maintain_orders' | TradingEnabled=True
+2026-02-21 16:47:04,839 - BotExecutor - INFO - 🔍 [MISSION-FLOW] Bot Recovered_Bot_10011: action='maintain_orders' | TradingEnabled=True
+2026-02-21 16:47:15,211 - BotExecutor - INFO - 🔍 [MISSION-FLOW] Bot Recovered_Bot_10011: action='maintain_orders' | TradingEnabled=True
+2026-02-21 16:47:29,267 - BotExecutor - INFO - 🔍 [MISSION-FLOW] Bot Recovered_Bot_10011: action='maintain_orders' | TradingEnabled=True
+2026-02-21 16:47:39,205 - BotExecutor - INFO - 🔍 [MISSION-FLOW] Bot Recovered_Bot_10011: action='maintain_orders' | TradingEnabled=True
+2026-02-21 16:47:49,367 - BotExecutor - INFO - 🔍 [MISSION-FLOW] Bot Recovered_Bot_10011: action='maintain_orders' | TradingEnabled=True
+2026-02-21 16:47:57,061 - BotExecutor - INFO - 🔍 [MISSION-FLOW] Bot Recovered_Bot_10011: action='maintain_orders' | TradingEnabled=True
+2026-02-21 16:47:58,519 - StateReconciliation - DEBUG - Skipping non-filled order CQB_10011_TP_1_1771546320 (status=canceled)
+2026-02-21 16:47:58,543 - StateReconciliation - DEBUG - Skipping non-filled order CQB_10011_GRID_2_1771546320 (status=canceled)
+2026-02-21 16:48:01,121 - StateReconciliation - DEBUG - 🔍 [GET-STATE] Examining Bot 10011 (Active=1)
+2026-02-21 16:48:06,943 - WebSocketHandler - DEBUG - 📥 RAW WS MESSAGE: {"e":"ORDER_TRADE_UPDATE","T":1771663686703,"E":1771663686725,"o":{"s":"BTCUSDC","c":"CQB_10011_TP_0_1771658736","S":"BUY","o":"LIMIT","f":"GTC","q":"0.002","p":"66777.8","ap":"0","sp":"0","x":"CANCEL...
+2026-02-21 16:48:06,944 - WSEventHandlers - INFO - ❌ WS Cancel: Bot 10011 TP order 273700271 canceled
+2026-02-21 16:48:07,005 - WebSocketHandler - DEBUG - 📥 RAW WS MESSAGE: {"e":"ORDER_TRADE_UPDATE","T":1771663686703,"E":1771663686725,"o":{"s":"BTCUSDC","c":"CQB_10011_GRID_7_1771662802","S":"SELL","o":"LIMIT","f":"GTC","q":"0.282","p":"67976.5","ap":"0","sp":"0","x":"CAN...
+2026-02-21 16:48:07,007 - WSEventHandlers - INFO - ❌ WS Cancel: Bot 10011 GRID order 273781871 canceled
+2026-02-21 16:48:17,448 - BotExecutor - INFO - 🔍 [MISSION-FLOW] Bot Recovered_Bot_10011: action='maintain_orders' | TradingEnabled=True
+2026-02-21 16:48:17,448 - BotExecutor - INFO - 🔍 [TP-MAINTENANCE] Checking TP for Recovered_Bot_10011: tp_price=66883.74, amount=0.278
+2026-02-21 16:48:17,450 - ExchangeInterface.future - DEBUG - 🚀 RAW POST: https://demo-fapi.binance.com/fapi/v1/order | Body: newClientOrderId=CQB_10011_TP_6_1771663697&price=66883.7&quantity=0.278&recvWindow=60000&side=BUY&symbol=BTCUSDC&timeInForce=GTC&timestamp=1771663697450&type=LIMIT&signature=3be229f1dfdbdea350b3ab16ab61c5fb23d8f61559a543e1713fcc21268069ec
+2026-02-21 16:48:19,003 - WebSocketHandler - DEBUG - 📥 RAW WS MESSAGE: {"e":"ORDER_TRADE_UPDATE","T":1771663698903,"E":1771663698925,"o":{"s":"BTCUSDC","c":"CQB_10011_TP_6_1771663697","S":"BUY","o":"LIMIT","f":"GTC","q":"0.278","p":"66883.7","ap":"0","sp":"0","x":"NEW","...
+2026-02-21 16:48:19,004 - WSEventHandlers - DEBUG - 📝 WS New Order: Bot 10011 TP #273800596 @ 66883.7
+2026-02-21 16:48:19,029 - BotExecutor - INFO - ✅ Recovered_Bot_10011: Maintained TP order for BTC/USDC:USDC @ 66883.74
+2026-02-21 16:48:19,033 - BotExecutor - INFO - 🔍 [GRID-MAINTENANCE] Recovered_Bot_10011: Target=$68001.16 | Grid: ATR(14)=8.99 * 1.16 | Cumulative 7 steps (mult=1.1) -> Dist 98.89
+2026-02-21 16:48:19,033 - BotExecutor - INFO - 🔍 [GRID-DEBUG] Bot Recovered_Bot_10011 (SHORT) | Price=67927.0 | GridTarget=68001.16 | Amount=0.283
+2026-02-21 16:48:19,033 - ExchangeInterface.future - DEBUG - 🚀 RAW POST: https://demo-fapi.binance.com/fapi/v1/order | Body: newClientOrderId=CQB_10011_GRID_7_1771663699&price=68001.1&quantity=0.282&recvWindow=60000&side=SELL&symbol=BTCUSDC&timeInForce=GTC&timestamp=1771663699033&type=LIMIT&signature=eeb9a070bdf4adcf9ac0e244c02f85bb4480f6226ac75d6bbc400d957a9c1d27
+2026-02-21 16:48:20,049 - WebSocketHandler - DEBUG - 📥 RAW WS MESSAGE: {"e":"ORDER_TRADE_UPDATE","T":1771663699967,"E":1771663699972,"o":{"s":"BTCUSDC","c":"CQB_10011_GRID_7_1771663699","S":"SELL","o":"LIMIT","f":"GTC","q":"0.282","p":"68001.1","ap":"0","sp":"0","x":"NEW...
+2026-02-21 16:48:20,052 - WSEventHandlers - DEBUG - 📝 WS New Order: Bot 10011 GRID #273800619 @ 68001.1
+2026-02-21 16:48:20,079 - BotExecutor - INFO - ✅ Recovered_Bot_10011: Maintained Grid order for BTC/USDC:USDC @ 68001.16
+2026-02-21 16:48:31,634 - BotExecutor - INFO - 🔍 [MISSION-FLOW] Bot Recovered_Bot_10011: action='maintain_orders' | TradingEnabled=True
+2026-02-21 16:48:44,403 - BotExecutor - INFO - 🔍 [MISSION-FLOW] Bot Recovered_Bot_10011: action='maintain_orders' | TradingEnabled=True
+2026-02-21 16:48:51,817 - BotExecutor - INFO - 🔍 [MISSION-FLOW] Bot Recovered_Bot_10011: action='maintain_orders' | TradingEnabled=True
+2026-02-21 16:49:02,120 - BotExecutor - INFO - 🔍 [MISSION-FLOW] Bot Recovered_Bot_10011: action='maintain_orders' | TradingEnabled=True
+2026-02-21 16:49:15,347 - BotExecutor - INFO - 🔍 [MISSION-FLOW] Bot Recovered_Bot_10011: action='maintain_orders' | TradingEnabled=True
+2026-02-21 16:49:27,396 - BotExecutor - INFO - 🔍 [MISSION-FLOW] Bot Recovered_Bot_10011: action='maintain_orders' | TradingEnabled=True
+2026-02-21 16:49:39,291 - BotExecutor - INFO - 🔍 [MISSION-FLOW] Bot Recovered_Bot_10011: action='maintain_orders' | TradingEnabled=True
+2026-02-21 16:49:45,975 - BotExecutor - INFO - 🔍 [MISSION-FLOW] Bot Recovered_Bot_10011: action='maintain_orders' | TradingEnabled=True
+2026-02-21 16:49:52,593 - BotExecutor - INFO - 🔍 [MISSION-FLOW] Bot Recovered_Bot_10011: action='maintain_orders' | TradingEnabled=True
+2026-02-21 16:49:58,576 - BotExecutor - INFO - 🔍 [MISSION-FLOW] Bot Recovered_Bot_10011: action='maintain_orders' | TradingEnabled=True
+2026-02-21 16:50:05,802 - BotExecutor - INFO - 🔍 [MISSION-FLOW] Bot Recovered_Bot_10011: action='maintain_orders' | TradingEnabled=True
+2026-02-21 16:50:12,328 - BotExecutor - INFO - 🔍 [MISSION-FLOW] Bot Recovered_Bot_10011: action='maintain_orders' | TradingEnabled=True
+2026-02-21 16:50:18,894 - BotExecutor - INFO - 🔍 [MISSION-FLOW] Bot Recovered_Bot_10011: action='maintain_orders' | TradingEnabled=True
+2026-02-21 16:50:25,431 - BotExecutor - INFO - 🔍 [MISSION-FLOW] Bot Recovered_Bot_10011: action='maintain_orders' | TradingEnabled=True
+2026-02-21 17:40:13,245 - StateReconciliation - DEBUG - Skipping non-filled order CQB_10011_TP_1_1771546320 (status=canceled)
+2026-02-21 17:40:13,245 - StateReconciliation - DEBUG - Skipping non-filled order CQB_10011_GRID_2_1771546320 (status=canceled)
+2026-02-21 17:40:13,796 - StateReconciliation - DEBUG - Skipping non-filled order CQB_10011_TP_1_1771546320 (status=canceled)
+2026-02-21 17:40:13,797 - StateReconciliation - DEBUG - Skipping non-filled order CQB_10011_GRID_2_1771546320 (status=canceled)
+2026-02-21 17:40:14,133 - BotRunner - INFO -    > Active Bots Allowed: {'10008', '10010', '10004', '10011', '10007', '10009', '10013', '10012', '10005'}
+2026-02-21 17:40:16,616 - engine.strategies.martingale_strategy - INFO - 🔍 [Recovered_Bot_10011] Triggers: Price=✅ | ATRP=❌ → Entry=NO
+2026-02-21 17:40:16,619 - BotExecutor - DEBUG - [MISSION-FLOW] Bot Recovered_Bot_10011: no action (Scanning)
+2026-02-21 17:40:17,987 - engine.strategies.martingale_strategy - INFO - 🔍 [Recovered_Bot_10011] Triggers: Price=✅ | ATRP=❌ → Entry=NO
+2026-02-21 17:40:17,987 - BotExecutor - DEBUG - [MISSION-FLOW] Bot Recovered_Bot_10011: no action (Scanning)
+2026-02-21 17:40:24,663 - engine.strategies.martingale_strategy - INFO - 🔍 [Recovered_Bot_10011] Triggers: Price=✅ | ATRP=❌ → Entry=NO
+2026-02-21 17:40:24,664 - BotExecutor - DEBUG - [MISSION-FLOW] Bot Recovered_Bot_10011: no action (Scanning)
+2026-02-21 17:40:31,576 - engine.strategies.martingale_strategy - INFO - 🔍 [Recovered_Bot_10011] Triggers: Price=✅ | ATRP=❌ → Entry=NO
+2026-02-21 17:40:31,580 - BotExecutor - DEBUG - [MISSION-FLOW] Bot Recovered_Bot_10011: no action (Scanning)
+2026-02-21 17:40:37,741 - engine.strategies.martingale_strategy - INFO - 🔍 [Recovered_Bot_10011] Triggers: Price=✅ | ATRP=❌ → Entry=NO
+2026-02-21 17:40:37,741 - BotExecutor - DEBUG - [MISSION-FLOW] Bot Recovered_Bot_10011: no action (Scanning)
+2026-02-21 17:40:44,413 - engine.strategies.martingale_strategy - INFO - 🔍 [Recovered_Bot_10011] Triggers: Price=✅ | ATRP=❌ → Entry=NO
+2026-02-21 17:40:44,414 - BotExecutor - DEBUG - [MISSION-FLOW] Bot Recovered_Bot_10011: no action (Scanning)
+2026-02-21 17:40:51,203 - engine.strategies.martingale_strategy - INFO - 🔍 [Recovered_Bot_10011] Triggers: Price=✅ | ATRP=❌ → Entry=NO
+2026-02-21 17:40:51,205 - BotExecutor - DEBUG - [MISSION-FLOW] Bot Recovered_Bot_10011: no action (Scanning)
+2026-02-21 17:40:58,043 - engine.strategies.martingale_strategy - INFO - 🔍 [Recovered_Bot_10011] Triggers: Price=✅ | ATRP=❌ → Entry=NO
+2026-02-21 17:40:58,044 - BotExecutor - DEBUG - [MISSION-FLOW] Bot Recovered_Bot_10011: no action (Scanning)
+2026-02-21 17:41:04,005 - engine.strategies.martingale_strategy - INFO - 🔍 [Recovered_Bot_10011] Triggers: Price=✅ | ATRP=❌ → Entry=NO
+2026-02-21 17:41:04,015 - BotExecutor - DEBUG - [MISSION-FLOW] Bot Recovered_Bot_10011: no action (Scanning)
+2026-02-21 17:41:10,884 - engine.strategies.martingale_strategy - INFO - 🔍 [Recovered_Bot_10011] Triggers: Price=✅ | ATRP=❌ → Entry=NO
+2026-02-21 17:41:10,884 - BotExecutor - DEBUG - [MISSION-FLOW] Bot Recovered_Bot_10011: no action (Scanning)
+2026-02-21 17:41:17,045 - engine.strategies.martingale_strategy - INFO - 🔍 [Recovered_Bot_10011] Triggers: Price=✅ | ATRP=❌ → Entry=NO
+2026-02-21 17:41:17,048 - BotExecutor - DEBUG - [MISSION-FLOW] Bot Recovered_Bot_10011: no action (Scanning)
+2026-02-21 17:41:23,583 - engine.strategies.martingale_strategy - INFO - 🔍 [Recovered_Bot_10011] Triggers: Price=✅ | ATRP=❌ → Entry=NO
+2026-02-21 17:41:23,583 - BotExecutor - DEBUG - [MISSION-FLOW] Bot Recovered_Bot_10011: no action (Scanning)
+2026-02-21 17:41:29,867 - engine.strategies.martingale_strategy - INFO - 🔍 [Recovered_Bot_10011] Triggers: Price=✅ | ATRP=❌ → Entry=NO
+2026-02-21 17:41:29,871 - BotExecutor - DEBUG - [MISSION-FLOW] Bot Recovered_Bot_10011: no action (Scanning)
+2026-02-21 17:41:36,459 - engine.strategies.martingale_strategy - INFO - 🔍 [Recovered_Bot_10011] Triggers: Price=✅ | ATRP=❌ → Entry=NO
+2026-02-21 17:41:36,460 - BotExecutor - DEBUG - [MISSION-FLOW] Bot Recovered_Bot_10011: no action (Scanning)
+2026-02-21 17:41:43,224 - engine.strategies.martingale_strategy - INFO - 🔍 [Recovered_Bot_10011] Triggers: Price=✅ | ATRP=❌ → Entry=NO
+2026-02-21 17:41:43,226 - BotExecutor - DEBUG - [MISSION-FLOW] Bot Recovered_Bot_10011: no action (Scanning)
+2026-02-21 17:41:49,268 - engine.strategies.martingale_strategy - INFO - 🔍 [Recovered_Bot_10011] Triggers: Price=✅ | ATRP=❌ → Entry=NO
+2026-02-21 17:41:49,268 - BotExecutor - DEBUG - [MISSION-FLOW] Bot Recovered_Bot_10011: no action (Scanning)
+2026-02-21 17:41:56,160 - engine.strategies.martingale_strategy - INFO - 🔍 [Recovered_Bot_10011] Triggers: Price=✅ | ATRP=❌ → Entry=NO
+2026-02-21 17:41:56,160 - BotExecutor - DEBUG - [MISSION-FLOW] Bot Recovered_Bot_10011: no action (Scanning)
+2026-02-21 17:42:02,468 - engine.strategies.martingale_strategy - INFO - 🔍 [Recovered_Bot_10011] Triggers: Price=✅ | ATRP=❌ → Entry=NO
+2026-02-21 17:42:02,468 - BotExecutor - DEBUG - [MISSION-FLOW] Bot Recovered_Bot_10011: no action (Scanning)
+2026-02-21 17:42:09,132 - engine.strategies.martingale_strategy - INFO - 🔍 [Recovered_Bot_10011] Triggers: Price=✅ | ATRP=❌ → Entry=NO
+2026-02-21 17:42:09,134 - BotExecutor - DEBUG - [MISSION-FLOW] Bot Recovered_Bot_10011: no action (Scanning)
+2026-02-21 17:42:15,315 - engine.strategies.martingale_strategy - INFO - 🔍 [Recovered_Bot_10011] Triggers: Price=✅ | ATRP=❌ → Entry=NO
+2026-02-21 17:42:15,317 - BotExecutor - DEBUG - [MISSION-FLOW] Bot Recovered_Bot_10011: no action (Scanning)
+2026-02-21 17:42:22,185 - engine.strategies.martingale_strategy - INFO - 🔍 [Recovered_Bot_10011] Triggers: Price=✅ | ATRP=❌ → Entry=NO
+2026-02-21 17:42:22,187 - BotExecutor - DEBUG - [MISSION-FLOW] Bot Recovered_Bot_10011: no action (Scanning)
+2026-02-21 17:42:28,504 - engine.strategies.martingale_strategy - INFO - 🔍 [Recovered_Bot_10011] Triggers: Price=✅ | ATRP=❌ → Entry=NO
+2026-02-21 17:42:28,507 - BotExecutor - DEBUG - [MISSION-FLOW] Bot Recovered_Bot_10011: no action (Scanning)
+2026-02-21 17:42:35,049 - engine.strategies.martingale_strategy - INFO - 🔍 [Recovered_Bot_10011] Triggers: Price=✅ | ATRP=❌ → Entry=NO
+2026-02-21 17:42:35,050 - BotExecutor - DEBUG - [MISSION-FLOW] Bot Recovered_Bot_10011: no action (Scanning)

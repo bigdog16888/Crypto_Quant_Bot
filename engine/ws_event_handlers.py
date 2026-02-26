@@ -43,18 +43,20 @@ def handle_order_update(event: Dict):
         
         # Only process bot orders (tagged with CQB_)
         if not client_id.startswith('CQB_'):
-            logger.debug(f"Ignoring non-bot order update: {order_id}")
+            logger.info(f"⏭️ WS Ignoring non-bot order {order_id} (CID: {client_id})")
             return
             
         # Parse bot ID from clientOrderId
         # Format: CQB_{bot_id}_{type}_{uuid}
         parts = client_id.split('_')
         if len(parts) < 3:
-            logger.warning(f"Invalid clientOrderId format: {client_id}")
+            logger.warning(f"⚠️ WS Invalid clientOrderId format: {client_id}")
             return
             
         bot_id = int(parts[1])
         order_type = parts[2]  # ENTRY, TP, GRID
+        
+        logger.debug(f"📬 WS Processing {order_type} for Bot {bot_id} (Status: {status})")
         
         # FUNDAMENTAL SAFETY CHECK: Is Bot Active?
         # If we process a fill for an inactive bot, we might trigger new orders (Grid/TP)
@@ -134,63 +136,82 @@ def _handle_order_filled(bot_id: int, order_type: str, event: Dict):
         # Grid order filled - increment step
         logger.info(f"📈 WS Grid Fill for Bot {bot_id}")
         try:
-            # Get current step and increment
-            from engine.database import get_bot_status
-            trade_data = get_bot_status(bot_id)
-            if trade_data:
-                current_step = trade_data.get('current_step', 0)
-                current_invested = float(trade_data.get('total_invested', 0))
-                current_avg = float(trade_data.get('avg_entry_price', 0)) or avg_price
-                
-                # Calculate new average
-                added_value = avg_price * filled_qty
-                new_invested = current_invested + added_value
-                new_avg = (current_avg * current_invested + added_value) / new_invested if new_invested > 0 else avg_price
-                
-                update_martingale_step(
-                    bot_id, 
-                    current_step + 1,
-                    new_invested,
-                    new_avg,
-                    new_avg * 1.015  # Recalculate TP
-                )
-                log_trade(bot_id, 'WS_GRID_FILL', symbol, avg_price, filled_qty, 0, "GRID", current_step + 1)
-                add_notification('info', f"📉 Grid Fill for {symbol} (Step {current_step+1})", bot_id)
+            _update_trade_state_from_fill(bot_id, order_type, symbol, avg_price, filled_qty, event)
+            add_notification('info', f"📉 Grid Fill for {symbol}", bot_id)
         except Exception as e:
             logger.error(f"Failed to process Grid fill for bot {bot_id}: {e}")
             
     elif order_type == 'ENTRY':
-        # Entry order filled - start trade
+        # Entry order filled - start or expand trade
         logger.info(f"🚀 WS Entry Fill for Bot {bot_id}")
         try:
-            update_martingale_step(
-                bot_id,
-                0,
-                avg_price * filled_qty,
-                avg_price,
-                avg_price * 1.015  # Initial TP
-            )
-            log_trade(bot_id, 'WS_ENTRY_FILL', symbol, avg_price, filled_qty, 0, "ENTRY")
-            # RATE LIMITING: Check if we just notified for this bot/symbol
-            # This prevents the "Entry Fill" flood if the WS stream replays or loops
+            _update_trade_state_from_fill(bot_id, order_type, symbol, avg_price, filled_qty, event)
+            
+            # RATE LIMITING for Entry Notifications
             import time
             current_time = time.time()
             fill_key = f"ENTRY_FILL_{bot_id}_{symbol}"
             last_fill_time = _notified_fills_timestamps.get(fill_key, 0)
             
-            if (current_time - last_fill_time) > 10.0: # Only notify once per 10 seconds for same bot/symbol entry
+            if (current_time - last_fill_time) > 10.0: 
                 add_notification('info', f"🚀 Entry Fill for {symbol}", bot_id)
                 _notified_fills_timestamps[fill_key] = current_time
-            else:
-                logger.debug(f"Combinator: Skipping duplicate Entry Fill notification for {symbol} (Time delta: {current_time - last_fill_time:.2f}s)")
         except Exception as e:
             logger.error(f"Failed to process Entry fill for bot {bot_id}: {e}")
     
-    # Close order in DB
+    # 🛡️ FIX: Mark order as 'filled' (NOT cancelled) so reconciler & integrity
+    # checks can distinguish a completed fill from an orphan or cancelled order.
     try:
-        close_order_in_db(order_id)
+        from engine.database import update_order_status
+        update_order_status(order_id, 'filled')
+        logger.debug(f"Marked order {order_id} as filled in DB.")
     except Exception as e:
-        logger.debug(f"Could not close order {order_id} in DB: {e}")
+        logger.debug(f"Could not mark order {order_id} as filled in DB: {e}")
+
+
+def _update_trade_state_from_fill(bot_id: int, order_type: str, symbol: str, avg_price: float, filled_qty: float, event: Dict = None):
+    """Unified helper to update trade state from a fill event (Entry or Grid) using atomic DB accumulation."""
+    from engine.database import accumulate_trade_fill, log_trade, get_bot_status
+    
+    # 🚀 FUNDAMENTAL FIX: Extract exact step from Client Order ID directly
+    new_step = None
+    if event:
+        client_id = event.get('client_order_id', '')
+        parts = client_id.split('_')
+        # format: CQB_{bot_id}_{type}_{step}_{uuid}
+        if len(parts) > 3 and parts[3].isdigit():
+            new_step = int(parts[3])
+
+    if new_step is None:
+        trade_data = get_bot_status(bot_id)
+        current_step = trade_data.get('current_step', 0) if trade_data else 0
+        new_step = current_step
+        if order_type == 'GRID':
+            new_step = current_step + 1
+        elif order_type == 'ENTRY':
+            new_step = 1
+
+    added_value = avg_price * filled_qty
+    
+    # Conservative TP: 1.5% above new average (Runner will refine this based on bot settings)
+    tp_price = avg_price * 1.015 # Fallback
+    
+    is_entry = (order_type == 'ENTRY')
+
+    # Execute Atomic Update
+    accumulate_trade_fill(
+        bot_id=bot_id,
+        added_invested=added_value,
+        added_qty=filled_qty,
+        avg_price=avg_price,
+        new_step=new_step,
+        tp_price=tp_price,
+        is_entry=is_entry
+    )
+    
+    # Log to history
+    log_type = f'WS_{order_type}_FILL'
+    log_trade(bot_id, log_type, symbol, avg_price, filled_qty, added_value, order_type, new_step)
 
 
 def _handle_order_canceled(bot_id: int, order_type: str, event: Dict):

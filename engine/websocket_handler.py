@@ -31,10 +31,12 @@ class BinanceUserDataStream:
     """
     
     # Binance endpoints
-    TESTNET_REST = "https://testnet.binancefuture.com"
-    TESTNET_WSS = "wss://stream.binancefuture.com"
+    # Demo (Testnet) URLs — Updated to current official Demo FAPI endpoints
+    # REST: demo-fapi.binance.com  |  WSS: fstream.binancefuture.com
+    TESTNET_REST = "https://demo-fapi.binance.com"
+    TESTNET_WSS  = "wss://fstream.binancefuture.com"   # User-data stream (not market stream)
     MAINNET_REST = "https://fapi.binance.com"
-    MAINNET_WSS = "wss://fstream.binance.com"
+    MAINNET_WSS  = "wss://fstream.binance.com"
     
     def __init__(self, api_key: str, api_secret: str, testnet: bool = True):
         self.api_key = api_key
@@ -127,6 +129,8 @@ class BinanceUserDataStream:
             data = json.loads(message)
             event_type = data.get('e')
             
+            logger.debug(f"📥 RAW WS MESSAGE: {message[:200]}...")
+
             if event_type == 'ORDER_TRADE_UPDATE':
                 # Order update
                 order_data = data.get('o', {})
@@ -145,7 +149,7 @@ class BinanceUserDataStream:
                     'realized_pnl': float(order_data.get('rp', 0)),
                     'timestamp': data.get('E')
                 }
-                logger.info(f"📬 Order Update: {parsed['symbol']} {parsed['side']} {parsed['status']} #{parsed['order_id']}")
+                logger.info(f"📬 Order Update: {parsed['symbol']} {parsed['side']} {parsed['status']} #{parsed['order_id']} | CID: {parsed['client_order_id']}")
                 
                 if self._on_order_update:
                     self._on_order_update(parsed)
@@ -198,6 +202,9 @@ class BinanceUserDataStream:
             try:
                 # Get listen key
                 self.listen_key = self._get_listen_key()
+                if self.listen_key:
+                    self.listen_key = self.listen_key.strip() # 🛡️ SAFETY: Remove any \n \r
+                
                 if not self.listen_key:
                     logger.error("Cannot start WS without listenKey. Retrying in 10s...")
                     await asyncio.sleep(10)
@@ -206,7 +213,12 @@ class BinanceUserDataStream:
                 ws_url = f"{self.wss_url}/ws/{self.listen_key}"
                 logger.info(f"🔌 Connecting to WebSocket: {ws_url[:50]}...")
                 
-                async with websockets.connect(ws_url) as ws:
+                async with websockets.connect(
+                    ws_url,
+                    open_timeout=15,
+                    ping_interval=20,
+                    ping_timeout=10
+                ) as ws:
                     self.ws = ws
                     logger.info("✅ WebSocket connected!")
                     self._last_keepalive = time.time()
@@ -251,6 +263,11 @@ class BinanceUserDataStream:
         self._thread = threading.Thread(target=run_loop, daemon=True, name="WSHandler")
         self._thread.start()
         logger.info("🚀 WebSocket handler started in background thread")
+        
+    @property
+    def is_alive(self) -> bool:
+        """Check if the stream thread is running and WebSocket is connected."""
+        return self._running and self.ws is not None and self._thread is not None and self._thread.is_alive()
         
     def stop(self):
         """Stop the WebSocket handler."""

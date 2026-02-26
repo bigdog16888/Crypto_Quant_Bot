@@ -62,8 +62,17 @@ st.markdown("""
     
     /* Force opaque background for main container to prevent ghosting */
     .main .block-container {
-        background-color: var(--bg-color);
+        background-color: var(--bg-color) !important;
         padding-top: 2rem;
+    }
+    
+    /* Ensure widgets have solid backgrounds */
+    .stSelectbox, .stTextInput, .stNumberInput, .stButton, .stTabs {
+        background-color: var(--card-bg) !important;
+    }
+    
+    .stApp > header {
+        background-color: var(--bg-color) !important;
     }
 
     [data-testid="stSidebar"] {
@@ -368,14 +377,37 @@ with st.sidebar:
     EMERGENCY_FILE = config.PATHS["EMERGENCY_FILE"]
     
     def is_engine_running():
+        """Check if engine is running via SocketLock port OR PID file."""
+        # Method 1: Check SocketLock port (authoritative)
+        import socket
+        try:
+            test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            test_sock.settimeout(0.5)
+            test_sock.bind(("127.0.0.1", 19888))
+            test_sock.close()
+            # Port is FREE → engine is NOT running
+        except OSError:
+            # Port is BOUND → engine IS running
+            # Try to get PID from file for display
+            pid = None
+            if os.path.exists(PID_FILE):
+                try:
+                    with open(PID_FILE, "r") as f:
+                        pid = int(f.read().strip())
+                except Exception:
+                    pass
+            return True, pid
+        
+        # Method 2: Fallback to PID file
         if os.path.exists(PID_FILE):
             try:
                 with open(PID_FILE, "r") as f:
                     pid = int(f.read().strip())
-                # Check existance
                 os.kill(pid, 0)
                 return True, pid
             except Exception:
+                # Stale PID file — clean it up
+                os.remove(PID_FILE)
                 return False, None
         return False, None
 
@@ -500,22 +532,28 @@ with st.sidebar:
     st.subheader("Navigation")
     
     # Handle auto-navigation requests from other views
+    nav_index = 0  # Default: Live Monitor
+    pages = ["📊 Live Monitor", "🏗️ Bot Creator", "🛠️ Bot Manager", "📈 Analytics"]
+    
     if '_nav_to_monitor' in st.session_state and st.session_state['_nav_to_monitor']:
-        selected_page = "📊 Live Monitor"
+        nav_index = 0
         del st.session_state['_nav_to_monitor']
-    else:
-        selected_page = st.radio(
-            "Go to", 
-            ["📊 Live Monitor", "🏗️ Bot Creator", "🛠️ Bot Manager", "📈 Analytics"], 
-            index=0,
-            label_visibility="collapsed"
-        )
+    elif '_nav_to_manager' in st.session_state and st.session_state['_nav_to_manager']:
+        nav_index = 2
+        del st.session_state['_nav_to_manager']
+    
+    selected_page = st.radio(
+        "Go to", 
+        pages, 
+        index=nav_index,
+        label_visibility="collapsed"
+    )
     
 # Render ONLY the selected page
-# Use containers to ensure clean DOM separation between views
-main_container = st.container()
+# Use st.empty to ensure the container is wiped clean between renders to prevent ghosting
+main_placeholder = st.empty()
 
-with main_container:
+with main_placeholder.container():
     if selected_page == "📊 Live Monitor":
         # Clear Bot Manager specific state when leaving
         if 'editing_bot_id' in st.session_state:

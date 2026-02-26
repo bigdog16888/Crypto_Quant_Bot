@@ -23,7 +23,7 @@ class ExchangeInterface:
 
     def __init__(self, market_type='future'):
         self.logger = logging.getLogger(f"ExchangeInterface.{market_type}")
-        self.market_type = market_type
+        self.market_type = normalize_market_type(market_type)  # Canonical gate: 'futures'→'future'
         self.exchange = self._create_exchange_instance()
         self._ensure_markets()
 
@@ -77,6 +77,7 @@ class ExchangeInterface:
                 # Use shared anon instance
                 anon = self._get_anon_exchange()
                 self.exchange.markets = anon.load_markets()
+                self.exchange.markets_by_id = anon.markets_by_id
             except Exception as e2:
                 self.logger.error(f"Critical: Anonymous market load also failed: {e2}")
 
@@ -88,9 +89,22 @@ class ExchangeInterface:
         base_url = "https://demo-fapi.binance.com"
         query_dict = params.copy() if params else {}
         query_dict['timestamp'] = int(time.time() * 1000)
+        query_dict['recvWindow'] = 60000 # Max allowed by Binance to tolerate time drift
         
-        # Calculate signature
-        query_string = urlencode(query_dict)
+        # --- FUNDAMENTAL FIX: DETERMINISTIC SIGNING ---
+        # 1. Sort keys lexicographically
+        # 2. Format floats consistently to avoid signature mismatches
+        sorted_keys = sorted(query_dict.keys())
+        query_parts = []
+        for key in sorted_keys:
+            val = query_dict[key]
+            if isinstance(val, float):
+                # Format to 8 decimal places and remove trailing zeros
+                val = format(val, '.8f').rstrip('0').rstrip('.')
+            query_parts.append(f"{key}={val}")
+        
+        query_string = "&".join(query_parts)
+        
         signature = hmac.new(
             config.API_SECRET.encode('utf-8'),
             query_string.encode('utf-8'),
@@ -115,12 +129,24 @@ class ExchangeInterface:
 
             if response.status_code == 200:
                 return response.json()
+            elif response.status_code == 400 and 'Unknown order' in response.text:
+                # Expected: order was already filled/cancelled on exchange
+                self.logger.debug(f"Cancel-order 400 (order already gone): {response.text}")
+                return None
             else:
                 self.logger.error(f"Raw API Error {response.status_code}: {response.text}")
-                return None
+                # 🚀 FUNDAMENTAL FIX: Bubble up the actual Binance Error so we don't mask it
+                try:
+                    err_json = response.json()
+                    error_msg = err_json.get('msg', response.text)
+                except:
+                    error_msg = response.text
+                raise APIError(f"Binance API {response.status_code}: {error_msg}")
+        except APIError:
+            raise
         except Exception as e:
             self.logger.error(f"Raw Request Failed ({endpoint}): {e}")
-            return None
+            raise APIError(f"Request Error: {str(e)}")
 
     def get_last_price(self, symbol: str) -> Optional[float]:
         try:
@@ -147,17 +173,30 @@ class ExchangeInterface:
                 return []
             
             symbols = []
+            is_futures = self.market_type == 'future'
+            
             for symbol in self.exchange.markets:
-                # CCXT symbols are usually BASE/QUOTE
-                if symbol.endswith(f"/{quote_asset}") or symbol.endswith(quote_asset):
-                    # Filter out non-trading pairs if possible, but for now just check active
-                    market = self.exchange.markets[symbol]
-                    if market.get('active', True):
-                         symbols.append(symbol)
+                market = self.exchange.markets[symbol]
+                if not market.get('active', True):
+                    continue
+                
+                # Futures symbols use the format BASE/QUOTE:QUOTE (e.g. BNB/USDC:USDC)
+                # Spot symbols use BASE/QUOTE (e.g. BNB/USDC)
+                has_settle_suffix = ':' in symbol
+                
+                if is_futures:
+                    # Only include futures contracts (BASE/QUOTE:SETTLE)
+                    if has_settle_suffix and f"/{quote_asset}:" in symbol:
+                        symbols.append(symbol)
+                else:
+                    # Only include spot pairs (BASE/QUOTE, no colon)
+                    if not has_settle_suffix and symbol.endswith(f"/{quote_asset}"):
+                        symbols.append(symbol)
+                        
             return sorted(symbols)
         except Exception as e:
             self.logger.error(f"Error fetching symbols: {e}")
-            return []
+            return None # Return None to signal error, distinct from empty list []
 
     def fetch_positions(self) -> List[dict]:
         try:
@@ -168,10 +207,24 @@ class ExchangeInterface:
             
             positions = []
             if 'positions' in res:
+                # Ensure markets are loaded for symbol unification
+                self._ensure_markets()
+                
                 for pos in res['positions']:
                     if float(pos.get('positionAmt', 0)) != 0:
+                        raw_symbol = pos['symbol']
+                        unified_symbol = raw_symbol
+                        
+                        # Try to map raw symbol (BTCUSDT) to Unified (BTC/USDT)
+                        if self.exchange.markets_by_id and raw_symbol in self.exchange.markets_by_id:
+                            entry = self.exchange.markets_by_id[raw_symbol]
+                            if isinstance(entry, list):
+                                unified_symbol = entry[0]['symbol']
+                            else:
+                                unified_symbol = entry['symbol']
+                        
                         positions.append({
-                            'symbol': pos['symbol'],
+                            'symbol': unified_symbol,
                             'contracts': float(pos['positionAmt']),
                             'side': 'long' if float(pos['positionAmt']) > 0 else 'short',
                             'unrealizedPnl': float(pos['unrealizedProfit']),
@@ -213,11 +266,90 @@ class ExchangeInterface:
                         'amount': float(o['origQty']),
                         'clientOrderId': o['clientOrderId'],
                         'status': o['status'].lower(),
-                        'type': o['type'].lower()
+                        'type': o['type'].lower(),
+                        'timestamp': o['time']
                     })
             return orders
         except Exception as e:
             self.logger.error(f"Orders Fetch Error: {e}")
+            return []
+
+    def fetch_closed_orders(self, symbol: str, since: Optional[int] = None, limit: int = 50) -> List[dict]:
+        """
+        Fetches closed/filled orders. 
+        Crucial for State Reconstruction (Offline Fills).
+        """
+        try:
+            if config.TESTNET or config.DEMO_TRADING:
+                endpoint = '/fapi/v1/allOrders'
+                params = {
+                    'symbol': normalize_symbol(symbol),
+                    'limit': limit
+                }
+                if since: params['startTime'] = since
+                
+                res = self._raw_request(endpoint, params=params)
+                orders = []
+                if res:
+                    for o in res:
+                        status = o['status'].lower()
+                        # We only care about terminal states for "closed" orders
+                        if status in ['filled', 'canceled', 'expired', 'rejected']:
+                            orders.append({
+                                'id': o['orderId'],
+                                'symbol': o['symbol'],
+                                'side': o['side'].lower(),
+                                'price': float(o['avgPrice'] if float(o.get('avgPrice', 0)) > 0 else o['price']),
+                                'amount': float(o['executedQty']), # Use executedQty for fills
+                                'clientOrderId': o['clientOrderId'],
+                                'status': status,
+                                'type': o['type'].lower(),
+                                'timestamp': o['time'],
+                                'average': float(o.get('avgPrice', 0))
+                            })
+                return orders
+            
+            # Mainnet fallback
+            return self.exchange.fetch_closed_orders(symbol, since=since, limit=limit)
+        except Exception as e:
+            self.logger.error(f"Closed Orders Fetch Error for {symbol}: {e}")
+            return []
+
+    def fetch_my_trades(self, symbol: str, since: Optional[int] = None, limit: int = 50) -> List[dict]:
+        """
+        Fetches specific fill details (trades).
+        Crucial for forensic proof of position ownership.
+        """
+        try:
+            if config.TESTNET or config.DEMO_TRADING:
+                endpoint = '/fapi/v1/userTrades'
+                params = {
+                    'symbol': normalize_symbol(symbol),
+                    'limit': limit
+                }
+                if since: params['startTime'] = since
+                
+                res = self._raw_request(endpoint, params=params)
+                trades = []
+                if res:
+                    for t in res:
+                        trades.append({
+                            'id': t['id'],
+                            'orderId': t['orderId'],
+                            'symbol': t['symbol'],
+                            'side': t['side'].lower(),
+                            'price': float(t['price']),
+                            'amount': float(t['qty']),
+                            'cost': float(t['quoteQty']),
+                            'commission': float(t.get('commission', 0)),
+                            'timestamp': t['time']
+                        })
+                return trades
+            
+            # Mainnet fallback
+            return self.exchange.fetch_my_trades(symbol, since=since, limit=limit)
+        except Exception as e:
+            self.logger.error(f"Trades Fetch Error for {symbol}: {e}")
             return []
 
     def get_symbol_precision(self, symbol: str) -> Dict[str, Any]:
@@ -260,14 +392,28 @@ class ExchangeInterface:
                  # Fallback to CCXT if raw filters missing (unlikely)
                  pass
             
-            # SAFETY CLAMP: Force USDC pairs to max 3 decimals on Demo if needed
-            if 'USDC' in symbol:
-                if p_qty > 3:
-                    self.logger.warning(f"⚠️ Clamping QTY precision for {symbol} from {p_qty} to 3 (Demo Constraint)")
-                    p_qty = 3
-                if p_price > 1: # Strict 0.1 tick size for BTC/USDC
-                    self.logger.warning(f"⚠️ Clamping PRICE precision for {symbol} from {p_price} to 1 (Demo Constraint)")
-                    p_price = 1
+            # DEMO PRECISION OVERRIDE: Demo exchange uses different tick/step sizes than mainnet.
+            # CCXT loads mainnet metadata but demo rejects orders that don't match demo rules.
+            if config.TESTNET or config.DEMO_TRADING:
+                if 'BTC' in symbol:
+                    # Demo BTC: tick_size=0.1, step_size=0.001
+                    if p_price > 1:
+                        self.logger.debug(f"⚙️ Demo clamp: {symbol} price precision {p_price} → 1 (tick=0.1)")
+                        p_price = 1
+                        tick_size = 0.1
+                    if p_qty > 3:
+                        self.logger.debug(f"⚙️ Demo clamp: {symbol} qty precision {p_qty} → 3 (step=0.001)")
+                        p_qty = 3
+                        step_size = 0.001
+                elif 'ETH' in symbol:
+                    # Demo ETH: tick_size=0.01, step_size=0.001
+                    if p_price > 2:
+                        self.logger.debug(f"⚙️ Demo clamp: {symbol} price precision {p_price} → 2 (tick=0.01)")
+                        p_price = 2
+                        tick_size = 0.01
+                    if p_qty > 3:
+                        p_qty = 3
+                        step_size = 0.001
                 
             return {
                 'qty_precision': p_qty,
@@ -430,6 +576,18 @@ class ExchangeInterface:
         except: pass
         return cancelled_count
 
+    def cancel_all_orders(self, symbol: str):
+        """Cancels all open orders for a symbol."""
+        try:
+            if config.TESTNET or config.DEMO_TRADING:
+                endpoint = '/fapi/v1/allOpenOrders'
+                params = {'symbol': normalize_symbol(symbol)}
+                return self._raw_request(endpoint, method='DELETE', params=params)
+            return self.exchange.cancel_all_orders(symbol)
+        except Exception as e:
+            self.logger.error(f"Cancel All Orders Failed for {symbol}: {e}")
+            return None
+
 def cleanup_caches():
     pass
 
@@ -437,3 +595,10 @@ def normalize_symbol(symbol: str) -> str:
     if not symbol: return ""
     return symbol.replace('/', '').replace('-', '').split(':')[0].upper()
 
+def normalize_market_type(mt: str) -> str:
+    """Canonicalize market type strings: 'futures'/'swap' → 'future', etc."""
+    if not mt: return 'future'
+    mt = mt.lower().strip()
+    if mt in ('futures', 'swap', 'linear'):
+        return 'future'
+    return mt

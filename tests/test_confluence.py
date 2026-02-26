@@ -55,6 +55,26 @@ def test_8_trigger_confluence():
     print(f"Pattern Trigger (Consec Down): Buy={buy}, Sell={sell}")
     assert buy == True, "Pattern trigger failed on matching data"
 
+    # 4. Test Price + CCI confluence (both pass)
+    params = {
+        'mode_price': 1, 'price_threshold': 100.0,  # Price > 100 (last close ~110)
+        'mode_cci': 1, 'cci_level': 50, 'cci_period': 14
+    }
+    strat = MartingaleStrategy(params=params)
+    buy, sell = strat.check_signals(data)
+    print(f"Price + CCI Confluence (both pass): Buy={buy}, Sell={sell}")
+    assert buy == True, "Both triggers should pass"
+
+    # 5. Test Price + CCI confluence (price fails)
+    params = {
+        'mode_price': 1, 'price_threshold': 200.0,  # Price > 200 (last close ~110)
+        'mode_cci': 1, 'cci_level': 50, 'cci_period': 14
+    }
+    strat = MartingaleStrategy(params=params)
+    buy, sell = strat.check_signals(data)
+    print(f"Price + CCI Confluence (price fails): Buy={buy}, Sell={sell}")
+    assert buy == False, "Price trigger should block entry"
+
     print("✅ 8-Trigger Confluence verified!")
 
 if __name__ == "__main__":

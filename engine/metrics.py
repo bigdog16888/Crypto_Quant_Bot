@@ -1,23 +1,28 @@
 import logging
-from prometheus_client import Gauge, start_http_server
 import threading
 import time
 import pandas as pd
 import io
+from prometheus_client import Gauge, start_http_server, REGISTRY
 
 from config.settings import config
 from engine.database import get_connection
 
 logger = logging.getLogger("MetricsServer")
 
-# Prometheus Gauges
-BOT_CYCLE_TIME = Gauge('bot_cycle_time_seconds', 'Time taken for one bot cycle')
-BOT_ACTIVE_COUNT = Gauge('bot_active_count', 'Number of active bots')
-BOT_IN_TRADE_COUNT = Gauge('bot_in_trade_count', 'Number of bots currently in trade')
-ACCOUNT_EQUITY = Gauge('account_equity_usd', 'Total account equity in USD')
-ACCOUNT_DRAWDOWN_PCT = Gauge('account_drawdown_percent', 'Percentage drawdown from initial equity')
-ORDER_COUNT_DAILY = Gauge('bot_order_count_daily', 'Daily order count per bot', ['bot_id', 'bot_name'])
-ORDER_COUNT_CYCLE = Gauge('bot_order_count_cycle', 'Orders placed in current cycle per bot', ['bot_id', 'bot_name'])
+# Prometheus Gauges - Safe registration to handle Streamlit reloads
+def get_gauge(name, documentation, labelnames=None):
+    if name in REGISTRY._names_to_collectors:
+        return REGISTRY._names_to_collectors[name]
+    return Gauge(name, documentation, labelnames or [])
+
+BOT_CYCLE_TIME = get_gauge('bot_cycle_time_seconds', 'Time taken for one bot cycle')
+BOT_ACTIVE_COUNT = get_gauge('bot_active_count', 'Number of active bots')
+BOT_IN_TRADE_COUNT = get_gauge('bot_in_trade_count', 'Number of bots currently in trade')
+ACCOUNT_EQUITY = get_gauge('account_equity_usd', 'Total account equity in USD')
+ACCOUNT_DRAWDOWN_PCT = get_gauge('account_drawdown_percent', 'Percentage drawdown from initial equity')
+ORDER_COUNT_DAILY = get_gauge('bot_order_count_daily', 'Daily order count per bot', ['bot_id', 'bot_name'])
+ORDER_COUNT_CYCLE = get_gauge('bot_order_count_cycle', 'Orders placed in current cycle per bot', ['bot_id', 'bot_name'])
 
 def export_trade_history(bot_id: int | None = None, format: str = 'csv') -> str:
     """

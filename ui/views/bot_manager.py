@@ -15,6 +15,9 @@ from engine.bot_management import (
 import engine.indicators as ta
 import pandas as pd
 import json
+import logging
+
+logger = logging.getLogger(__name__)
 
 # --- Caching Wrappers ---
 @st.cache_resource(ttl=3600, show_spinner=False)
@@ -129,7 +132,7 @@ def render_bot_manager_view():
                     )
                     
                     params = json.loads(raw_params[7]) if raw_params[7] else {}
-                    strat = MartingaleStrategy(name=name, params=params)
+                    strat = MartingaleStrategy(params=params)
                     
                     # Fetch minimal OHLCV for ATR grid if needed
                     market_data = pd.DataFrame() # Placeholder, ATR needs data
@@ -170,7 +173,10 @@ def render_bot_manager_view():
                 except Exception as e:
                     row_cols[5].caption(f"BE: {be:.2f}")
                     row_cols[5].caption(f"TP: {tp:.2f}")
-                    row_cols[5].write("Error loading NO")
+                    # Show valid error for debugging, but abbr if too long
+                    err_msg = str(e)[:20] + "..." if len(str(e)) > 20 else str(e)
+                    row_cols[5].caption(f"Err: {err_msg}")
+                    logger.error(f"Error calculating NO for {name}: {e}")
             else:
                 row_cols[5].write("-")
 
@@ -353,7 +359,6 @@ def render_bot_manager_view():
         st.divider()
 
 @st.dialog("Edit Bot Settings")
-
 def render_edit_form(bot_id):
     from config.settings import config  # Import config for this function
     
@@ -373,13 +378,13 @@ def render_edit_form(bot_id):
     if pair and '/' in pair:
         current_quote = pair.split('/')[1]
 
-
     # --- Market Configuration (Per-Bot) ---
     # KEPT OUTSIDE FORM for dynamic updates
     st.markdown("#### 🌐 Market Configuration")
     mcol1, mcol2, mcol3 = st.columns(3)
     
     with mcol1:
+        # Load market type from config, default to 'future' if missing
         current_market_type = config_dict.get('market_type', 'future')
         market_options = ["Spot", "Futures (Swap)"]
         market_idx = 0 if current_market_type == 'spot' else 1
@@ -392,8 +397,14 @@ def render_edit_form(bot_id):
         new_market_type = 'spot' if new_market_type_display == "Spot" else 'future'
     
     with mcol2:
+        # Load quote asset from pair string or config
+        # Pair format: BASE/QUOTE
+        inferred_quote = "USDT"
+        if pair and '/' in pair:
+            inferred_quote = pair.split('/')[1]
+            
         quote_options = ["USDT", "USDC"]
-        quote_idx = quote_options.index(current_quote) if current_quote in quote_options else 0
+        quote_idx = quote_options.index(inferred_quote) if inferred_quote in quote_options else 0
         new_quote = st.selectbox(
             "Quote Asset",
             quote_options,
@@ -404,12 +415,8 @@ def render_edit_form(bot_id):
     with mcol3:
         # Fetch available pairs dynamically
         try:
-            # Use cached instance for connection, but we need to ensure markets are loaded
+            # Use cached instance for connection
             edit_exchange = get_exchange_instance(new_market_type)
-            
-            # We can't easily cache the list of symbols per quote without a new wrapper, 
-            # but get_available_symbols is relatively fast if markets are loaded.
-            # Force load if needed (ExchangeInterface usually loads on init)
             available_pairs = edit_exchange.get_available_symbols(quote_asset=new_quote)
             if not available_pairs:
                 available_pairs = [f"BTC/{new_quote}", f"ETH/{new_quote}"]
@@ -417,14 +424,19 @@ def render_edit_form(bot_id):
             st.warning(f"Could not fetch pairs: {e}")
             available_pairs = [f"BTC/{new_quote}", f"ETH/{new_quote}", f"SOL/{new_quote}"]
         
-        # Find current pair in list, or default to first
+        # Smart Index Match
         pair_idx = 0
-        # Check if current pair matches the new quote asset
-        if pair in available_pairs:
-            pair_idx = available_pairs.index(pair)
-        elif f"{pair.split('/')[0]}/{new_quote}" in available_pairs:
-            # Try to keep same base asset with new quote
-            pair_idx = available_pairs.index(f"{pair.split('/')[0]}/{new_quote}")
+        current_pair_normalized = pair.strip().upper()
+        
+        # Try exact match
+        if current_pair_normalized in available_pairs:
+            pair_idx = available_pairs.index(current_pair_normalized)
+        # Try matching Base asset (e.g. switching USDT -> USDC)
+        elif '/' in current_pair_normalized:
+            base = current_pair_normalized.split('/')[0]
+            candidate = f"{base}/{new_quote}"
+            if candidate in available_pairs:
+                pair_idx = available_pairs.index(candidate)
         
         new_pair = st.selectbox(
             "Trading Pair",
@@ -437,98 +449,71 @@ def render_edit_form(bot_id):
     config_dict['market_type'] = new_market_type
     
     st.divider()
-    
-    # --- MAIN FORM ---
-    # Wrap all other settings in a form to prevent reload on every change
-    with st.form(key=f"edit_bot_form_{bot_id}"):
-        col1, col2 = st.columns(2)
-        new_name = col1.text_input("Bot Name", value=name)
-        new_direction = col2.selectbox("Direction", ["LONG", "SHORT"], index=0 if direction == "LONG" else 1)
-        
-        # Leverage Editing (Futures Only)
-        if new_market_type == 'future':
-            current_lev = int(config_dict.get('leverage', 1))
-            new_leverage = col2.slider("Leverage (x)", 1, 50, current_lev)
-            config_dict['leverage'] = new_leverage
-        else:
-            config_dict['leverage'] = 1
 
-        col3, col4 = st.columns(2)
-        # Strategy type options matching bot_creator
-        strat_options = ["Martingale", "MarketMaker", "MagicHour"]
-        strat_index = 0
-        if strategy_type in strat_options:
-            strat_index = strat_options.index(strategy_type)
-        new_strat = col3.selectbox("Strategy Type", strat_options, index=strat_index)
+    # --- MAIN FORM ---
+    with st.form(key=f"edit_bot_form_{bot_id}"):
         
+        col1, col2 = st.columns(2)
+        with col1:
+            new_name = st.text_input("Bot Name", value=name)
+            new_direction = st.selectbox("Direction", ["LONG", "SHORT"], index=["LONG", "SHORT"].index(direction))
+            config_dict['leverage'] = st.number_input("Leverage", min_value=1, max_value=100, value=int(config_dict.get('leverage', 1)))
+
+        with col2:
+            stTypes = ["Martingale", "MagicHour", "MarketMaker"]
+            curr_strat = strategy_type if strategy_type in stTypes else "Martingale"
+            new_strat = st.selectbox("Strategy Type", stTypes, index=stTypes.index(curr_strat))
+            new_max_steps = st.number_input("Max Steps", min_value=1, max_value=50, value=int(config_dict.get('max_steps', 10)))
+
+        st.markdown("#### ⚙️ Order Calculation")
         col5, col6, col7 = st.columns(3)
-        # Safe Min Calculation
         # Safe Min Calculation
         min_safe_usd = 5.0
         if new_pair:
             try:
                 # Use cached instance
                 exchange = get_exchange_instance(new_market_type)
-                # Fetch price for accurate calc
-                p_for_calc = fetch_last_price_cached(new_market_type, new_pair)
-                if p_for_calc > 0:
-                    min_safe_usd = exchange.calculate_safe_min_size(new_pair, p_for_calc)
-                else:
-                     min_safe_usd = exchange.get_min_order_usd(new_pair)
-            except Exception:
-                pass
-                
-        # Ensure min_safe_usd is at least 5.0 as a baseline
-        min_safe_usd = max(5.0, min_safe_usd)
-                
-        new_base = col5.number_input(
-            f"Order Size ($USDC) [Safe Min: ${min_safe_usd:.2f}]", 
-            min_value=0.0,  # Allow 0 to let user type, but validate below
-            step=1.0, 
-            value=max(float(base_size), min_safe_usd),
-            help=f"Minimum calculated based on exchange limits + rounding. Lower values will be rejected by Binance."
-        )
-        
-        if new_base < min_safe_usd:
-            col5.error(f"⚠️ TOO LOW! Min Safe: ${min_safe_usd:.2f}")
-            if col5.button("🔧 Auto-Fix Size", key=f"fix_size_{bot_id}"):
-                # We can't update the widget directly easily without session state hacks, 
-                # but we can update the config value which will reflect on next render?
-                # Actually, easier to just let the user type, but show strong error.
+                # Check min cost for pair
+                market = exchange.get_market_structure(new_pair)
+                if market:
+                    # Limits
+                    min_cost = market.get('cost_min', 5.0)
+                    min_safe_usd = max(5.0, min_cost * 1.1) # 10% buffer
+            except:
                 pass
 
+        # [FEATURE PARITY] Use Min Size Checkbox
+        use_min = config_dict.get('use_min_size', False)
+        
+        with col5:
+            new_base = st.number_input(
+                f"Order Size ($USDC) [Safe Min: ${min_safe_usd:.2f}]", 
+                min_value=0.0,  # Allow 0 to let user type, but validate below
+                step=1.0, 
+                value=max(float(base_size), min_safe_usd),
+                help=f"Minimum calculated based on exchange limits + rounding. Lower values will be rejected by Binance."
+            )
+            new_use_min = st.checkbox("Auto-Size (Min Qty)", value=use_min, key=f"edit_use_min_{bot_id}")
+            config_dict['use_min_size'] = new_use_min
             
-        new_mm = col6.number_input("Martingale Multiplier", value=float(martingale_multiplier))
-        
-        # New Max Steps Input
-        new_max_steps = col7.number_input("Max Steps", min_value=1, max_value=30, value=int(config_dict.get('max_steps', 10)))
-        config_dict['max_steps'] = new_max_steps
+            if new_base < min_safe_usd and not new_use_min:
+                 st.caption(f"⚠️ Low Size (Min: ${min_safe_usd:.2f})")
 
-        # Legacy RSI Limit (Hidden/Fixed)
-        new_rsi = float(rsi_limit) if rsi_limit else 30.0
-
-        # --- NEW: Take Profit Editing ---
-        st.markdown("#### Take Profit Logic")
-        curr_tp_type = config_dict.get('TakeProfitType', 'USD')
-        # Map USD -> index 0, Percent -> index 1
-        tp_type_idx = 0 if curr_tp_type == 'USD' else 1
+        with col6:
+            new_mm = st.number_input("Martingale Multiplier", value=float(martingale_multiplier), step=0.1)
         
-        new_tp_type = st.radio("TP Mode", ["Dollar Target ($)", "Percentage (%)"], index=tp_type_idx, horizontal=True)
+        with col7:
+            config_dict['ProfitSet'] = st.number_input("Trailing Distance (%)", 
+                value=float(config_dict.get('ProfitSet', 0.5)), 
+                step=0.1, 
+                help="Distance from peak price to trigger trailing stop.")
+            config_dict['MaximizeProfit'] = st.checkbox("Enable Trailing", 
+                value=bool(config_dict.get('MaximizeProfit', False)), 
+                help="If checked, uses Trailing Stop. If unchecked, uses fixed Take Profit.")
         
-        if new_tp_type == "Dollar Target ($)":
-            new_tp_base = st.number_input("Take Profit Target ($USDC)", min_value=0.1, step=0.1, value=float(config_dict.get('TakeProfitBase', 10.0)))
-            config_dict['TakeProfitType'] = 'USD'
-            config_dict['TakeProfitBase'] = new_tp_base
-        else:
-            new_tp_pct = st.number_input("Take Profit Target (%)", min_value=0.01, step=0.01, value=float(config_dict.get('TakeProfitPct', 1.0)), format="%.2f")
-            config_dict['TakeProfitType'] = 'Percent'
-            config_dict['TakeProfitPct'] = new_tp_pct
-
-        # --- NEW: Risk & Grid Configuration ---
+        # [Grid Settings]
         st.markdown("#### 🛡️ Risk & Grid Configuration")
-        with st.expander("Grid Spacing & Safety", expanded=False):
-            st.subheader("Grid Spacing Logic")
-            
+        with st.expander("Grid Spacing & Safety", expanded=True):
             # Consolidated Grid Logic
             use_atr_grid = st.checkbox("Use Dynamic ATR Grid", value=config_dict.get('UseATRGrid', False), help="If OFF, uses fixed 'Base Grid' distance.")
             config_dict['UseATRGrid'] = use_atr_grid
@@ -558,6 +543,7 @@ def render_edit_form(bot_id):
                 )
                 config_dict['ATRPeriods'] = atr_periods
                 
+                # ATR Mode logic (dynamic vs locked)
                 atr_mode = st.radio(
                     "ATR Mode",
                     ["dynamic", "locked"],
@@ -584,39 +570,36 @@ def render_edit_form(bot_id):
                     )
                     config_dict['ATRGridFactor'] = 1.0 # Default hidden
 
-                # 2. Martingale Spacing (Exponential Grid)
-                # Check if currently enabled (Multiplier != 1.0)
+                # Martingale Spacing
                 curr_mult = float(config_dict.get('GridMultiplier', 1.0))
                 is_exp_enabled = abs(curr_mult - 1.0) > 0.001
                 use_grid_mult = st.checkbox("Enable Exponential Spacing", value=is_exp_enabled)
                 
                 if use_grid_mult:
-                     # Default to 1.1 if enabling for first time (curr_mult was 1.0)
                      val_to_show = curr_mult if is_exp_enabled else 1.1
-                     config_dict['GridMultiplier'] = st.number_input("Spacing Multiplier", value=val_to_show, step=0.05, min_value=0.1, help="> 1.0 expands grid. < 1.0 tightens grid.")
+                     config_dict['GridMultiplier'] = st.number_input("Spacing Multiplier", value=val_to_show, step=0.05, min_value=0.1)
                 else:
                      config_dict['GridMultiplier'] = 1.0
 
             st.divider()
-            
-            # Advanced Rules Section (Consolidated)
             st.markdown("##### 🎯 Advanced Step-Based Rules")
             grid_rules = config_dict.get('GridStepRules', [])
-            
             if grid_rules:
                 st.info(f"✅ Active Rules: {len(grid_rules)}")
-                for rule in grid_rules:
-                    r_desc = f"Steps {rule['start']}-{rule['end']}: "
-                    if rule['type'] == 'atr': r_desc += f"ATR × {rule['multiplier']}"
-                    else: r_desc += f"Fixed ${rule['value']}"
-                    st.markdown(f"- {r_desc}")
-                st.caption("ℹ️ To modify rules, please re-create the bot or edit the JSON config directly if comfortable.")
             else:
                  st.caption("No custom step rules defined.")
 
         # Math Projection in Editor
         try:
-            # Merge basic params with config_dict to ensure Strategy __init__ sees everything (like UseATRGrid)
+            # Fetch current price for projection
+            # Use cached fetch
+            ohlcv = fetch_ohlcv_cached(new_market_type, new_pair if new_pair else "BTC/USDT", '1m')
+            if ohlcv and len(ohlcv) > 0:
+                curr_p = float(ohlcv[-1][4]) 
+            else:
+                curr_p = 40000.0
+            
+            # Merge params for strategy calculation
             combined_params = config_dict.copy()
             combined_params.update({
                 'base_size': new_base, 
@@ -625,111 +608,41 @@ def render_edit_form(bot_id):
                 'max_steps': new_max_steps
             })
             
+            # Calculate Logic (Simplified for View)
             temp_strat = MartingaleStrategy(params=combined_params)
             
-            # Fetch current price for projection using the bot's market type
-            # Use cached fetch
-            ohlcv = fetch_ohlcv_cached(new_market_type, new_pair if new_pair else "BTC/USDT", '1m')
-            # Handle cached result which might be empty
-            if ohlcv and len(ohlcv) > 0:
-                curr_p = float(ohlcv[-1][4]) # Use last close
-            else:
-                curr_p = 40000.0
-            
-            # Pass ATR context for grid
-            # Use 'ATR_Timeframe' from config if present
-            atr_tf = config_dict.get('ATR_Timeframe', '1h')
-            
-            # Calculate Real ATR for Projection
-            p_atr = 0.0
+            # ATR Context
             atr_timeframe = config_dict.get('ATR_Timeframe', '1h')
-            atr_period = int(config_dict.get('ATRPeriods', 14))
-            atr_period = min(max(atr_period, 3), 240)  # Clamp to valid range
-            
+            p_atr = curr_p * 0.01 # Default fallback
             try:
-                # Fetch data at ATR timeframe - Cached
-                ohlcv_atr = fetch_ohlcv_cached(new_market_type, new_pair if new_pair else "BTC/USDT", atr_timeframe)
-                
-                if ohlcv_atr:
+                 ohlcv_atr = fetch_ohlcv_cached(new_market_type, new_pair if new_pair else "BTC/USDT", atr_timeframe)
+                 if ohlcv_atr:
                     df_atr = pd.DataFrame(ohlcv_atr, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                    
-                    # Calculate True Range
                     tr1 = df_atr['high'] - df_atr['low']
                     tr2 = (df_atr['high'] - df_atr['close'].shift()).abs()
                     tr3 = (df_atr['low'] - df_atr['close'].shift()).abs()
                     true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-                    
-                    if len(true_range) >= atr_period:
-                        # Average True Range over atr_period
-                        p_atr = float(true_range.iloc[-atr_period:].mean())
-                    else:
-                        p_atr = curr_p * 0.01  # Fallback 1% if not enough data
-                else:
-                    p_atr = curr_p * 0.01  # Fallback 1% if data fetch fails
-            except Exception as e:
-                p_atr = curr_p * 0.01
-                st.warning(f"ATR Calc Failed: {e}")
+                    p_atr = float(true_range.iloc[-14:].mean())
+            except:
+                 pass
 
             projections = temp_strat.calculate_projections(base_price=curr_p, current_atr=p_atr)
+            
             with st.expander("🔍 Editor Risk Projection & Math Summary", expanded=False):
                 st.caption("ℹ️ Projections update after saving changes.")
-                # Display Key Metrics
-                m1, m2, m3 = st.columns(3)
-                m1.metric("Simulated Price", f"${curr_p:,.4f}")
-                m2.metric(f"ATR ({atr_tf})", f"{p_atr:.4f}")
+                st.caption(f"Simulated levels starting at: **{curr_p:,.2f}** (ATR: {p_atr:.2f})")
                 
-                grid_dist_pips = p_atr * float(config_dict.get('ATRGridFactor', 1.0)) if config_dict.get('UseATRGrid') else float(config_dict.get('base_grid', 25.0))
-                m3.metric("Grid Step Size", f"{grid_dist_pips:.4f}")
-
-                # --- DYNAMIC GRID VISUALIZER ---
-                if projections:
-                    import plotly.graph_objects as go
-                    
-                    proj_df = pd.DataFrame(projections)
-                    steps = proj_df['step']
-                    prices = proj_df['price']
-                    tps = proj_df['tp_price']
-                    
-                    fig = go.Figure()
-                    
-                    # Grid Levels
-                    fig.add_trace(go.Scatter(x=steps, y=prices, mode='lines+markers', name='Grid Orders', line=dict(color='#58a6ff')))
-                    
-                    # TP Levels
-                    fig.add_trace(go.Scatter(x=steps, y=tps, mode='lines+markers', name='Take Profit', line=dict(color='#3fb950', dash='dash')))
-                    
-                    # Current Price Line
-                    fig.add_hline(y=curr_p, line_dash="solid", line_color="#1f2328", annotation_text="Entry")
-                    
-                    fig.update_layout(
-                        title="Grid Visualizer",
-                        xaxis_title="Martingale Step",
-                        yaxis_title="Price ($)",
-                        template="plotly_white",
-                        height=300,
-                        margin=dict(l=10, r=10, t=30, b=10),
-                        paper_bgcolor='rgba(0,0,0,0)',
-                        plot_bgcolor='rgba(0,0,0,0)',
-                        font=dict(color='#1f2328')
-                    )
-                    st.plotly_chart(fig, width='stretch')
-                # -------------------------------
-
-                st.caption(f"Simulated levels starting at: **{curr_p:,.2f}**")
                 proj_df = pd.DataFrame(projections)
-                proj_df.columns = ["Step", "Grid Price", "Order ($)", "Total Inv. ($)", "TP Price", "Hedge Size", "Is Hedge"]
-                st.table(proj_df)
-                
-                # Hedge Summary
-                hedge_steps = [p for p in projections if p['is_hedge']]
-                if hedge_steps:
-                    h1 = hedge_steps[0]
-                    st.info(f"🛡️ **Hedge Summary**: At Step {h1['step']} (Price: {h1['price']}), a hedge of **${h1['hedge_size_usdc']}** activates.")
-                else:
-                    if config_dict.get('UseHedge'):
-                        st.warning("⚠️ Hedge enabled but not triggered in max steps.")
-                    else:
-                        st.info("ℹ️ No Hedge Configured.")
+                if not proj_df.empty:
+                    proj_df.columns = [
+                        "Step", "Grid Price", "Order ($)", "Total Inv. ($)", 
+                        "Avg Price", "TP Price", "Is Hedge", "Hedge Size"
+                    ]
+                    dt_view = proj_df[[
+                        "Step", "Grid Price", "Avg Price", "TP Price", 
+                        "Order ($)", "Total Inv. ($)", "Is Hedge", "Hedge Size"
+                    ]]
+                    st.table(dt_view)
                         
         except Exception as e:
             st.warning(f"Projection skip: {e}")
@@ -813,7 +726,7 @@ def render_edit_form(bot_id):
             with t_col4:
                 config_dict['mode_rsi'] = st.selectbox("RSI Switch", [0, 1, 2], index=int(config_dict.get('mode_rsi', 0)), format_func=lambda x: {0: "OFF", 1: "Below", 2: "Above"}[x])
                 config_dict['rsi_level'] = st.number_input("RSI Level", value=float(config_dict.get('rsi_level', 30)))
-                config_dict['rsi_tf'] = st.selectbox("RSI TF", ["1m","15m","1h"], index=["1m","15m","1h"].index(config_dict.get('rsi_tf', "15m")))
+                config_dict['rsi_tf'] = st.selectbox("RSI TF", ["1m","5m","15m","1h","4h","1d"], index=["1m","5m","15m","1h","4h","1d"].index(config_dict.get('rsi_tf', "15m")))
 
             st.markdown("#### Price & Volatility Triggers (9 & 10)")
             pv_col1, pv_col2 = st.columns(2)
@@ -825,7 +738,7 @@ def render_edit_form(bot_id):
                 config_dict['mode_atrp'] = st.selectbox("Volatility Context", [0, 1, 2], index=int(config_dict.get('mode_atrp', 0)), format_func=lambda x: {0: "OFF", 1: "Below (Quiet)", 2: "Above (Extreme)"}[x], help="Compares current volatility to historical levels.")
                 pa1, pa2 = st.columns(2)
                 config_dict['atrp_level'] = pa1.number_input("Lookback Level %", value=float(config_dict.get('atrp_level', 50.0)))
-                config_dict['atrp_tf'] = pa2.selectbox("ATR TF", ["15m","1h","4h","1d"], index=1, key=f"atrp_tf_select_{bot_id}")
+                config_dict['atrp_tf'] = pa2.selectbox("ATR TF", ["1m","5m","15m","1h","4h","1d"], index=3, key=f"atrp_tf_select_{bot_id}")
 
 
             st.markdown("#### Trigger 11: ATR Expansion (Current Move vs Range)")
@@ -835,7 +748,7 @@ def render_edit_form(bot_id):
             with e_col2:
                 config_dict['atre_level'] = st.number_input("Target % of ATR", value=float(config_dict.get('atre_level', 100.0)))
             with e_col3:
-                config_dict['atre_tf'] = st.selectbox("TF to Watch (T11)", ["1h","4h","1d"], index=0)
+                config_dict['atre_tf'] = st.selectbox("TF to Watch (T11)", ["1m","5m","15m","1h","4h","1d"], index=3)
 
             st.markdown("#### Pattern Slots")
             for p_idx in range(1, 4, 2):

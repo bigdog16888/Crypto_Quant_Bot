@@ -8,6 +8,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 
 from engine.database import add_bot
 from engine.exchange_interface import ExchangeInterface
+from engine.strategies.martingale_strategy import MartingaleStrategy
 
 # --- Performance Caching Wrappers ---
 @st.cache_resource(ttl=3600, show_spinner=False)
@@ -344,7 +345,7 @@ def render_bot_creator_view():
             with i_col4: 
                 bot_config['mode_rsi'] = st.selectbox("RSI Switch", [0, 1, 2], index=0, format_func=lambda x: {0: "OFF", 1: "Below Level", 2: "Above Level"}[x], key="create_mode_rsi")
                 bot_config['rsi_level'] = st.number_input("RSI Level", value=30, key="create_rsi_lvl")
-                bot_config['rsi_tf'] = st.selectbox("RSI TF", ["1m","15m","1h"], index=1, key="create_rsi_tf")
+                bot_config['rsi_tf'] = st.selectbox("RSI TF", ["1m","5m","15m","1h","4h","1d"], index=2, key="create_rsi_tf")
 
             st.divider()
             st.markdown("### 📊 2. Consecutive Pattern Slots")
@@ -375,7 +376,7 @@ def render_bot_creator_view():
                 bot_config['mode_atrp'] = st.selectbox("Market State", [0, 1, 2], index=0, format_func=lambda x: {0: "OFF", 1: "Below (Quiet)", 2: "Above (Extreme)"}[x], key="create_mode_atrp")
                 a_col1, a_col2 = st.columns(2)
                 bot_config['atrp_level'] = a_col1.number_input("Lookback Level %", value=50.0, key="create_atrp_level")
-                bot_config['atrp_tf'] = a_col2.selectbox("ATR TF (T10)", ["15m","1h","4h","1d"], index=1, key="create_atrp_tf")
+                bot_config['atrp_tf'] = a_col2.selectbox("ATR TF (T10)", ["1m","5m","15m","1h","4h","1d"], index=3, key="create_atrp_tf")
 
             st.divider()
             st.markdown("**Trigger 11: ATR Expansion (Current Move vs Range)**")
@@ -385,7 +386,7 @@ def render_bot_creator_view():
             with e_col2:
                 bot_config['atre_level'] = st.number_input("Target % of ATR", value=100.0, key="create_atre_level")
             with e_col3:
-                bot_config['atre_tf'] = st.selectbox("TF to Watch (T11)", ["1h","4h","1d"], index=0, key="create_atre_tf")
+                bot_config['atre_tf'] = st.selectbox("TF to Watch (T11)", ["1m","5m","15m","1h","4h","1d"], index=3, key="create_atre_tf")
             
             st.divider()
             st.markdown("**Trigger 12: Moving Average Filter (Trend Bias)**")
@@ -546,7 +547,7 @@ def render_bot_creator_view():
             use_hedge = st.checkbox("Use Hedging", value=False)
             bot_config['UseHedge'] = use_hedge
             bot_config['HedgeStartStep'] = st.number_input("Hedge Start Step (1-10)", min_value=1, max_value=10, value=7)
-            bot_config['HedgeStart'] = st.number_input("Hedge Start (DD%)", value=20.0)
+            bot_config['HedgeStart'] = st.number_input("Hedge Start (DD%)", value=70.0)
 
             # Update Temp Strat for Projection if Hedging is toggled
             if use_hedge:
@@ -668,7 +669,7 @@ def render_bot_creator_view():
             elif strategy_type == "Magic Hour":
                 strat_id = "MagicHour"
                 
-            bot_config['market_type'] = 'spot' if mode_id == 'spot' else 'futures'
+            bot_config['market_type'] = 'spot' if mode_id == 'spot' else 'future'
             
             bot_id = add_bot(
                 name=name,

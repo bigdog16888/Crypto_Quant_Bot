@@ -5,7 +5,7 @@ import json
 from typing import Any, Optional, Dict
 from datetime import datetime, timedelta
 from engine.database import get_connection
-from engine.exchange_interface import ExchangeInterface, normalize_symbol
+from engine.exchange_interface import ExchangeInterface, normalize_symbol, normalize_market_type
 from config.settings import config
 
 logger = logging.getLogger("RiskManager")
@@ -60,7 +60,7 @@ def get_unrealized_pnl(bot_id: Optional[int] = None, exchange: Any = None, excha
             
             pair, config_json = row
             cfg = json.loads(config_json) if config_json else {}
-            market_type = cfg.get('market_type', config.MARKET_TYPE)
+            market_type = normalize_market_type(cfg.get('market_type', config.MARKET_TYPE))
             target_norm = normalize_symbol(pair)
             
             if exchange_snapshot and market_type in exchange_snapshot:
