@@ -42,6 +42,9 @@ class Config:
         # 🛡️ SAFETY TOGGLE: Allow user to disable auto-cancellation of zombie orders
         self.AUTO_FIX_ZOMBIES = os.getenv("AUTO_FIX_ZOMBIES", "True").lower() == "true"
         
+        # 🛡️ SAFETY LIMIT: Maximum account drawdown percentage before blocking new entries (Default 80%)
+        self.MAX_ACCOUNT_DRAWDOWN_PERCENT = float(os.getenv("MAX_ACCOUNT_DRAWDOWN_PERCENT", 80.0))
+        
         # 🛡️ SAFETY TOGGLE: Strict Cleanup (True = Kill Manual Orders, False = Protect Them)
         self.STRICT_CLEANUP = os.getenv("STRICT_CLEANUP", "False").lower() == "true"
 

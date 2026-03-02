@@ -78,11 +78,11 @@ class UnifiedBotState:
     exchange_position_size: float
     exchange_entry_price: float
     exchange_open_orders: int
-    has_entry_order: bool = False
     
     # Health indicators
     is_consistent: bool
     inconsistencies: List[str]
+    has_entry_order: bool = False
     
     @property
     def needs_reconciliation(self) -> bool:

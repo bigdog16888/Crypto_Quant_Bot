@@ -13,6 +13,7 @@ from logging.handlers import RotatingFileHandler
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from engine.database import get_connection, init_db, get_bot_status, update_martingale_step, log_trade, reset_bot_after_tp, deactivate_bot, get_bot_params, save_bot_order, get_bot_order_ids, get_starting_equity, update_active_positions_snapshot, update_full_snapshot, update_active_positions
+import sqlite3
 from engine.exchange_interface import ExchangeInterface, normalize_symbol, normalize_market_type
 from engine.strategies.martingale_strategy import MartingaleStrategy
 from engine.manager import manage_trade
@@ -20,6 +21,10 @@ from engine.bot_executor import BotExecutor
 import engine.bot_executor
 from engine.metrics import MetricsServer, BOT_CYCLE_TIME
 from engine.integrity import enforce_integrity
+from engine.database import (
+    get_connection, get_bot_status, get_starting_equity
+)
+from engine.ws_cache import get_ws_cache
 
 
 from config.settings import config
@@ -687,14 +692,29 @@ class BotRunner:
             for mt in active_market_types:
                 if mt in self.exchanges:
                     ex = self.exchanges[mt]
-                    snap_pos = ex.fetch_positions()
+                    
+                    # 🚀 FAST-PATH: Use WebSocket Memory Cache if fresh
+                    ws_cache = get_ws_cache()
+                    
+                    if ws_cache.is_fresh(max_age_seconds=300):
+                        logger.debug(f"⚡ [WS-CACHE] Reading positions and orders from memory for {mt}")
+                        snap_pos = ws_cache.get_all_positions()
+                        snap_orders = ws_cache.get_all_open_orders()
+                    else:
+                        logger.debug(f"🐢 [REST-API] WS Cache stale or missing. Fetching from API for {mt}")
+                        snap_pos = ex.fetch_positions()
+                        snap_orders = ex.fetch_open_orders()
+                        
+                        # 🚀 PRE-POPULATE WS CACHE to avoid data loss on startup
+                        if snap_pos is not None and snap_orders is not None:
+                            ws_cache.populate_from_rest(snap_pos, snap_orders)
+                        
                     # Skip fetch_balance — circuit breaker is disabled, no consumer
                     snap_bal = None
-                    snap_orders = ex.fetch_open_orders()
                     
                     # Position Fetch Trace
-                    if snap_pos:
-                        logger.debug(f"{mt} fetch_positions returned {len(snap_pos)} items: {[p['symbol'] for p in snap_pos]}")
+                    if snap_pos is not None:
+                        logger.debug(f"{mt} fetch_positions returned {len(snap_pos)} items: {[p.get('symbol', 'UNK') for p in snap_pos]}")
                     else:
                         logger.debug(f"{mt} fetch_positions returned EMPTY/NONE")
 
@@ -846,6 +866,25 @@ class BotRunner:
                             multi_tf_data[pair] = pair_tf_data
                         except Exception as e:
                             logger.error(f"Failed to fetch market data for {pair}: {e}")
+
+                    # 🚀 UI PERFORMANCE BATCHING: Save the OHLCV Cache to JSON for the Dashboard
+                    try:
+                        cache_dir = os.path.join(config.ROOT_DIR, 'data')
+                        os.makedirs(cache_dir, exist_ok=True)
+                        cache_file = os.path.join(cache_dir, 'market_cache.json')
+                        
+                        # We need to convert Pandas DataFrames into simple JSON dicts
+                        json_ready_cache = {}
+                        for pair, tf_dict in multi_tf_data.items():
+                            json_ready_cache[pair] = {}
+                            for tf, df in tf_dict.items():
+                                json_ready_cache[pair][tf] = df.to_dict(orient='records')
+                        
+                        with open(cache_file, 'w') as f:
+                            json.dump(json_ready_cache, f)
+                        # logger.debug(f"💾 Saved Market Data Cache to {cache_file}")
+                    except Exception as cache_err:
+                        logger.warning(f"Failed to save market cache for UI: {cache_err}")
 
                     exchange_snapshot[mt] = {
                         'positions': snap_pos,

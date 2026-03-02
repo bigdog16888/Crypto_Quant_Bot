@@ -199,6 +199,25 @@ class BotExecutor:
             if mission:
                 if mission['action'] == 'entry':
                      
+                    # 🛡️ GLOBAL SAFETY: Check Maximum Account Drawdown
+                    # Prevents full portfolio wipeout during flash crashes across all bots
+                    try:
+                        market_type = normalize_market_type(strategy.params.get('market_type', 'spot'))
+                        account_info = exchange_snapshot.get(market_type, {}).get('account', {})
+                        
+                        balance = account_info.get('totalWalletBalance') or account_info.get('totalMarginBalance')
+                        equity = account_info.get('totalCrossWalletBalance') or account_info.get('totalMarginBalance')
+                        
+                        if balance and equity:
+                            drawdown_pct = ((float(balance) - float(equity)) / float(balance)) * 100
+                            
+                            if drawdown_pct >= config.MAX_ACCOUNT_DRAWDOWN_PERCENT > 0:
+                                logger.critical(f"🛑 [GLOBAL-SAFETY-LOCK] Account Drawdown ({drawdown_pct:.1f}%) > Max Limit ({config.MAX_ACCOUNT_DRAWDOWN_PERCENT}%). Blocking Bot {name} from NEW ENTRY.")
+                                # We allow existing bots to maintain grids via `maintain_orders`, but BLOCK new ones.
+                                return None, None
+                    except Exception as e:
+                        logger.error(f"Global Drawdown Safety Check Failed: {e}")
+
                     # 🚀 WORKFLOW VERIFICATION: Physical Reality Check (MOVED HERE)
                     # Before placing a NEW Entry, we must confirm we have NO position on the exchange.
                     can_enter = True
@@ -358,7 +377,7 @@ class BotExecutor:
 
                     logger.info(f"🧐 {name}: Creating Order on Exchange...")
                     client_order_id = self._generate_deterministic_id(bot_id, 'ENTRY', 1)
-                    order = exchange.create_order(pair, 'limit', side, amount, price, params={'clientOrderId': client_order_id})
+                    order = exchange.create_order(pair, 'limit', side, amount, price, params={'clientOrderId': client_order_id, 'postOnly': True, 'timeInForce': 'GTX'})
                     if order:
                         try:
                             save_bot_order(bot_id, 'entry', order['id'], price, amount, 1, 'open', client_order_id=client_order_id)
@@ -412,7 +431,7 @@ class BotExecutor:
                         client_order_id = self._generate_deterministic_id(bot_id, 'TP', bot_status['current_step'])
                         # 🚀 FIXED: Map direction to exchange side for TP
                         side = 'sell' if direction == 'LONG' else 'buy'
-                        order = exchange.create_order(pair, 'limit', side, tp_amount, tp_price, params={'reduceOnly': True, 'clientOrderId': client_order_id})
+                        order = exchange.create_order(pair, 'limit', side, tp_amount, tp_price, params={'reduceOnly': True, 'clientOrderId': client_order_id, 'postOnly': True, 'timeInForce': 'GTX'})
                         if order:
                             save_bot_order(bot_id, 'tp', order['id'], tp_price, tp_amount, bot_status['current_step'], 'open', client_order_id=client_order_id)
                             logger.info(f"✅ {name}: Placed TP order for {pair} @ {tp_price} (ID: {order['id']})")
@@ -447,7 +466,7 @@ class BotExecutor:
                     try:
                         client_order_id_grid = self._generate_deterministic_id(bot_id, 'GRID', bot_status['current_step'] + 1)
                         # 🚀 FIXED: Map direction to exchange side
-                        order = exchange.create_order(pair, 'limit', side, grid_amount, grid_price, params={'clientOrderId': client_order_id_grid})
+                        order = exchange.create_order(pair, 'limit', side, grid_amount, grid_price, params={'clientOrderId': client_order_id_grid, 'postOnly': True, 'timeInForce': 'GTX'})
                         if order:
                             save_bot_order(bot_id, 'grid', order['id'], grid_price, grid_amount, bot_status['current_step'] + 1, 'open', client_order_id=client_order_id_grid, notes=grid_explain)
                             logger.info(f"✅ {name}: Placed Grid order for {pair} @ {grid_price} (ID: {order['id']})")
@@ -571,6 +590,7 @@ class BotExecutor:
              logger.warning(f"🧹 {name}: Found dangling ENTRY order {existing_entry_order['id']} while IN TRADE. Cancelling to enforce state.")
              try:
                  exchange.cancel_order(existing_entry_order['id'], pair)
+                 update_order_status(existing_entry_order['id'], 'cancelled', bot_id=bot_id)
                  existing_entry_order = None # Removed
              except Exception as e:
                  logger.error(f"Failed to cancel dangling entry: {e}")
@@ -587,6 +607,7 @@ class BotExecutor:
                 logger.warning(f"🧹 {name}: Found dangling GRID order while SCANNING. Cancelling.")
                 try:
                     exchange.cancel_order(existing_grid_order['id'], pair)
+                    update_order_status(existing_grid_order['id'], 'cancelled', bot_id=bot_id)
                 except: pass
                 grid_orders = [] # Clear local list
             
@@ -594,6 +615,7 @@ class BotExecutor:
                 logger.warning(f"🧹 {name}: Found dangling TP order while SCANNING. Cancelling.")
                 try:
                     exchange.cancel_order(existing_tp_order['id'], pair)
+                    update_order_status(existing_tp_order['id'], 'cancelled', bot_id=bot_id)
                 except: pass
                 tp_orders = []
 
@@ -614,6 +636,7 @@ class BotExecutor:
             for o in stale_orders:
                 try:
                     exchange.cancel_order(o['id'], pair)
+                    update_order_status(o['id'], 'cancelled', bot_id=bot_id)
                     logger.info(f"🔥 Cancelled stale {o.get('clientOrderId')}")
                 except Exception as e:
                     logger.error(f"Failed to cancel stale {o['id']}: {e}")
@@ -623,7 +646,9 @@ class BotExecutor:
             logger.warning(f"⚠️ {name}: Found {len(valid_grid_orders)} duplicate GRID orders for step {current_step+1}. Cleaning...")
             valid_grid_orders.sort(key=lambda x: str(x['id']), reverse=True)
             for o in valid_grid_orders[1:]:
-                try: exchange.cancel_order(o['id'], pair)
+                try: 
+                    exchange.cancel_order(o['id'], pair)
+                    update_order_status(o['id'], 'cancelled', bot_id=bot_id)
                 except: pass
             valid_grid_orders = [valid_grid_orders[0]]
 
@@ -631,7 +656,9 @@ class BotExecutor:
             logger.warning(f"⚠️ {name}: Found {len(valid_tp_orders)} duplicate TP orders for step {current_step}. Cleaning...")
             valid_tp_orders.sort(key=lambda x: str(x['id']), reverse=True)
             for o in valid_tp_orders[1:]:
-                try: exchange.cancel_order(o['id'], pair)
+                try: 
+                    exchange.cancel_order(o['id'], pair)
+                    update_order_status(o['id'], 'cancelled', bot_id=bot_id)
                 except: pass
             valid_tp_orders = [valid_tp_orders[0]]
 
@@ -646,6 +673,23 @@ class BotExecutor:
             tp_price = strategy.calculate_take_profit_price(bot_status, current_price)
             tp_amount = strategy.calculate_take_profit_amount(bot_status, current_price, pair, exchange)
             
+            # 🚀 OFFLINE PROFIT GAP FIX
+            # If the market gapped past our TP while offline, placing a standard limit order
+            # at the original tp_price will trigger Binance Error -4024 (Limit price can't be > X% from mark).
+            # We adjust it precisely to the nearest limit (current price) since price favors the position.
+            if direction == 'LONG' and current_price > tp_price:
+                 logger.info(f"🚀 {name}: Offline Gap! Current price {current_price} > TP {tp_price}. Adjusting TP to current price {current_price} (nearest limit).")
+                 tp_price = current_price
+            elif direction == 'SHORT' and current_price < tp_price:
+                 logger.info(f"🚀 {name}: Offline Gap! Current price {current_price} < TP {tp_price}. Adjusting TP to current price {current_price} (nearest limit).")
+                 tp_price = current_price
+
+            # Re-round just in case
+            try:
+                prec = exchange.get_symbol_precision(pair)
+                tp_price = exchange.round_to_step(tp_price, prec['tick_size'])
+            except: pass
+
             logger.info(f"🔍 [TP-MAINTENANCE] Checking TP for {name}: tp_price={tp_price}, amount={tp_amount}")
             if bot_id == 10000:
                  logger.debug(f"TP Logic Bot 10000 | Existing={existing_tp_order is not None} | Amt={tp_amount} | Price={tp_price} | Invested={bot_status['total_invested']}")
@@ -660,7 +704,7 @@ class BotExecutor:
                         try:
                             client_order_id = self._generate_deterministic_id(bot_id, 'TP', bot_status['current_step'])
                             side = 'sell' if direction == 'LONG' else 'buy'
-                            order = exchange.create_order(pair, 'limit', side, tp_amount, tp_price, params={'clientOrderId': client_order_id})
+                            order = exchange.create_order(pair, 'limit', side, tp_amount, tp_price, params={'clientOrderId': client_order_id, 'postOnly': True, 'timeInForce': 'GTX'})
                             if order:
                                 save_bot_order(bot_id, 'tp', order['id'], tp_price, tp_amount, bot_status['current_step'], 'open', client_order_id=client_order_id)
                                 logger.info(f"✅ {name}: Maintained TP order for {pair} @ {tp_price}")
@@ -793,7 +837,7 @@ class BotExecutor:
                         try:
                             client_order_id_grid = self._generate_deterministic_id(bot_id, 'GRID', bot_status['current_step'] + 1)
                             # 🚀 FIXED: Map direction to exchange side
-                            order = exchange.create_order(pair, 'limit', side, grid_amount, grid_price, params={'clientOrderId': client_order_id_grid})
+                            order = exchange.create_order(pair, 'limit', side, grid_amount, grid_price, params={'clientOrderId': client_order_id_grid, 'postOnly': True, 'timeInForce': 'GTX'})
                             if order:
                                 save_bot_order(bot_id, 'grid', order['id'], grid_price, grid_amount, bot_status['current_step'] + 1, 'open', client_order_id=client_order_id_grid, notes=grid_explain)
                                 logger.info(f"✅ {name}: Maintained Grid order for {pair} @ {grid_price}")

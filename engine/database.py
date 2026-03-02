@@ -38,8 +38,9 @@ def get_connection():
     
     if need_new_connection:
         _local.connection = sqlite3.connect(DB_PATH, timeout=30.0)
-        # ENABLE WAL MODE for concurrency safety - DISABLED for Windows Stability
-        _local.connection.execute("PRAGMA journal_mode=DELETE")
+        # ENABLE WAL MODE for enterprise concurrency safety
+        _local.connection.execute("PRAGMA journal_mode=WAL")
+        _local.connection.execute("PRAGMA synchronous=NORMAL")
         _local.connection.execute("PRAGMA busy_timeout=30000")
     
     return _local.connection
@@ -92,7 +93,8 @@ def init_db():
     conn = None
     try:
         conn = sqlite3.connect(DB_PATH, timeout=60.0)
-        conn.execute("PRAGMA journal_mode=DELETE")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA busy_timeout=60000")
         cursor = conn.cursor()
         

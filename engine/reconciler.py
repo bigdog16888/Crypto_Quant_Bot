@@ -235,14 +235,24 @@ class StateReconciler:
 
                             # Update Bot State
                             order_status = order.get('status', '').lower()
-                            # GUARD: Only process actually-filled orders. Cancelled/expired order
-                            # history is also returned by fetch_closed_orders — skip them.
-                            if order_status not in ('filled', 'closed'):
-                                logger.debug(f"Skipping non-filled order {cid} (status={order_status})")
-                                continue
-
+                            # GUARD: Only process actually-filled orders.
+                            # However, if the order was cancelled/expired/rejected on the exchange,
+                            # we MUST update the local DB to reflect that so it doesn't stay 'open' forever.
                             fill_price = order.get('average') or order.get('price') or 0.0
                             fill_qty = order.get('filled') or order.get('amount') or 0.0
+
+                            # Update local DB if cancelled, but DO NOT skip if there was a partial fill
+                            if order_status in ['canceled', 'cancelled', 'expired', 'rejected']:
+                                logger.debug(f"🧹 [OFFLINE-SYNC] Syncing cancelled order {cid} (status={order_status}) to DB.")
+                                cursor.execute("UPDATE bot_orders SET status=?, updated_at=? WHERE order_id=?",
+                                               (order_status, int(time.time()), order['id']))
+                                # ONLY skip if it wasn't partially filled.
+                                # If fill_qty > 0, it was partially filled before dying, so WE MUST PROCESS IT!
+                                if fill_qty <= 0:
+                                    continue
+                            elif order_status not in ('filled', 'closed'):
+                                logger.debug(f"Skipping non-filled order {cid} (status={order_status})")
+                                continue
                             fill_symbol = order.get('symbol', pair)
                             bot_name = f"Bot-{bot_id}" # Placeholder, ideally fetch name
                             
@@ -695,10 +705,10 @@ class StateReconciler:
                 # 3. Identify Suspects (Bots contributing to the error)
                 suspects = [b for b in bots if b.in_trade and b.direction.upper() == error_side]
                 
-                # Get orders for this pair
-                pair_orders = all_orders.get(pair_normalized, [])
-                
                 for b in suspects:
+                    # Get orders for THIS specific bot's raw pair string
+                    pair_orders = all_orders.get(b.pair, [])
+                    
                     # 4. Proof of Life Check: Does this bot have open orders?
                     bot_orders = [o for o in pair_orders if o.client_order_id and f"CQB_{b.bot_id}_" in o.client_order_id]
                     
@@ -993,6 +1003,7 @@ class StateReconciler:
     def fetch_all_exchange_positions(self) -> Tuple[bool, Dict[str, List[ExchangePosition]]]:
         all_pos = {}
         success = True
+        seen_positions = set()
         for mt, ex in self.exchanges.items():
             if not ex: continue
             try:
@@ -1002,9 +1013,17 @@ class StateReconciler:
                     continue
                 for p in raw:
                     sym = normalize_symbol(p.get('symbol', ''))
+                    side = 'LONG' if float(p.get('contracts',0) or p.get('size',0)) > 0 else 'SHORT'
+                    
+                    # Deduplicate globally using symbol and side to prevent double-counting if endpoints overlap
+                    pos_id = f"{sym}_{side}"
+                    if pos_id in seen_positions:
+                        continue
+                    seen_positions.add(pos_id)
+                    
                     pos = ExchangePosition(
                         symbol=sym,
-                        side='LONG' if float(p.get('contracts',0) or p.get('size',0)) > 0 else 'SHORT',
+                        side=side,
                         size=abs(float(p.get('contracts',0) or p.get('size',0))),
                         entry_price=float(p.get('entryPrice',0)),
                         mark_price=float(p.get('markPrice',0)),
@@ -1019,6 +1038,7 @@ class StateReconciler:
 
     def fetch_all_exchange_orders(self, pairs: List[str]) -> Dict[str, List[ExchangeOrder]]:
         orders_by_pair = {}
+        seen_order_ids = set() # Prevent duplicated orders from overlapping API endpoints
         for pair in pairs:
             orders_by_pair[pair] = []
             for mt, ex in self.exchanges.items():
@@ -1029,8 +1049,13 @@ class StateReconciler:
                         logger.warning(f"⚠️ fetch_open_orders returned non-list for exchange '{mt}', pair '{pair}': {raw}. Skipping.")
                         continue
                     for o in raw:
+                        oid = str(o.get('id', ''))
+                        if oid in seen_order_ids:
+                            continue
+                        seen_order_ids.add(oid)
+                        
                         orders_by_pair[pair].append(ExchangeOrder(
-                            order_id=str(o.get('id','')),
+                            order_id=oid,
                             symbol=pair,
                             side=o.get('side',''),
                             order_type=o.get('type','limit'),

@@ -20,11 +20,26 @@ def get_exchange_instance(market_type):
     return ExchangeInterface(market_type=market_type)
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=5, show_spinner=False)
 def fetch_ohlcv_cached(market_type, symbol, timeframe):
+    """
+    UI PERFORMANCE BATCHING 🚀
+    Reads pre-fetched OHLCV data from the Engine's local JSON cache
+    instead of making parallel REST API calls that stall the Dashboard.
+    """
     try:
+        cache_file = os.path.join(global_config.ROOT_DIR, 'data', 'market_cache.json')
+        if os.path.exists(cache_file):
+            with open(cache_file, 'r') as f:
+                cache_data = json.load(f)
+            
+            # Find the symbol in the cache
+            # Cache keys might be normalized (e.g., BTC/USDC)
+            if symbol in cache_data and timeframe in cache_data[symbol]:
+                return cache_data[symbol][timeframe]
+            
+        # Fallback to direct fetch if cache is missing or stale
         ex = get_exchange_instance(market_type)
-        # Symbol Normalization for CCXT Futures if needed
         norm_symbol = symbol
         if market_type == 'future' and ':' not in symbol:
             if symbol.endswith('/USDT'): norm_symbol = f"{symbol}:USDT"
@@ -330,7 +345,7 @@ def render_monitor_view():
             st.rerun()
 
     # Auto-Refresh Toggle (Default ON) - Capture state here, execute later
-    auto_refresh = st.toggle("⚡ Auto-Refresh (15s)", value=True, key="auto_refresh_toggle")
+    auto_refresh = st.toggle("⚡ Auto-Refresh (5s) [ASync]", value=True, key="auto_refresh_toggle")
 
     # --- Data Fetching (Parallel) ---
     with st.spinner("Fetching market data..."):
@@ -773,6 +788,51 @@ def render_monitor_view():
             df_pos['Trigger Condition'] = info_df['Trigger']
             df_pos['Active Orders'] = info_df['Orders']
             
+            # --- PERFORMANCE MATRIX (Enterprise Batch View) ---
+            # Calculate dense metrics for 20+ bots
+            st.markdown("### ⚡ Batch Performance Matrix")
+            try:
+                matrix_df = df_pos.copy()
+                
+                # 1. PnL Estimate Column
+                def est_profit(row):
+                    if row['total_invested'] > 0 and row['avg_entry_price'] > 0 and row['target_tp_price'] > 0:
+                        qty = row['total_invested'] / row['avg_entry_price']
+                        if row['direction'] == 'LONG':
+                            return (row['target_tp_price'] - row['avg_entry_price']) * qty
+                        else:
+                            return (row['avg_entry_price'] - row['target_tp_price']) * qty
+                    return 0.0
+                
+                matrix_df['Expected Profit'] = matrix_df.apply(est_profit, axis=1)
+                
+                # 2. Time in Trade Column
+                current_time = time.time()
+                def time_in_trade(row):
+                    if row['total_invested'] > 0 and row['basket_start_time'] > 0:
+                        sec = current_time - row['basket_start_time']
+                        m, s = divmod(sec, 60)
+                        h, m = divmod(m, 60)
+                        return f"{int(h)}h {int(m)}m"
+                    return "-"
+                
+                matrix_df['Time in Trade'] = matrix_df.apply(time_in_trade, axis=1)
+                
+                # 3. Format columns
+                cols_matrix = ['name', 'pair', 'direction', 'current_step', 'total_invested', 'Expected Profit', 'Time in Trade', 'status']
+                matrix_df = matrix_df[[c for c in cols_matrix if c in matrix_df.columns]]
+                
+                matrix_df['total_invested'] = matrix_df['total_invested'].apply(lambda x: f"${x:,.2f}" if x > 0 else "-")
+                matrix_df['Expected Profit'] = matrix_df['Expected Profit'].apply(lambda x: f"${x:,.2f}" if x > 0 else "-")
+                
+                st.dataframe(matrix_df, width="stretch")
+            except Exception as e:
+                st.warning(f"Failed to render Batch Matrix: {e}")
+                
+            st.divider()
+            
+            st.markdown("### ⚙️ Detailed Bot State (Debug View)")
+            
             # Reorder columns for readability
             cols = ['name', 'pair', 'direction', 'status', 'Active Orders', 'Trigger Condition', 'current_step', 'total_invested', 'avg_entry_price']
             # Filter strictly for columns that exist
@@ -917,8 +977,7 @@ def render_monitor_view():
     # --- Auto-Refresh Upgrade ---
     if auto_refresh:
         from streamlit_autorefresh import st_autorefresh
-        # Using st_autorefresh properly re-runs the script without a full 
-        # browser page reload (which causes the annoying scroll-to-top behavior).
-        st_autorefresh(interval=15000, limit=None, key="monitor_autorefresh")
+        # 🚀 UI PERFORMANCE BATCHING: Now that rendering is async/cached, we can safely refresh every 5s
+        st_autorefresh(interval=5000, limit=None, key="monitor_autorefresh")
     else:
         st.caption("ℹ️ Tip: Auto-Refresh is OFF. Toggle it in the sidebar for real-time updates.")

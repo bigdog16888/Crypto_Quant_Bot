@@ -34,6 +34,12 @@
         else:
             # Real Order
             try:
+                # Enforce Post-Only Maker Execution to prevent taker fees
+                if params is None:
+                    params = {}
+                params['postOnly'] = True
+                params['timeInForce'] = 'GTX'
+                
                 # Use create_order which now has validation and retries
                 order = self.exchange.create_order(pair, 'limit', side, amount, price, params=params)
                 if order:

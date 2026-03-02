@@ -12,6 +12,8 @@ Updates database state based on these events.
 import logging
 from typing import Dict
 
+from engine.ws_cache import get_ws_cache
+
 logger = logging.getLogger("WSEventHandlers")
 
 
@@ -79,6 +81,17 @@ def handle_order_update(event: Dict):
             _handle_order_new(bot_id, order_type, event)
         elif status == 'EXPIRED':
             _handle_order_canceled(bot_id, order_type, event)
+            
+        # 🚀 WS CACHING: Keep our memory snapshot alive
+        ws_cache = get_ws_cache()
+        
+        # 🔧 CCXT COMPATIBILITY: Map WebSocket keys to CCXT format for BotExecutor
+        if 'clientOrderId' not in event:
+            event['clientOrderId'] = client_id
+        if 'id' not in event:
+            event['id'] = str(order_id)
+            
+        ws_cache.update_order(order_id, event)
             
     except Exception as e:
         logger.error(f"Error handling order update: {e}")
@@ -264,6 +277,18 @@ def handle_position_update(event: Dict):
             # Could trigger ghost detection or cleanup here
         else:
             logger.debug(f"📊 WS Position: {symbol} {position_amt} @ {entry_price} (uPnL: ${unrealized_pnl:.2f})")
+            
+        # 🚀 WS CACHING: Update memory snapshot
+        # Format the event to look roughly like CCXT position output
+        position_data = {
+            'symbol': symbol,
+            'contracts': position_amt,
+            'entryPrice': entry_price,
+            'unrealizedPnl': unrealized_pnl,
+            'marginType': event.get('margin_type', 'cross'),
+            'timestamp': event.get('timestamp')
+        }
+        get_ws_cache().update_position(symbol, position_data)
             
     except Exception as e:
         logger.error(f"Error handling position update: {e}")
