@@ -176,9 +176,9 @@ def render_monitor_view():
             curr = price_map.get(pair, 0.0)
             
             # --- 🛡️ PnL EXPLOSION SAFEGUARD ---
-            # If entry price is abnormally low (e.g. 1.0 for BTC/XAU), it's likely corrupted data
-            # BTC is usually > 20k, XAU > 2k. Floor of $10 is safe.
-            if curr > 0 and entry > 10.0: 
+            # If entry price is abnormally low (e.g. 0.0001 for BTC/XAU), it's likely corrupted data
+            # Changed floor to 0.0001 to support cheap altcoins like XRP and SUI
+            if curr > 0 and entry > 0.0001: 
                 if direction == 'LONG':
                     pnl = (curr - entry) / entry * inv
                 else:
@@ -765,20 +765,28 @@ def render_monitor_view():
                     bot_id = row['id']
                     # Filter market_orders (deduplicated)
                     my_orders = [o for o in market_orders if o.get('clientOrderId', '').startswith(f"CQB_{bot_id}_")]
+                    res['TP_Price'] = 0.0
+                    res['Grid_Price'] = 0.0
+
                     if my_orders:
                         types = [o['type'].upper() for o in my_orders]
                         # Try to identify TP/Grid/Entry based on ID
                         detailed = []
                         for o in my_orders:
                             cid = o.get('clientOrderId', '')
-                            if 'TP' in cid: detailed.append('TP')
-                            elif 'GRID' in cid: detailed.append('GRID')
+                            price_val = float(o.get('price', 0.0) or 0.0)
+                            if 'TP' in cid: 
+                                detailed.append('TP')
+                                res['TP_Price'] = price_val
+                            elif 'GRID' in cid: 
+                                detailed.append('GRID')
+                                res['Grid_Price'] = price_val
                             elif 'ENTRY' in cid: detailed.append('ENTRY')
                             else: detailed.append('LIMIT')
                         
                         res['Orders'] = f"{len(my_orders)} " + (f"({', '.join(detailed)})" if detailed else "")
                     else:
-                            res['Orders'] = "0"
+                        res['Orders'] = "0"
                             
                 except Exception as e: 
                     print(e)
@@ -787,6 +795,8 @@ def render_monitor_view():
             info_df = df_pos.apply(extract_info, axis=1, result_type='expand')
             df_pos['Trigger Condition'] = info_df['Trigger']
             df_pos['Active Orders'] = info_df['Orders']
+            df_pos['Active TP'] = info_df['TP_Price'].apply(lambda x: f"${x:,.2f}" if x > 0 else "-")
+            df_pos['Next Grid'] = info_df['Grid_Price'].apply(lambda x: f"${x:,.2f}" if x > 0 else "-")
             
             # --- PERFORMANCE MATRIX (Enterprise Batch View) ---
             # Calculate dense metrics for 20+ bots
@@ -819,7 +829,7 @@ def render_monitor_view():
                 matrix_df['Time in Trade'] = matrix_df.apply(time_in_trade, axis=1)
                 
                 # 3. Format columns
-                cols_matrix = ['name', 'pair', 'direction', 'current_step', 'total_invested', 'Expected Profit', 'Time in Trade', 'status']
+                cols_matrix = ['name', 'pair', 'direction', 'current_step', 'total_invested', 'Active TP', 'Next Grid', 'Expected Profit', 'Time in Trade', 'status']
                 matrix_df = matrix_df[[c for c in cols_matrix if c in matrix_df.columns]]
                 
                 matrix_df['total_invested'] = matrix_df['total_invested'].apply(lambda x: f"${x:,.2f}" if x > 0 else "-")

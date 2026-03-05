@@ -604,7 +604,8 @@ class BotRunner:
                 SELECT b.id, b.name, b.pair, b.direction, b.strategy_type, b.config, 
                        COALESCE(t.total_invested, 0), 
                        COALESCE(t.current_step, 0), 
-                       b.rsi_limit, b.is_active
+                       b.rsi_limit, b.is_active,
+                       b.base_size, b.martingale_multiplier
                 FROM bots b
                 LEFT JOIN trades t ON b.id = t.bot_id
             ''')
@@ -701,9 +702,18 @@ class BotRunner:
                         snap_pos = ws_cache.get_all_positions()
                         snap_orders = ws_cache.get_all_open_orders()
                     else:
-                        logger.debug(f"🐢 [REST-API] WS Cache stale or missing. Fetching from API for {mt}")
                         snap_pos = ex.fetch_positions()
-                        snap_orders = ex.fetch_open_orders()
+                        
+                        # 🚀 BUG FIX: Binance Demo FAPI truncates fetch_open_orders() without symbol to ~12 orders!
+                        # This HIDES existing orders from the engine, tricking it into placing duplicates!
+                        # We must fetch open orders explicitly for every active pair on this market type.
+                        snap_orders = []
+                        mt_active_pairs = set([b[2] for b in bots if b[5] and normalize_market_type(json.loads(b[5]).get('market_type', config.MARKET_TYPE)) == mt])
+                        if not mt_active_pairs: mt_active_pairs = set([b[2] for b in bots]) # Fallback
+                        
+                        for pair_symbol in mt_active_pairs:
+                            pair_orders = ex.fetch_open_orders(pair_symbol)
+                            if pair_orders: snap_orders.extend(pair_orders)
                         
                         # 🚀 PRE-POPULATE WS CACHE to avoid data loss on startup
                         if snap_pos is not None and snap_orders is not None:

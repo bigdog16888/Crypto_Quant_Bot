@@ -69,14 +69,58 @@ class BotExecutor:
             
         return self.strategies[bot_id]
 
+    def _place_gtx_order_with_retry(self, exchange, pair: str, side: str, amount: float, price: float, params: dict, label: str = "order") -> dict:
+        """
+        Places a GTX (Post-Only) limit order. If Binance rejects with -50004 (would execute as
+        taker/cross the book), auto-fetches live bid1/ask1 and retries ONCE at the correct
+        maker price.
+
+        Maker price rules:
+          - BUY  (LONG entry, SHORT TP): price must be <= best BID  (buying at or below bid → maker)
+          - SELL (SHORT entry, LONG TP): price must be >= best ASK   (selling at or above ask → maker)
+        """
+        try:
+            return exchange.create_order(pair, 'limit', side, amount, price, params=params)
+        except Exception as e:
+            err_str = str(e)
+            if '-50004' in err_str or 'Post Only' in err_str or 'post only' in err_str.lower():
+                logger.warning(f"⚠️ [{label}] GTX rejected (-50004) for {pair} {side} @ {price:.4f}. Fetching live bid/ask for retry...")
+                bid, ask = exchange.get_best_bid_ask(pair)
+                if bid is None or ask is None:
+                    logger.error(f"❌ [{label}] Could not fetch bid/ask for retry. Giving up.")
+                    raise
+                # Determine safe maker price
+                prec = exchange.get_symbol_precision(pair)
+                tick = prec['tick_size']
+                if side.lower() == 'buy':
+                    # To be maker on a BUY, place AT or BELOW the best bid
+                    retry_price = exchange.round_to_step(bid, tick)
+                else:
+                    # To be maker on a SELL, place AT or ABOVE the best ask
+                    retry_price = exchange.ceil_to_step(ask, tick)
+                logger.info(f"🔄 [{label}] Retrying {pair} {side} @ {retry_price:.4f} (bid={bid:.4f} ask={ask:.4f})")
+                return exchange.create_order(pair, 'limit', side, amount, retry_price, params=params)
+            raise  # Re-raise if it's a different error
+
     def process_bot(self, bot_data: Tuple, exchange_snapshot: Dict[str, Any]) -> Tuple[Optional[float], Optional[Dict[str, Any]]]:
-        bot_id, name, pair, direction, strategy_type, config_json, base_size, martingale_multiplier, rsi_limit, is_active = bot_data
+        try:
+            bot_id, name, pair, direction, strategy_type, config_json, db_invested, db_step, rsi_limit, is_active, base_size, martingale_multiplier = bot_data
+        except ValueError:
+            # Fallback if old code paths or test mocks pass fewer elements
+            bot_id, name, pair, direction, strategy_type, config_json, db_invested, db_step, rsi_limit, is_active = bot_data[:10]
+            base_size = 10.0
+            martingale_multiplier = 1.5
 
         import random
         # 🛡️ JITTER: Add random sleep to desynchronize parallel bots and reduce race conditions
         time.sleep(random.uniform(0.1, 0.8))
         
-        bot_id, name, pair, direction, strategy_type, config_json, base_size, martingale_multiplier, rsi_limit, is_active = bot_data
+        try:
+            bot_id, name, pair, direction, strategy_type, config_json, db_invested, db_step, rsi_limit, is_active, base_size, martingale_multiplier = bot_data
+        except ValueError:
+            bot_id, name, pair, direction, strategy_type, config_json, db_invested, db_step, rsi_limit, is_active = bot_data[:10]
+            base_size = 10.0
+            martingale_multiplier = 1.5
 
         # 🚀 FUNDAMENTAL FIX: Double-Check Activation Status from DB
         # This prevents "Zombie Bots" (like 'long gold') from resurrecting if the in-memory 'bot_data' is stale
@@ -108,9 +152,43 @@ class BotExecutor:
             bot_config['direction'] = direction
             bot_config['bot_name'] = name # Inject Name for logging
             bot_config['bot_id'] = bot_id # Inject ID for logging
+            
+            # 🚀 FUNDAMENTAL FIX: Inject missing SQLite configuration 
+            # so the strategy doesn't fallback to $150 and 2.0x
+            bot_config['base_size'] = base_size
+            bot_config['martingale_multiplier'] = martingale_multiplier
+            bot_config['rsi_limit'] = rsi_limit
 
-            strategy = self._get_strategy_instance(bot_id, bot_config, config_json)
             exchange = self._get_thread_exchange(market_type) # Use thread-specific exchange
+            
+            current_price = exchange.get_last_price(pair) # Get current price
+            if not current_price:
+                logger.warning(f"Could not get current price for {pair}. Skipping bot {name}.")
+                return None, None
+                
+            # 🚀 AUTO MIN-SIZE CALCULATION
+            if bot_config.get('use_min_size', False):
+                prec = exchange.get_symbol_precision(pair)
+                step_size = prec.get('step_size', 0.001)
+                min_cost_qty = step_size * current_price
+                
+                # Enforce Binance Demo FAPI $100 minimum notional constraint
+                if getattr(config, 'TESTNET', False) or getattr(config, 'DEMO_TRADING', False):
+                    min_cost_notional = 100.0
+                else:
+                    min_cost_notional = 5.0 if market_type == 'future' else 10.0
+                
+                # Target 5% above the strict minimum to avoid slippage drops
+                auto_min_size = max(min_cost_qty, min_cost_notional) * 1.05
+                bot_config['base_size'] = auto_min_size
+            else:
+                # Safety check: Even if not explicitly use_min_size, if we are on Demo FAPI, enforce the $100 minimum to prevent constant API rejections
+                if getattr(config, 'TESTNET', False) or getattr(config, 'DEMO_TRADING', False):
+                    if bot_config.get('base_size', 0) < 100.0:
+                        bot_config['base_size'] = 105.0
+
+            # Inject the fully hydrated config into strategy calculation
+            strategy = self._get_strategy_instance(bot_id, bot_config, json.dumps(bot_config))
             
             bot_status = get_bot_status(bot_id) # Fetch latest status
             if not bot_status: 
@@ -125,18 +203,6 @@ class BotExecutor:
                     'basket_start_time': 0,
                     'entry_confirmed': 0
                 }
-                # Create initial entry in trades table if missing
-                # This is now handled by update_full_snapshot for atomicity
-                # conn = get_connection()
-                # cursor = conn.cursor()
-                # cursor.execute("INSERT OR IGNORE INTO trades (bot_id, pair, current_step, total_invested) VALUES (?, ?, 0, 0.0)", (bot_id, pair))
-                # conn.commit()
-                # conn.close()
-
-            current_price = exchange.get_last_price(pair) # Get current price
-            if not current_price:
-                logger.warning(f"Could not get current price for {pair}. Skipping bot {name}.")
-                return None, None
             
             # 🚀 GHOST ORDER CLEANUP (Scanning/Idle Bots)
             # If we are NOT in a trade (invested <= 10), we should have NO orders.
@@ -152,13 +218,19 @@ class BotExecutor:
                      bot_ghosts = [o for o in open_orders_check if o.get('clientOrderId', '').startswith(f'CQB_{bot_id}_')]
                      
                      if bot_ghosts:
-                          logger.warning(f"👻 {name}: Found {len(bot_ghosts)} GHOST orders while SCANNING (Invested={bot_status['total_invested']}). Purging...")
-                          for ghost in bot_ghosts:
-                               logger.info(f"🔥 Cancelling ghost order {ghost['id']} ({ghost.get('clientOrderId')})")
-                               try:
-                                   exchange.cancel_order(ghost['id'], pair)
-                               except Exception as e:
-                                   logger.error(f"Failed to cancel ghost {ghost['id']}: {e}")
+                          # 🚀 RACE CONDITION FIX: Do not cancel ENTRY orders here!
+                          # If the strategy just placed an ENTRY order, it takes a moment for the WS to confirm.
+                          # If we cancel it here, the strategy will place another one, causing a runaway accumulation loop!
+                          true_ghosts = [o for o in bot_ghosts if '_ENTRY_' not in o.get('clientOrderId', '')]
+                          
+                          if true_ghosts:
+                              logger.warning(f"👻 {name}: Found {len(true_ghosts)} GHOST orders while SCANNING (Invested={bot_status['total_invested']}). Purging...")
+                              for ghost in true_ghosts:
+                                   logger.info(f"🔥 Cancelling ghost order {ghost['id']} ({ghost.get('clientOrderId')})")
+                                   try:
+                                       exchange.cancel_order(ghost['id'], pair)
+                                   except Exception as e:
+                                       logger.error(f"Failed to cancel ghost {ghost['id']}: {e}")
                  except Exception as e:
                       logger.error(f"Ghost cleanup failed for {name}: {e}")
             # ---------------------------------------------------------
@@ -251,8 +323,17 @@ class BotExecutor:
                                    logger.warning(f"🛑 {name}: Attempted NEW ENTRY but already invested ({am_i_invested}). Aborting.")
                                    can_enter = False
                               elif size > 0 and not am_i_invested:
-                                   logger.info(f"⚠️ {name}: Virtual Hedging - Physical Position exists ({size}), but I am new. Allowing Entry.")
-                                   can_enter = True
+                                   # 🛡️ SYNC-LAG PROTECTION: If a position exists but DB says $0, check for recent fills
+                                   from engine.database import get_last_filled_order
+                                   last_fill = get_last_filled_order(bot_id)
+                                   
+                                   # If we had a fill in the last 60 seconds, trust that it's just sync lag.
+                                   if last_fill and (time.time() - last_fill.get('created_at', 0)) < 60:
+                                       logger.warning(f"🛡️ {name}: Position detected ({size}) and recent fill found in DB history. Blocking double-entry (Sync Lag).")
+                                       can_enter = False
+                                   else:
+                                       logger.info(f"⚠️ {name}: Virtual Hedging - Physical Position exists ({size}), but I am new. Allowing Entry.")
+                                       can_enter = True
                          
                     except Exception as e:
                          logger.error(f"Entry Safety Check Failed: {e}")
@@ -377,7 +458,7 @@ class BotExecutor:
 
                     logger.info(f"🧐 {name}: Creating Order on Exchange...")
                     client_order_id = self._generate_deterministic_id(bot_id, 'ENTRY', 1)
-                    order = exchange.create_order(pair, 'limit', side, amount, price, params={'clientOrderId': client_order_id, 'postOnly': True, 'timeInForce': 'GTX'})
+                    order = self._place_gtx_order_with_retry(exchange, pair, side, amount, price, params={'clientOrderId': client_order_id, 'postOnly': True, 'timeInForce': 'GTX'}, label=f"{name}-ENTRY")
                     if order:
                         try:
                             save_bot_order(bot_id, 'entry', order['id'], price, amount, 1, 'open', client_order_id=client_order_id)
@@ -431,10 +512,11 @@ class BotExecutor:
                         client_order_id = self._generate_deterministic_id(bot_id, 'TP', bot_status['current_step'])
                         # 🚀 FIXED: Map direction to exchange side for TP
                         side = 'sell' if direction == 'LONG' else 'buy'
-                        order = exchange.create_order(pair, 'limit', side, tp_amount, tp_price, params={'reduceOnly': True, 'clientOrderId': client_order_id, 'postOnly': True, 'timeInForce': 'GTX'})
+                        order = self._place_gtx_order_with_retry(exchange, pair, side, tp_amount, tp_price, params={'clientOrderId': client_order_id, 'postOnly': True, 'timeInForce': 'GTX'}, label=f"{name}-TP")
                         if order:
                             save_bot_order(bot_id, 'tp', order['id'], tp_price, tp_amount, bot_status['current_step'], 'open', client_order_id=client_order_id)
                             logger.info(f"✅ {name}: Placed TP order for {pair} @ {tp_price} (ID: {order['id']})")
+                            existing_tp_order = order # 🚀 FIXED: Assign to memory so Step 4 doesn't delete it
                     except Exception as e:
                         logger.error(f"❌ {name}: Error placing TP order for {pair}: {e}")
 
@@ -466,22 +548,24 @@ class BotExecutor:
                     try:
                         client_order_id_grid = self._generate_deterministic_id(bot_id, 'GRID', bot_status['current_step'] + 1)
                         # 🚀 FIXED: Map direction to exchange side
-                        order = exchange.create_order(pair, 'limit', side, grid_amount, grid_price, params={'clientOrderId': client_order_id_grid, 'postOnly': True, 'timeInForce': 'GTX'})
+                        order = self._place_gtx_order_with_retry(exchange, pair, side, grid_amount, grid_price, params={'clientOrderId': client_order_id_grid, 'postOnly': True, 'timeInForce': 'GTX'}, label=f"{name}-GRID-{bot_status['current_step'] + 1}")
                         if order:
                             save_bot_order(bot_id, 'grid', order['id'], grid_price, grid_amount, bot_status['current_step'] + 1, 'open', client_order_id=client_order_id_grid, notes=grid_explain)
                             logger.info(f"✅ {name}: Placed Grid order for {pair} @ {grid_price} (ID: {order['id']})")
+                            existing_grid_order = order # 🚀 FIXED: Assign to memory so Step 4 doesn't delete it
                     except Exception as e:
                         logger.error(f"❌ {name}: Error placing Grid order for {pair}: {e}")
                         
         # 4. Cleanup any untracked open orders for this bot
         # 🚀 FIXED: Handle None for existing orders prevents AttributeError
+        # 🚀 FIXED: Order IDs in local DB are under `order_id`, while local row primary keys are `id`. We must default to `order_id` to compare physical IDs properly.
         known_order_ids = []
-        if existing_tp_order: known_order_ids.append(existing_tp_order.get('id'))
-        if existing_grid_order: known_order_ids.append(existing_grid_order.get('id'))
+        if existing_tp_order: known_order_ids.append(existing_tp_order.get('order_id', existing_tp_order.get('id')))
+        if existing_grid_order: known_order_ids.append(existing_grid_order.get('order_id', existing_grid_order.get('id')))
         
         # Also protect the Entry order from being cancelled as "untracked"
         if existing_entry_order:
-             known_order_ids.append(existing_entry_order.get('id'))
+             known_order_ids.append(existing_entry_order.get('order_id', existing_entry_order.get('id')))
         
         for order in bot_open_orders:
             # Skip if it is an Entry order (handled primarily by strategy logic)
@@ -492,7 +576,7 @@ class BotExecutor:
                 logger.warning(f"⚠️ {name}: Untracked open order {order['id']} for {pair}. Cancelling.")
                 try:
                     exchange.cancel_order(order['id'], pair) # Use exchange's cancel_order, not specific bot
-                    update_order_status(bot_id, order['id'], 'cancelled')
+                    update_order_status(order['id'], 'cancelled', bot_id=bot_id)
                 except Exception as e:
                     logger.error(f"Failed to cancel untracked order {order['id']}: {e}")
 
@@ -543,7 +627,18 @@ class BotExecutor:
                     else:
                         logger.warning(f"⚠️ {name}: TP order {tp_order_id} not yet filled. Monitoring. (Status: {status}, Filled: {filled})")
             except Exception as e:
-                logger.error(f"❌ {name}: Error fetching TP order {tp_order_id} status: {e}")
+                err_msg = str(e).lower()
+                if "not found" in err_msg or "-2013" in err_msg or "invalidorder" in err_msg:
+                    logger.warning(f"⚠️ {name}: TP order {tp_order_id} no longer exists on Exchange (OrderNotFound). Purging from state.")
+                    from engine.database import get_connection
+                    conn = get_connection()
+                    cursor = conn.cursor()
+                    cursor.execute("UPDATE trades SET tp_order_id = NULL WHERE bot_id = ?", (bot_id,))
+                    cursor.execute("UPDATE bot_orders SET status = 'missing' WHERE order_id = ?", (tp_order_id,))
+                    conn.commit()
+                    conn.close()
+                else:
+                    logger.error(f"❌ {name}: Error fetching TP order {tp_order_id} status: {e}")
         else:
             logger.warning(f"⚠️ {name}: No TP order found in DB for {pair}. Waiting for maintain_orders to place one.")
             # Do NOT force reset here, because the physical position is still open!
@@ -597,14 +692,16 @@ class BotExecutor:
 
         # CASE 2: SCANNING (No Position) -> NO TP/GRID ALLOWED 
         # (This is handled by 'untracked order' cleanup, but let's be explicit)
-        # CASE 2: SCANNING (No Position) -> NO TP/GRID ALLOWED 
-        # (This is handled by 'untracked order' cleanup, but let's be explicit)
-        if bot_status['total_invested'] <= 10.0: # Tolerance for dust
+        # 🚀 ZERO-INVESTED RACE CONDITION FIX:
+        # If the bot's `total_invested` still says 0.0 because the DB hasn't caught up,
+        # but `current_step > 0` or we JUST placed an Entry order, it is actively in a trade.
+        # Do NOT purge orders in this state.
+        if bot_status['total_invested'] <= 10.0 and bot_status['current_step'] == 0:
             existing_grid_order = next((o for o in grid_orders), None)
             existing_tp_order = next((o for o in tp_orders), None)
 
             if existing_grid_order:
-                logger.warning(f"🧹 {name}: Found dangling GRID order while SCANNING. Cancelling.")
+                logger.warning(f"👻 {name}: Found dangling GRID order while SCANNING (Invested=0.0). Purging...")
                 try:
                     exchange.cancel_order(existing_grid_order['id'], pair)
                     update_order_status(existing_grid_order['id'], 'cancelled', bot_id=bot_id)
@@ -612,7 +709,7 @@ class BotExecutor:
                 grid_orders = [] # Clear local list
             
             if existing_tp_order:
-                logger.warning(f"🧹 {name}: Found dangling TP order while SCANNING. Cancelling.")
+                logger.warning(f"👻 {name}: Found dangling TP order while SCANNING (Invested=0.0). Purging...")
                 try:
                     exchange.cancel_order(existing_tp_order['id'], pair)
                     update_order_status(existing_tp_order['id'], 'cancelled', bot_id=bot_id)
@@ -628,9 +725,32 @@ class BotExecutor:
         valid_tp_orders = [o for o in tp_orders if tp_tag in o.get('clientOrderId', '')]
         valid_grid_orders = [o for o in grid_orders if grid_tag in o.get('clientOrderId', '')]
         
-        stale_orders = [o for o in tp_orders if tp_tag not in o.get('clientOrderId', '')]
-        stale_orders += [o for o in grid_orders if grid_tag not in o.get('clientOrderId', '')]
-
+        # 🚀 FORWARD-STEP-BUG FIX
+        # A grid order's clientOrderId contains the step it belongs to (e.g. _GRID_2_).
+        # We must NOT cancel orders that are strictly *greater* than our current step calculation
+        # just because our local `bot_status` DB read is lagging by a few milliseconds!
+        # Only cancel orders that are manifestly from the *past*.
+        stale_orders = []
+        for o in tp_orders:
+            cid = o.get('clientOrderId', '')
+            if tp_tag not in cid:
+                try:
+                    step_num = int(cid.split('_TP_')[1].split('_')[0])
+                    if step_num < current_step:
+                        stale_orders.append(o)
+                except:
+                     stale_orders.append(o) # Fallback if malformed
+                     
+        for o in grid_orders:
+            cid = o.get('clientOrderId', '')
+            if grid_tag not in cid:
+                 try:
+                     # Grid target is inherently Step + 1
+                     step_num = int(cid.split('_GRID_')[1].split('_')[0])
+                     if step_num < (current_step + 1):
+                         stale_orders.append(o)
+                 except:
+                     stale_orders.append(o)
         if stale_orders:
             logger.warning(f"🧹 {name}: Found {len(stale_orders)} STALE orders from previous steps. Purging to sync with Step {current_step}...")
             for o in stale_orders:
@@ -673,16 +793,28 @@ class BotExecutor:
             tp_price = strategy.calculate_take_profit_price(bot_status, current_price)
             tp_amount = strategy.calculate_take_profit_amount(bot_status, current_price, pair, exchange)
             
-            # 🚀 OFFLINE PROFIT GAP FIX
-            # If the market gapped past our TP while offline, placing a standard limit order
-            # at the original tp_price will trigger Binance Error -4024 (Limit price can't be > X% from mark).
-            # We adjust it precisely to the nearest limit (current price) since price favors the position.
-            if direction == 'LONG' and current_price > tp_price:
-                 logger.info(f"🚀 {name}: Offline Gap! Current price {current_price} > TP {tp_price}. Adjusting TP to current price {current_price} (nearest limit).")
-                 tp_price = current_price
-            elif direction == 'SHORT' and current_price < tp_price:
-                 logger.info(f"🚀 {name}: Offline Gap! Current price {current_price} < TP {tp_price}. Adjusting TP to current price {current_price} (nearest limit).")
-                 tp_price = current_price
+            # 🚀 OFFLINE PROFIT GAP FIX (Maker Edition)
+            # To prevent Binance Maker-Only ('GTX') -2010 rejections when filling offline gaps,
+            # we must clip the order exactly to the top of the orderbook (Bid1/Ask1) instead of 
+            # crossing the spread with a Taker limit order.
+            gap_occurred = False
+            if (direction == 'LONG' and current_price > tp_price) or (direction == 'SHORT' and current_price < tp_price):
+                gap_occurred = True
+                try:
+                    ticker = exchange.fetch_ticker(pair)
+                    # We are Selling to close a Long. Must join the Asks.
+                    if direction == 'LONG':
+                        ask = float(ticker.get('ask') or current_price)
+                        tp_price = max(tp_price, ask)
+                        logger.info(f"🚀 {name}: Offline Gap! Current price > TP. Adjusting TP to Ask {tp_price} to preserve Maker.")
+                    # We are Buying to close a Short. Must join the Bids.
+                    else:
+                        bid = float(ticker.get('bid') or current_price)
+                        tp_price = min(tp_price, bid)
+                        logger.info(f"🚀 {name}: Offline Gap! Current price < TP. Adjusting TP to Bid {tp_price} to preserve Maker.")
+                except Exception as e:
+                    logger.warning(f"⚠️ {name}: Offline Gap, but fetch_ticker failed ({e}). Falling back to Taker gap adjustment.")
+                    tp_price = current_price
 
             # Re-round just in case
             try:
@@ -704,7 +836,16 @@ class BotExecutor:
                         try:
                             client_order_id = self._generate_deterministic_id(bot_id, 'TP', bot_status['current_step'])
                             side = 'sell' if direction == 'LONG' else 'buy'
-                            order = exchange.create_order(pair, 'limit', side, tp_amount, tp_price, params={'clientOrderId': client_order_id, 'postOnly': True, 'timeInForce': 'GTX'})
+                            
+                            ccxt_params = {'clientOrderId': client_order_id, 'postOnly': True, 'timeInForce': 'GTX'}
+                            
+                            # 🚀 SPREAD-CROSS FIX: If the price was dynamically adjusted to `current_price` due to an Offline Gap,
+                            # a Maker-Only GTX flag will guarantee Binance rejects it with `-2010`. We fallback to a standard GTC Limit.
+                            if tp_price == exchange.round_to_step(current_price, exchange.get_symbol_precision(pair)['tick_size']):
+                                logger.warning(f"⚠️ {name}: TP price matches active market gap. Dropping GTX Maker flag to allow execution.")
+                                ccxt_params = {'clientOrderId': client_order_id, 'timeInForce': 'GTC'}
+                                
+                            order = self._place_gtx_order_with_retry(exchange, pair, side, tp_amount, tp_price, params=ccxt_params, label=f"{name}-MAINTAIN-TP")
                             if order:
                                 save_bot_order(bot_id, 'tp', order['id'], tp_price, tp_amount, bot_status['current_step'], 'open', client_order_id=client_order_id)
                                 logger.info(f"✅ {name}: Maintained TP order for {pair} @ {tp_price}")
@@ -781,26 +922,29 @@ class BotExecutor:
              except Exception as _guard_err:
                  logger.debug(f"Physical-size guard check failed for {name}: {_guard_err}")
 
-             # 🚀 STEP-PROGRESSION-PROOF: Before placing Step N+1, prove Step N is actually filled!
+                                       # 🚀 STEP-PROGRESSION-PROOF: Before placing Step N+1, prove Step N is actually filled!
              if bot_status['current_step'] > 0:
                  try:
-                     from engine.database import get_connection
-                     conn = get_connection()
-                     cursor = conn.cursor()
-                     # If calculating Grid Step N (current_step+1), we need Step N-1 (current_step) to be recorded and filled.
-                     cursor.execute("""
-                         SELECT COUNT(*) FROM bot_orders 
-                         WHERE bot_id=? AND status='filled' AND step=? AND created_at >= (? - 60)
-                     """, (bot_id, bot_status['current_step'], bot_status.get('basket_start_time', 0)))
-                     row = cursor.fetchone()
-                     conn.close()
-                     if not row or row[0] == 0:
-                         logger.warning(
-                             f"🛑 {name}: Step Progression Blocked! Attempting to place Grid for Step {bot_status['current_step'] + 1}, "
-                             f"but Step {bot_status['current_step']} is NOT marked 'filled' in DB for this session. "
-                             f"Waiting for reconciler/WS to confirm previous steps."
-                         )
-                         return None
+                     # 🛡️ FUNDAMENTAL FIX: Trust the `entry_confirmed` flag as primary proof.
+                     if bot_status.get('entry_confirmed', 0) == 1:
+                         logger.info(f"🛡️ {name}: Bypassing fill-proof check because trade/step is natively confirmed.")
+                     else:
+                         from engine.database import get_connection
+                         conn = get_connection()
+                         cursor = conn.cursor()
+                         # Fallback to order history (30-day window)
+                         cursor.execute("""
+                             SELECT COUNT(*) FROM bot_orders 
+                             WHERE bot_id=? AND status IN ('filled', 'closed') AND step=? AND created_at >= (? - 2592000)
+                         """, (bot_id, bot_status['current_step'], bot_status.get('basket_start_time', 0)))
+                         row = cursor.fetchone()
+                         conn.close()
+                         if not row or row[0] == 0:
+                             logger.warning(
+                                 f"🛑 {name}: Step Progression Blocked! Step {bot_status['current_step']} proof-of-fill not found in DB. "
+                                 f"Waiting for reconciler/WS to confirm."
+                             )
+                             return None
                  except Exception as e:
                      logger.error(f"❌ Error checking step progression proof for {name}: {e}")
 
@@ -812,6 +956,23 @@ class BotExecutor:
              if market_snapshot:
                   market_snapshot_inner = market_snapshot.get('market_data', {})
                   current_market_data = market_snapshot_inner.get(pair)
+
+             # 🚀 FUNDAMENTAL FIX: Re-calculate base size dynamically here
+             # Just like execute_entry, we must override bot_config BEFORE calling Strategy
+             if bot_config.get('use_min_size', False):
+                 prec = exchange.get_symbol_precision(pair)
+                 step_size = prec.get('step_size', 0.001)
+                 min_cost_qty = step_size * current_price
+                 if getattr(config, 'TESTNET', False) or getattr(config, 'DEMO_TRADING', False):
+                     min_cost_notional = 100.0
+                 else:
+                     min_cost_notional = 5.0 if market_type == 'future' else 10.0
+                     
+                 bot_config['base_size'] = max(min_cost_qty, min_cost_notional) * 1.05
+             else:
+                 if getattr(config, 'TESTNET', False) or getattr(config, 'DEMO_TRADING', False):
+                     if bot_config.get('base_size', 0) < 100.0:
+                         bot_config['base_size'] = 105.0
             
              grid_res = strategy.calculate_grid_order_price(bot_status, current_price, market_data=current_market_data)
              if isinstance(grid_res, tuple):
@@ -820,14 +981,34 @@ class BotExecutor:
                   grid_price, grid_explain = grid_res, ""
 
              grid_amount = strategy.calculate_grid_order_amount(bot_status, current_price, pair, exchange)
-            
+             
+             # 🚀 OFFLINE GRID GAP FIX (Maker Edition)
+             # If the market swept past our intended grid target, placing a standard grid limit order
+             # will cross the spread and trigger a -2010 GTX Maker-Only rejection.
+             if (direction == 'LONG' and current_price < grid_price) or (direction == 'SHORT' and current_price > grid_price):
+                 try:
+                     ticker = exchange.fetch_ticker(pair)
+                     # We are Buying to open a Long grid. Must join the Bids.
+                     if direction == 'LONG':
+                         bid = float(ticker.get('bid') or current_price)
+                         grid_price = min(grid_price, bid)
+                         logger.info(f"🚀 {name}: Grid Gap! Price Dropped. Adjusting Grid to Bid {grid_price} to preserve Maker.")
+                     # We are Selling to open a Short grid. Must join the Asks.
+                     else:
+                         ask = float(ticker.get('ask') or current_price)
+                         grid_price = max(grid_price, ask)
+                         logger.info(f"🚀 {name}: Grid Gap! Price Rallied. Adjusting Grid to Ask {grid_price} to preserve Maker.")
+                 except Exception as e:
+                     logger.warning(f"⚠️ {name}: Grid Gap, but fetch_ticker failed ({e}). Falling back to Taker grid adjustment.")
+                     grid_price = current_price
+                     
              logger.info(f"🔍 [GRID-MAINTENANCE] {name}: Target=${grid_price} | {grid_explain}")
 
              if grid_amount > 0 and grid_price > 0:
                 if config.DRY_RUN:
                     logger.info(f"📊 [DRY-RUN] Bot {name} maintains Grid for {pair} @ {grid_price}")
                 else:
-                    logger.info(f"🔍 [GRID-DEBUG] Bot {name} ({direction}) | Price={current_price} | GridTarget={grid_price} | Amount={grid_amount}")
+                    logger.info(f"🔍 [GRID-DEBUG] Bot {name} ({direction}) | Price={current_price} | GridTarget={grid_price} | Amount={grid_amount} | Step={bot_status['current_step']} | BaseSize={bot_config.get('base_size')} | Multi={bot_config.get('martingale_multiplier')} | StratBase={strategy.params.get('base_size')} | StratMult={strategy.params.get('martingale_multiplier')}")
                     
                     side = 'buy' if direction == 'LONG' else 'sell'
                     valid, grid_amount, grid_price, msg = exchange.validate_order(pair, side, grid_amount, grid_price)
@@ -837,7 +1018,16 @@ class BotExecutor:
                         try:
                             client_order_id_grid = self._generate_deterministic_id(bot_id, 'GRID', bot_status['current_step'] + 1)
                             # 🚀 FIXED: Map direction to exchange side
-                            order = exchange.create_order(pair, 'limit', side, grid_amount, grid_price, params={'clientOrderId': client_order_id_grid, 'postOnly': True, 'timeInForce': 'GTX'})
+                            
+                            ccxt_grid_params = {'clientOrderId': client_order_id_grid, 'postOnly': True, 'timeInForce': 'GTX'}
+                            
+                            # 🚀 SPREAD-CROSS FIX: If the grid target evaluates to precisely the current active market price
+                            # (due to rapid drops/gaps), drop Maker-Only GTX flag to prevent immediate rejection (-2010).
+                            if grid_price == exchange.round_to_step(current_price, exchange.get_symbol_precision(pair)['tick_size']):
+                                logger.warning(f"⚠️ {name}: Grid price matches active market gap. Dropping GTX Maker flag to allow execution.")
+                                ccxt_grid_params = {'clientOrderId': client_order_id_grid, 'timeInForce': 'GTC'}
+                                
+                            order = self._place_gtx_order_with_retry(exchange, pair, side, grid_amount, grid_price, params=ccxt_grid_params, label=f"{name}-MAINTAIN-GRID")
                             if order:
                                 save_bot_order(bot_id, 'grid', order['id'], grid_price, grid_amount, bot_status['current_step'] + 1, 'open', client_order_id=client_order_id_grid, notes=grid_explain)
                                 logger.info(f"✅ {name}: Maintained Grid order for {pair} @ {grid_price}")

@@ -750,17 +750,15 @@ def render_edit_form(bot_id):
             with e_col3:
                 config_dict['atre_tf'] = st.selectbox("TF to Watch (T11)", ["1m","5m","15m","1h","4h","1d"], index=3)
 
-            st.markdown("#### Pattern Slots")
-            for p_idx in range(1, 4, 2):
-                pc1, pc2 = st.columns(2)
-                for i, col in enumerate([pc1, pc2]):
-                    idx = p_idx + i
-                    with col:
-                        c_p1, c_p2, c_p3, c_p4 = st.columns(4)
-                        config_dict[f'pat_{idx}_mode'] = c_p1.selectbox(f"Type ##{idx}", [0, 1, 2], index=int(config_dict.get(f'pat_{idx}_mode', 0)), format_func=lambda x: {0: "OFF", 1: "Up", 2: "Down"}[x])
-                        config_dict[f'pat_{idx}_source'] = c_p2.selectbox(f"Source ##{idx}", ["Price", "RSI", "CCI"], index=["Price", "RSI", "CCI"].index(config_dict.get(f'pat_{idx}_source', "Price")))
-                        config_dict[f'pat_{idx}_tf'] = c_p3.selectbox(f"TF ##{idx}", ["1m","5m","15m","1h","4h","1d"], index=["1m","5m","15m","1h","4h","1d"].index(config_dict.get(f'pat_{idx}_tf', "5m")))
-                        config_dict[f'pat_{idx}_count'] = c_p4.number_input(f"Count ##{idx}", min_value=1, value=int(config_dict.get(f'pat_{idx}_count', 3)))
+            st.markdown("#### Pattern Slots (Consecutive Triggers)")
+            # 🚀 FIXED: Flattened the nested columns to give the SelectBoxes more horizontal breathing room
+            for p_idx in range(1, 4):
+                st.caption(f"**Trigger Pattern {p_idx}**")
+                c_p1, c_p2, c_p3, c_p4 = st.columns([1.5, 1.5, 1, 1])
+                config_dict[f'pat_{p_idx}_mode'] = c_p1.selectbox(f"Type ##{p_idx}", [0, 1, 2], index=int(config_dict.get(f'pat_{p_idx}_mode', 0)), format_func=lambda x: {0: "OFF", 1: "Consecutive Up", 2: "Consecutive Down"}[x])
+                config_dict[f'pat_{p_idx}_source'] = c_p2.selectbox(f"Source ##{p_idx}", ["Price", "RSI", "CCI"], index=["Price", "RSI", "CCI"].index(config_dict.get(f'pat_{p_idx}_source', "Price")))
+                config_dict[f'pat_{p_idx}_tf'] = c_p3.selectbox(f"TF ##{p_idx}", ["1m","5m","15m","1h","4h","1d"], index=["1m","5m","15m","1h","4h","1d"].index(config_dict.get(f'pat_{p_idx}_tf', "5m")))
+                config_dict[f'pat_{p_idx}_count'] = c_p4.number_input(f"Count ##{p_idx}", min_value=1, value=int(config_dict.get(f'pat_{p_idx}_count', 3)))
 
             st.markdown("#### Advanced Filters & MTF Trend")
             af1, af2, af3, af4 = st.columns(4)

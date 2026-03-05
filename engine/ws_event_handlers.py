@@ -73,14 +73,15 @@ def handle_order_update(event: Dict):
             logger.warning(f"⛔ WS IGNORING Event for INACTIVE Bot {bot_id} (ClientID: {client_id})")
             return
         
-        if status == 'FILLED':
+        # Standardize status for robust matching
+        status_upper = status.upper() if status else ""
+        
+        if status_upper in ['FILLED', 'CLOSED']:
             _handle_order_filled(bot_id, order_type, event)
-        elif status == 'CANCELED':
+        elif status_upper in ['CANCELED', 'CANCELLED', 'EXPIRED', 'REJECTED']:
             _handle_order_canceled(bot_id, order_type, event)
-        elif status == 'NEW':
+        elif status_upper == 'NEW':
             _handle_order_new(bot_id, order_type, event)
-        elif status == 'EXPIRED':
-            _handle_order_canceled(bot_id, order_type, event)
             
         # 🚀 WS CACHING: Keep our memory snapshot alive
         ws_cache = get_ws_cache()
@@ -114,7 +115,7 @@ def _handle_order_filled(bot_id: int, order_type: str, event: Dict):
     """Process a filled order - update trade state."""
     from engine.database import (
         update_martingale_step, reset_bot_after_tp, 
-        get_bot_order_ids, close_order_in_db, log_trade,
+        get_bot_order_ids, log_trade,
         add_notification
     )
     
@@ -229,13 +230,13 @@ def _update_trade_state_from_fill(bot_id: int, order_type: str, symbol: str, avg
 
 def _handle_order_canceled(bot_id: int, order_type: str, event: Dict):
     """Process a canceled order - update DB."""
-    from engine.database import close_order_in_db
+    from engine.database import cancel_order_in_db
     
     order_id = event.get('order_id')
     logger.info(f"❌ WS Cancel: Bot {bot_id} {order_type} order {order_id} canceled")
     
     try:
-        close_order_in_db(order_id)
+        cancel_order_in_db(order_id)
     except Exception as e:
         logger.debug(f"Could not close canceled order {order_id} in DB: {e}")
 

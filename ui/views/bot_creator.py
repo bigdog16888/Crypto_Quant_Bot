@@ -351,18 +351,14 @@ def render_bot_creator_view():
             st.markdown("### 📊 2. Consecutive Pattern Slots")
             st.caption("📈 Entries will wait for X consecutive green/red candles on specified TFs.")
             
-            for p_idx in range(1, 5, 2): 
-                pc1, pc2 = st.columns(2)
-                for i, col in enumerate([pc1, pc2]):
-                    idx = p_idx + i
-                    if idx > 4: continue
-                    with col:
-                        st.markdown(f"**Pattern Slot {idx}**")
-                        c_p1, c_p2, c_p3, c_p4 = st.columns(4)
-                        bot_config[f'pat_{idx}_mode'] = c_p1.selectbox(f"Type ##{idx}", [0, 1, 2], index=0, format_func=lambda x: {0: "OFF", 1: "Up", 2: "Down"}[x], key=f"create_p_mode_{idx}")
-                        bot_config[f'pat_{idx}_source'] = c_p2.selectbox(f"Source ##{idx}", ["Price", "RSI", "CCI"], index=0, key=f"create_p_src_{idx}")
-                        bot_config[f'pat_{idx}_tf'] = c_p3.selectbox(f"TF ##{idx}", ["1m","5m","15m","1h","4h","1d"], index=1, key=f"create_p_tf_{idx}")
-                        bot_config[f'pat_{idx}_count'] = c_p4.number_input(f"Count ##{idx}", min_value=1, value=3, key=f"create_p_count_{idx}")
+            # 🚀 FIXED: Flattened the nested columns to give the SelectBoxes more horizontal breathing room
+            for p_idx in range(1, 5): 
+                st.markdown(f"**Trigger Pattern {p_idx}**")
+                c_p1, c_p2, c_p3, c_p4 = st.columns([1.5, 1.5, 1, 1])
+                bot_config[f'pat_{p_idx}_mode'] = c_p1.selectbox(f"Type ##{p_idx}", [0, 1, 2], index=0, format_func=lambda x: {0: "OFF", 1: "Consecutive Up", 2: "Consecutive Down"}[x], key=f"create_p_mode_{p_idx}")
+                bot_config[f'pat_{p_idx}_source'] = c_p2.selectbox(f"Source ##{p_idx}", ["Price", "RSI", "CCI"], index=0, key=f"create_p_src_{p_idx}")
+                bot_config[f'pat_{p_idx}_tf'] = c_p3.selectbox(f"TF ##{p_idx}", ["1m","5m","15m","1h","4h","1d"], index=1, key=f"create_p_tf_{p_idx}")
+                bot_config[f'pat_{p_idx}_count'] = c_p4.number_input(f"Count ##{p_idx}", min_value=1, value=3, key=f"create_p_count_{p_idx}")
 
             st.divider()
             st.markdown("### 3. Price & Volatility Triggers")

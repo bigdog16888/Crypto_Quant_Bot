@@ -469,7 +469,8 @@ def get_bot_status(bot_id):
                COALESCE(t.last_exit_time, 0) as last_exit_time,
                COALESCE(t.basket_start_time, 0) as basket_start_time,
                b.direction, b.is_active,
-               COALESCE(t.entry_confirmed, 0) as entry_confirmed
+               COALESCE(t.entry_confirmed, 0) as entry_confirmed,
+               COALESCE(t.cycle_id, 1) as cycle_id
         FROM bots b 
         LEFT JOIN trades t ON b.id = t.bot_id 
         WHERE b.id = ?
@@ -491,7 +492,8 @@ def get_bot_status(bot_id):
         'basket_start_time': row[9],
         'direction': row[10],
         'is_active': row[11],
-        'entry_confirmed': row[12]
+        'entry_confirmed': row[12],
+        'cycle_id': row[13],
     }
 
     # --- SAFETY GUARD: Log suspicious entry prices but do NOT wipe state ---
@@ -523,8 +525,8 @@ def validate_trade_data(bot_id, step, invested, avg_price):
     Validates trade data before writing to DB.
     Blocks 'nonsense' data that causes PnL explosions ($9M error).
     """
-    # 1. Price Floor: BTC/XAU cannot reasonably be < $10.0
-    if avg_price > 0 and avg_price < 10.0:
+    # 1. Price Floor: Prevent mathematically corrupted zero-ish prices (e.g. from missing API data)
+    if avg_price > 0 and avg_price < 0.0001:
         logger.critical(f"🛡️ VALIDATION BLOCKED: Bot {bot_id} attempted to save impossible avg_price={avg_price}. REJECTING.")
         return False
     
@@ -626,8 +628,11 @@ def reset_bot_after_tp(bot_id, exit_price, direction=None, action_label='TP_HIT'
             else:
                 pnl = (avg_entry_price - exit_price) * est_qty
         log_trade(bot_id, action_label, pair, exit_price, total_invested / avg_entry_price if avg_entry_price > 0 else 0, total_invested, step=current_step, pnl=pnl, notes=notes)
-        cursor.execute("UPDATE trades SET current_step = 0, total_invested = 0, avg_entry_price = 0, target_tp_price = 0, last_exit_price = ?, last_exit_time = ?, basket_start_time = ?, entry_confirmed = 0, entry_order_id = NULL, tp_order_id = NULL, bot_position_id = NULL, close_type = ? WHERE bot_id = ?", (exit_price, int(time.time()), int(time.time()), action_label, bot_id))
+        cursor.execute("UPDATE trades SET current_step = 0, total_invested = 0, avg_entry_price = 0, target_tp_price = 0, last_exit_price = ?, last_exit_time = ?, basket_start_time = ?, entry_confirmed = 0, entry_order_id = NULL, tp_order_id = NULL, bot_position_id = NULL, close_type = ?, cycle_id = COALESCE(cycle_id, 1) + 1 WHERE bot_id = ?", (exit_price, int(time.time()), int(time.time()), action_label, bot_id))
+        # 🔑 CYCLE-ID ARCHIVE: Mark ALL bot_orders from the OLD cycle as reset_cleared.
+        # The Reconciler strictly filters by cycle_id, so these will never be re-adopted.
         cursor.execute("UPDATE bot_orders SET status = 'auto_closed', updated_at = ? WHERE bot_id = ? AND status = 'open'", (int(time.time()), bot_id))
+        cursor.execute("UPDATE bot_orders SET status = 'reset_cleared', updated_at = ? WHERE bot_id = ? AND status IN ('filled', 'closed', 'missing')", (int(time.time()), bot_id))
         cursor.execute("UPDATE bots SET status='Scanning' WHERE id = ?", (bot_id,))
         conn.commit()
     except Exception as e:
@@ -645,14 +650,31 @@ def check_and_fix_integrity():
     cursor = conn.cursor()
     
     # 0. Fix Corrupted Data (The $9M PnL Bug)
-    # Wipe any trade with impossible entry prices
-    cursor.execute("SELECT bot_id, name, avg_entry_price FROM trades t JOIN bots b ON t.bot_id = b.id WHERE avg_entry_price > 0 AND avg_entry_price < 10.0")
-    corrupted = cursor.fetchall()
-    for bid, bname, bprice in corrupted:
-        logger.critical(f"☢️ DATA INTEGRITY ALERT: Bot {bname} (ID {bid}) has CORRUPTED entry price ${bprice}. Wiping trade state to prevent PnL explosion.")
-        cursor.execute("UPDATE trades SET current_step=0, total_invested=0, avg_entry_price=0, entry_confirmed=0 WHERE bot_id=?", (bid,))
-        cursor.execute("UPDATE bots SET status='Scanning' WHERE id=?", (bid,))
+    # Wipe any trade with impossible entry prices OR where total_invested / avg_entry_price * avg_entry_price != total_invested
+    cursor.execute("SELECT bot_id, name, avg_entry_price, total_invested FROM trades t JOIN bots b ON t.bot_id = b.id WHERE avg_entry_price > 0 AND total_invested > 0")
+    corrupted_candidates = cursor.fetchall()
+    
+    fixed_count = 0
+    for bid, bname, bprice, btotal in corrupted_candidates:
+        # Check for impossible entry prices (e.g. practically zero due to API flaws)
+        if float(bprice) > 0 and float(bprice) < 0.0001:
+            logger.critical(f"☢️ DATA INTEGRITY ALERT: Bot {bname} (ID {bid}) has CORRUPTED entry price ${bprice}. Wiping trade state to prevent PnL explosion.")
+            cursor.execute("UPDATE trades SET current_step=0, total_invested=0, avg_entry_price=0, entry_confirmed=0 WHERE bot_id=?", (bid,))
+            cursor.execute("UPDATE bots SET status='Scanning' WHERE id=?", (bid,))
+            fixed_count += 1
+            continue # Move to next bot after fixing this one
 
+        # Check for float precision corruption: total_invested / avg_entry_price * avg_entry_price should equal total_invested
+        # Use a tolerance (rounding) to avoid microscopic float drift wiping valid trades
+        if float(btotal) > 0.0 and float(bprice) > 0.0:
+            implied_amount = float(btotal) / float(bprice)
+            # Round both to 4 decimals to avoid microscopic float drift wiping valid trades
+            if round(implied_amount * float(bprice), 4) != round(float(btotal), 4):
+                logger.critical(f"☢️ DATA INTEGRITY ALERT: Bot {bname} (ID {bid}) has CORRUPTED total_invested/avg_entry_price relationship (total={btotal}, avg_price={bprice}). Wiping trade state to prevent PnL explosion.")
+                cursor.execute("UPDATE trades SET total_invested=0, avg_entry_price=0, current_step=0, entry_confirmed=0 WHERE bot_id=?", (bid,))
+                cursor.execute("UPDATE bots SET status='Scanning' WHERE id=?", (bid,))
+                fixed_count += 1
+                
     cursor.execute("SELECT b.id, b.name, b.status, t.total_invested, t.entry_order_id FROM bots b LEFT JOIN trades t ON b.id = t.bot_id WHERE b.is_active = 1")
     rows = cursor.fetchall()
     
@@ -665,8 +687,8 @@ def check_and_fix_integrity():
     inactive_cleared = cursor.rowcount
     if inactive_cleared > 0:
         logger.warning(f"⚠️ [INTEGRITY] Cleared stale trade data for {inactive_cleared} inactive bots.")
-    
-    fixed_count = len(corrupted)
+        fixed_count += inactive_cleared
+        
     for row in rows:
         bot_id, name, status, invested, entry_order_id = row
         invested = invested or 0
@@ -809,20 +831,18 @@ def import_position_from_exchange(bot_id: int, pair: str, position_size: float, 
             existing_step = exists[0] or 0
             # If bot already has a step, preserve it — don't overwrite
             use_step = existing_step if existing_step > 0 else calculated_step
-            # Do NOT overwrite basket_start_time with time.time(), as it severs the link to past historical orders.
-            # Instead, set it to 0 (allow all history) or preserve it if valid. Here we set it to 0 to be safe for adoption.
-            cursor.execute("UPDATE trades SET current_step=?, total_invested=?, avg_entry_price=?, target_tp_price=?, basket_start_time=0, entry_confirmed=1 WHERE bot_id=?", 
-                           (use_step, total_invested, float(entry_price), tp_price, bot_id))
+            # Do NOT overwrite basket_start_time with 0, as it exposes the bot to past historical orders.
+            # Instead, set it to the current time to enforce a forward-only sync paradigm.
+            cursor.execute("UPDATE trades SET current_step=?, total_invested=?, avg_entry_price=?, target_tp_price=?, basket_start_time=?, entry_confirmed=1 WHERE bot_id=?", 
+                           (use_step, total_invested, float(entry_price), tp_price, int(time.time()), bot_id))
             logger.debug(f"import_position_from_exchange: UPDATED bot {bot_id}")
         else:
             # INSERT new record
-            # We don't overwrite basket_start_time to now if we are adopting, ideally we'd find the oldest order, 
-            # but to be safe we can use 0 to allow all history, or trust the exchange order time if we had it.
-            # Using 0 ensures that reconciler can see ALL historical orders for this bot until a new TP resets it.
+            # Setting basket_start_time to now ensures that reconciler only sees newly generated orders going forward.
             cursor.execute("""
                 INSERT INTO trades (bot_id, current_step, total_invested, avg_entry_price, target_tp_price, basket_start_time, entry_confirmed)
-                VALUES (?, ?, ?, ?, ?, 0, 1)
-            """, (bot_id, calculated_step, total_invested, float(entry_price), tp_price))
+                VALUES (?, ?, ?, ?, ?, ?, 1)
+            """, (bot_id, calculated_step, total_invested, float(entry_price), tp_price, int(time.time())))
             logger.debug(f"import_position_from_exchange: INSERTED bot {bot_id}")
             
         # --- FUNDAMENTAL ARCHITECTURE FIX: EVIDENCE-PROOF ADOPTION ---
@@ -889,22 +909,31 @@ def update_active_positions(positions: List[Dict]):
         cursor.execute("BEGIN TRANSACTION")
         cursor.execute("DELETE FROM active_positions")
         
+        # Fetch and aggregate positions to prevent Binance fragmented duplicate flaws
+        agg_positions = {}
         for p in positions:
-            # Handle standard CCXT structure
             pair = p.get('symbol', 'Unknown')
-            # Handle potential string values for numeric fields
             raw_size = p.get('contracts', 0) or p.get('info', {}).get('positionAmt', 0)
             size = float(raw_size)
             price = float(p.get('entryPrice', 0) or 0)
             side = p.get('side', 'long').upper() # 'long' or 'short'
             
             if abs(size) > 0:
-                # Store absolute size, side determines direction
-                cursor.execute("""
-                    INSERT INTO active_positions (bot_id, pair, side, size, entry_price, last_checked)
-                    VALUES (0, ?, ?, ?, ?, ?)
-                """, (pair, side, abs(size), price, timestamp))
-                
+                key = (pair, side)
+                if key not in agg_positions:
+                    agg_positions[key] = {'size': abs(size), 'value': abs(size) * price}
+                else:
+                    agg_positions[key]['size'] += abs(size)
+                    agg_positions[key]['value'] += (abs(size) * price)
+
+        # Insert cleanly aggregated positions
+        for (pair, side), data in agg_positions.items():
+            avg_price = data['value'] / data['size'] if data['size'] > 0 else 0
+            cursor.execute("""
+                INSERT INTO active_positions (bot_id, pair, side, size, entry_price, last_checked)
+                VALUES (0, ?, ?, ?, ?, ?)
+            """, (pair, side, data['size'], avg_price, timestamp))
+            
         cursor.execute("COMMIT")
     except Exception as e:
         cursor.execute("ROLLBACK")
@@ -1139,15 +1168,16 @@ def accumulate_trade_fill(bot_id: int, added_invested: float, added_qty: float, 
         if row:
             # ATOMIC UPDATE: 
             # 1. total_invested = current + added
-            # 2. avg_entry_price = (old_avg * old_invested + added_invested) / (new_total_invested)
+            # 2. avg_entry_price = (total_invested + added) / ((total_invested/avg) + (added/new_avg))
             # 3. current_step = If ENTRY, exact step. Else, max(current_step, new_step)
             
             cursor.execute("""
                 UPDATE trades 
                 SET total_invested = total_invested + ?,
                     avg_entry_price = CASE 
-                        WHEN (total_invested + ?) > 0 
-                        THEN (avg_entry_price * total_invested + ? * ?) / (total_invested + ?)
+                        WHEN total_invested = 0 THEN ?
+                        WHEN avg_entry_price > 0 AND ? > 0 
+                        THEN (total_invested + ?) / ((total_invested / avg_entry_price) + (? / ?))
                         ELSE ? 
                     END,
                     current_step = CASE 
@@ -1160,19 +1190,24 @@ def accumulate_trade_fill(bot_id: int, added_invested: float, added_qty: float, 
                 WHERE bot_id = ?
             """, (
                 added_invested, 
-                added_invested, avg_price, added_invested, added_invested, 
-                avg_price, # Fallback for ELSE case
+                avg_price, 
+                avg_price,
+                added_invested, added_invested, avg_price,
+                avg_price,
                 is_entry, new_step,
                 new_step, new_step,
                 tp_price,
                 bot_id
             ))
         else:
-            # FIRST ENTRY: Insert new record
+            # FIRST ENTRY: Insert new record.
+            # cycle_id: Start at 1, or MAX(cycle_id)+1 if history exists from previous aborted runs.
             cursor.execute("""
-                INSERT INTO trades (bot_id, current_step, total_invested, avg_entry_price, target_tp_price, entry_confirmed, basket_start_time)
-                VALUES (?, ?, ?, ?, ?, 1, ?)
-            """, (bot_id, new_step, added_invested, avg_price, tp_price, int(time.time())))
+                INSERT INTO trades (bot_id, current_step, total_invested, avg_entry_price, target_tp_price, entry_confirmed, basket_start_time, cycle_id)
+                VALUES (?, ?, ?, ?, ?, 1, ?, 
+                    COALESCE((SELECT MAX(cycle_id) FROM bot_orders WHERE bot_id=?), 0) + 1
+                )
+            """, (bot_id, new_step, added_invested, avg_price, tp_price, int(time.time()), bot_id))
             
         # Fix 2: Sync bots.status → 'IN TRADE' immediately on fill
         # The WebSocket handler calls this; bots.status must match trades.total_invested.
@@ -1202,7 +1237,7 @@ def reconcile_with_db(bot_id, current_price, open_orders, exchange_position):
     total_invested, pair = res
     if not exchange_position or float(exchange_position.get('size', 0)) == 0:
         if total_invested > 0:
-            cursor.execute("UPDATE trades SET current_step = 0, total_invested = 0, avg_entry_price = 0, target_tp_price = 0, last_exit_price = ?, last_exit_time = ?, basket_start_time = 0, entry_confirmed = 0, entry_order_id = NULL, tp_order_id = NULL, bot_position_id = NULL, close_type = 'RECONCILE' WHERE bot_id = ?", (current_price, bot_id))
+            cursor.execute("UPDATE trades SET current_step = 0, total_invested = 0, avg_entry_price = 0, target_tp_price = 0, last_exit_price = ?, last_exit_time = ?, basket_start_time = ?, entry_confirmed = 0, entry_order_id = NULL, tp_order_id = NULL, bot_position_id = NULL, close_type = 'RECONCILE' WHERE bot_id = ?", (current_price, int(time.time()), int(time.time()), bot_id))
             cursor.execute("UPDATE bot_orders SET status = 'auto_closed', updated_at = ? WHERE bot_id = ? AND status = 'open'", (int(time.time()), bot_id))
             cursor.execute("UPDATE bots SET status='Scanning' WHERE id = ?", (bot_id,))
     conn.commit()
@@ -1407,7 +1442,20 @@ def save_bot_order(bot_id, order_type, exchange_order_id, price, amount, step, s
     conn = get_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("INSERT INTO bot_orders (bot_id, step, order_type, order_id, price, amount, status, created_at, client_order_id, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (bot_id, step, order_type, exchange_order_id, price, amount, status, int(time.time()), client_order_id, notes))
+        # CYCLE-ID STAMP: Read the bot's current cycle_id from trades.
+        # Every order placed is tagged with the cycle it belongs to.
+        # The Reconciler uses this to ONLY adopt fills from the current cycle.
+        # If not in trade, we can still stamp it with what WILL be the current cycle
+        cursor.execute("""
+            SELECT COALESCE(
+                (SELECT cycle_id FROM trades WHERE bot_id=?),
+                (SELECT MAX(cycle_id) FROM bot_orders WHERE bot_id=?)
+            ) + CASE WHEN (SELECT 1 FROM trades WHERE bot_id=?) IS NULL THEN 1 ELSE 0 END
+        """, (bot_id, bot_id, bot_id))
+        row = cursor.fetchone()
+        cycle_id = row[0] if row and row[0] else 1
+
+        cursor.execute("INSERT INTO bot_orders (bot_id, step, order_type, order_id, price, amount, status, created_at, client_order_id, notes, cycle_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (bot_id, step, order_type, exchange_order_id, price, amount, status, int(time.time()), client_order_id, notes, cycle_id))
         
         # CRITICAL FIX: Also update trades table so get_bot_order_ids() / Guardian can see them.
         # Previously only bot_orders was written, but Guardian reads trades.entry_order_id/tp_order_id.
@@ -1424,10 +1472,10 @@ def save_bot_order(bot_id, order_type, exchange_order_id, price, amount, step, s
 
 # NOTE: update_order_status is defined earlier (L1393) — correct version with updated_at timestamp.
 
-def close_order_in_db(order_id):
+def cancel_order_in_db(order_id):
     try:
         conn = get_connection()
-        conn.execute("UPDATE bot_orders SET status = 'closed', updated_at = ? WHERE order_id = ?", (int(time.time()), order_id))
+        conn.execute("UPDATE bot_orders SET status = 'canceled', updated_at = ? WHERE order_id = ?", (int(time.time()), order_id))
         conn.commit()
         return True
     except: return False
@@ -1461,7 +1509,7 @@ def get_last_filled_order(bot_id):
         c.execute("SELECT basket_start_time FROM trades WHERE bot_id = ?", (bot_id,))
         res = c.fetchone()
         basket_start_time = res[0] if res else 0
-        c.execute("SELECT price, amount, step, created_at FROM bot_orders WHERE bot_id = ? AND order_type = 'buy' AND status = 'filled' AND created_at >= ? ORDER BY created_at DESC LIMIT 1", (bot_id, basket_start_time))
+        c.execute("SELECT price, amount, step, created_at FROM bot_orders WHERE bot_id = ? AND order_type = 'buy' AND status IN ('filled', 'closed') AND created_at >= ? ORDER BY created_at DESC LIMIT 1", (bot_id, basket_start_time))
         row = c.fetchone()
         if row: return {'price': row[0], 'amount': row[1], 'step': row[2], 'timestamp': row[3]}
     except: pass
@@ -1564,12 +1612,7 @@ def update_full_snapshot(trade_updates: List[Dict[str, Any]], physical_positions
         
         # logger.info(f"✅ Transactional snapshot update complete. Physical positions written: {len(physical_positions)}")
         
-        # 🚀 DEBUG: Self-Verify
-        try:
-            chk = conn.execute("SELECT COUNT(*) FROM active_positions").fetchone()[0]
-            st = os.stat(DB_PATH)
-            print(f"DEBUG DB: Post-Commit Check -> {chk} rows in {DB_PATH} | Size: {st.st_size} | Inode: {st.st_ino}")
-        except: pass
+        # logger.info(f"✅ Transactional snapshot update complete. Physical positions written: {len(physical_positions)}")
 
     except Exception as e:
         logger.error(f"Failed to execute transactional snapshot update: {e}")

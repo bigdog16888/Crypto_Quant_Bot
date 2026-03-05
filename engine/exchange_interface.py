@@ -20,6 +20,10 @@ class ExchangeInterface:
     """
     _anon_exchange = None
     _anon_lock = threading.Lock()
+    # Class-level cache: normalized symbol -> {step_size, tick_size, qty_precision, price_precision}
+    _exchange_info_cache: Dict[str, Any] = {}
+    _exchange_info_loaded = False
+    _exchange_info_lock = threading.Lock()
 
     def __init__(self, market_type='future'):
         self.logger = logging.getLogger(f"ExchangeInterface.{market_type}")
@@ -72,7 +76,7 @@ class ExchangeInterface:
         try:
             self.exchange.load_markets()
         except Exception as e:
-            self.logger.info(f"Market load with keys failed (likely Testnet/Demo context). falling back to anonymous mode...")
+            self.logger.debug(f"Market load with keys failed (likely Testnet/Demo context). falling back to anonymous mode...")
             try:
                 # Use shared anon instance
                 anon = self._get_anon_exchange()
@@ -80,6 +84,48 @@ class ExchangeInterface:
                 self.exchange.markets_by_id = anon.markets_by_id
             except Exception as e2:
                 self.logger.error(f"Critical: Anonymous market load also failed: {e2}")
+
+    @classmethod
+    def _fetch_exchange_info(cls):
+        """
+        Fetches LOT_SIZE and PRICE_FILTER for EVERY symbol from the real exchange endpoint.
+        Queries Demo FAPI on demo mode, Mainnet FAPI otherwise.
+        Cached at the class level—only runs once per process lifetime.
+        """
+        if cls._exchange_info_loaded:
+            return
+        with cls._exchange_info_lock:
+            if cls._exchange_info_loaded:  # double-check inside lock
+                return
+            try:
+                if config.TESTNET or config.DEMO_TRADING:
+                    url = 'https://demo-fapi.binance.com/fapi/v1/exchangeInfo'
+                else:
+                    url = 'https://fapi.binance.com/fapi/v1/exchangeInfo'
+                resp = requests.get(url, timeout=10)
+                resp.raise_for_status()
+                data = resp.json()
+                for sym_info in data.get('symbols', []):
+                    raw_sym = sym_info.get('symbol', '')  # e.g. BNBUSDC
+                    step_size = 0.001
+                    tick_size = 0.01
+                    for f in sym_info.get('filters', []):
+                        if f['filterType'] == 'LOT_SIZE':
+                            step_size = float(f['stepSize'])
+                        elif f['filterType'] == 'PRICE_FILTER':
+                            tick_size = float(f['tickSize'])
+                    qty_precision = (int(-math.log10(step_size)) if 0 < step_size < 1 else 0)
+                    price_precision = (int(-math.log10(tick_size)) if 0 < tick_size < 1 else 0)
+                    cls._exchange_info_cache[raw_sym] = {
+                        'step_size': step_size,
+                        'tick_size': tick_size,
+                        'qty_precision': qty_precision,
+                        'price_precision': price_precision,
+                    }
+                cls._exchange_info_loaded = True
+                logger.info(f"📐 Exchange precision cache loaded for {len(cls._exchange_info_cache)} symbols from {'Demo' if config.DEMO_TRADING or config.TESTNET else 'Mainnet'} FAPI.")
+            except Exception as e:
+                logger.error(f"⚠️ Could not load exchangeInfo precision cache: {e}")
 
     def _raw_request(self, endpoint: str, method: str = 'GET', params: dict = None) -> Any:
         """
@@ -354,94 +400,61 @@ class ExchangeInterface:
 
     def get_symbol_precision(self, symbol: str) -> Dict[str, Any]:
         """
-        Returns full precision metadata for a given symbol.
-        Uses exchange metadata to ensure fundamental compliance for any pair.
+        Returns precision metadata for an exchange symbol.
+        FUNDAMENTAL: Fetches real step sizes from the actual Demo or Mainnet exchangeInfo
+        endpoint (cached). Works universally for ALL pairs without hardcoded overrides.
         """
+        # Ensure the cache is populated from the real exchange endpoint
+        self._fetch_exchange_info()
+
+        # Normalize to the raw Binance symbol format (e.g., BTC/USDC:USDC -> BTCUSDC)
+        norm = normalize_symbol(symbol)
+
+        if norm in self._exchange_info_cache:
+            return self._exchange_info_cache[norm]
+
+        # Fallback: parse from CCXT markets if cache somehow missed this symbol
+        self.logger.warning(f"⚠️ [{norm}] not in precision cache — falling back to CCXT markets.")
         try:
             self._ensure_markets()
-            if not self.exchange or not self.exchange.markets:
-                return {'qty_precision': 5, 'price_precision': 2, 'step_size': 0.00001, 'tick_size': 0.01}
-                
-            # Get the correct symbol key (BTC/USDC or BTCUSDC)
             m_key = symbol if symbol in self.exchange.markets else symbol.replace('/', '')
-            market = self.exchange.markets.get(m_key)
-            
-            # Defaults for safety
-            p_qty = 3
-            p_price = 2
+            market = self.exchange.markets.get(m_key, {})
             step_size = 0.001
             tick_size = 0.01
-            
-            if market and 'info' in market and 'filters' in market['info']:
-                # ROBUST FIX: Parse raw filters directly from exchange info
-                for f in market['info']['filters']:
-                    if f['filterType'] == 'LOT_SIZE':
-                        step_size = float(f['stepSize'])
-                        if step_size < 1:
-                            p_qty = int(-math.log10(step_size))
-                        else:
-                            p_qty = 0
-                    
-                    if f['filterType'] == 'PRICE_FILTER':
-                        tick_size = float(f['tickSize'])
-                        if tick_size < 1:
-                            p_price = int(-math.log10(tick_size))
-                        else:
-                            p_price = 0
-            elif market:
-                 # Fallback to CCXT if raw filters missing (unlikely)
-                 pass
-            
-            # DEMO PRECISION OVERRIDE: Demo exchange uses different tick/step sizes than mainnet.
-            # CCXT loads mainnet metadata but demo rejects orders that don't match demo rules.
-            if config.TESTNET or config.DEMO_TRADING:
-                if 'BTC' in symbol:
-                    # Demo BTC: tick_size=0.1, step_size=0.001
-                    if p_price > 1:
-                        self.logger.debug(f"⚙️ Demo clamp: {symbol} price precision {p_price} → 1 (tick=0.1)")
-                        p_price = 1
-                        tick_size = 0.1
-                    if p_qty > 3:
-                        self.logger.debug(f"⚙️ Demo clamp: {symbol} qty precision {p_qty} → 3 (step=0.001)")
-                        p_qty = 3
-                        step_size = 0.001
-                elif 'ETH' in symbol:
-                    # Demo ETH: tick_size=0.01, step_size=0.001
-                    if p_price > 2:
-                        self.logger.debug(f"⚙️ Demo clamp: {symbol} price precision {p_price} → 2 (tick=0.01)")
-                        p_price = 2
-                        tick_size = 0.01
-                    if p_qty > 3:
-                        p_qty = 3
-                        step_size = 0.001
-                
-            return {
-                'qty_precision': p_qty,
-                'price_precision': p_price,
-                'step_size': step_size,
-                'tick_size': tick_size
-            }
+            for f in market.get('info', {}).get('filters', []):
+                if f['filterType'] == 'LOT_SIZE':
+                    step_size = float(f['stepSize'])
+                elif f['filterType'] == 'PRICE_FILTER':
+                    tick_size = float(f['tickSize'])
+            qty_precision = int(-math.log10(step_size)) if step_size < 1 else 0
+            price_precision = int(-math.log10(tick_size)) if tick_size < 1 else 0
+            return {'qty_precision': qty_precision, 'price_precision': price_precision,
+                    'step_size': step_size, 'tick_size': tick_size}
         except Exception as e:
             self.logger.error(f"Error fetching precision for {symbol}: {e}")
-            return {
-                'qty_precision': 3, # Standard usually 3 for BTC
-                'price_precision': 2,
-                'step_size': 0.001,
-                'tick_size': 0.01
-            }
+            return {'qty_precision': 3, 'price_precision': 2, 'step_size': 0.001, 'tick_size': 0.01}
 
     @staticmethod
     def round_to_step(value: float, step: float) -> float:
-        """Rounds a value to the nearest exchange step size (e.g., 0.05)."""
+        """Rounds a value DOWN to the nearest exchange step size (e.g., 0.05). Use for normal quantities."""
         if not step or step <= 0: return value
         import math
-        # Use decimal-safe rounding
         if step < 1:
             precision = int(-math.log10(step))
         else:
-            precision = 0 # Integer steps like 1.0, 10.0
-            
+            precision = 0
         return round(math.floor(value / step) * step, precision)
+
+    @staticmethod
+    def ceil_to_step(value: float, step: float) -> float:
+        """Rounds a value UP to the nearest exchange step size. Use when scaling UP to meet minimum notional."""
+        if not step or step <= 0: return value
+        import math
+        if step < 1:
+            precision = int(-math.log10(step))
+        else:
+            precision = 0
+        return round(math.ceil(value / step) * step, precision)
 
     def create_order(self, symbol, type, side, amount, price=None, params=None) -> dict:
         try:
@@ -538,12 +551,26 @@ class ExchangeInterface:
             
             market = self.exchange.markets[m_key]
             
-            # Min Notional Check (Approximate)
-            # Binance Futures usually $5 min
+            # Min Notional Auto-Adjustment
+            # Binance Futures Mainnet is usually $5 min. Testnet/Demo is often $100 min.
+            min_notional = 100.0 if (config.TESTNET or config.DEMO_TRADING) else 5.0
+            
             if price and amount:
                  notional = price * amount
-                 if notional < 5.0:
-                     return False, amount, price, f"Order value ${notional:.2f} < Min Notional $5.0"
+                 if notional < min_notional:
+                     # 🚀 AUTO-SCALE: Dynamically increase the amount to meet the exchange's minimum notional limit
+                     # Add a $2.00 buffer to ensure slight price drops don't cause instant rejection during network transit
+                     needed_notional = min_notional + 2.0
+                     adjusted_amount = needed_notional / price
+                     
+                     # Ceil to exchange step size so we never round back below the notional threshold
+                     try:
+                         prec = self.get_symbol_precision(symbol)
+                         amount = self.ceil_to_step(adjusted_amount, prec['step_size'])
+                     except:
+                         amount = adjusted_amount
+                     
+                     self.logger.warning(f"⚠️ [AUTO-SCALE] Order value ${notional:.2f} < Min Notional ${min_notional}. Auto-scaled amount to target ${needed_notional:.2f} ({amount} units).")
 
             # Basic Validation Passed
             return True, amount, price, ""
@@ -587,6 +614,26 @@ class ExchangeInterface:
         except Exception as e:
             self.logger.error(f"Cancel All Orders Failed for {symbol}: {e}")
             return None
+
+    def get_best_bid_ask(self, symbol: str) -> tuple:
+        """
+        Fetches the current best bid and ask price for a symbol.
+        Returns (bid, ask) tuple. Used to retry Post-Only orders at the correct maker price.
+        - LONG entry / SHORT TP → price must be <= best BID (place below market to be maker)
+        - SHORT entry / LONG TP → price must be >= best ASK (place above market to be maker)
+        """
+        try:
+            norm_sym = normalize_symbol(symbol)
+            if config.TESTNET or config.DEMO_TRADING:
+                res = self._raw_request('/fapi/v1/ticker/bookTicker', params={'symbol': norm_sym})
+                if res:
+                    return float(res['bidPrice']), float(res['askPrice'])
+            # Mainnet fallback via CCXT
+            ticker = self.exchange.fetch_ticker(symbol)
+            return float(ticker['bid']), float(ticker['ask'])
+        except Exception as e:
+            self.logger.error(f"get_best_bid_ask failed for {symbol}: {e}")
+            return None, None
 
 def cleanup_caches():
     pass

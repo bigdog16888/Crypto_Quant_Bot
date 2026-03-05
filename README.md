@@ -82,7 +82,7 @@ streamlit run ui/app.py
 
 ## 🔧 Architecture & Troubleshooting
 
-See `HANDOFF.md` for a deep dive into the system architecture and detailed debugging steps.
+See `UNIFIED_BOT_DOCUMENTATION.md` for a deep dive into the system architecture, mathematical rules, and detailed debugging steps.
 
 ### Common Fixes
 *   **System Slow?** Enable "Auto-Refresh" in the UI only when needed. The Dashboard now uses **parallel fetching** for speed.

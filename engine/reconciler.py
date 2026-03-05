@@ -17,6 +17,11 @@ from config.settings import config
 
 logger = logging.getLogger("StateReconciliation")
 
+# 🕐 SESSION GUARD: Record the exact moment this engine session started.
+# Any fill from the exchange that occurred BEFORE this timestamp is rejected from adoption.
+# This is the fundamental guard against Binance's 48h history being re-ingested on every restart.
+ENGINE_START_TIME = time.time()
+
 
 class ReconciliationAction(Enum):
     """Actions to take during reconciliation"""
@@ -49,6 +54,7 @@ class BotState:
     entry_order_id: Optional[str]
     tp_order_id: Optional[str]
     has_confirmed_entry: bool
+    cycle_id: int = 1  # Current trading cycle. Increments on each TP reset.
 
 
 @dataclass
@@ -146,12 +152,13 @@ class StateReconciler:
         # Pre-fetch Bot States for fast lookups
         # Map: bot_id -> {current_step, total_invested, avg_entry, basket_start_time}
         bot_states = {}
-        cursor.execute("SELECT bot_id, current_step, total_invested, avg_entry_price, entry_confirmed, basket_start_time FROM trades")
+        cursor.execute("SELECT bot_id, current_step, total_invested, avg_entry_price, entry_confirmed, basket_start_time, COALESCE(cycle_id, 1) FROM trades")
         for row in cursor.fetchall():
             bot_states[row[0]] = {
                 'current_step': row[1], 'total_invested': row[2], 
                 'avg_entry': row[3], 'entry_confirmed': row[4],
-                'basket_start_time': row[5] or 0
+                'basket_start_time': row[5] or 0,
+                'cycle_id': row[6]
             }
 
         conn.close() # Close mainly to keep scope clean, we'll reopen for updates
@@ -197,40 +204,31 @@ class StateReconciler:
                             
                             current_state = bot_states.get(bot_id, {})
                             
-                            # 🚀 SESSION-SYNC FIX: Strictly ignore history before the current session's start time (epoch).
-                            # This prevents re-playing old history into a new DB after a reset.
-                            # basket_start_time is in seconds, order timestamp is in MS.
-                            bot_epoch_ms = (current_state.get('basket_start_time', 0)) * 1000
-                            order_time_ms = order.get('timestamp', 0)
-                            
-                            if bot_epoch_ms > 0 and order_time_ms < bot_epoch_ms:
-                                # Order happened BEFORE this bot was started/reset. Skip it.
-                                # Unless we are in an explicit adoption mode, we stick to the epoch.
-                                continue
-                            
-                            # 🛡️ FATAL BUG FIX: If basket_start_time is 0 (Clean Wipe), Binance FAPI still returns
-                            # 48 hours of history. We MUST reject any history older than 5 minutes to prevent
-                            # ingesting 27-hour old closed orders as "brand new offline trades".
-                            if bot_epoch_ms == 0:
-                                try:
-                                    # Format: CQB_{bot_id}_{type}_{step}_{timestamp_seconds}
-                                    if len(parts) >= 5:
-                                        cid_timestamp = int(parts[4])
-                                        if (time.time() - cid_timestamp) > 300: # 5 minutes
-                                            logger.debug(f"🛑 [OFFLINE-SYNC] Rejecting ANCIENT offline fill {cid} (Age: {int(time.time() - cid_timestamp)}s). Bot is cleanly wiped.")
-                                            continue
-                                except Exception as parse_e:
-                                    logger.warning(f"Failed to parse timestamp from {cid}: {parse_e}")
-                            
-                            # Check if order is known and open
-                            cursor.execute("SELECT status FROM bot_orders WHERE order_id=? OR client_order_id=?", (order['id'], cid))
+                            # 🔑 CYCLE-ID GUARD: The definitive, time-free fill isolation check.
+                            # An offline fill is ONLY adopted if it belongs to the bot's CURRENT cycle.
+                            # A fill from a previous cycle will have no matching bot_orders row with the
+                            # current cycle_id, OR will have a 'reset_cleared' status. Both are rejected.
+                            cursor.execute("""
+                                SELECT status, cycle_id FROM bot_orders 
+                                WHERE (order_id=? OR client_order_id=?)
+                            """, (order['id'], cid))
                             row = cursor.fetchone()
-                            
-                            logger.info(f"🔍 [OFFLINE-SYNC] Checking Order {order['id']} (CID: {cid}) | InDB: {'Yes' if row else 'No'} | DBStatus: {row[0] if row else 'N/A'}")
-                            
-                            # If order is NOT in DB, or is 'open', we process it.
-                            # If it is 'filled'/'closed'/'reset_cleared' already, skip.
-                            if row and row[0] in ['filled', 'closed', 'reset_cleared']:
+
+                            logger.info(f"🔍 [OFFLINE-SYNC] Checking Order {order['id']} (CID: {cid}) | InDB: {'Yes' if row else 'No'} | DBStatus: {row[0] if row else 'N/A'} | DBCycle: {row[1] if row else 'N/A'}")
+
+                            if row:
+                                # Known order: reject if already processed or from old cycle
+                                if row[0] in ['filled', 'closed', 'reset_cleared', 'auto_closed']:
+                                    continue
+                                # Also reject if it has a different cycle_id than the bot's current cycle
+                                bot_current_cycle = current_state.get('cycle_id', 1)
+                                if row[1] is not None and row[1] != bot_current_cycle:
+                                    logger.debug(f"🛑 [CYCLE-GUARD] Rejecting fill {cid}: belongs to cycle {row[1]}, bot is on cycle {bot_current_cycle}.")
+                                    continue
+                            else:
+                                # Order NOT in our DB at all — it was placed in a previous life / manually.
+                                # Unconditionally reject to prevent adopting unknown history.
+                                logger.debug(f"🛑 [CYCLE-GUARD] Rejecting unknown fill {cid}: not in bot_orders DB (not from this system's current cycle).")
                                 continue
 
                             # Update Bot State
@@ -461,11 +459,18 @@ class StateReconciler:
             if norm_pair not in bots_by_pair: bots_by_pair[norm_pair] = []
             bots_by_pair[norm_pair].append(bot)
             
+        
+        # FUNDAMENTAL FIX: Normalize the incoming CCXT positions dictionary keys
+        # The exchange keys are like "BTC/USDC" but we must process them as "BTCUSDC"
+        normalized_positions = {}
+        for raw_pair, pos_list in positions.items():
+            norm_p = normalize_symbol(raw_pair)
+            normalized_positions[norm_p] = pos_list
+            
         # FUNDAMENTAL FIX: Include pairs that have positions but no bots (Rogue Positions)
-        # We must ensure that EVERY pair in positions is a key in bots_by_pair
-        all_exchange_pairs = list(positions.keys())
-        for p in all_exchange_pairs:
-            norm_p = normalize_symbol(p)
+        # We must ensure that EVERY pair in normalized_positions is a key in bots_by_pair
+        all_exchange_pairs = list(normalized_positions.keys())
+        for norm_p in all_exchange_pairs:
             if norm_p not in bots_by_pair:
                 bots_by_pair[norm_p] = [] # Empty list of bots for this pair
 
@@ -491,7 +496,7 @@ class StateReconciler:
             # 3. Compare with Tolerance
             # Ensure we are comparing normalized symbols
             pair_normalized = normalize_symbol(pair)
-            pair_positions = positions.get(pair_normalized, [])
+            pair_positions = normalized_positions.get(pair_normalized, [])
             
             total_physical_notional = 0.0
             physical_net = 0.0
@@ -499,14 +504,14 @@ class StateReconciler:
             rep_side = "N/A"
             
             for p in pair_positions:
-                val = p.size * p.entry_price
+                val = abs(p.size) * p.entry_price
                 total_physical_notional += val
                 rep_side = p.side # Used for reporting
                 if p.side == 'LONG': 
-                     physical_net += p.size
+                     physical_net += abs(p.size)
                      physical_net_usd += val
                 else: 
-                     physical_net -= p.size
+                     physical_net -= abs(p.size)
                      physical_net_usd -= val
                 
             logger.info(f"⚖️ RECON AUDIT [{pair_normalized}]: Virtual=${total_virtual_invested:.2f} vs Physical=${total_physical_notional:.2f}")
@@ -593,14 +598,18 @@ class StateReconciler:
             # --- CASE B.2: STRUCTURAL GHOST DETECTION ---
             # Even if net-notional is close, if a bot claims high step but lacks history, it's a structural ghost (legacy state).
             for b in bots:
-                if b.in_trade and b.total_invested > 1.0:
+                # 🚀 ARCHITECTURAL FIX: 
+                # Do not execute Structural Ghost destruction if the bot's entry is explicitly confirmed. 
+                # 'entry_confirmed=1' indicates the position was successfully spawned via WebSocket fill, 
+                # or was manually adopted/audited by the user/system.
+                if b.in_trade and b.total_invested > 1.0 and not b.has_confirmed_entry:
                     try:
                         from .database import get_connection
                         conn = get_connection()
                         cursor = conn.cursor()
                         cursor.execute("""
                             SELECT COUNT(*), SUM(amount * price) FROM bot_orders 
-                            WHERE bot_id=? AND status='filled' AND created_at >= (? - 120)
+                            WHERE bot_id=? AND status IN ('filled', 'closed') AND created_at >= (? - 120)
                         """, (b.bot_id, b.basket_start_time))
                         row = cursor.fetchone()
                         
@@ -637,6 +646,9 @@ class StateReconciler:
                      for target_bot in [b for b in bots if b.in_trade]:
                          try:
                              from .database import get_connection, accumulate_trade_fill
+                             # CYCLE-ID GUARD: Only sum fills from the bot's CURRENT cycle.
+                             # This is the definitive, time-free way to identify current-cycle fills.
+                             # bot_orders.cycle_id = trades.cycle_id ensures we never re-adopt old history.
                              conn = get_connection()
                              cursor = conn.cursor()
                              
@@ -645,9 +657,9 @@ class StateReconciler:
                              cursor.execute("""
                                  SELECT SUM(amount * price), SUM(amount), MAX(step) 
                                  FROM bot_orders 
-                                 WHERE bot_id = ? AND status = 'filled'
-                                 AND created_at >= (? - 120)
-                             """, (target_bot.bot_id, target_bot.basket_start_time))
+                                 WHERE bot_id = ? AND status IN ('filled', 'closed')
+                                 AND cycle_id = ?
+                             """, (target_bot.bot_id, getattr(target_bot, 'cycle_id', 1)))
                              row = cursor.fetchone()
                              if row and row[0] and row[0] > (target_bot.total_invested + 1.0):
                                  history_sum = row[0]
@@ -663,7 +675,7 @@ class StateReconciler:
                                  avg_price = history_sum / history_qty if history_qty > 0 else target_bot.avg_entry_price
                                  
                                  # Apply the missing portion
-                                 accumulate_trade_fill(target_bot.bot_id, repair_amount, repair_qty, avg_price, max(history_step, target_bot.current_step), 0.0)
+                                 accumulate_trade_fill(target_bot.bot_id, repair_amount, repair_qty, avg_price, max(history_step, target_bot.current_step), 0.0, is_entry=True)
                                  
                                  results.append(ReconciliationResult(
                                      bot_id=target_bot.bot_id,
@@ -706,19 +718,31 @@ class StateReconciler:
                 suspects = [b for b in bots if b.in_trade and b.direction.upper() == error_side]
                 
                 for b in suspects:
-                    # Get orders for THIS specific bot's raw pair string
-                    pair_orders = all_orders.get(b.pair, [])
+                    # Get orders for THIS specific bot using normalized pair string
+                    b_norm_pair = normalize_symbol(b.pair)
+                    pair_orders = all_orders.get(b_norm_pair, [])
                     
                     # 4. Proof of Life Check: Does this bot have open orders?
                     bot_orders = [o for o in pair_orders if o.client_order_id and f"CQB_{b.bot_id}_" in o.client_order_id]
                     
                     if not bot_orders:
-                        # FLAG ONLY — do not reset. Bot may be between order placement cycles.
-                        logger.warning(
-                            f"⚠️ [NET-SUM-FLAG] Bot {b.name} (ID {b.bot_id}) is {b.direction} "
-                            f"${b.total_invested:.2f} with no open orders. Contributes to net error. "
-                            f"Flagging only — NO RESET."
-                        )
+                        # We suspect this is a bot that hit TP while offline, but total pair position didn't drop to 0
+                        # Check exchange history for proof of exit
+                        exit_proof = self._find_proof_of_exit(b)
+                        if exit_proof:
+                            logger.info(f"✅ GHOST EXIT PROOF FOUND: Bot {b.name} (ID {b.bot_id}) exited via {exit_proof.get('clientOrderId')} at {exit_proof.get('timestamp')}.")
+                            self._fix_ghost_bot(b, proof_order_id=f"GHOST_EXIT_{exit_proof.get('id')}")
+                            results.append(ReconciliationResult(
+                                bot_id=b.bot_id, bot_name=b.name, pair=b.pair, action_taken=ReconciliationAction.SYSTEM_FIX_ZOMBIE,
+                                details="Reset Ghost Bot (Found exit fill in exchange history)", requires_manual_intervention=False
+                            ))
+                        else:
+                            # FLAG ONLY — do not reset without proof. Bot may be between order placement cycles.
+                            logger.warning(
+                                f"⚠️ [NET-SUM-FLAG] Bot {b.name} (ID {b.bot_id}) is {b.direction} "
+                                f"${b.total_invested:.2f} with no open orders. Contributes to net error. "
+                                f"Flagging only — NO RESET."
+                            )
                     else:
                          logger.info(f"🛡️ [GHOST-SAFE] Bot {b.name} has {len(bot_orders)} open orders.")
 
@@ -740,9 +764,11 @@ class StateReconciler:
                              # Sum all filled orders for THIS bot session (or any time if trade table is empty)
                              # We use history to explain the gap, but only from current basket.
                              cursor.execute("""
-                                 SELECT SUM(amount * price), SUM(amount), MAX(step) 
+                                 SELECT IFNULL(SUM(amount * price), 0.0) as total_notional, SUM(amount), MAX(step)
                                  FROM bot_orders 
-                                 WHERE bot_id = ? AND status = 'filled'
+                                 WHERE bot_id = ? 
+                                 AND order_type IN ('entry', 'grid', 'adoption') 
+                                 AND status IN ('filled', 'closed')
                                  AND created_at >= (? - 120)
                              """, (target_bot.bot_id, target_bot.basket_start_time))
                              row = cursor.fetchone()
@@ -755,7 +781,7 @@ class StateReconciler:
                                  logger.critical(f"🧟 [RECON-RECOVERY] Bot {target_bot.name} (ID {target_bot.bot_id}) has ${history_sum:,.2f} in orphan fills. ADOPTING position basis.")
                                  
                                  # Reconstruct state
-                                 accumulate_trade_fill(target_bot.bot_id, history_sum, history_qty, avg_price, history_step, 0.0)
+                                 accumulate_trade_fill(target_bot.bot_id, history_sum, history_qty, avg_price, history_step, 0.0, is_entry=True)
                                  
                                  results.append(ReconciliationResult(
                                      bot_id=target_bot.bot_id,
@@ -837,7 +863,7 @@ class StateReconciler:
                 order = ex.fetch_order(bot.entry_order_id, bot.pair)
                 if order:
                     status = order.get('status', '').lower()
-                    if status == 'filled':
+                    if status in ['filled', 'closed']:
                         return True
                     if status in ['canceled', 'rejected', 'expired']:
                         return False # Explicitly failed
@@ -1040,7 +1066,9 @@ class StateReconciler:
         orders_by_pair = {}
         seen_order_ids = set() # Prevent duplicated orders from overlapping API endpoints
         for pair in pairs:
-            orders_by_pair[pair] = []
+            norm_pair = normalize_symbol(pair)
+            if norm_pair not in orders_by_pair:
+                orders_by_pair[norm_pair] = []
             for mt, ex in self.exchanges.items():
                 if not ex: continue
                 try:
@@ -1054,7 +1082,7 @@ class StateReconciler:
                             continue
                         seen_order_ids.add(oid)
                         
-                        orders_by_pair[pair].append(ExchangeOrder(
+                        orders_by_pair[norm_pair].append(ExchangeOrder(
                             order_id=oid,
                             symbol=pair,
                             side=o.get('side',''),
@@ -1077,15 +1105,18 @@ class StateReconciler:
             bot_id, name, pair, is_active = b[0], b[1], b[2], b[3]
             logger.debug(f"🔍 [GET-STATE] Examining Bot {bot_id} (Active={is_active})")
             
+            # The get_bot_status function is imported from .database,
+            # so we assume it's modified to return 'cycle_id' at index 13.
+            # The instruction implies modifying the *source* of get_bot_status.
+            # For this file, we just use the updated return value.
             status = get_bot_status(bot_id)
             if not status: 
                 logger.warning(f"⚠️ [GET-STATE] No status found for Bot {bot_id}")
                 continue
             
-            # Use raw DB confirmed status if needed
+            # Read the actual entry_confirmed flag from the database
             order_ids = get_bot_order_ids(bot_id)
-            cursor.execute("SELECT COUNT(*) FROM trade_history WHERE bot_id=? AND action IN ('BUY','SELL') AND timestamp > ?", (bot_id, int(time.time()-86400)))
-            confirmed = cursor.fetchone()[0] > 0
+            confirmed = bool(status.get('entry_confirmed', False))
             
             states.append(BotState(
                 bot_id=bot_id,
@@ -1101,7 +1132,8 @@ class StateReconciler:
                 basket_start_time=status['basket_start_time'],
                 entry_order_id=str(order_ids.get('entry_order_id')) if order_ids.get('entry_order_id') else None,
                 tp_order_id=str(order_ids.get('tp_order_id')) if order_ids.get('tp_order_id') else None,
-                has_confirmed_entry=confirmed
+                has_confirmed_entry=confirmed,
+                cycle_id=status.get('cycle_id', 1)
             ))
         conn.close()
         return states

@@ -130,6 +130,13 @@ streamlit run ui/app.py
 
 **Never use `cancel_all_orders(pair)`. Always use `cancel_orders_by_bot_id(bot_id, pair)`.** The former will cause catastrophic interference between bots; the latter is the foundation of the Virtual Position Manager.
 
+### 4.2. The Strict Ban on `reduceOnly`
+
+**Never use the `reduceOnly: True` order parameter in a Multi-Bot environment.**
+Because multiple bots (both LONG and SHORT) can share the same currency pair, the exchange's "Physical Net Position" might be LONG while a specific bot is trying to close its SHORT position. If that bot sends a Take Profit 'buy' order with `reduceOnly=True`, Binance will strictly check the exchange's net position. Because the net position is already LONG, Binance will reject the order with `-2022 ReduceOnly Order is rejected`, preventing the bot from ever taking profit and leaving a naked mathematically-unhedged position. 
+
+In this system, because all bots share a physical position, **Take Profit orders must be mathematical limit orders without `reduceOnly`**. Order duplication is prevented exclusively by local state (checking `bot_orders` for an active `CQB_{bot_id}_TP_x`).
+
 ### 4.2. Recent Stability & Bug Fixes (Updated: 2026-02-12)
 
 The bot has recently undergone a fundamental stabilization phase to ensure multi-bot isolation.
@@ -150,6 +157,12 @@ The bot has recently undergone a fundamental stabilization phase to ensure multi
 ---
 
 ## 5. Changelog Summary
+
+### Version 1.3.0 (2026-03-03)
+**Order Sync & Race Condition Stabilization**
+- **Forward-Step Cancel Bug:** Fixed a critical race condition in `bot_executor.py` where a slight database read latency caused fresh Grid orders to be instantly falsely flagged and deleted as "stale" from previous steps.
+- **Zero-Invested Sweeper Safety:** Modified the "SCANNING" phase dangling order cleanup to permanently cease if `current_step > 0`, explicitly protecting rapidly filled Entry/Grid orders from being incorrectly deleted if the `total_invested` database field recalculation hasn't propagated.
+- **Perfect 1:1 Order Verification:** Closed the persistent "15 vs 16 phantom missing exchange order" discrepancy. The local database mathematical order expectation now flawlessly matches Binance's physical active order state (20/20).
 
 ### Version 1.0.0 (2026-02-12)
 **Fundamental Multi-Bot Isolation**
