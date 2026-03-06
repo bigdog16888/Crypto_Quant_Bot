@@ -75,10 +75,11 @@ def render_bot_manager_view():
 
     for bot in bots:
 
-        # Note: update engine/database.py get_all_bots to return these if not already
-        # Current get_all_bots returns: b.id, b.name, b.pair, b.is_active, b.strategy_type, t.total_invested, t.current_step
-        # We need t.avg_entry_price, t.target_tp_price as well.
+        # Current get_all_bots returns: b.id, b.name, b.pair, b.is_active, b.strategy_type, t.total_invested, t.current_step, last_error, last_error_time
+        # Robust unpacking to handle stale module versions
         b_id, name, pair, is_active, strat_type, total_invested, step = bot[:7]
+        last_error = bot[7] if len(bot) > 7 else None
+        last_error_time = bot[8] if len(bot) > 8 else None
         
         # FIX: Handle potential None values from LEFT JOIN if trade record missing
         total_invested = float(total_invested) if total_invested is not None else 0.0
@@ -191,21 +192,32 @@ def render_bot_manager_view():
 
             # Determine trading state (IN TRADE vs IDLE)
             in_trade = total_invested > 0
-            
-            # Status logic:
-            # - Active + In Trade = "IN TRADE" (green)
-            # - Active + Idle = "SCANNING" (blue)
-            # - Paused = "PAUSED" (yellow)
-            # - Error = "ERROR" (red)
+
+            # --- PARTIAL FILL CHECK (Yellow Light) ---
+            is_partial = False
+            if in_trade:
+                try:
+                    conn = get_connection()
+                    cursor = conn.cursor()
+                    # Check if any open order has filled_amount > 0
+                    cursor.execute("SELECT COUNT(*) FROM bot_orders WHERE bot_id = ? AND status = 'open' AND filled_amount > 0", (b_id,))
+                    is_partial = cursor.fetchone()[0] > 0
+                except:
+                    pass
             
             if error_reason:
                 status_text = 'ERROR'
                 pulse_color = "#cf222e"  # Red
                 state_label = "ERROR"
             elif in_trade:
-                status_text = 'IN TRADE'
-                pulse_color = "#3fb950"  # Green
-                state_label = f"TRADE (S{step})"
+                if is_partial:
+                    status_text = 'PARTIAL FILL'
+                    pulse_color = "#d29921"  # Yellow
+                    state_label = f"PARTIAL (S{step})"
+                else:
+                    status_text = 'IN TRADE'
+                    pulse_color = "#3fb950"  # Green
+                    state_label = f"TRADE (S{step})"
             elif is_active:
                 status_text = 'Waiting for Signal'
                 pulse_color = "#58a6ff"  # Blue
@@ -242,6 +254,9 @@ def render_bot_manager_view():
             
             if error_reason:
                  st.caption(f"🛑 {error_reason}")
+            
+            if last_error:
+                 st.markdown(f"<div style='color: #cf222e; font-size: 0.8em; margin-top: 5px;'>⚠️ {last_error}</div>", unsafe_allow_html=True)
             
             # Simple toggle below visual status
             if st.button("⏯️ Toggle", key=f"btn_toggle_{b_id}", help="Start/Stop Bot"):
@@ -292,6 +307,18 @@ def render_bot_manager_view():
                             st.rerun()
                         else:
                             st.error(f"❌ Failed: {result.get('error')}")
+                            
+                    # Danger Zone: Panic Close
+                    st.markdown("---")
+                    st.markdown("**🚨 Emergency Panic Close**")
+                    panic_confirm = st.checkbox(f"⚠️ Confirm instant MARKET close for 100% of {name}'s position.", key=f"confirm_panic_{b_id}")
+                    if st.button("🚨 PANIC CLOSE & FLATTEN", key=f"panic_all_{b_id}", type="primary", disabled=not panic_confirm, help="Instantly market-sells entire position and resets bot state."):
+                        result = close_position(b_id, close_pct=100.0, reason="PANIC FLAT from UI")
+                        if result['success']:
+                            st.success(f"✅ PANIC CLOSED {name}. PnL: ${result.get('pnl', 0):.2f}")
+                            st.rerun()
+                        else:
+                            st.error(f"❌ Panic Failed: {result.get('error')}")
                     
                     # Stop settings
                     st.markdown("---")
@@ -376,7 +403,8 @@ def render_edit_form(bot_id):
     
     current_quote = "USDT"
     if pair and '/' in pair:
-        current_quote = pair.split('/')[1]
+        raw_quote = pair.split('/')[1]
+        current_quote = raw_quote.split(':')[0] if ':' in raw_quote else raw_quote
 
     # --- Market Configuration (Per-Bot) ---
     # KEPT OUTSIDE FORM for dynamic updates
@@ -398,10 +426,11 @@ def render_edit_form(bot_id):
     
     with mcol2:
         # Load quote asset from pair string or config
-        # Pair format: BASE/QUOTE
+        # Pair format: BASE/QUOTE or BASE/QUOTE:QUOTE
         inferred_quote = "USDT"
         if pair and '/' in pair:
-            inferred_quote = pair.split('/')[1]
+            raw_quote = pair.split('/')[1]
+            inferred_quote = raw_quote.split(':')[0] if ':' in raw_quote else raw_quote
             
         quote_options = ["USDT", "USDC"]
         quote_idx = quote_options.index(inferred_quote) if inferred_quote in quote_options else 0
@@ -466,7 +495,7 @@ def render_edit_form(bot_id):
             new_max_steps = st.number_input("Max Steps", min_value=1, max_value=50, value=int(config_dict.get('max_steps', 10)))
 
         st.markdown("#### ⚙️ Order Calculation")
-        col5, col6, col7 = st.columns(3)
+        col5, col6 = st.columns(2)
         # Safe Min Calculation
         min_safe_usd = 5.0
         if new_pair:
@@ -501,18 +530,49 @@ def render_edit_form(bot_id):
 
         with col6:
             new_mm = st.number_input("Martingale Multiplier", value=float(martingale_multiplier), step=0.1)
-        
-        with col7:
+            
+        st.markdown("#### 🎯 Take Profit & Trailing")
+        tp_col1, tp_col2, tp_col3, tp_col4 = st.columns(4)
+        with tp_col1:
+            tp_types_ui = ["Fixed", "Percentage"]
+            db_tp_type = config_dict.get('TakeProfitType', 'Fixed')
+            curr_tp = "Percentage" if db_tp_type == "Percent" else "Fixed"
+            
+            selected_tp_ui = st.selectbox("Take Profit Type", tp_types_ui, index=tp_types_ui.index(curr_tp), key=f"edit_tp_type_{bot_id}")
+            # Map back to DB expected string format
+            config_dict['TakeProfitType'] = "Percent" if selected_tp_ui == "Percentage" else "Fixed"
+            
+        with tp_col2:
+            # Load from correct base/pct field depending on current selection
+            if selected_tp_ui == "Percentage":
+                initial_val = float(config_dict.get('TakeProfitPct', 1.5))
+                step_val = 0.1
+            else:
+                initial_val = float(config_dict.get('TakeProfitBase', 15.0))
+                step_val = 1.0
+                
+            new_tp_val = st.number_input("TP Target Value", value=initial_val, step=step_val, key=f"edit_tp_val_{bot_id}")
+            
+            # Save into correct field
+            if selected_tp_ui == "Percentage":
+                config_dict['TakeProfitPct'] = new_tp_val
+            else:
+                config_dict['TakeProfitBase'] = new_tp_val
+            
+        with tp_col3:
             config_dict['ProfitSet'] = st.number_input("Trailing Distance (%)", 
                 value=float(config_dict.get('ProfitSet', 0.5)), 
                 step=0.1, 
                 help="Distance from peak price to trigger trailing stop.")
+                
+        with tp_col4:
+            st.markdown("<br>", unsafe_allow_html=True)
             config_dict['MaximizeProfit'] = st.checkbox("Enable Trailing", 
                 value=bool(config_dict.get('MaximizeProfit', False)), 
                 help="If checked, uses Trailing Stop. If unchecked, uses fixed Take Profit.")
         
         # [Grid Settings]
-        st.markdown("#### 🛡️ Risk & Grid Configuration")
+        st.markdown("#### 📐 Grid & Martingale Settings")
         with st.expander("Grid Spacing & Safety", expanded=True):
             # Consolidated Grid Logic
             use_atr_grid = st.checkbox("Use Dynamic ATR Grid", value=config_dict.get('UseATRGrid', False), help="If OFF, uses fixed 'Base Grid' distance.")
@@ -803,16 +863,20 @@ def render_edit_form(bot_id):
             config_dict['UseVolSizing'] = st.checkbox("Volatility Position Sizing", value=config_dict.get('UseVolSizing', False), help="Adjusts lot size based on ATR (High Vol = Smaller Size).")
 
         st.markdown("#### Advanced Exit & Hedge Settings")
-        col_ee1, col_ee2, col_ee3, col_ee4 = st.columns(4)
+        col_ee1, col_ee2, col_ee3, col_ee4, col_ee5 = st.columns(5)
         with col_ee1:
             use_ee = st.checkbox("Use Early Exit", value=config_dict.get('UseEarlyExit', False), help="Moves TP target closer to Break Even over time to exit stale trades safely.")
         with col_ee2:
-            decay_interval = st.number_input("Decay Interval (Mins)", value=float(config_dict.get('DecayIntervalMins', 15.0)), help="How often (in minutes) the profit target is reduced.")
+            ee_start_hours = st.number_input("Start After (Hours)", value=float(config_dict.get('EEStartHours', 2.0)), min_value=0.0, step=0.5,
+                help="Hours after entry before decay begins.")
         with col_ee3:
-            decay_pct = st.number_input("TP Reduction (%)", value=float(config_dict.get('DecayPercentPerInterval', 30.0)), help="What percentage of the current profit target to cut per interval.")
+            decay_interval = st.number_input("Decay Every (Mins)", value=float(config_dict.get('DecayIntervalMins', 15.0)), help="How often (in minutes) the profit target is reduced.")
         with col_ee4:
-            hedge_step = st.number_input("Hedge Step", min_value=1, max_value=10, value=int(config_dict.get('HedgeStartStep', 7)), help="Which Martingale step triggers the hedge trade.")
-        
+            decay_pct = st.number_input("TP Reduction (%)", value=float(config_dict.get('DecayPercentPerInterval', 30.0)), help="What percentage of the current profit target to cut per interval.")
+        with col_ee5:
+            ee_allow_loss = st.checkbox("Allow Loss Exit", value=bool(config_dict.get('EEAllowLoss', False)),
+                help="Allow TP to decay past break-even to exit at a small loss.")
+
         st.markdown("#### Post-Exit Re-entry & Cooldown")
         re1, re2, re3 = st.columns(3)
         with re1:
@@ -822,9 +886,16 @@ def render_edit_form(bot_id):
         with re3:
             post_stop = st.checkbox("Stop After Cycle", value=bool(config_dict.get('post_exit_stop', False)))
 
+        # EE
         config_dict['UseEarlyExit'] = use_ee
+        config_dict['EEStartHours'] = ee_start_hours
         config_dict['DecayIntervalMins'] = decay_interval
         config_dict['DecayPercentPerInterval'] = decay_pct
+        config_dict['EEAllowLoss'] = ee_allow_loss
+        # Hedge step now in separate row below
+        ee_hedge_row = st.columns(3)
+        with ee_hedge_row[0]:
+            hedge_step = st.number_input("Hedge Step", min_value=1, max_value=10, value=int(config_dict.get('HedgeStartStep', 7)), help="Which Martingale step triggers the hedge trade.")
         config_dict['HedgeStartStep'] = hedge_step
         config_dict['reentry_cooldown_mins'] = reentry_mins
         config_dict['reentry_distance_pct'] = reentry_dist
@@ -897,8 +968,10 @@ def render_edit_form(bot_id):
                 'TakeProfitBase': float(config_dict.get('TakeProfitBase', 10.0)),
                 'TakeProfitPct': float(config_dict.get('TakeProfitPct', 1.0)),
                 'UseEarlyExit': bool(config_dict.get('UseEarlyExit', False)),
+                'EEStartHours': float(config_dict.get('EEStartHours', 2.0)),
                 'DecayIntervalMins': float(config_dict.get('DecayIntervalMins', 15.0)),
                 'DecayPercentPerInterval': float(config_dict.get('DecayPercentPerInterval', 30.0)),
+                'EEAllowLoss': bool(config_dict.get('EEAllowLoss', False)),
                 
                 # Trailing Profit
                 'MaximizeProfit': bool(config_dict.get('MaximizeProfit', False)), # Trailing Switch

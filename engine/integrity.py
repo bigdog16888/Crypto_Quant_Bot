@@ -69,7 +69,12 @@ def flag_unmatched_positions(runner, snapshot: Dict[str, Any]):
     virtual_map = {}  # {norm_pair: {'long': invested_usd, 'short': invested_usd}}
 
     for bot in bots:
-        b_id, b_name, b_pair, b_dir, _, _, b_invested, _, _, _ = bot
+        # Robust access to handle varying column counts from different get_active_bots versions
+        b_id = bot[0]
+        b_name = bot[1]
+        b_pair = bot[2]
+        b_dir = bot[3]
+        b_invested = float(bot[6]) if len(bot) > 6 else 0.0
         pair = normalize_symbol(b_pair)
         direction = b_dir.lower()
         invested = float(b_invested or 0)

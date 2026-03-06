@@ -163,6 +163,37 @@ class StateReconciler:
 
         conn.close() # Close mainly to keep scope clean, we'll reopen for updates
 
+        # 🚀 SELF-HEALING: basket_start_time Recovery
+        # If a bot is actively IN TRADE (total_invested > 0) but basket_start_time=0,
+        # EE decay is permanently silent. Recover the timestamp from the oldest filled order
+        # in this session — this runs every reconciler pass so no restart is ever needed.
+        _heal_conn = get_connection()
+        _heal_cur = _heal_conn.cursor()
+        _healed = 0
+        for _bot_id, _state in bot_states.items():
+            if _state['total_invested'] > 0 and _state['basket_start_time'] == 0:
+                # Try to recover from oldest filled entry order in bot_orders
+                _heal_cur.execute("""
+                    SELECT MIN(created_at) FROM bot_orders 
+                    WHERE bot_id=? AND order_type='entry' AND status IN ('filled','closed')
+                """, (_bot_id,))
+                _row = _heal_cur.fetchone()
+                recovered_ts = (_row[0] if _row and _row[0] else None)
+                if not recovered_ts:
+                    # Fallback: use current time so EE at least starts from now
+                    recovered_ts = int(time.time())
+                _heal_cur.execute(
+                    "UPDATE trades SET basket_start_time=? WHERE bot_id=? AND basket_start_time=0",
+                    (int(recovered_ts), _bot_id)
+                )
+                _state['basket_start_time'] = int(recovered_ts)  # update in-memory too
+                _healed += 1
+                logger.info(f"🩹 [SELF-HEAL] Bot {_bot_id}: basket_start_time recovered to {recovered_ts} (was 0 while in trade — EE now active).")
+        if _healed:
+            _heal_conn.commit()
+        _heal_conn.close()
+
+
         # 2. Scan History per Pair
         since_ts = int((time.time() - (since_hours * 3600)) * 1000)
         
@@ -272,6 +303,24 @@ class StateReconciler:
                                 # MODIFIED: Allow step >= curr_step to recover from "Alzheimer's" repeat-fills
                                 # If the order ID wasn't already marked closed/filled in DB, we MUST credit it.
                                 if step >= curr_step:
+                                    # 🔑 IDEMPOTENCY CHECK: Was this fill already recorded by the WebSocket handler?
+                                    # No time window — for a genuine offline fill, there is NO WS_GRID_FILL entry
+                                    # at all (WS was down too), so this check safely allows offline fills through.
+                                    # For WS-online fills, the WS handler logs WS_GRID_FILL — we skip duplicates
+                                    # regardless of how much time has passed since the WS fill was logged.
+                                    cursor.execute(
+                                        "SELECT COUNT(*) FROM trade_history "
+                                        "WHERE bot_id=? AND ABS(price - ?) < ? AND ABS(amount - ?) < ? "
+                                        "AND action IN ('WS_GRID_FILL','GRID_FILL','WS_ENTRY_FILL')",
+                                        (bot_id, fill_price, fill_price * 0.001, fill_qty, fill_qty * 0.001)
+                                    )
+                                    already_logged = cursor.fetchone()[0] > 0
+                                    if already_logged:
+                                        logger.info(f"⏭️ [OFFLINE-DEDUP] Skipping fill for Bot {bot_id} Step {step} @ {fill_price} x{fill_qty} — already logged by WS handler.")
+                                        # Mark bot_order as filled so reconciler doesn't re-check on next cycle
+                                        cursor.execute("UPDATE bot_orders SET status='filled' WHERE (order_id=? OR client_order_id=?)", (order['id'], cid))
+                                        continue
+                                    
                                     logger.info(f"✅ Re-playing OFFLINE_GRID for Bot {bot_id} (Step {step})")
                                     self._handle_offline_grid_fill(cursor, bot_id, bot_name, fill_price, fill_qty, curr_step, current_state.get('total_invested',0), current_state.get('avg_entry',0), fill_symbol)
                                     stats['grid_fills'] += 1
@@ -691,6 +740,36 @@ class StateReconciler:
                          finally:
                              if 'conn' in locals(): conn.close()
 
+                 # 🚀 SYNC-TO-REALITY: If Virtual > Physical, it's likely over-accumulation (e.g. Double Counting Bug)
+                 elif total_virtual_invested > (total_physical_notional + 50.0):
+                     # Find active bots on this pair that are in trade
+                     active_bots_on_pair = [b for b in bots if b.in_trade]
+                     if len(active_bots_on_pair) == 1:
+                         target_bot = active_bots_on_pair[0]
+                         new_invested = max(total_physical_notional, 0.0)
+                         logger.critical(f"👨‍⚕️ [SYNC-TO-REALITY] Bot {target_bot.name} (ID {target_bot.bot_id}) virtual (${target_bot.total_invested:,.2f}) > physical (${total_physical_notional:,.2f}). SYNCING down to ${new_invested:,.2f}.")
+                         try:
+                             from .database import get_connection
+                             conn = get_connection()
+                             cursor = conn.cursor()
+                             cursor.execute("UPDATE trades SET total_invested = ? WHERE bot_id = ?", (new_invested, target_bot.bot_id))
+                             conn.commit()
+                             
+                             results.append(ReconciliationResult(
+                                 bot_id=target_bot.bot_id,
+                                 bot_name=target_bot.name,
+                                 pair=target_bot.pair,
+                                 action_taken=ReconciliationAction.SYSTEM_FIX_ZOMBIE,
+                                 details=f"Synced to Reality: Diminished virtual invested to ${new_invested:,.2f}.",
+                                 requires_manual_intervention=False
+                             ))
+                         except Exception as e:
+                             logger.error(f"❌ Sync-to-reality failed for Bot {target_bot.bot_id}: {e}")
+                         finally:
+                             if 'conn' in locals(): conn.close()
+                     else:
+                         logger.warning(f"⚠️ [SYNC-TO-REALITY] Cannot auto-sync {pair} because there are {len(active_bots_on_pair)} active bots in trade. Requires manual intervention.")
+
             # ------------------------------------------------------------------
             # CASE D: NET-SUM GHOST DETECTION (Revised Fix #1)
             # ------------------------------------------------------------------
@@ -956,9 +1035,9 @@ class StateReconciler:
             cursor.execute("""
                 UPDATE trades 
                 SET total_invested=0, current_step=0, avg_entry_price=0, 
-                    entry_confirmed=0, basket_start_time=0
+                    entry_confirmed=0, basket_start_time=?
                 WHERE bot_id=?
-            """, (bot_id,))
+            """, (int(time.time()), bot_id))  # 🚀 FUNDAMENTAL FIX: Never set basket_start_time=0. Always stamp reset time so EE fires on next cycle.
             cursor.execute("UPDATE bots SET status='Scanning' WHERE id=?", (bot_id,))
             
             from .database import log_reconciliation
@@ -1007,10 +1086,10 @@ class StateReconciler:
             cursor = conn.cursor()
             cursor.execute("""
                 UPDATE trades 
-                SET total_invested=0, current_step=0, entry_confirmed=0, basket_start_time=0,
+                SET total_invested=0, current_step=0, entry_confirmed=0, basket_start_time=?,
                     avg_entry_price=0, target_tp_price=0
                 WHERE bot_id=?
-            """, (bot.bot_id,))
+            """, (int(time.time()), bot.bot_id))  # 🚀 FUNDAMENTAL FIX: Never set basket_start_time=0. Always stamp reset time so EE fires on next cycle.
             cursor.execute("UPDATE bots SET status='Scanning' WHERE id=?", (bot.bot_id,))
             
             # Also cancel any open internal orders to prevent zombie revival

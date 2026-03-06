@@ -347,7 +347,11 @@ class MartingaleStrategy(BaseStrategy):
     def calculate_take_profit_price(self, bot_status: Dict, current_price: float) -> float:
         avg_price = float(bot_status.get('avg_entry_price', 0))
         if avg_price == 0: avg_price = current_price
-        tp_pct = float(self.params.get('tp_pct', 1.5))
+        # 🚀 HARMONIZED KEYS: Support both UI 'TakeProfitBase' and engine 'tp_pct'
+        tp_pct = float(self.params.get('tp_pct', self.params.get('TakeProfitBase', 1.5)))
+        # 🛡️ SAFETY FLOOR: Prevent 0.0 or negative TP which causes infinite execution
+        tp_pct = max(0.1, tp_pct)
+        
         direction = self.params.get('direction', 'LONG').upper()
         price = avg_price * (1 + tp_pct/100) if direction == 'LONG' else avg_price * (1 - tp_pct/100)
         # 🚀 DYNAMIC ROUNDING
@@ -365,7 +369,11 @@ class MartingaleStrategy(BaseStrategy):
         Returns: (price, explanation_string)
         """
         try:
-            dist_pct = float(self.params.get('grid_dist_pct', 1.0))
+            # 🚀 HARMONIZED KEYS: Support both UI 'StepPct' and engine 'grid_dist_pct'
+            dist_pct = float(self.params.get('grid_dist_pct', self.params.get('StepPct', 1.0)))
+            # 🛡️ SAFETY FLOOR: Prevent 0.0 or negative distance which causes 'Same Price' ordering
+            dist_pct = max(0.1, dist_pct)
+            
             direction = self.params.get('direction', 'LONG').upper()
             base_grid = float(self.params.get('base_grid', 100.0))
             use_atr = self.params.get('UseATRGrid', False)
@@ -380,12 +388,25 @@ class MartingaleStrategy(BaseStrategy):
                      atr_period = int(self.params.get('ATRPeriods', 14))
                      atr_val = iATR(market_data['high'], market_data['low'], market_data['close'], atr_period)
                      atr_factor = float(self.params.get('ATRGridFactor', 1.0))
-                     grid_dist = atr_val * atr_factor
-                     explanation.append(f"ATR({atr_period})={atr_val:.2f} * {atr_factor}")
+                     
+                     # Smart display: use enough decimal places to show a non-zero value
+                     def _fmt(v): return f"{v:.6f}".rstrip('0').rstrip('.') if v < 0.01 else f"{v:.4f}" if v < 1.0 else f"{v:.2f}"
+                     
+                     # Safety floor: if ATR is too small (< 0.01% of price), fall back to price-relative distance
+                     min_atr_floor = current_price * 0.0001  # 0.01% of price
+                     if atr_val <= 0 or atr_val < min_atr_floor:
+                         # Fallback to percentage-relative distance (safe for any price magnitude)
+                         pct_fallback = current_price * (dist_pct / 100.0)
+                         logger.warning(f"ATR({atr_period})={_fmt(atr_val)} below floor ({_fmt(min_atr_floor)}), using {dist_pct}% = {_fmt(pct_fallback)} instead.")
+                         grid_dist = pct_fallback
+                         explanation.append(f"ATR({atr_period})={_fmt(atr_val)} [FLOOR->{dist_pct}%={_fmt(pct_fallback)}]")
+                     else:
+                         grid_dist = atr_val * atr_factor
+                         explanation.append(f"ATR({atr_period})={_fmt(atr_val)} * {atr_factor}")
                  except Exception as e:
                      logger.error(f"ATR Calc failed: {e}")
-                     grid_dist = base_grid # Fallback
-                     explanation.append(f"ATR Fail (Fallback Fixed): {base_grid}")
+                     grid_dist = current_price * (dist_pct / 100.0)  # Safe fallback for any asset
+                     explanation.append(f"ATR Fail (Fallback {dist_pct}%)")
             else:
                  # Standard Percentage or Fixed Pips?
                  # Old logic used 'grid_dist_pct' (Percentage).
@@ -431,7 +452,8 @@ class MartingaleStrategy(BaseStrategy):
                  is_invalid = True # Sell Order BELOW Market → use recovery
             
             if is_invalid:
-                logger.info(f"📐 Gap Recovery: Grid {price:.2f} crossed Market {current_price:.2f}. Placing at better price.")
+                def _p(v): return f"{v:.6f}".rstrip('0').rstrip('.') if v < 1.0 else f"{v:.4f}" if v < 10.0 else f"{v:,.2f}"
+                logger.info(f"📐 Gap Recovery: Grid {_p(price)} crossed Market {_p(current_price)}. Placing at better price.")
                 if direction == 'LONG':
                     price = current_price - final_dist
                 else:
@@ -441,7 +463,9 @@ class MartingaleStrategy(BaseStrategy):
             # 🚀 DYNAMIC ROUNDING
             final_price = round(price, self.price_precision)
             
-            explain_str = f"Grid: {' | '.join(explanation)} -> Dist {final_dist:.2f}"
+            # Smart distance display: show enough decimals so it never reads 0.00
+            def _fmt_dist(v): return f"{v:.6f}".rstrip('0').rstrip('.') if v < 0.01 else f"{v:.4f}" if v < 1.0 else f"{v:.2f}"
+            explain_str = f"Grid: {' | '.join(explanation)} -> Dist {_fmt_dist(final_dist)}"
             return final_price, explain_str
 
         except Exception as e:

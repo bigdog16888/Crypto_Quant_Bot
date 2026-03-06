@@ -16,6 +16,15 @@ from engine.ws_cache import get_ws_cache
 
 logger = logging.getLogger("WSEventHandlers")
 
+# Deduplication set for notifications
+_notified_fills = set()
+_notified_fills_timestamps = {}
+_notified_fills_max_size = 10000
+
+# Per-order partial fill tracker: {f"{bot_id}_{order_id}": last_cumulative_filled_qty}
+# Computes the INCREMENTAL fill on each PARTIALLY_FILLED event to avoid double-counting.
+_partial_fill_tracker: Dict[str, float] = {}
+
 
 def handle_order_update(event: Dict):
     """
@@ -77,9 +86,28 @@ def handle_order_update(event: Dict):
         status_upper = status.upper() if status else ""
         
         if status_upper in ['FILLED', 'CLOSED']:
+            # Final fill — clean up partial tracker and calculate final incremental piece
+            tracker_key = f"{bot_id}_{order_id}"
+            cumulative_filled = float(event.get('filled_qty', 0) or 0)
+            prev_filled = _partial_fill_tracker.pop(tracker_key, 0.0)
+            incremental_qty = cumulative_filled - prev_filled
+            
+            # Pass incremental quantity so _handle_order_filled doesn't double-count
+            event['incremental_qty'] = incremental_qty
+            
             _handle_order_filled(bot_id, order_type, event)
+
+        elif status_upper == 'PARTIALLY_FILLED':
+            _handle_order_partial_fill(bot_id, order_type, event)
+
         elif status_upper in ['CANCELED', 'CANCELLED', 'EXPIRED', 'REJECTED']:
+            # Order cancelled after partial fill — clean tracker, keep what was already accumulated
+            tracker_key = f"{bot_id}_{order_id}"
+            prev_qty = _partial_fill_tracker.pop(tracker_key, 0.0)
+            if prev_qty > 0:
+                logger.info(f"📋 WS Cancel after partial fill: Bot {bot_id} {order_type} had {prev_qty:.6f} already accumulated")
             _handle_order_canceled(bot_id, order_type, event)
+
         elif status_upper == 'NEW':
             _handle_order_new(bot_id, order_type, event)
             
@@ -99,9 +127,6 @@ def handle_order_update(event: Dict):
 
 
 # Module-level set to track notified order fills (prevents duplicates)
-_notified_fills = set()
-_notified_fills_max_size = 10000  # Prevent unbounded growth
-_notified_fills_timestamps = {} # For rate limiting specific notification types
 
 def _cleanup_notified_fills():
     """Cleanup notified fills set if it grows too large."""
@@ -110,6 +135,70 @@ def _cleanup_notified_fills():
         # Keep most recent 50%, clear old ones
         logger.info(f"🧹 Cleaning up notified_fills set (size: {len(_notified_fills)})")
         _notified_fills = set(list(_notified_fills)[-5000:])
+
+def _handle_order_partial_fill(bot_id: int, order_type: str, event: Dict):
+    """
+    Handle PARTIALLY_FILLED events for ENTRY, GRID, and TP orders.
+
+    ENTRY/GRID: Accumulate the incremental filled portion into total_invested.
+    TP: Log and update the bot_order record so the system knows true remaining qty.
+
+    Uses _partial_fill_tracker to compute incremental fills, so multiple partial
+    events for the same order don't double-count.
+    """
+    order_id = event.get('order_id')
+    avg_price = float(event.get('avg_price', 0) or 0)
+    cumulative_filled = float(event.get('filled_qty', 0) or 0)  # total filled so far
+    symbol = event.get('symbol')
+
+    if avg_price <= 0 or cumulative_filled <= 0:
+        return
+
+    tracker_key = f"{bot_id}_{order_id}"
+    prev_filled = _partial_fill_tracker.get(tracker_key, 0.0)
+    incremental_qty = cumulative_filled - prev_filled
+
+    if incremental_qty <= 1e-9:
+        # No new fill since last event — ignore
+        return
+
+    _partial_fill_tracker[tracker_key] = cumulative_filled
+    logger.info(f"⚡ WS PARTIAL FILL: Bot {bot_id} {order_type} +{incremental_qty:.6f} @ {avg_price} (total so far: {cumulative_filled:.6f})")
+
+    if order_type in ('ENTRY', 'GRID'):
+        # Accumulate the incremental portion into trade state
+        # We pass is_entry=True only on ENTRY type so basket_start_time is set
+        try:
+            from engine.database import accumulate_trade_fill, log_trade, update_order_fill
+            accumulate_trade_fill(
+                bot_id=bot_id,
+                added_invested=avg_price * incremental_qty,
+                added_qty=incremental_qty,
+                avg_price=avg_price,
+                new_step=None,   # Don't increment step mid-fill; final FILLED event will set it
+                tp_price=None,
+                is_entry=(order_type == 'ENTRY')
+            )
+            log_trade(bot_id, f'WS_{order_type}_PARTIAL', symbol, avg_price, incremental_qty,
+                      avg_price * incremental_qty, order_type)
+            # 🚀 PERSIST partial progress for UI
+            update_order_fill(order_id, cumulative_filled, bot_id=bot_id)
+        except Exception as e:
+            logger.error(f"Failed to accumulate partial fill for bot {bot_id}: {e}")
+
+    elif order_type == 'TP':
+        # TP partial fill: the position is being reduced. Log it for audit.
+        # The bot doesn't reset until the full TP fills. We just track it.
+        try:
+            from engine.database import log_trade, update_order_fill
+            log_trade(bot_id, 'WS_TP_PARTIAL', symbol, avg_price, incremental_qty,
+                      0.0, 'TP_PARTIAL')
+            logger.info(f"📋 WS TP Partial: Bot {bot_id} sold {incremental_qty:.6f} @ {avg_price}. Waiting for full fill.")
+            # 🚀 PERSIST partial progress for UI
+            update_order_fill(order_id, cumulative_filled, bot_id=bot_id)
+        except Exception as e:
+            logger.error(f"Failed to log TP partial for bot {bot_id}: {e}")
+
 
 def _handle_order_filled(bot_id: int, order_type: str, event: Dict):
     """Process a filled order - update trade state."""
@@ -121,11 +210,14 @@ def _handle_order_filled(bot_id: int, order_type: str, event: Dict):
     
     order_id = event.get('order_id')
     avg_price = event.get('avg_price', 0)
-    filled_qty = event.get('filled_qty', 0)
+    
+    # 🚀 FUNDAMENTAL FIX: Use incremental_qty to avoid double-counting if there were partial fills
+    filled_qty = event.get('incremental_qty', event.get('filled_qty', 0))
+    
     realized_pnl = event.get('realized_pnl', 0)
     symbol = event.get('symbol')
     
-    logger.info(f"🎯 WS FILL: Bot {bot_id} {order_type} filled @ {avg_price} (PnL: ${realized_pnl:.2f})")
+    logger.info(f"🎯 WS FILL: Bot {bot_id} {order_type} filled @ {avg_price} (Qty: {filled_qty:.6f}, PnL: ${realized_pnl:.2f})")
     logger.info(f"🔍 [DIAG-NOTIFICATION] About to add notification for {order_type} fill")
     
     # DEDUPLICATION: Check if we already notified for this order

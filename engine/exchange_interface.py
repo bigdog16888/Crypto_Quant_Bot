@@ -24,6 +24,8 @@ class ExchangeInterface:
     _exchange_info_cache: Dict[str, Any] = {}
     _exchange_info_loaded = False
     _exchange_info_lock = threading.Lock()
+    _hybrid_mode_logged = False
+
 
     def __init__(self, market_type='future'):
         self.logger = logging.getLogger(f"ExchangeInterface.{market_type}")
@@ -64,7 +66,9 @@ class ExchangeInterface:
             if not hasattr(exchange, 'urls'): exchange.urls = {'api': {}}
             exchange.urls['api']['fapiPublic'] = f"{base_url}/fapi/v1"
             exchange.urls['api']['fapi'] = base_url
-            self.logger.warning(f"🛡️ HYBRID RAW MODE ACTIVE (Demo FAPI)")
+            if not ExchangeInterface._hybrid_mode_logged:
+                self.logger.warning(f"🛡️ HYBRID RAW MODE ACTIVE (Demo FAPI)")
+                ExchangeInterface._hybrid_mode_logged = True
             
         return exchange
 
@@ -210,7 +214,13 @@ class ExchangeInterface:
             anon = self._get_anon_exchange()
             return anon.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         except Exception as e:
-            self.logger.error(f"OHLCV Error for {symbol}: {e}")
+            err_msg = str(e)
+            # If it's a JSON decoding error (truncated response), log it as a warning instead of error to reduce alarm
+            if "Expecting" in err_msg or "JSON" in err_msg:
+                self.logger.warning(f"⚠️ OHLCV JSON Error for {symbol} (intermittent): {err_msg[:60]}...")
+            else:
+                self.logger.error(f"OHLCV Error for {symbol}: {e}")
+            return []
     def get_available_symbols(self, quote_asset: str = 'USDT') -> List[str]:
         """Returns a list of available symbols for the given quote asset."""
         try:

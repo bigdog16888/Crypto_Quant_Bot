@@ -8,6 +8,20 @@ from engine.metrics import export_trade_history
 def render_analytics_view():
     st.header("📈 Performance Analytics")
     
+    st.sidebar.markdown("### ⚙️ Analytics Settings")
+    initial_equity = st.sidebar.number_input("Starting Equity ($)", min_value=0.0, value=0.0, step=100.0, help="Base value for plotting the absolute Equity Curve.")
+    
+    if st.sidebar.button("🗑️ Wipe Trade History", type="secondary", help="Irreversibly deletes all historical trades (PnL data) from the database."):
+        try:
+            conn = get_connection()
+            conn.execute("DELETE FROM trade_history")
+            conn.commit()
+            conn.close()
+            st.sidebar.success("✅ Trade history cleared!")
+            st.rerun()
+        except Exception as e:
+            st.sidebar.error(f"Reset failed: {e}")
+    
     # --- Data Fetching ---
     try:
         conn = get_connection()
@@ -56,7 +70,7 @@ def render_analytics_view():
     # Ensure pnl is numeric (handle any string values from DB)
     df['pnl'] = pd.to_numeric(df['pnl'], errors='coerce').fillna(0.0)
     
-    df['cumulative_pnl'] = df['pnl'].cumsum()
+    df['cumulative_pnl'] = initial_equity + df['pnl'].cumsum()
     
     # --- KPI Cards ---
     total_trades = len(df)
@@ -80,7 +94,20 @@ def render_analytics_view():
 
     # --- Charts ---
     st.subheader("Equity Curve (Realized PnL)")
-    fig_equity = px.line(df, x='datetime', y='cumulative_pnl', markers=True, title='Account Growth')
+    
+    # Prepend a starting plot point so the graph originates at the Initial Equity
+    if not df.empty:
+        start_time = df['datetime'].iloc[0] - pd.Timedelta(minutes=5)
+        start_row = pd.DataFrame([{'datetime': start_time, 'cumulative_pnl': initial_equity, 'pnl': 0}])
+        df_chart = pd.concat([start_row, df[['datetime', 'cumulative_pnl', 'pnl']]], ignore_index=True)
+    else:
+        df_chart = df
+        
+    fig_equity = px.line(df_chart, x='datetime', y='cumulative_pnl', markers=True, title='Absolute Account Growth')
+    
+    # Add a horizontal dotted line indicating the Starting Equity baseline
+    fig_equity.add_hline(y=initial_equity, line_dash="dot", annotation_text="Starting Equity", annotation_position="bottom right")
+    
     st.plotly_chart(fig_equity, width='stretch')
     
     col_c1, col_c2 = st.columns(2)

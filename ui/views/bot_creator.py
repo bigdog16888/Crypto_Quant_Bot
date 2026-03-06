@@ -414,7 +414,7 @@ def render_bot_creator_view():
             
             st.divider()
 
-        with st.expander("Risk Management (Grid & Safety)", expanded=False):
+        with st.expander("📐 Grid & Martingale Settings", expanded=True):
             st.subheader("Grid Spacing Logic")
             
             # Consolidated Grid Logic
@@ -464,6 +464,8 @@ def render_bot_creator_view():
                      bot_config['GridMultiplier'] = st.number_input("Spacing Multiplier", value=1.1, step=0.05, min_value=0.1, help="> 1.0 expands grid (classic). < 1.0 tightens grid (aggressive).")
                 else:
                      bot_config['GridMultiplier'] = 1.0
+                
+                bot_config['UseVolSizing'] = st.checkbox("Volatility Position Sizing", value=False, help="Adjusts lot size based on ATR (High Vol = Smaller Size).")
 
             st.divider()
             
@@ -518,13 +520,22 @@ def render_bot_creator_view():
             
         with st.expander("Trade Management (Exit & Hedge)", expanded=False):
             st.subheader("Accelerated Early Exit (Smart Decay)")
+            st.caption("Gradually moves the TP toward break-even over time to exit stale trades.")
             bot_config['UseEarlyExit'] = st.checkbox("Enable Early Exit", value=True)
-            col_ee1, col_ee2 = st.columns(2)
+            col_ee1, col_ee2, col_ee3, col_ee4 = st.columns(4)
             with col_ee1:
-                bot_config['DecayIntervalMins'] = st.number_input("Decay Interval (Mins)", value=15.0)
+                bot_config['EEStartHours'] = st.number_input("Start After (Hours)", value=2.0, min_value=0.0, step=0.5,
+                    help="How many hours after entry before decay begins. 0 = start immediately.")
             with col_ee2:
-                bot_config['DecayPercentPerInterval'] = st.number_input("Reduction (%) per Interval", value=30.0)
-            
+                bot_config['DecayIntervalMins'] = st.number_input("Decay Every (Mins)", value=15.0, min_value=1.0,
+                    help="How often the TP is reduced.")
+            with col_ee3:
+                bot_config['DecayPercentPerInterval'] = st.number_input("Reduction (%) per Interval", value=30.0, min_value=1.0,
+                    help="How much of the remaining profit gap is cut each interval.")
+            with col_ee4:
+                bot_config['EEAllowLoss'] = st.checkbox("Allow Loss Exit", value=False,
+                    help="If checked, TP can decay past break-even (exit at a small loss to free capital).")
+
             st.subheader("Moving Profit")
             bot_config['MaximizeProfit'] = st.checkbox("Use Moving Profit Target", value=False)
             bot_config['ProfitSet'] = st.slider("Profit Set % (Lock in)", 0.1, 0.9, 0.5)

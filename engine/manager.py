@@ -55,9 +55,20 @@ def calculate_early_exit_decay(
     # Calculate Decay Factor (1.0 = No Decay, 0.0 = Full Decay to BE)
     decay_factor = 1.0 - ee_pc
     
-    allow_loss = settings.get('EEAllowLoss', False)
-    if not allow_loss and decay_factor < 0:
-        decay_factor = 0.0 # Floor at BreakEven
+    allow_loss = str(settings.get('EEAllowLoss', 'False')).lower() == 'true'
+    if not allow_loss:
+        # Cap decay_factor at 0.0 (Break-Even) if losses are not allowed
+        if decay_factor < 0.0:
+            decay_factor = 0.0
+    else:
+        # If losses are allowed, decay_factor can go below 0,
+        # moving the TP past break-even into a loss.
+        # But we shouldn't let it decay infinitely.
+        # Let's cap the maximum loss at the Initial TP distance.
+        # i.e. Decay factor goes from 1.0 (TP) -> 0.0 (BE) -> -1.0 (Loss equal to TP distance)
+        max_decay = -1.0 
+        if decay_factor < max_decay:
+            decay_factor = max_decay
     
     # New TP is weighted average of InitialTP and BE
     # Logic: NewTP = BE + (InitialTP - BE) * DecayFactor
@@ -362,6 +373,17 @@ def manage_trade(bot_id, bot_name, pair, direction, settings, trade_data, curren
         effective_tp = calculate_early_exit_decay(
             start_dt, now_dt, current_step + 1, target_tp_price, avg_entry_price, settings
         )
+        # ✅ Write EE-adjusted TP back to DB so bot_executor can detect drift and move the exchange order
+        if abs(effective_tp - target_tp_price) / max(target_tp_price, 0.0001) > 0.001:  # >0.1% change
+            try:
+                from engine.database import get_connection
+                _conn = get_connection()
+                _conn.execute("UPDATE trades SET target_tp_price=? WHERE bot_id=?", (effective_tp, bot_id))
+                _conn.commit()
+                _conn.close()
+                logger.debug(f"[EE] Updated target_tp_price for bot {bot_id}: {target_tp_price:.4f} -> {effective_tp:.4f}")
+            except Exception as _e:
+                logger.warning(f"[EE] Failed to update target_tp_price: {_e}")
 
     # 6. Evaluate TP Trigger
     tp_hit = False

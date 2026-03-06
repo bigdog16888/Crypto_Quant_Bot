@@ -795,8 +795,13 @@ class BotRunner:
                              relevant_bots_for_mt = [b for b in bots if config.MARKET_TYPE == mt]
     
                         for bot in relevant_bots_for_mt:
-                            b_id, b_name, b_pair, b_direction, _, _, b_invested, b_step, _, _ = bot
-                            if float(b_invested or 0) <= 0:
+                            # Use index access — safe regardless of how many columns get_active_bots() returns
+                            b_id      = bot[0]
+                            b_name    = bot[1]
+                            b_pair    = bot[2]
+                            b_direction = bot[3]
+                            b_invested = float(bot[6] or 0)  # col 6 = total_invested
+                            if b_invested <= 0:
                                 continue
                             
                             # Check if exchange has any position for this pair
@@ -913,13 +918,10 @@ class BotRunner:
         # DISABLE CIRCUIT BREAKER FOR DEBUGGING (False Positives on Testnet)
         # self.check_circuit_breaker(exchange_snapshot=exchange_snapshot)
         
-        if os.path.exists(config.PATHS["EMERGENCY_FILE"]):
-            self.handle_emergency_liquidation()
-            self.running = False
-            return False
-        if os.path.exists(config.PATHS["STOP_FILE"]):
-            self.running = False
-            return False
+        # Signal file checks are handled in the main while loop in __main__.
+        # Keeping a lightweight in-cycle check here as a secondary safety net.
+        if os.path.exists(config.PATHS["EMERGENCY_FILE"]) or os.path.exists(config.PATHS["STOP_FILE"]):
+            return False  # Main loop will handle the file cleanup and liquidation
 
         # 3. Process Bots
         # Update workers size
@@ -1144,8 +1146,31 @@ if __name__ == "__main__":
     
     while runner.running:
         try:
+            # ── SIGNAL FILE CHECKS (checked every cycle) ─────────────────────
+            # These files are written by the Streamlit UI sidebar buttons.
+            # Without these checks, Stop Monitoring and Emergency Close All are
+            # completely non-functional — the engine never sees them.
+            if os.path.exists(EMERGENCY):
+                logger.critical("🚨 EMERGENCY LIQUIDATION SIGNAL received. Closing all positions...")
+                os.remove(EMERGENCY)
+                try:
+                    runner.handle_emergency_liquidation()
+                    logger.critical("✅ Emergency liquidation complete.")
+                except Exception as _em_err:
+                    logger.critical(f"Emergency liquidation failed: {_em_err}")
+                runner.running = False
+                break
+
+            if os.path.exists(STOP):
+                logger.info("🛑 STOP signal received. Shutting down gracefully...")
+                os.remove(STOP)
+                runner.running = False
+                break
+            # ─────────────────────────────────────────────────────────────────
+
             # Periodic Cache Cleanup (Every 60s)
             now = time.time()
+
             if now - last_cleanup > 60:
                 cleanup_caches()
                 last_cleanup = now
