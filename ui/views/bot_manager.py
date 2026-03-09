@@ -59,6 +59,24 @@ def render_bot_manager_view():
         return
         
     st.markdown("### 📈 Active Inventory")
+    
+    # Global Controls
+    st.markdown("##### 🌍 Global Controls")
+    g_cols = st.columns([1, 1, 2])
+    with g_cols[0]:
+        if st.button("🛑 Set Stop After Cycle (All Active)", key="global_stop_cycle_on"):
+            from engine.trading_controls import update_all_bots_stop_cycle
+            if update_all_bots_stop_cycle(True):
+                st.success("Global Stop After Cycle ENABLED for all active bots.")
+                st.rerun()
+    with g_cols[1]:
+        if st.button("▶️ Clear Stop After Cycle (All Active)", key="global_stop_cycle_off"):
+            from engine.trading_controls import update_all_bots_stop_cycle
+            if update_all_bots_stop_cycle(False):
+                st.success("Global Stop After Cycle DISABLED for all active bots.")
+                st.rerun()
+                
+    st.divider()
 
     # Header Row
     cols = st.columns([0.5, 1.5, 1.5, 1.5, 2, 2, 2, 2])

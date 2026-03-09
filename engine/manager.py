@@ -43,7 +43,7 @@ def calculate_early_exit_decay(
         
     # 2. Accelerated Interval-based decay (User Style: 30% per 15 mins)
     if decay_per_interval > 0:
-        intervals_passed = duration_mins / interval_mins
+        intervals_passed = math.floor(duration_mins / interval_mins)
         ee_pc += intervals_passed * decay_per_interval
         
     # 3. Level-based decay
@@ -318,8 +318,6 @@ def _perform_tp_self_healing(bot_id, bot_name, direction, avg_entry_price, total
 
 def manage_trade(bot_id, bot_name, pair, direction, settings, trade_data, current_price, strategy, exchange_interface, open_orders=None):
     """Refactored core trade management logic."""
-    import logging
-    from engine.risk_manager import check_drawdown_reduction
     logger = logging.getLogger("TradeManager")
 
     # 1. Unpack & Validate Trade Data
@@ -493,41 +491,12 @@ def manage_trade(bot_id, bot_name, pair, direction, settings, trade_data, curren
     }
 
 
-    # 3. Check Hedge
-    drawdown_pc = 0.0
-    if avg_entry_price > 0:
-        if direction == 'LONG':
-            drawdown_pc = (avg_entry_price - current_price) / avg_entry_price * 100
-        else:
-            drawdown_pc = (current_price - avg_entry_price) / avg_entry_price * 100
-
-    hedge_trigger = check_hedge_entry(drawdown_pc, current_step, settings)
-    if hedge_trigger:
-        hedge_size = total_invested * hedge_trigger.get('size_mult', 1.0)
-        logger.warning(f"🛡️ Bot {bot_name} - HEDGE TRIGGERED! Size: ${hedge_size} at {current_price}")
-        
-        # MISSION: OPEN HEDGE
-        return {
-            'action': 'hedge_open',
-            'bot_id': bot_id,
-            'bot_name': bot_name,
-            'pair': pair,
-            'direction': direction,
-            'price': current_price,
-            'amount_usd': hedge_size,
-            'qty': hedge_size / current_price if current_price > 0 else 0,
-            'step': current_step,
-            'drawdown_pct': drawdown_pc
-        }
-
-    return {'action': 'none'}
 
 def emergency_close_all(exchange_interface, bots_in_trouble):
     """
     Kills all orders and closes all positions for specified bots.
     If bots_in_trouble is empty, it should close EVERYTHING.
     """
-    import logging
     logger = logging.getLogger(__name__)
     logger.warning("🚨 EMERGENCY CLOSE TRIGGERED 🚨")
     

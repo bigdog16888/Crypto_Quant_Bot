@@ -6,6 +6,7 @@ import math
 import os
 import traceback
 from typing import Optional, Dict, Any, List, Tuple
+from datetime import datetime
 
 from engine.database import (
     get_bot_status,
@@ -21,6 +22,7 @@ from engine.database import (
 )
 from engine.exchange_interface import ExchangeInterface, normalize_symbol, normalize_market_type
 from engine.strategies.martingale_strategy import MartingaleStrategy
+from engine.manager import calculate_early_exit_decay
 from config.settings import config
 
 logger = logging.getLogger("BotExecutor")
@@ -102,6 +104,102 @@ class BotExecutor:
                 logger.info(f"🔄 [{label}] Retrying {pair} {side} @ {retry_price:.4f} (bid={bid:.4f} ask={ask:.4f})")
                 return exchange.create_order(pair, 'limit', side, amount, retry_price, params=params)
             raise  # Re-raise if it's a different error
+
+    # ---------------------------------------------------------------------------
+    # Private helpers — single canonical implementations shared across methods
+    # ---------------------------------------------------------------------------
+
+    @staticmethod
+    def _get_order_amount(order: dict) -> float:
+        """Safe multi-key accessor for order quantity.
+        CCXT live orders use 'amount', DB-cached orders may use 'origQty' or 'qty'."""
+        return float(order.get('amount') or order.get('origQty') or order.get('qty') or 0)
+
+    def _compute_effective_tp(self, bot_id: int, name: str, bot_status: dict,
+                               bot_config: dict, strategy) -> float:
+        """Return the effective TP price after Early Exit decay, persisting any change to DB.
+        Falls back to the raw DB value if EE is disabled or calculation fails."""
+        raw_db_tp = float(bot_status.get('target_tp_price', 0))
+        if not (bot_config.get('UseEarlyExit', False) and bot_status.get('basket_start_time', 0) > 0):
+            return raw_db_tp
+        try:
+            original_tp = strategy.calculate_take_profit_price(
+                bot_status, bot_status.get('avg_entry_price', 0)
+            )
+            start_dt = datetime.fromtimestamp(bot_status['basket_start_time'])
+            now_dt   = datetime.fromtimestamp(time.time())
+            decayed_tp = calculate_early_exit_decay(
+                start_dt, now_dt,
+                bot_status.get('current_step', 0) + 1,
+                original_tp,
+                bot_status.get('avg_entry_price', original_tp),
+                bot_config
+            )
+            if abs(decayed_tp - raw_db_tp) / max(raw_db_tp, 0.0001) > 0.0001:
+                logger.info(f"⏳ [EE-DECAY] {name}: TP decaying {raw_db_tp:.4f} → {decayed_tp:.4f} (Baseline: {original_tp:.4f})")
+                try:
+                    _c = get_connection()
+                    _c.execute("UPDATE trades SET target_tp_price=? WHERE bot_id=?", (decayed_tp, bot_id))
+                    _c.commit()
+                    _c.close()
+                except Exception as _db_err:
+                    logger.warning(f"[EE] Failed to persist decayed TP: {_db_err}")
+                return decayed_tp
+        except Exception as _err:
+            logger.warning(f"[EE] Decay calculation failed for {name}: {_err}")
+        return raw_db_tp
+
+    def _sync_replace_tp(self, bot_id: int, name: str, pair: str, direction: str,
+                          bot_status: dict, exchange: ExchangeInterface,
+                          db_tp: float, db_qty: float,
+                          existing_tp_order: dict) -> Optional[dict]:
+        """Cancel the out-of-date TP order and place a fresh one at db_tp / db_qty.
+        Automatically applies reduceOnly when this bot is the sole active bot on the pair.
+        Returns the new order dict, or None on failure."""
+        try:
+            # Determine reduceOnly — only when sole bot on this pair
+            try:
+                _c2 = get_connection()
+                _cur2 = _c2.cursor()
+                _cur2.execute(
+                    "SELECT COUNT(*) FROM bots b JOIN trades t ON b.id=t.bot_id "
+                    "WHERE b.pair=? AND t.total_invested>0 AND b.id!=?",
+                    (pair, bot_id)
+                )
+                should_reduce = (_cur2.fetchone()[0] == 0)
+                _c2.close()
+            except Exception:
+                should_reduce = False
+
+            tp_order_id = existing_tp_order.get('order_id', existing_tp_order.get('id'))
+            exchange.cancel_order(tp_order_id, pair)
+            update_order_status(tp_order_id, 'cancelled', bot_id=bot_id)
+
+            if db_qty <= 0 or db_tp <= 0 or config.DRY_RUN:
+                return None
+
+            side = 'sell' if direction == 'LONG' else 'buy'
+            valid, db_qty, db_tp, msg = exchange.validate_order(pair, side, db_qty, db_tp)
+            if not valid:
+                logger.warning(f"[TP-SYNC] {name}: Validation failed — {msg}")
+                return None
+
+            client_order_id = self._generate_deterministic_id(bot_id, 'TP', bot_status['current_step'])
+            tp_params = {'clientOrderId': client_order_id, 'postOnly': True, 'timeInForce': 'GTX'}
+            if should_reduce:
+                tp_params['reduceOnly'] = True
+
+            order = self._place_gtx_order_with_retry(
+                exchange, pair, side, db_qty, db_tp, params=tp_params, label=f"{name}-TP-SYNC"
+            )
+            if order:
+                save_bot_order(bot_id, 'tp', order['id'], db_tp, db_qty,
+                               bot_status['current_step'], 'open', client_order_id=client_order_id)
+                logger.info(f"✅ [SYNC] {name}: Re-placed TP @ {db_tp:.4f} Qty {db_qty:.4f}")
+            return order
+        except Exception as _ex:
+            logger.error(f"❌ [SYNC] {name}: Failed to replace TP: {_ex}")
+            return None
 
     def process_bot(self, bot_data: Tuple, exchange_snapshot: Dict[str, Any]) -> Tuple[Optional[float], Optional[Dict[str, Any]]]:
         # Robust index-based access to handle potential schema/unpacking mismatches
@@ -270,7 +368,6 @@ class BotExecutor:
 
 
                 logger.error(f"Error in decide_action: {e}")
-                import traceback
                 logger.error(traceback.format_exc())
                 mission = None
 
@@ -550,6 +647,18 @@ class BotExecutor:
                         if order:
                             save_bot_order(bot_id, 'tp', order['id'], tp_price, tp_amount, bot_status['current_step'], 'open', client_order_id=client_order_id)
                             logger.info(f"✅ {name}: Placed TP order for {pair} @ {tp_price} (ID: {order['id']})")
+                            
+                            # 🚀 GAP RECOVERY FIX: Sync the reconstructed live TP back to trades.target_tp_price
+                            try:
+                                from engine.database import get_connection
+                                _upd_conn = get_connection()
+                                _upd_conn.execute("UPDATE trades SET target_tp_price=? WHERE bot_id=?", (tp_price, bot_id))
+                                _upd_conn.commit()
+                                _upd_conn.close()
+                                bot_status['target_tp_price'] = tp_price # update local memory too
+                            except Exception as _sync_err:
+                                logger.warning(f"Failed to sync reconstructed TP to DB for {name}: {_sync_err}")
+
                             existing_tp_order = order # 🚀 FIXED: Assign to memory so Step 4 doesn't delete it
                             update_bot_error(bot_id, None) # Clear any previous error
                     except Exception as e:
@@ -557,85 +666,22 @@ class BotExecutor:
                         logger.error(f"❌ {name}: Error placing TP order for {pair}: {error_msg}")
                         update_bot_error(bot_id, f"TP Order Error: {error_msg}")
 
-        # 2b. EE/SYNC DRIFT CHECK: If we have a TP order but it's at the wrong price or wrong quantity
+        # 2b. EE/SYNC DRIFT CHECK: existing TP at wrong price or qty
         elif existing_tp_order and bot_status.get('total_invested', 0) > 0:
-            # --- EARLY EXIT DECAY (wired into live execution) ---
-            raw_db_tp = float(bot_status.get('target_tp_price', 0))
-            db_tp = raw_db_tp
-            
-            if bot_config.get('UseEarlyExit', False) and bot_status.get('basket_start_time', 0) > 0:
-                try:
-                    from engine.manager import calculate_early_exit_decay
-                    from datetime import datetime
-                    
-                    # 🚀 FUNDAMENTAL FIX: Use the stable "Strategy TP" as the baseline, not the already-decayed DB TP.
-                    # This prevents the "Recursive Decay" trap where TP stalls near BE.
-                    original_tp = strategy.calculate_take_profit_price(
-                        bot_status,
-                        bot_status.get('avg_entry_price', 0)
-                    )
-                    
-                    start_dt = datetime.fromtimestamp(bot_status['basket_start_time'])
-                    now_dt = datetime.fromtimestamp(time.time())
-                    
-                    decayed_tp = calculate_early_exit_decay(
-                        start_dt, now_dt,
-                        bot_status.get('current_step', 0) + 1,
-                        original_tp,
-                        bot_status.get('avg_entry_price', original_tp),
-                        bot_config
-                    )
-                    
-                    # If the decayed TP shifted from what's currently in the DB
-                    if abs(decayed_tp - raw_db_tp) / max(raw_db_tp, 0.0001) > 0.0001:
-                        logger.info(f"⏳ [EE-DECAY] {name}: TP decaying {raw_db_tp:.4f} → {decayed_tp:.4f} (Baseline: {original_tp:.4f})")
-                        db_tp = decayed_tp
-                        # Write decayed TP back to DB so reconciler and UI see it
-                        try:
-                            _conn = get_connection()
-                            _conn.execute("UPDATE trades SET target_tp_price=? WHERE bot_id=?", (decayed_tp, bot_id))
-                            _conn.commit()
-                            _conn.close()
-                        except Exception as _ee_db_err:
-                            logger.warning(f"[EE] Failed to persist decayed TP: {_ee_db_err}")
-                except Exception as _ee_err:
-                    logger.warning(f"[EE] Decay calculation failed for {name}: {_ee_err}")
-                    db_tp = raw_db_tp
-            else:
-                db_tp = raw_db_tp
-            exchange_tp = float(existing_tp_order.get('price', existing_tp_order.get('stopPrice', 0)) or 0)
-
-            
-            # Recalculate expected quantity to check for sync drift
+            db_tp  = self._compute_effective_tp(bot_id, name, bot_status, bot_config, strategy)
             db_qty = strategy.calculate_take_profit_amount(bot_status, current_price, pair, exchange)
-            exchange_qty = float(existing_tp_order.get('amount', 0))
-            
+            exchange_tp  = float(existing_tp_order.get('price') or existing_tp_order.get('stopPrice') or 0)
+            exchange_qty = self._get_order_amount(existing_tp_order)
+
             if db_tp > 0 and exchange_tp > 0:
-                tp_drift_pct = abs(db_tp - exchange_tp) / db_tp
+                tp_drift_pct  = abs(db_tp  - exchange_tp)  / db_tp
                 qty_drift_pct = abs(db_qty - exchange_qty) / max(db_qty, 0.0001)
-                
-                # Move if price drifted > 0.001% (to catch precision updates) OR quantity drifted > 1%
-                if tp_drift_pct > 0.00001 or qty_drift_pct > 0.01:
-                    drift_reason = f"price {tp_drift_pct*100:.4f}%" if tp_drift_pct > 0.00001 else f"qty {qty_drift_pct*100:.2f}%"
-                    logger.info(f"🔄 [SYNC-DRIFT] {name}: TP drifted by {drift_reason}. (Target={db_tp:.4f}, Qty={db_qty:.4f}). Replacing.")
-                    try:
-                        tp_order_id = existing_tp_order.get('order_id', existing_tp_order.get('id'))
-                        exchange.cancel_order(tp_order_id, pair)
-                        update_order_status(tp_order_id, 'cancelled', bot_id=bot_id)
-                        existing_tp_order = None  # Force re-place
-                        
-                        if db_qty > 0 and db_tp > 0 and not config.DRY_RUN:
-                            side = 'sell' if direction == 'LONG' else 'buy'
-                            valid, db_qty, db_tp, msg = exchange.validate_order(pair, side, db_qty, db_tp)
-                            if valid:
-                                client_order_id = self._generate_deterministic_id(bot_id, 'TP', bot_status['current_step'])
-                                order = self._place_gtx_order_with_retry(exchange, pair, side, db_qty, db_tp, params={'clientOrderId': client_order_id, 'postOnly': True, 'timeInForce': 'GTX'}, label=f"{name}-TP-SYNC")
-                                if order:
-                                    save_bot_order(bot_id, 'tp', order['id'], db_tp, db_qty, bot_status['current_step'], 'open', client_order_id=client_order_id)
-                                    logger.info(f"✅ [SYNC] {name}: Re-placed TP @ {db_tp:.4f} Qty {db_qty:.4f}")
-                                    existing_tp_order = order
-                    except Exception as e_ee:
-                        logger.error(f"❌ [SYNC] {name}: Failed to update TP for drift: {e_ee}")
+                if tp_drift_pct > 0.001 or qty_drift_pct > 0.01:
+                    logger.info(f"[SYNC-DRIFT] {name}: TP drifted price {tp_drift_pct*100:.4f}% qty {qty_drift_pct*100:.2f}%. Replacing.")
+                    existing_tp_order = self._sync_replace_tp(
+                        bot_id, name, pair, direction, bot_status, exchange,
+                        db_tp, db_qty, existing_tp_order
+                    )
 
         # 3. Check for missing / filled Grid order
         if not existing_grid_order and bot_status['current_step'] < strategy.max_steps and bot_status['total_invested'] > 0:
@@ -671,13 +717,14 @@ class BotExecutor:
             
             if target_grid_price > 0:
                 side = 'buy' if direction == 'LONG' else 'sell'
+                # Safe fallback for amount key — varies by source (CCXT vs DB cache)
+                grid_amt_existing = float(existing_grid_order.get('amount') or existing_grid_order.get('origQty') or existing_grid_order.get('qty') or 0)
                 # Pass through validation to get correct precision
-                _, _, target_grid_price, _ = exchange.validate_order(pair, side, existing_grid_order['amount'], target_grid_price)
+                _, _, target_grid_price, _ = exchange.validate_order(pair, side, grid_amt_existing, target_grid_price)
                 
                 curr_grid_price = float(existing_grid_order.get('price', 0))
-                # If price differs (e.g. 0.94 vs 0.9412), replace it
-                # Precision drift check (extremely sensitive to capture precision updates)
-                if abs(curr_grid_price - target_grid_price) / max(target_grid_price, 0.0001) > 0.00001:
+                # Replace if price drifted > 0.1% (avoid floating-point noise triggers)
+                if abs(curr_grid_price - target_grid_price) / max(target_grid_price, 0.0001) > 0.001:
                     logger.info(f"🔄 [GRID-SYNC] {name}: Grid drifted ({curr_grid_price:.4f} -> {target_grid_price:.4f}). Replacing.")
                     try:
                         grid_order_id = existing_grid_order.get('order_id', existing_grid_order.get('id'))
@@ -1008,96 +1055,34 @@ class BotExecutor:
                         except Exception as e:
                              logger.error(f"❌ {name}: Error maintaining TP: {e}")
 
-        # 2b. EE/SYNC DRIFT CHECK: If we have a TP order but it's at the wrong price or wrong quantity
+        # 2b. EE/SYNC DRIFT CHECK: existing TP at wrong price or qty
         elif existing_tp_order and bot_status.get('total_invested', 0) > 0:
-            # --- EARLY EXIT DECAY (wired into live execution) ---
-            raw_db_tp = float(bot_status.get('target_tp_price', 0))
-            db_tp = raw_db_tp
-            
-            if bot_config.get('UseEarlyExit', False) and bot_status.get('basket_start_time', 0) > 0:
-                try:
-                    from engine.manager import calculate_early_exit_decay
-                    from datetime import datetime
-                    
-                    original_tp = strategy.calculate_take_profit_price(
-                        bot_status,
-                        bot_status.get('avg_entry_price', 0)
-                    )
-                    
-                    start_dt = datetime.fromtimestamp(bot_status['basket_start_time'])
-                    now_dt = datetime.fromtimestamp(time.time())
-                    
-                    decayed_tp = calculate_early_exit_decay(
-                        start_dt, now_dt,
-                        bot_status.get('current_step', 0) + 1,
-                        original_tp,
-                        bot_status.get('avg_entry_price', original_tp),
-                        bot_config
-                    )
-                    
-                    # If the decayed TP shifted from what's currently in the DB
-                    if abs(decayed_tp - raw_db_tp) / max(raw_db_tp, 0.0001) > 0.0001:
-                        logger.info(f"⏳ [EE-DECAY] {name}: TP decaying {raw_db_tp:.4f} → {decayed_tp:.4f} (Baseline: {original_tp:.4f})")
-                        db_tp = decayed_tp
-                        try:
-                            _conn = get_connection()
-                            _conn.execute("UPDATE trades SET target_tp_price=? WHERE bot_id=?", (decayed_tp, bot_id))
-                            _conn.commit()
-                            _conn.close()
-                        except Exception as _ee_db_err:
-                            logger.warning(f"[EE] Failed to persist decayed TP: {_ee_db_err}")
-                except Exception as _ee_err:
-                    logger.warning(f"[EE] Decay calculation failed for {name}: {_ee_err}")
-                    db_tp = raw_db_tp
-            else:
-                db_tp = raw_db_tp
-            
-            exchange_tp = float(existing_tp_order.get('price', existing_tp_order.get('stopPrice', 0)) or 0)
+            db_tp  = self._compute_effective_tp(bot_id, name, bot_status, bot_config, strategy)
             db_qty = strategy.calculate_take_profit_amount(bot_status, current_price, pair, exchange)
-            exchange_qty = float(existing_tp_order.get('amount', 0))
-            
-            if db_tp > 0 and exchange_tp > 0:
-                tp_drift_pct = abs(db_tp - exchange_tp) / db_tp
-                qty_drift_pct = abs(db_qty - exchange_qty) / max(db_qty, 0.0001)
-                
-                # Also check if reduceOnly status needs to change (another bot may have entered/exited the pair)
-                current_order_reduce_only = bool(existing_tp_order.get('info', {}).get('reduceOnly', False))
+            exchange_tp  = float(existing_tp_order.get('price') or existing_tp_order.get('stopPrice') or 0)
+            exchange_qty = self._get_order_amount(existing_tp_order)
+
+            # DB-TP ZERO GUARD: recalculate if target_tp_price was wiped (post-repair/reset)
+            if db_tp == 0 and bot_status.get('avg_entry_price', 0) > 0:
+                db_tp = strategy.calculate_take_profit_price(bot_status, bot_status.get('avg_entry_price', 0))
+                logger.info(f"[TP-RECOVER] {name}: db_tp was 0, recalculated to {db_tp:.4f} from avg_entry.")
                 try:
-                    from engine.database import get_connection as _gc2
-                    _c2 = _gc2()
-                    _cur2 = _c2.cursor()
-                    _cur2.execute("SELECT COUNT(*) FROM bots b JOIN trades t ON b.id=t.bot_id WHERE b.pair=? AND t.total_invested>0 AND b.id!=?", (pair, bot_id))
-                    other_bots_count = _cur2.fetchone()[0]
-                    _c2.close()
-                    should_be_reduce_only = (other_bots_count == 0)
+                    _c = get_connection()
+                    _c.execute("UPDATE trades SET target_tp_price=? WHERE bot_id=?", (db_tp, bot_id))
+                    _c.commit(); _c.close()
                 except Exception:
-                    should_be_reduce_only = current_order_reduce_only
-                reduce_only_mismatch = (current_order_reduce_only != should_be_reduce_only)
-                if reduce_only_mismatch:
-                    logger.info(f"🔄 [SYNC-DRIFT] {name}: reduceOnly mismatch (is={current_order_reduce_only}, should={should_be_reduce_only}). Replacing TP.")
-                
-                # Move if price drifted > 0.001% OR quantity drifted > 1% OR reduceOnly flag changed
-                if tp_drift_pct > 0.00001 or qty_drift_pct > 0.01 or reduce_only_mismatch:
-                    drift_reason = f"price {tp_drift_pct*100:.4f}%" if tp_drift_pct > 0.00001 else (f"qty {qty_drift_pct*100:.2f}%" if qty_drift_pct > 0.01 else "reduceOnly flag change")
-                    logger.info(f"🔄 [SYNC-DRIFT] {name}: TP drifted by {drift_reason}. (Target={db_tp:.4f}, Qty={db_qty:.4f}). Replacing.")
-                    try:
-                        tp_order_id = existing_tp_order.get('order_id', existing_tp_order.get('id'))
-                        exchange.cancel_order(tp_order_id, pair)
-                        update_order_status(tp_order_id, 'cancelled', bot_id=bot_id)
-                        existing_tp_order = None  # Force re-place
-                        
-                        if db_qty > 0 and db_tp > 0 and not config.DRY_RUN:
-                            side = 'sell' if direction == 'LONG' else 'buy'
-                            valid, db_qty, db_tp, msg = exchange.validate_order(pair, side, db_qty, db_tp)
-                            if valid:
-                                client_order_id = self._generate_deterministic_id(bot_id, 'TP', bot_status['current_step'])
-                                order = self._place_gtx_order_with_retry(exchange, pair, side, db_qty, db_tp, params={**{'clientOrderId': client_order_id, 'postOnly': True, 'timeInForce': 'GTX'}, **({'reduceOnly': True} if should_be_reduce_only else {})}, label=f"{name}-TP-SYNC")
-                                if order:
-                                    save_bot_order(bot_id, 'tp', order['id'], db_tp, db_qty, bot_status['current_step'], 'open', client_order_id=client_order_id)
-                                    logger.info(f"✅ [SYNC] {name}: Re-placed TP @ {db_tp:.4f} Qty {db_qty:.4f}")
-                                    existing_tp_order = order
-                    except Exception as e_ee:
-                        logger.error(f"❌ [SYNC] {name}: Failed to update TP for drift: {e_ee}")
+                    pass
+
+            if db_tp > 0 and exchange_tp > 0:
+                tp_drift_pct  = abs(db_tp  - exchange_tp)  / db_tp
+                qty_drift_pct = abs(db_qty - exchange_qty) / max(db_qty, 0.0001)
+                if tp_drift_pct > 0.001 or qty_drift_pct > 0.01:
+                    logger.info(f"[SYNC-DRIFT] {name}: TP drifted price {tp_drift_pct*100:.4f}% qty {qty_drift_pct*100:.2f}%. Replacing.")
+                    existing_tp_order = self._sync_replace_tp(
+                        bot_id, name, pair, direction, bot_status, exchange,
+                        db_tp, db_qty, existing_tp_order
+                    )
+
 
         # 3. Check for missing / filled Grid order
         if not existing_grid_order and bot_status['current_step'] < strategy.max_steps:
@@ -1285,13 +1270,14 @@ class BotExecutor:
             
             if target_grid_price > 0:
                 side = 'buy' if direction == 'LONG' else 'sell'
+                # Safe fallback for amount key — varies by source (CCXT vs DB cache)
+                grid_amt = float(existing_grid_order.get('amount') or existing_grid_order.get('origQty') or existing_grid_order.get('qty') or 0)
                 # Pass through validation to get correct precision
-                _, _, target_grid_price, _ = exchange.validate_order(pair, side, existing_grid_order['amount'], target_grid_price)
+                _, _, target_grid_price, _ = exchange.validate_order(pair, side, grid_amt, target_grid_price)
                 
                 curr_grid_price = float(existing_grid_order.get('price', 0))
-                # If price differs (e.g. 0.94 vs 0.9412), replace it
-                # Precision drift check (extremely sensitive to capture precision updates)
-                if abs(curr_grid_price - target_grid_price) / max(target_grid_price, 0.0001) > 0.00001:
+                # Replace if price drifted > 0.1% (avoid floating-point noise triggers)
+                if abs(curr_grid_price - target_grid_price) / max(target_grid_price, 0.0001) > 0.001:
                     logger.info(f"🔄 [GRID-SYNC] {name}: Grid drifted ({curr_grid_price:.4f} -> {target_grid_price:.4f}). Replacing.")
                     try:
                         grid_order_id = existing_grid_order.get('order_id', existing_grid_order.get('id'))

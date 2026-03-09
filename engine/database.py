@@ -631,10 +631,10 @@ def reset_bot_after_tp(bot_id, exit_price, direction=None, action_label='TP_HIT'
     conn = get_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("SELECT total_invested, current_step, avg_entry_price, name, pair, direction FROM trades t JOIN bots b ON t.bot_id = b.id WHERE t.bot_id = ?", (bot_id,))
+        cursor.execute("SELECT total_invested, current_step, avg_entry_price, name, pair, direction, config FROM trades t JOIN bots b ON t.bot_id = b.id WHERE t.bot_id = ?", (bot_id,))
         row = cursor.fetchone()
         if not row: return
-        total_invested, current_step, avg_entry_price, bot_name, pair, db_direction = row
+        total_invested, current_step, avg_entry_price, bot_name, pair, db_direction, config_str = row
         
         # Use provided direction or fallback to DB direction
         final_direction = direction or db_direction or 'LONG'
@@ -652,7 +652,23 @@ def reset_bot_after_tp(bot_id, exit_price, direction=None, action_label='TP_HIT'
         # The Reconciler strictly filters by cycle_id, so these will never be re-adopted.
         cursor.execute("UPDATE bot_orders SET status = 'auto_closed', updated_at = ? WHERE bot_id = ? AND status = 'open'", (int(time.time()), bot_id))
         cursor.execute("UPDATE bot_orders SET status = 'reset_cleared', updated_at = ? WHERE bot_id = ? AND status IN ('filled', 'closed', 'missing')", (int(time.time()), bot_id))
-        cursor.execute("UPDATE bots SET status='Scanning' WHERE id = ?", (bot_id,))
+        
+        # Check Stop After Cycle
+        stop_after_cycle = False
+        try:
+            if config_str:
+                config_data = json.loads(config_str)
+                stop_after_cycle = bool(config_data.get('post_exit_stop', False))
+        except:
+            pass
+            
+        if stop_after_cycle:
+            cursor.execute("UPDATE bots SET status='STOPPED', is_active=0 WHERE id = ?", (bot_id,))
+            logger.info(f"🛑 Bot {bot_name} paused due to 'Stop After Cycle' setting.")
+            add_notification('warning', f"Bot {bot_name} paused after cycle completion (Stop After Cycle enabled).", bot_id)
+        else:
+            cursor.execute("UPDATE bots SET status='Scanning' WHERE id = ?", (bot_id,))
+            
         conn.commit()
     except Exception as e:
         try: conn.rollback()

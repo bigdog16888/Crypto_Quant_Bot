@@ -194,10 +194,10 @@ class MartingaleStrategy(BaseStrategy):
         period = int(self.params.get('boll_period', 20))
         dev = float(self.params.get('boll_dev', 2.0))
         upper, mid, lower = ta_custom.bollinger_bands(df['close'], period=period, deviation=dev)
-        if mode == 1:  # Price above upper band
-            return current_price > float(upper.iloc[-1])
-        if mode == 2:  # Price below lower band
+        if mode == 1:  # Outside Lower — price BELOW lower band (entry: price dropped to oversold)
             return current_price < float(lower.iloc[-1])
+        if mode == 2:  # Outside Upper — price ABOVE upper band (entry: price broke above overbought)
+            return current_price > float(upper.iloc[-1])
         return None
 
     def _check_stochastic(self, market_data: pd.DataFrame, multi_tf_data: dict):
@@ -346,15 +346,27 @@ class MartingaleStrategy(BaseStrategy):
 
     def calculate_take_profit_price(self, bot_status: Dict, current_price: float) -> float:
         avg_price = float(bot_status.get('avg_entry_price', 0))
-        if avg_price == 0: avg_price = current_price
-        # 🚀 HARMONIZED KEYS: Support both UI 'TakeProfitBase' and engine 'tp_pct'
-        tp_pct = float(self.params.get('tp_pct', self.params.get('TakeProfitBase', 1.5)))
-        # 🛡️ SAFETY FLOOR: Prevent 0.0 or negative TP which causes infinite execution
-        tp_pct = max(0.1, tp_pct)
-        
+        if avg_price == 0:
+            avg_price = current_price
         direction = self.params.get('direction', 'LONG').upper()
-        price = avg_price * (1 + tp_pct/100) if direction == 'LONG' else avg_price * (1 - tp_pct/100)
-        # 🚀 DYNAMIC ROUNDING
+        tp_type = self.params.get('TakeProfitType', 'Percent')
+
+        if tp_type == 'Percent':
+            # TakeProfitPct = user's % profit target (UI Percentage mode)
+            tp_pct = float(self.params.get('TakeProfitPct', self.params.get('tp_pct', 1.5)))
+            tp_pct = max(0.1, tp_pct)
+            price = avg_price * (1 + tp_pct / 100) if direction == 'LONG' else avg_price * (1 - tp_pct / 100)
+        else:
+            # TakeProfitBase = dollar/USD profit target (UI Fixed mode)
+            target_usd = float(self.params.get('TakeProfitBase', 10.0))
+            total_invested = float(bot_status.get('total_invested', avg_price))
+            est_qty = total_invested / avg_price if avg_price > 0 else 0
+            if est_qty > 0:
+                dist = target_usd / est_qty
+                price = avg_price + dist if direction == 'LONG' else avg_price - dist
+            else:
+                price = avg_price  # fallback: no movement
+
         return round(price, self.price_precision)
 
     def calculate_take_profit_amount(self, bot_status: Dict, current_price: float, pair: str, exchange: Any) -> float:
@@ -494,16 +506,14 @@ class MartingaleStrategy(BaseStrategy):
         # 🚀 DYNAMIC ROUNDING
         return round(size_usd / calc_price, self.qty_precision)
 
-    def calculate_next_grid_price(self, direction: str, current_price: float, avg_entry: float, step: int, market_data: Any) -> float:
+    def calculate_next_grid_price(self, direction: str, current_price: float, avg_entry: float, step: int, market_data: Any, **kwargs) -> float:
         """Helper for UI to predict next grid order price."""
-        dist_pct = float(self.params.get('grid_dist_pct', 1.0))
+        dist_pct = float(self.params.get('grid_dist_pct', self.params.get('StepPct', 1.0)))
         base_grid = float(self.params.get('base_grid', 100.0))
         use_atr = self.params.get('UseATRGrid', False)
         
         # Calculate distance
         if use_atr and hasattr(market_data, 'empty') and not market_data.empty:
-             # Calculate ATR on the fly or use passed value if pre-calculated?
-             # For UI helper, assume market_data is DataFrame with OHLCV
              try:
                  atr_period = int(self.params.get('ATRPeriods', 14))
                  atr_val = iATR(market_data['high'], market_data['low'], market_data['close'], atr_period)
@@ -511,20 +521,28 @@ class MartingaleStrategy(BaseStrategy):
              except:
                  grid_dist = base_grid # Fallback
         else:
-             grid_dist = base_grid # Default fixed grid
-             
-        # Direction Logic
-        if direction.upper() == 'LONG':
-             price = avg_entry - (grid_dist * (step + 1)) if avg_entry > 0 else current_price - grid_dist
-        else:
-             price = avg_entry + (grid_dist * (step + 1)) if avg_entry > 0 else current_price + grid_dist
-             
+             # If not ATR, use percentage of entry if StepPct is set, otherwise base_grid
+             if self.params.get('StepPct') is not None or self.params.get('grid_dist_pct') is not None:
+                 ref_price = avg_entry if avg_entry > 0 else current_price
+                 grid_dist = ref_price * (dist_pct / 100.0)
+             else:
+                 grid_dist = base_grid # Default fixed grid
+                 
         # Dynamic Multiplier logic if enabled
         grid_mult = float(self.params.get('GridMultiplier', 1.0))
-        if step > 0 and grid_mult != 1.0:
-            # Simple exponential for UI
-            price = price * (grid_mult ** step)
-            
+        if step > 0 and grid_mult > 1.0:
+            grid_dist = grid_dist * (grid_mult ** step)
+             
+        # Direction Logic
+        last_grid_price = kwargs.get('last_grid_price', 0)
+        # Using last_grid_price provides absolute origin anchoring instead of drifting avg_entry
+        ref_price = last_grid_price if last_grid_price > 0 else (avg_entry if avg_entry > 0 else current_price)
+        
+        if direction.upper() == 'LONG':
+             price = ref_price - grid_dist
+        else:
+             price = ref_price + grid_dist
+             
         return round(price, self.price_precision)
 
     def calculate_projections(self, base_price: float, current_atr: float = 0.0) -> List[Dict[str, Any]]:

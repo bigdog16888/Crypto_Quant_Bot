@@ -127,7 +127,7 @@ class StateReconciler:
     # ------------------------------------------------------------------
     # STEP 1: OFFLINE FILL DETECTION
     # ------------------------------------------------------------------
-    def detect_offline_fills(self, since_hours: int = 48) -> Dict[str, int]:
+    def detect_offline_fills(self, since_hours: int = 168) -> Dict[str, int]:
         """
         Scans exchange history for orders that filled while we were offline.
         Updates the DB immediately so subsequent checks see the correct state.
@@ -206,8 +206,8 @@ class StateReconciler:
             for mt, ex in self.exchanges.items():
                 if not ex: continue
                 try:
-                    # Fetch History
-                    history = ex.fetch_closed_orders(pair, since=since_ts, limit=100)
+                    # Fetch History (Limit 1000 to ensure high-spam bots don't push fills off-page)
+                    history = ex.fetch_closed_orders(pair, since=since_ts, limit=1000)
                     if not isinstance(history, list):
                         if history is not None:
                             logger.debug(f"⚠️ Unexpected history format for {pair}: {history}")
@@ -264,6 +264,16 @@ class StateReconciler:
 
                             # Update Bot State
                             order_status = order.get('status', '').lower()
+                            
+                            # GRACE PERIOD GUARD for Filled/Closed orders
+                            # If an order just finished filling, the WebSocket might still be processing its fragmented partial fills.
+                            # Give the WS 60 seconds to finish. We only reconstruct offline history if the order is truly 'cold'.
+                            if order_status in ['closed', 'filled']:
+                                finish_ts = order.get('lastTradeTimestamp') or order.get('timestamp') or 0
+                                if (time.time() * 1000 - finish_ts) < 60000:
+                                    logger.debug(f"⏳ [GRACE PERIOD] Skipping recently filled order {cid} (Age: {int((time.time()*1000 - finish_ts)/1000)}s); giving WS time to process.")
+                                    continue
+                                    
                             # GUARD: Only process actually-filled orders.
                             # However, if the order was cancelled/expired/rejected on the exchange,
                             # we MUST update the local DB to reflect that so it doesn't stay 'open' forever.
@@ -684,7 +694,14 @@ class StateReconciler:
             # --- CASE C: SIGNIFICANT NOTIONAL DEVIATION (AUTO-REPAIR) ---
             # Both exist, but delta is massive — attempt to reconcile using local history
             delta_notional = abs(total_virtual_invested - total_physical_notional)
-            if total_virtual_invested > 10.0 and total_physical_notional > 1.0 and delta_notional > 50.0:
+            
+            # 🚀 SCANNING-BOT GUARD: Only run NOTIONAL-GAP repair if at least one bot
+            # on this pair is GENUINELY in trade (status=IN TRADE with real invested amount > $50).
+            # Without this, dust residuals after a clean TP exit trigger AUTO-REPAIR and write
+            # the dust back into the bot's virtual position, resurrecting a closed cycle.
+            genuine_in_trade_bots = [b for b in bots if b.in_trade]
+            
+            if total_virtual_invested > 10.0 and total_physical_notional > 1.0 and delta_notional > 50.0 and genuine_in_trade_bots:
                  logger.warning(
                      f"⚠️ [NOTIONAL-GAP] {pair}: Virtual=${total_virtual_invested:.2f} vs "
                      f"Physical=${total_physical_notional:.2f} (Delta=${delta_notional:.2f}). Attempting auto-repair..."
@@ -692,7 +709,7 @@ class StateReconciler:
                  
                  # 🚀 AUTO-REPAIR: If Physical > Virtual, it's likely missed fills (Memory Gap)
                  if total_physical_notional > total_virtual_invested:
-                     for target_bot in [b for b in bots if b.in_trade]:
+                     for target_bot in genuine_in_trade_bots:
                          try:
                              from .database import get_connection, accumulate_trade_fill
                              # CYCLE-ID GUARD: Only sum fills from the bot's CURRENT cycle.
@@ -708,6 +725,7 @@ class StateReconciler:
                                  FROM bot_orders 
                                  WHERE bot_id = ? AND status IN ('filled', 'closed')
                                  AND cycle_id = ?
+                                 AND (client_order_id LIKE 'CQB_%' OR client_order_id IS NULL)
                              """, (target_bot.bot_id, getattr(target_bot, 'cycle_id', 1)))
                              row = cursor.fetchone()
                              if row and row[0] and row[0] > (target_bot.total_invested + 1.0):
@@ -742,33 +760,57 @@ class StateReconciler:
 
                  # 🚀 SYNC-TO-REALITY: If Virtual > Physical, it's likely over-accumulation (e.g. Double Counting Bug)
                  elif total_virtual_invested > (total_physical_notional + 50.0):
-                     # Find active bots on this pair that are in trade
-                     active_bots_on_pair = [b for b in bots if b.in_trade]
-                     if len(active_bots_on_pair) == 1:
-                         target_bot = active_bots_on_pair[0]
-                         new_invested = max(total_physical_notional, 0.0)
-                         logger.critical(f"👨‍⚕️ [SYNC-TO-REALITY] Bot {target_bot.name} (ID {target_bot.bot_id}) virtual (${target_bot.total_invested:,.2f}) > physical (${total_physical_notional:,.2f}). SYNCING down to ${new_invested:,.2f}.")
-                         try:
-                             from .database import get_connection
-                             conn = get_connection()
-                             cursor = conn.cursor()
-                             cursor.execute("UPDATE trades SET total_invested = ? WHERE bot_id = ?", (new_invested, target_bot.bot_id))
-                             conn.commit()
-                             
-                             results.append(ReconciliationResult(
-                                 bot_id=target_bot.bot_id,
-                                 bot_name=target_bot.name,
-                                 pair=target_bot.pair,
-                                 action_taken=ReconciliationAction.SYSTEM_FIX_ZOMBIE,
-                                 details=f"Synced to Reality: Diminished virtual invested to ${new_invested:,.2f}.",
-                                 requires_manual_intervention=False
-                             ))
-                         except Exception as e:
-                             logger.error(f"❌ Sync-to-reality failed for Bot {target_bot.bot_id}: {e}")
-                         finally:
-                             if 'conn' in locals(): conn.close()
-                     else:
-                         logger.warning(f"⚠️ [SYNC-TO-REALITY] Cannot auto-sync {pair} because there are {len(active_bots_on_pair)} active bots in trade. Requires manual intervention.")
+                      # Find active bots on this pair that are in trade
+                      active_bots_on_pair = [b for b in bots if b.in_trade]
+                      if len(active_bots_on_pair) == 1:
+                          target_bot = active_bots_on_pair[0]
+                          
+                          # 🚀 PARTIAL-FILL GUARD: Do NOT sync down if the bot has any open GRID or ENTRY orders.
+                          # Physical position grows incrementally during partial fills — syncing to mid-fill snapshot
+                          # permanently destroys the virtual position, creating a cascading data loss loop.
+                          has_active_fill_order = False
+                          try:
+                              from .database import get_connection # Import for the guard check
+                              _chk_conn = get_connection()
+                              _chk_cur = _chk_conn.cursor()
+                              _chk_cur.execute(
+                                  "SELECT COUNT(*) FROM bot_orders WHERE bot_id=? AND status='open' AND order_type IN ('entry','grid')",
+                                  (target_bot.bot_id,)
+                              )
+                              has_active_fill_order = (_chk_cur.fetchone()[0] > 0)
+                              _chk_conn.close()
+                          except Exception:
+                              has_active_fill_order = True  # Fail-safe: skip sync if check fails
+                          
+                          if has_active_fill_order:
+                              logger.warning(
+                                  f"⏳ [SYNC-TO-REALITY SKIPPED] Bot {target_bot.name}: virtual (${target_bot.total_invested:,.2f}) > "
+                                  f"physical (${total_physical_notional:,.2f}) but has open GRID/ENTRY order — partial fill in progress. Waiting."
+                              )
+                          else:
+                              new_invested = max(total_physical_notional, 0.0)
+                              logger.critical(f"👨‍⚕️ [SYNC-TO-REALITY] Bot {target_bot.name} (ID {target_bot.bot_id}) virtual (${target_bot.total_invested:,.2f}) > physical (${total_physical_notional:,.2f}). SYNCING down to ${new_invested:,.2f}.")
+                              try:
+                                  from .database import get_connection
+                                  conn = get_connection()
+                                  cursor = conn.cursor()
+                                  cursor.execute("UPDATE trades SET total_invested = ? WHERE bot_id = ?", (new_invested, target_bot.bot_id))
+                                  conn.commit()
+                                  
+                                  results.append(ReconciliationResult(
+                                      bot_id=target_bot.bot_id,
+                                      bot_name=target_bot.name,
+                                      pair=target_bot.pair,
+                                      action_taken=ReconciliationAction.SYSTEM_FIX_ZOMBIE,
+                                      details=f"Synced to Reality: Diminished virtual invested to ${new_invested:,.2f}.",
+                                      requires_manual_intervention=False
+                                  ))
+                              except Exception as e:
+                                  logger.error(f"❌ Sync-to-reality failed for Bot {target_bot.bot_id}: {e}")
+                              finally:
+                                  if 'conn' in locals(): conn.close()
+                      else:
+                          logger.warning(f"⚠️ [SYNC-TO-REALITY] Cannot auto-sync {pair} because there are {len(active_bots_on_pair)} active bots in trade. Requires manual intervention.")
 
             # ------------------------------------------------------------------
             # CASE D: NET-SUM GHOST DETECTION (Revised Fix #1)
@@ -848,6 +890,7 @@ class StateReconciler:
                                  WHERE bot_id = ? 
                                  AND order_type IN ('entry', 'grid', 'adoption') 
                                  AND status IN ('filled', 'closed')
+                                 AND (client_order_id LIKE 'CQB_%' OR client_order_id IS NULL)
                                  AND created_at >= (? - 120)
                              """, (target_bot.bot_id, target_bot.basket_start_time))
                              row = cursor.fetchone()
@@ -911,8 +954,8 @@ class StateReconciler:
         for mt, ex in self.exchanges.items():
             if not ex: continue
             try:
-                # Fetch history for the specific pair
-                history = ex.fetch_closed_orders(bot.pair, limit=50)
+                # Fetch history for the specific pair (High limit to catch old exits)
+                history = ex.fetch_closed_orders(bot.pair, limit=1000)
                 if not isinstance(history, list):
                     continue
                 

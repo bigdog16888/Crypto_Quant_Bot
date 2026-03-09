@@ -340,7 +340,7 @@ def render_monitor_view():
         # Layout hack to align button with selectboxes
         st.write("")
         st.write("")
-        if st.button("🔄 Refresh Now"):
+        if st.button("🔄 Refresh Now", use_container_width=True):
             st.cache_data.clear()
             st.rerun()
 
@@ -780,33 +780,36 @@ def render_monitor_view():
 
                     ee_status = ""
                     if row['status'] == '🔴 IN TRADE' and cfg.get('UseEarlyExit', False) and row.get('basket_start_time', 0) > 0:
-                        import time
-                        duration_sec = time.time() - row['basket_start_time']
-                        
-                        start_hours = cfg.get('EEStartHours', 0.0)
-                        hours_pc = cfg.get('EEHoursPC', 0.0)
-                        interval_mins = cfg.get('DecayIntervalMins', 60.0)
-                        decay_per_interval = cfg.get('DecayPercentPerInterval', 0.0)
-                        start_level = cfg.get('EEStartLevel', 5)
-                        level_pc = cfg.get('EELevelPC', 0.0)
-                        
-                        duration_hours = duration_sec / 3600.0
-                        duration_mins = duration_sec / 60.0
-                        
-                        ee_pc = 0.0
-                        if duration_hours > start_hours:
-                            ee_pc += (duration_hours - start_hours) * hours_pc
-                        if decay_per_interval > 0 and interval_mins > 0:
-                            ee_pc += (duration_mins / interval_mins) * decay_per_interval
-                        
-                        current_step = row.get('current_step', 1)
-                        if current_step >= start_level:
-                            ee_pc += (current_step - start_level + 1) * level_pc
-                            
-                        if ee_pc > 0:
-                            if not cfg.get('EEAllowLoss', False):
-                                ee_pc = min(ee_pc, 100.0)
-                            ee_status = f" [EE Active: -{ee_pc:.1f}%]"
+                        import time as _t
+                        from datetime import datetime as _dt
+                        try:
+                            from engine.manager import calculate_early_exit_decay as _eed
+                            avg_p = float(row.get('avg_entry_price', 0) or 0)
+                            tp_p  = float(row.get('target_tp_price', 0) or 0)
+                            if avg_p > 0 and tp_p > 0:
+                                start_dt = _dt.fromtimestamp(row['basket_start_time'])
+                                now_dt   = _dt.fromtimestamp(_t.time())
+                                step_n   = int(row.get('current_step', 0)) + 1
+                                decayed_tp = _eed(start_dt, now_dt, step_n, tp_p, avg_p, cfg)
+                                # Derive the % decay relative to the original spread
+                                direction_up = row.get('direction', 'LONG').upper() == 'LONG'
+                                orig_spread = abs(tp_p - avg_p)
+                                decayed_spread = abs(decayed_tp - avg_p)
+                                if orig_spread > 0:
+                                    ee_pc = (1 - decayed_spread / orig_spread) * 100
+                                    ee_pc = max(0.0, min(ee_pc, 100.0) if not cfg.get('EEAllowLoss', False) else ee_pc)
+                                    ee_status = f" [EE: -{ee_pc:.1f}% → TP {decayed_tp:,.4f}]"
+                        except Exception:
+                            # Fallback: simple interval-based display only
+                            duration_mins = (_t.time() - row['basket_start_time']) / 60.0
+                            interval_mins = float(cfg.get('DecayIntervalMins', 60.0))
+                            decay_per_interval = float(cfg.get('DecayPercentPerInterval', 0.0))
+                            if decay_per_interval > 0 and interval_mins > 0:
+                                ee_pc = (duration_mins / interval_mins) * decay_per_interval
+                                if not cfg.get('EEAllowLoss', False):
+                                    ee_pc = min(ee_pc, 100.0)
+                                if ee_pc > 0:
+                                    ee_status = f" [EE: -{ee_pc:.1f}%]"
 
                     if row['status'] == '🔴 IN TRADE':
                         res['Trigger'] = f"In Trade{ee_status} ({desc_trigger})"
@@ -869,18 +872,35 @@ def render_monitor_view():
                 # 1. PnL Estimate Column
                 def est_profit(row):
                     if row['total_invested'] > 0 and row['avg_entry_price'] > 0 and row['target_tp_price'] > 0:
+                        ee_full_decay = False
+                        if 'Trigger Condition' in row and isinstance(row['Trigger Condition'], str):
+                            if '-100.0%]' in row['Trigger Condition'] or '-100%]' in row['Trigger Condition']:
+                                ee_full_decay = True
+                        if ee_full_decay:
+                            return "$0.00 (Break-Even)"
+                        
                         qty = row['total_invested'] / row['avg_entry_price']
                         if row['direction'] == 'LONG':
                             profit = (row['target_tp_price'] - row['avg_entry_price']) * qty
                         else:
                             profit = (row['avg_entry_price'] - row['target_tp_price']) * qty
-                        # Calculate percentage yield relative to invested amount
                         try:
-                            pct_yield = (profit / row['total_invested']) * 100
+                            # ROI% = profit / notional invested (position size, not margin)
+                            roi_pct = (profit / row['total_invested']) * 100
+                            # ROE% = profit / margin (notional / leverage) — matches Binance UI
+                            try:
+                                cfg_raw = json.loads(row.get('config', '{}') or '{}')
+                                lev = float(cfg_raw.get('leverage', 1) or 1)
+                            except Exception:
+                                lev = 1.0
+                            roe_pct = roi_pct * lev
                             sign = "+" if profit >= 0 else ""
                             warn = " ⚠️ (Inverted TP)" if profit < 0 else ""
-                            return f"${profit:,.2f} ({sign}{pct_yield:.2f}%){warn}"
-                        except:
+                            if lev > 1:
+                                return f"${profit:,.2f} ({sign}{roi_pct:.2f}% | ROE {sign}{roe_pct:.1f}%){warn}"
+                            else:
+                                return f"${profit:,.2f} ({sign}{roi_pct:.2f}%){warn}"
+                        except Exception:
                             return f"${profit:,.2f}"
                     return "-"
                 
@@ -985,6 +1005,45 @@ def render_monitor_view():
                                     pct_away = abs(curr_p - p_thresh) / p_thresh * 100
                                     badge = "✅ Triggered" if triggered else ("🔥 Near" if pct_away <= 2 else ("👀 In Sight" if pct_away <= 10 else "🌑 Not Ready"))
                                     indicators.append(f"Price: {curr_p:.4f} (target {cond} {p_thresh:.4f}) — {badge}")
+                            
+                            # Bollinger Bands
+                            mode_boll = int(conf.get('mode_boll', 0))
+                            if mode_boll > 0:
+                                from engine.indicators import bollinger_bands
+                                boll_period = int(conf.get('boll_period', conf.get('bollinger_length', 20)))
+                                boll_dev = float(conf.get('boll_dev', conf.get('bollinger_std', 2.0)))
+                                upper, middle, lower = bollinger_bands(_close, boll_period, boll_dev)
+                                curr_p = float(_close.iloc[-1])
+                                b_up = float(upper.iloc[-1])
+                                b_dn = float(lower.iloc[-1])
+
+                                if mode_boll == 1:  # Outside Lower — price below lower band
+                                    triggered = curr_p < b_dn
+                                    dist = abs(curr_p - b_dn) / curr_p * 100
+                                    badge = "✅ Triggered" if triggered else ("🔥 Near" if dist <= 1 else ("👀 In Sight" if dist <= 3 else "🌑 Not Ready"))
+                                    indicators.append(f"BOLL: Outside Lower (Dist: {dist:.2f}%) — {badge}")
+                                elif mode_boll == 2:  # Outside Upper — price above upper band
+                                    triggered = curr_p > b_up
+                                    dist = abs(curr_p - b_up) / curr_p * 100
+                                    badge = "✅ Triggered" if triggered else ("🔥 Near" if dist <= 1 else ("👀 In Sight" if dist <= 3 else "🌑 Not Ready"))
+                                    indicators.append(f"BOLL: Outside Upper (Dist: {dist:.2f}%) — {badge}")
+                                    
+                            # ATR Percent/Expansion
+                            mode_atrp = int(conf.get('mode_atrp', 0))
+                            if mode_atrp > 0:
+                                indicators.append(f"ATR % Active (Target > {conf.get('atrp_level', 0)}%)")
+                            mode_atre = int(conf.get('mode_atre', 0))
+                            if mode_atre > 0:
+                                indicators.append(f"ATR Exp Active (Mult {conf.get('atre_mult', 0)})")
+                            
+                            # Patterns
+                            patterns = []
+                            if int(conf.get('pat_1_mode', 0)) > 0: patterns.append("Pat 1")
+                            if int(conf.get('pat_2_mode', 0)) > 0: patterns.append("Pat 2")
+                            if int(conf.get('pat_3_mode', 0)) > 0: patterns.append("Pat 3")
+                            if int(conf.get('pat_4_mode', 0)) > 0: patterns.append("Pat 4")
+                            if patterns:
+                                indicators.append(f"Patterns: {', '.join(patterns)} Active")
                             
                             with st.expander(f"📡 {sbot['name']} ({pair_s}) — {'No active triggers configured' if not indicators else f'{len(indicators)} trigger(s)'}", expanded=False):
                                 if indicators:

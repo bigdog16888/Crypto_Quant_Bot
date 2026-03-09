@@ -187,6 +187,9 @@ def set_manual_close_pct(bot_id: int, pct: float) -> bool:
     return update_bot_close_settings(bot_id, manual_close_pct=pct)
 
 
+
+
+
 def check_and_execute_stops(bot_id: int, exchange_interface=None) -> Optional[Dict[str, Any]]:
     """
     Check if any stop conditions are met and execute close if so.
