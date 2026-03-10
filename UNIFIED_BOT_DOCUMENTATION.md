@@ -1,8 +1,8 @@
 # Crypto Quant Bot: Unified Documentation
 
-**Version:** 1.4.0 (Exchange-Anchored Reconciler)  
+**Version:** 1.4.1 (Mathematical Step Recovery & Hedge Bypass)  
 **Status:** Highly Stable, Auto-Healing Active  
-**Last Updated:** 2026-03-09
+**Last Updated:** 2026-03-10
 
 This document provides a unified, comprehensive overview of the Crypto Quant Bot, its architecture, setup, and operational best practices. It consolidates the key information from over 20 separate markdown files.
 
@@ -163,6 +163,12 @@ The bot has recently undergone a fundamental stabilization phase to ensure multi
 ---
 
 ## 5. Changelog Summary
+
+### Version 1.4.1 (2026-03-10)
+**Virtual Hedge Guarding & Step Integrity**
+- **Protected Virtual Hedging:** `StateReconciler` safely bypasses 'Net Physical' anchoring logic when >1 bot is actively trading on the same token (e.g. tracking `BTC/USDC` Long and Short concurrently).
+- **Mathematical Step Recovery:** Position adoptions and re-links now logically derive their exact numerical Step natively using existing Martingale size configurations, eliminating Step 1 memory wipes upon adoption.
+- **Strict Cycle ID Proofing:** Fixed a "Ghost Loop" vulnerability in offline reconciliations by ensuring past Take Profit closures are strictly validated against the active bot's `cycle_id`.
 
 ### Version 1.4.0 (2026-03-09)
 **Exchange-Anchored Reconciler & Root Cause Fixes**
