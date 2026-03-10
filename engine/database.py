@@ -575,14 +575,14 @@ def update_martingale_step(bot_id, step, total_invested, avg_price, tp_price):
         if exists:
             # UPDATE existing record
             cursor.execute("""
-                UPDATE trades 
+                UPDATE trades
                 SET current_step = ?, 
                     total_invested = ?, 
                     avg_entry_price = ?, 
                     target_tp_price = ?,
                     entry_confirmed = 1
-                WHERE bot_id = ?
-            """, (step, total_invested, avg_price, tp_price, bot_id))
+                WHERE bot_id = ? AND (current_step <= ? OR ? = 0)
+            """, (step, total_invested, avg_price, tp_price, bot_id, step, step))
             logger.debug(f"✅ Updated trade state for bot {bot_id}: step={step}, invested={total_invested}, avg_price={avg_price}")
         else:
             # INSERT new record
@@ -651,7 +651,7 @@ def reset_bot_after_tp(bot_id, exit_price, direction=None, action_label='TP_HIT'
         # 🔑 CYCLE-ID ARCHIVE: Mark ALL bot_orders from the OLD cycle as reset_cleared.
         # The Reconciler strictly filters by cycle_id, so these will never be re-adopted.
         cursor.execute("UPDATE bot_orders SET status = 'auto_closed', updated_at = ? WHERE bot_id = ? AND status = 'open'", (int(time.time()), bot_id))
-        cursor.execute("UPDATE bot_orders SET status = 'reset_cleared', updated_at = ? WHERE bot_id = ? AND status IN ('filled', 'closed', 'missing')", (int(time.time()), bot_id))
+        cursor.execute("UPDATE bot_orders SET status = 'reset_cleared', updated_at = ? WHERE bot_id = ? AND status IN ('filled', 'closed', 'missing') AND order_type != 'hedge'", (int(time.time()), bot_id))
         
         # Check Stop After Cycle
         stop_after_cycle = False
@@ -898,10 +898,45 @@ def import_position_from_exchange(bot_id: int, pair: str, position_size: float, 
         # Fallback if runner isn't available (e.g., standalone script)
         tp_price = float(entry_price) * 1.015 if direction.upper() == 'LONG' else float(entry_price) * 0.985
 
-    # 🚀 FIX: Always set step=1 for adopted positions.
-    # The old forensic math (log estimation) produced wildly inflated steps.
-    # Step progression should ONLY happen via order fill events, not guessing.
+    # 🚀 STEP RECOVERY: Instead of blindly forcing Step 1, dynamically recover the true step.
+    # Because order history might be zeroed or belong to a past cycle during a crash,
+    # the most reliable way to recover the step is through raw mathematical derivation.
     calculated_step = 1
+    try:
+        # Use the config params to mathematically determine how many steps this position size represents.
+        db_base_size = float(base_size) if base_size else 10.0
+        db_mult = float(multiplier) if multiplier else 1.05
+        
+        if config_json:
+            cfg = json.loads(config_json)
+            db_base_size = float(cfg.get('base_order_size', db_base_size))
+            db_mult = float(cfg.get('martingale_multiplier', db_mult))
+        
+        if db_base_size > 0 and total_invested > 0:
+            import math
+            if total_invested <= db_base_size * 1.1:
+                calculated_step = 1
+            elif db_mult > 1:
+                # Math: Total invested = Base * (1 - r^n) / (1 - r) where r = multiplier, n = step
+                # A simpler approximation is to just keep adding steps until we reach total_invested
+                simulated_total = db_base_size
+                simulated_step = 1
+                current_order_size = db_base_size
+                
+                while simulated_total < (total_invested * 0.95): # 5% tolerance for slippage
+                    simulated_step += 1
+                    current_order_size *= db_mult
+                    simulated_total += current_order_size
+                    if simulated_step >= 50: # infinite loop safety
+                        break
+                        
+                calculated_step = simulated_step
+                logger.info(f"🔄 [STEP-RECOVERY] Bot {bot_id} mathematically derived Step {calculated_step} from ${total_invested:.2f} invested.")
+            else:
+                calculated_step = max(1, round(total_invested / db_base_size))
+                logger.info(f"🔄 [STEP-RECOVERY] Bot {bot_id} linearly derived Step {calculated_step} from ${total_invested:.2f} invested.")
+    except Exception as e:
+        logger.warning(f"Mathematical step recovery failed for bot {bot_id}: {e}")
     try:
         # Check if record exists (UPSERT logic)
         cursor.execute("SELECT current_step FROM trades WHERE bot_id = ?", (bot_id,))
@@ -1716,14 +1751,15 @@ def update_full_snapshot(trade_updates: List[Dict[str, Any]], physical_positions
             bot_id = update['bot_id']
             # Using UPSERT logic for robustness
             conn.execute("""
-                INSERT INTO trades (bot_id, total_invested, avg_entry_price, entry_confirmed, basket_start_time)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO trades (bot_id, total_invested, avg_entry_price, entry_confirmed, basket_start_time, current_step)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(bot_id) DO UPDATE SET
                     total_invested = excluded.total_invested,
                     avg_entry_price = excluded.avg_entry_price,
-                    entry_confirmed = excluded.entry_confirmed
-                WHERE bot_id = ?
-            """, (bot_id, update['total_invested'], update['avg_entry_price'], update['entry_confirmed'], update['basket_start_time'], bot_id))
+                    entry_confirmed = excluded.entry_confirmed,
+                    current_step = excluded.current_step
+                WHERE bot_id = ? AND (current_step <= excluded.current_step OR excluded.current_step = 0)
+            """, (bot_id, update['total_invested'], update['avg_entry_price'], update['entry_confirmed'], update['basket_start_time'], update.get('current_step', 0), bot_id))
 
         # Note: The empty-snapshot check is now handled by the consecutive-miss counter above.
         # If we reach here with empty positions, the counter already approved the clear.

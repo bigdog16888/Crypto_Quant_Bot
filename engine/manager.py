@@ -107,32 +107,18 @@ def check_moving_profit_target(current_price: float, average_price: float, targe
                 
     return new_sl
 
-def check_hedge_entry(drawdown_percent: float, open_levels: int, settings: dict) -> dict | None:
+def check_hedge_entry(current_step: int, settings: dict) -> dict | None:
     """
-    Determines if a hedge trade should be opened based on drawdown or levels.
+    Determines if a hedge lock order should be placed.
+    Triggers when the bot reaches HedgeStartStep (step-based, not drawdown%).
+    Returns a mission dict or None.
     """
     if not settings.get('UseHedge', False):
         return None
-        
-    hedge_start = settings.get('HedgeStart', 20.0)
-    use_dd = settings.get('HedgeTypeDD', True)
-    
-    trigger = False
-    if use_dd:
-        if drawdown_percent >= hedge_start:
-            trigger = True
-    else:
-        if open_levels >= int(hedge_start):
-            trigger = True
-            
-    if not trigger:
-        return None
-        
-    return {
-        'action': 'open_hedge',
-        'trigger_value': drawdown_percent if use_dd else open_levels,
-        'size_mult': settings.get('LotMultHedge', 1.0)
-    }
+    hedge_step = int(settings.get('HedgeStartStep', 7))
+    if current_step >= hedge_step:
+        return {'action': 'open_hedge', 'trigger_step': current_step}
+    return None
 
 def calculate_hedge_lot(main_basket_lots: float, settings: dict) -> float:
     """
@@ -456,15 +442,18 @@ def manage_trade(bot_id, bot_name, pair, direction, settings, trade_data, curren
         if direction == 'LONG': drawdown_pc = (avg_entry_price - current_price) / avg_entry_price * 100
         else: drawdown_pc = (current_price - avg_entry_price) / avg_entry_price * 100
 
-    hedge_trigger = check_hedge_entry(drawdown_pc, current_step, settings)
+    if total_invested <= 0:
+        return None
+
+    hedge_trigger = check_hedge_entry(current_step, settings)
     if hedge_trigger:
-        hedge_size = total_invested * hedge_trigger.get('size_mult', 1.0)
-        logger.warning(f"🛡️ Bot {bot_name} - HEDGE TRIGGERED! Size: ${hedge_size} at {current_price}")
+        # Pass the full qty needed for the lock (total_invested / avg_entry_price)
+        hedge_qty = total_invested / avg_entry_price if avg_entry_price > 0 else 0
+        logger.warning(f"🛡️ Bot {bot_name} - HEDGE TRIGGERED at step {current_step}! Lock qty: {hedge_qty:.4f}")
         return {
             'action': 'hedge_open', 'bot_id': bot_id, 'bot_name': bot_name, 'pair': pair,
-            'direction': direction, 'price': current_price, 'amount_usd': hedge_size,
-            'qty': hedge_size / current_price if current_price > 0 else 0,
-            'step': current_step, 'drawdown_pct': drawdown_pc
+            'direction': direction, 'price': current_price,  # Lock at trigger (step) price
+            'qty': hedge_qty, 'step': current_step
         }
         
     # 9b. Check Drawdown Reduction (Phase 10.2)

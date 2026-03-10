@@ -4,14 +4,19 @@ import ccxt
 
 load_dotenv()
 
+from config.settings import config
+
 try:
     conn = sqlite3.connect('crypto_bot.db')
     c = conn.cursor()
     ex = ccxt.binance({
-        'apiKey': os.getenv('BINANCE_API_KEY'),
-        'secret': os.getenv('BINANCE_API_SECRET'),
+        'apiKey': config.API_KEY,
+        'secret': config.API_SECRET,
         'options': {'defaultType': 'future'}
     })
+    if config.TESTNET or config.DEMO_TRADING:
+        ex.urls['api']['fapiPublic'] = 'https://demo-fapi.binance.com/fapi/v1'
+        ex.urls['api']['fapi'] = 'https://demo-fapi.binance.com'
     ex.options['warnOnFetchOpenOrdersWithoutSymbol'] = False
     
     # Get active pairs first

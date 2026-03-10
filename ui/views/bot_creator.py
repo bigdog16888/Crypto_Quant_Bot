@@ -333,18 +333,23 @@ def render_bot_creator_view():
                 st.markdown("### 1. Indicators")
             i_col1, i_col2, i_col3, i_col4 = st.columns(4)
             with i_col1: 
-                bot_config['mode_cci'] = st.selectbox("CCI Switch", [0, 1, 2], index=0, format_func=lambda x: {0: "OFF", 1: "Above Level", 2: "Below Level"}[x], key="create_mode_cci")
-                bot_config['cci_level'] = st.number_input("CCI Level", value=100, key="create_cci_lvl")
+                bot_config['mode_cci'] = st.selectbox("CCI Switch", [0, 1, 2], index=0, format_func=lambda x: {0: "OFF", 1: "Above Level", 2: "Below Level"}[x], key="create_mode_cci",
+                    help="Commodity Channel Index. Mode 1 (Above) = bullish momentum; Mode 2 (Below) = oversold/pullback entry.")
+                bot_config['cci_level'] = st.number_input("CCI Level", value=100, key="create_cci_lvl",
+                    help="CCI is unbounded but typically oscillates between -200 and +200. Common levels: ±100 (standard), ±150 (strong), 0 (neutral). Oversold entry: Below -100. Overbought: Above +100.")
                 bot_config['cci_tf'] = st.selectbox("CCI TF", ["1m","5m","15m","1h","4h","1d"], index=2, key="create_cci_tf")
             with i_col2: 
                 bot_config['mode_boll'] = st.selectbox("Boll Switch", [0, 1, 2], index=0, format_func=lambda x: {0: "OFF", 1: "Outside Lower", 2: "Outside Upper"}[x], key="create_mode_boll")
                 bot_config['boll_tf'] = st.selectbox("Boll TF", ["1m","5m","15m","1h","4h","1d"], index=2, key="create_bb_tf")
             with i_col3: 
-                bot_config['mode_stoch'] = st.selectbox("Stoch Switch", [0, 1, 2], index=0, format_func=lambda x: {0: "OFF", 1: "Oversold (DN)", 2: "Overbought (UP)"}[x], key="create_mode_stoch")
+                bot_config['mode_stoch'] = st.selectbox("Stoch Switch", [0, 1, 2], index=0, format_func=lambda x: {0: "OFF", 1: "Oversold (DN)", 2: "Overbought (UP)"}[x], key="create_mode_stoch",
+                    help="Stochastic Oscillator. Range: 0–100. Oversold = below 20; Overbought = above 80.")
                 bot_config['stoch_tf'] = st.selectbox("Stoch TF", ["1m","5m","15m","1h","4h","1d"], index=2, key="create_stoch_tf")
             with i_col4: 
-                bot_config['mode_rsi'] = st.selectbox("RSI Switch", [0, 1, 2], index=0, format_func=lambda x: {0: "OFF", 1: "Below Level", 2: "Above Level"}[x], key="create_mode_rsi")
-                bot_config['rsi_level'] = st.number_input("RSI Level", value=30, key="create_rsi_lvl")
+                bot_config['mode_rsi'] = st.selectbox("RSI Switch", [0, 1, 2], index=0, format_func=lambda x: {0: "OFF", 1: "Below Level", 2: "Above Level"}[x], key="create_mode_rsi",
+                    help="Relative Strength Index. Range: 0–100. Mode 1 (Below) = oversold entry (short-term bottom). Typical level: 30. Mode 2 (Above) = overbought/momentum entry. Typical level: 70.")
+                bot_config['rsi_level'] = st.number_input("RSI Level", value=30, min_value=0, max_value=100, key="create_rsi_lvl",
+                    help="RSI range is 0–100. Classic thresholds: 30 = oversold (LONG entry), 70 = overbought (SHORT entry).")
                 bot_config['rsi_tf'] = st.selectbox("RSI TF", ["1m","5m","15m","1h","4h","1d"], index=2, key="create_rsi_tf")
 
             st.divider()
@@ -553,8 +558,8 @@ def render_bot_creator_view():
             st.subheader("Hedging")
             use_hedge = st.checkbox("Use Hedging", value=False)
             bot_config['UseHedge'] = use_hedge
-            bot_config['HedgeStartStep'] = st.number_input("Hedge Start Step (1-10)", min_value=1, max_value=10, value=7)
-            bot_config['HedgeStart'] = st.number_input("Hedge Start (DD%)", value=70.0)
+            bot_config['HedgeStartStep'] = st.number_input("Hedge Start Step", min_value=1, max_value=20, value=7,
+                help="At this Martingale step, a limit Post-Only order is placed on the opposite side at your avg entry price, locking in the maximum loss. Requires manual removal after TP.")
 
             # Update Temp Strat for Projection if Hedging is toggled
             if use_hedge:

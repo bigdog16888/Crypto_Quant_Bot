@@ -166,8 +166,15 @@ def _handle_order_partial_fill(bot_id: int, order_type: str, event: Dict):
     logger.info(f"⚡ WS PARTIAL FILL: Bot {bot_id} {order_type} +{incremental_qty:.6f} @ {avg_price} (total so far: {cumulative_filled:.6f})")
 
     if order_type in ('ENTRY', 'GRID'):
+        # 🚀 FUNDAMENTAL FIX: Extract exact step from Client Order ID immediately.
+        # This prevents 'Step Lag' where the bot has partial money but the DB thinks it's still at Step N-1.
+        partial_step = None
+        if event:
+             parts = str(event.get('client_order_id', '')).split('_')
+             if len(parts) > 3 and parts[3].isdigit():
+                 partial_step = int(parts[3])
+
         # Accumulate the incremental portion into trade state
-        # We pass is_entry=True only on ENTRY type so basket_start_time is set
         try:
             from engine.database import accumulate_trade_fill, log_trade, update_order_fill
             accumulate_trade_fill(
@@ -175,12 +182,12 @@ def _handle_order_partial_fill(bot_id: int, order_type: str, event: Dict):
                 added_invested=avg_price * incremental_qty,
                 added_qty=incremental_qty,
                 avg_price=avg_price,
-                new_step=None,   # Don't increment step mid-fill; final FILLED event will set it
+                new_step=partial_step,   # 🚀 Fix: Advance step state even mid-fill
                 tp_price=None,
                 is_entry=(order_type == 'ENTRY')
             )
             log_trade(bot_id, f'WS_{order_type}_PARTIAL', symbol, avg_price, incremental_qty,
-                      avg_price * incremental_qty, order_type)
+                      avg_price * incremental_qty, order_type, new_step=partial_step)
             # 🚀 PERSIST partial progress for UI
             update_order_fill(order_id, cumulative_filled, bot_id=bot_id)
         except Exception as e:

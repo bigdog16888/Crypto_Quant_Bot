@@ -127,7 +127,79 @@ class StateReconciler:
     # ------------------------------------------------------------------
     # STEP 1: OFFLINE FILL DETECTION
     # ------------------------------------------------------------------
-    def detect_offline_fills(self, since_hours: int = 168) -> Dict[str, int]:
+    def _sync_positions_to_exchange(self, exchange: ExchangeInterface) -> None:
+        """
+        Preflight: fetch live exchange positions and sync DB for any diverging bot.
+        Runs BEFORE fill history replay. This is the primary guard against double-counting and math bugs.
+        If the exchange says we have 100 contracts @ $1.50, we force the DB to match, ignoring local history math.
+        """
+        try:
+            positions = exchange.fetch_positions()
+            # Map by normalized symbol
+            pos_map = {normalize_symbol(p['symbol']): p for p in positions if abs(p.get('contracts', 0)) > 0}
+            
+            conn = get_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT b.id, b.pair, b.direction, t.total_invested, t.avg_entry_price "
+                        "FROM bots b JOIN trades t ON b.id=t.bot_id WHERE b.is_active=1")
+            
+            bot_records = cur.fetchall()
+            
+            # Count active trades per pair to detect Virtual Hedging
+            pair_trade_counts = {}
+            for r in bot_records:
+                norm_p = normalize_symbol(r[1])
+                if r[3] > 0: # total_invested > 0
+                    pair_trade_counts[norm_p] = pair_trade_counts.get(norm_p, 0) + 1
+
+            synced_count = 0
+            for bot_id, pair, direction, db_inv, db_entry in bot_records:
+                norm = normalize_symbol(pair)
+                ex_pos = pos_map.get(norm)
+                if not ex_pos:
+                    continue  # Exchange flat — let existing zombie/reset logic handle it
+                
+                ex_entry = float(ex_pos.get('entryPrice') or 0)
+                ex_qty   = abs(float(ex_pos.get('contracts') or 0))
+                ex_inv   = ex_entry * ex_qty
+                ex_side  = ex_pos.get('side', '').upper()
+                
+                if ex_entry <= 0 or ex_qty <= 0:
+                    continue
+
+                # 🛡️ DIRECTION GUARD: Never anchor a bot to a position of the opposite side.
+                # This prevents a SHORT bot from being anchored to a LONG exchange position (Two Bot Battle).
+                if ex_side != direction.upper():
+                    logger.warning(f"🛡️ [DIRECTION-CONFLICT] Bot {bot_id} ({pair}) is {direction} but Exchange is {ex_side}. Anchoring BLOCKED.")
+                    continue
+                    
+                # 🛡️ HEDGE GUARD: Do not destructively overwrite a bot if multiple bots are actively
+                # trading this pair. Binances 'Net' position cannot be injected into a single bot seamlessly.
+                if pair_trade_counts.get(norm, 0) > 1:
+                    logger.debug(f"🛡️ [HEDGE-GUARD] Skipping Preflight Anchor for Bot {bot_id} ({pair}) — {pair_trade_counts[norm]} bots active on pair.")
+                    continue
+                    
+                entry_drift  = abs(ex_entry - db_entry) / max(db_entry, 0.0001)
+                inv_drift    = abs(ex_inv   - db_inv)   / max(db_inv,   0.0001)
+                
+                # >0.5% drift: DB is wrong. Exchange wins.
+                if entry_drift > 0.005 or inv_drift > 0.005:
+                    logger.warning(f"⚓ [POSITION-SYNC] Bot {bot_id} ({pair}): DB entry={db_entry:.4f} inv={db_inv:.2f} "
+                                   f"vs Exchange entry={ex_entry:.4f} inv={ex_inv:.2f}. Anchoring DB to exchange.")
+                    cur.execute("UPDATE trades SET avg_entry_price=?, total_invested=? WHERE bot_id=?",
+                                (ex_entry, ex_inv, bot_id))
+                    log_trade(bot_id, 'POSITION_SYNC', pair, ex_entry, ex_qty, ex_inv,
+                              'RECON_SYNC', 0, f'DB drifted {entry_drift*100:.1f}%. Anchored to exchange.', 0)
+                    synced_count += 1
+                    
+            if synced_count > 0:
+                conn.commit()
+            conn.close()
+            
+        except Exception as e:
+            logger.error(f"Error in _sync_positions_to_exchange: {e}")
+
+    def reconstruct_offline_fills(self, since_hours: int = 168) -> Dict[str, int]:
         """
         Scans exchange history for orders that filled while we were offline.
         Updates the DB immediately so subsequent checks see the correct state.
@@ -135,6 +207,15 @@ class StateReconciler:
         """
         stats = {'grid_fills': 0, 'tp_fills': 0, 'entry_fills': 0, 'total': 0}
         
+        # 🔑 PREFLIGHT: Sync DB positions to exchange before looking at any single fill
+        # This prevents fragmented/slow fills from corrupting a position that already matches
+        try:
+            ex_fut = self.exchanges.get('future')
+            if ex_fut:
+                self._sync_positions_to_exchange(ex_fut)
+        except Exception as e:
+            logger.error(f"Preflight sync failed: {e}")
+
         # 1. Identify pairs to scan (Active Bots + Open Orders)
         conn = get_connection()
         cursor = conn.cursor()
@@ -304,8 +385,32 @@ class StateReconciler:
                                 if fill_price <= 0:
                                     logger.warning(f"⚠️ Skipping OFFLINE_TP for Bot {bot_id}: fill_price={fill_price} is invalid.")
                                     continue
-                                # Only process if we haven't reset yet?
-                                # Ideally yes. If we are active, and find a TP fill, we MUST reset.
+                                
+                                # 🔑 EXCHANGE-POSITION GUARD: The most critical safety check.
+                                # If the exchange STILL has an open position for this symbol, this TP
+                                # either failed, was cancelled, or belongs to a previous cycle.
+                                # We MUST NOT reset the bot in this case — it would zero a live position.
+                                try:
+                                    ex_for_guard = self.exchanges.get('future') or self.exchanges.get('spot')
+                                    if ex_for_guard:
+                                        live_positions = ex_for_guard.fetch_positions()
+                                        norm_fill_sym = normalize_symbol(fill_symbol)
+                                        still_has_position = any(
+                                            normalize_symbol(p['symbol']) == norm_fill_sym and abs(float(p.get('contracts', 0))) > 0.001
+                                            for p in live_positions
+                                        )
+                                        if still_has_position:
+                                            logger.warning(
+                                                f"🛡️ [TP-GUARD] Skipping OFFLINE_TP reset for Bot {bot_id} ({fill_symbol}): "
+                                                f"Exchange STILL has an open position. This TP is stale/cancelled/from prior cycle."
+                                            )
+                                            # Mark the TP order as cancelled in our DB so we don't keep checking it
+                                            cursor.execute("UPDATE bot_orders SET status='auto_closed' WHERE (order_id=? OR client_order_id=?)", (order['id'], cid))
+                                            continue
+                                except Exception as guard_err:
+                                    logger.error(f"TP position guard failed for Bot {bot_id}: {guard_err}. Skipping reset to be safe.")
+                                    continue
+                                
                                 self._handle_offline_tp_fill(bot_id, bot_name, fill_price, fill_symbol)
                                 stats['tp_fills'] += 1
                                 
@@ -313,20 +418,27 @@ class StateReconciler:
                                 # MODIFIED: Allow step >= curr_step to recover from "Alzheimer's" repeat-fills
                                 # If the order ID wasn't already marked closed/filled in DB, we MUST credit it.
                                 if step >= curr_step:
-                                    # 🔑 IDEMPOTENCY CHECK: Was this fill already recorded by the WebSocket handler?
-                                    # No time window — for a genuine offline fill, there is NO WS_GRID_FILL entry
-                                    # at all (WS was down too), so this check safely allows offline fills through.
-                                    # For WS-online fills, the WS handler logs WS_GRID_FILL — we skip duplicates
-                                    # regardless of how much time has passed since the WS fill was logged.
+                                    # 🔑 IDEMPOTENCY CHECK v2: Two-layer guard.
+                                    # Layer 1: Check by exchange order_id in bot_orders (fastest, most accurate)
+                                    cursor.execute(
+                                        "SELECT COUNT(*) FROM bot_orders WHERE order_id=? AND status IN ('filled','closed')",
+                                        (order['id'],)
+                                    )
+                                    already_in_orders = cursor.fetchone()[0] > 0
+                                    
+                                    # Layer 2: Check trade_history by price+qty (catches WS fills logged
+                                    # under different order_ids due to partial fill fragmentation)
                                     cursor.execute(
                                         "SELECT COUNT(*) FROM trade_history "
                                         "WHERE bot_id=? AND ABS(price - ?) < ? AND ABS(amount - ?) < ? "
                                         "AND action IN ('WS_GRID_FILL','GRID_FILL','WS_ENTRY_FILL')",
                                         (bot_id, fill_price, fill_price * 0.001, fill_qty, fill_qty * 0.001)
                                     )
-                                    already_logged = cursor.fetchone()[0] > 0
+                                    already_in_history = cursor.fetchone()[0] > 0
+                                    
+                                    already_logged = already_in_orders or already_in_history
                                     if already_logged:
-                                        logger.info(f"⏭️ [OFFLINE-DEDUP] Skipping fill for Bot {bot_id} Step {step} @ {fill_price} x{fill_qty} — already logged by WS handler.")
+                                        logger.info(f"⏭️ [OFFLINE-DEDUP] Skipping fill for Bot {bot_id} Step {step} @ {fill_price} x{fill_qty} — already logged (orders={already_in_orders}, history={already_in_history}).")
                                         # Mark bot_order as filled so reconciler doesn't re-check on next cycle
                                         cursor.execute("UPDATE bot_orders SET status='filled' WHERE (order_id=? OR client_order_id=?)", (order['id'], cid))
                                         continue
@@ -334,10 +446,18 @@ class StateReconciler:
                                     logger.info(f"✅ Re-playing OFFLINE_GRID for Bot {bot_id} (Step {step})")
                                     self._handle_offline_grid_fill(cursor, bot_id, bot_name, fill_price, fill_qty, curr_step, current_state.get('total_invested',0), current_state.get('avg_entry',0), fill_symbol)
                                     stats['grid_fills'] += 1
-                                    # Update local state for subsequent orders in same history fetch
+                                    # ✅ FIX: Update the LOCAL cache so subsequent fills in THIS SAME SWEEP
+                                    # use the correct post-fill avg_entry and total_invested.
+                                    # Previously, 'avg_entry update omitted for local cache brevity' meant the
+                                    # second offline fill in a sweep used stale state, corrupting the average.
+                                    old_inv = bot_states[bot_id].get('total_invested', 0)
+                                    old_avg = bot_states[bot_id].get('avg_entry', 0)
+                                    fill_cost = fill_price * fill_qty
+                                    new_inv = old_inv + fill_cost
+                                    new_avg = ((old_inv * old_avg) + fill_cost) / new_inv if new_inv > 0 else fill_price
                                     bot_states[bot_id]['current_step'] = step
-                                    bot_states[bot_id]['total_invested'] += (fill_price * fill_qty)
-                                    # (avg_entry update omitted for local cache brevity, will be correct in DB)
+                                    bot_states[bot_id]['total_invested'] = new_inv
+                                    bot_states[bot_id]['avg_entry'] = new_avg
                                     
                             elif otype == 'ENTRY':
                                 if curr_step == 0:
@@ -348,6 +468,21 @@ class StateReconciler:
                                     bot_states[bot_id]['current_step'] = 1
                                     bot_states[bot_id]['entry_confirmed'] = 1
                                     bot_states[bot_id]['total_invested'] = fill_price * fill_qty
+
+                            elif otype == 'HEDGETP':
+                                logger.info(f"🛡️ ✅ [OFFLINE-HEDGETP] Re-playing HEDGETP for Bot {bot_id}")
+                                # Mark as filled in DB to trigger retirement in next executor cycle
+                                cursor.execute("UPDATE bot_orders SET status='filled', updated_at=? WHERE order_id=?", 
+                                               (int(time.time()), order['id']))
+                                stats['tp_fills'] += 1 # Count as a TP fill for stats
+
+                            elif otype == 'HEDGE':
+                                logger.info(f"🛡️ ✅ [OFFLINE-HEDGE] Re-playing HEDGE for Bot {bot_id}")
+                                # Mark as filled in DB
+                                cursor.execute("UPDATE bot_orders SET status='filled', updated_at=? WHERE order_id=?", 
+                                               (int(time.time()), order['id']))
+                                # Note: We don't update total_invested/avg_entry here as hedge is separate
+                                stats['grid_fills'] += 1 # Count as a grid fill for stats
                             
                             # Update/Insert Order Record
                             # bot_orders has no UNIQUE on order_id, so check first.
@@ -402,7 +537,7 @@ class StateReconciler:
         new_invested = (total_invested or 0) + fill_cost
         new_avg = ((total_invested or 0) * (avg_entry or 0) + fill_cost) / new_invested if new_invested > 0 else fill_price
         
-        # UPSERT trade
+        # UPSERT trade (Temporary local math — will be anchored to exchange immediately below)
         cursor.execute("SELECT bot_id FROM trades WHERE bot_id=?", (bot_id,))
         if cursor.fetchone():
             cursor.execute("UPDATE trades SET current_step=?, total_invested=?, avg_entry_price=? WHERE bot_id=?", 
@@ -412,9 +547,29 @@ class StateReconciler:
                            (bot_id, new_step, new_invested, new_avg))
         
         log_trade(bot_id, 'OFFLINE_GRID', symbol, fill_price, fill_amount, fill_cost, f"GRID_{new_step}", new_step, "Offline Grid Fill", 0)
+        
+        # ⚓ POST-FILL ANCHOR: Immediately sync DB to exchange position to kill arithmetic drift
+        try:
+            ex_fut = self.exchanges.get('future')
+            if ex_fut:
+                positions = ex_fut.fetch_positions()
+                norm_sym = normalize_symbol(symbol)
+                for p in positions:
+                    if normalize_symbol(p['symbol']) == norm_sym:
+                        ex_entry = float(p.get('entryPrice') or 0)
+                        ex_qty   = abs(float(p.get('contracts') or 0))
+                        ex_inv   = ex_entry * ex_qty
+                        if ex_entry > 0 and ex_qty > 0:
+                            cursor.execute("UPDATE trades SET avg_entry_price=?, total_invested=? WHERE bot_id=?", 
+                                           (ex_entry, ex_inv, bot_id))
+                            # Note: No separate trade log needed here, it just silently perfects the data
+                        break
+        except Exception as e:
+            logger.error(f"Post-fill anchor failed for bot {bot_id} ({symbol}): {e}")
 
     def _handle_offline_entry_fill(self, cursor, bot_id, bot_name, fill_price, fill_amount, symbol, timestamp_sec):
         fill_cost = fill_price * fill_amount
+        # UPSERT trade (Temporary local math — will be anchored to exchange immediately below)
         cursor.execute("SELECT bot_id FROM trades WHERE bot_id=?", (bot_id,))
         if cursor.fetchone():
             cursor.execute("UPDATE trades SET current_step=1, total_invested=?, avg_entry_price=?, entry_confirmed=1, basket_start_time=? WHERE bot_id=?",
@@ -424,6 +579,24 @@ class StateReconciler:
                            (bot_id, fill_cost, fill_price, timestamp_sec))
         
         log_trade(bot_id, 'OFFLINE_ENTRY', symbol, fill_price, fill_amount, fill_cost, "ENTRY", 1, "Offline Entry Fill", 0)
+        
+        # ⚓ POST-FILL ANCHOR: Immediately sync DB to exchange position to kill arithmetic drift
+        try:
+            ex_fut = self.exchanges.get('future')
+            if ex_fut:
+                positions = ex_fut.fetch_positions()
+                norm_sym = normalize_symbol(symbol)
+                for p in positions:
+                    if normalize_symbol(p['symbol']) == norm_sym:
+                        ex_entry = float(p.get('entryPrice') or 0)
+                        ex_qty   = abs(float(p.get('contracts') or 0))
+                        ex_inv   = ex_entry * ex_qty
+                        if ex_entry > 0 and ex_qty > 0:
+                            cursor.execute("UPDATE trades SET avg_entry_price=?, total_invested=? WHERE bot_id=?", 
+                                           (ex_entry, ex_inv, bot_id))
+                        break
+        except Exception as e:
+            logger.error(f"Post-fill anchor failed for bot {bot_id} ({symbol}): {e}")
 
     # ------------------------------------------------------------------
     # STEP 2: BOT-CENTRIC VALIDATION
@@ -707,111 +880,28 @@ class StateReconciler:
                      f"Physical=${total_physical_notional:.2f} (Delta=${delta_notional:.2f}). Attempting auto-repair..."
                  )
                  
-                 # 🚀 AUTO-REPAIR: If Physical > Virtual, it's likely missed fills (Memory Gap)
-                 if total_physical_notional > total_virtual_invested:
-                     for target_bot in genuine_in_trade_bots:
-                         try:
-                             from .database import get_connection, accumulate_trade_fill
-                             # CYCLE-ID GUARD: Only sum fills from the bot's CURRENT cycle.
-                             # This is the definitive, time-free way to identify current-cycle fills.
-                             # bot_orders.cycle_id = trades.cycle_id ensures we never re-adopt old history.
-                             conn = get_connection()
-                             cursor = conn.cursor()
-                             
-                             # Check if bot_orders has more filled value than we have in trades
-                             # Filter by basket_start_time to ensure we only sum CURRENT session fills
-                             cursor.execute("""
-                                 SELECT SUM(amount * price), SUM(amount), MAX(step) 
-                                 FROM bot_orders 
-                                 WHERE bot_id = ? AND status IN ('filled', 'closed')
-                                 AND cycle_id = ?
-                                 AND (client_order_id LIKE 'CQB_%' OR client_order_id IS NULL)
-                             """, (target_bot.bot_id, getattr(target_bot, 'cycle_id', 1)))
-                             row = cursor.fetchone()
-                             if row and row[0] and row[0] > (target_bot.total_invested + 1.0):
-                                 history_sum = row[0]
-                                 history_qty = row[1]
-                                 history_step = row[2] or 0
-                                 
-                                 repair_amount = history_sum - target_bot.total_invested
-                                 current_qty = (target_bot.total_invested / target_bot.avg_entry_price) if target_bot.avg_entry_price > 0 else 0
-                                 repair_qty = history_qty - current_qty
-                                 
-                                 logger.critical(f"👨‍⚕️ [RECON-REPAIR] Bot {target_bot.name} (ID {target_bot.bot_id}) is missing ${repair_amount:,.2f} from trade balance. REPAIRING from current session history.")
-                                 
-                                 avg_price = history_sum / history_qty if history_qty > 0 else target_bot.avg_entry_price
-                                 
-                                 # Apply the missing portion
-                                 accumulate_trade_fill(target_bot.bot_id, repair_amount, repair_qty, avg_price, max(history_step, target_bot.current_step), 0.0, is_entry=True)
-                                 
-                                 results.append(ReconciliationResult(
-                                     bot_id=target_bot.bot_id,
-                                     bot_name=target_bot.name,
-                                     pair=target_bot.pair,
-                                     action_taken=ReconciliationAction.SYSTEM_FIX_ZOMBIE,
-                                     details=f"Repaired: ${repair_amount:,.2f} cost basis recovered from order history.",
-                                     requires_manual_intervention=False
-                                 ))
-                                 # Removed break to allow multi-repair
-                         except Exception as repair_err:
-                             logger.error(f"❌ Auto-repair failed for Bot {target_bot.bot_id}: {repair_err}")
-                         finally:
-                             if 'conn' in locals(): conn.close()
-
-                 # 🚀 SYNC-TO-REALITY: If Virtual > Physical, it's likely over-accumulation (e.g. Double Counting Bug)
-                 elif total_virtual_invested > (total_physical_notional + 50.0):
-                      # Find active bots on this pair that are in trade
-                      active_bots_on_pair = [b for b in bots if b.in_trade]
-                      if len(active_bots_on_pair) == 1:
-                          target_bot = active_bots_on_pair[0]
-                          
-                          # 🚀 PARTIAL-FILL GUARD: Do NOT sync down if the bot has any open GRID or ENTRY orders.
-                          # Physical position grows incrementally during partial fills — syncing to mid-fill snapshot
-                          # permanently destroys the virtual position, creating a cascading data loss loop.
-                          has_active_fill_order = False
-                          try:
-                              from .database import get_connection # Import for the guard check
-                              _chk_conn = get_connection()
-                              _chk_cur = _chk_conn.cursor()
-                              _chk_cur.execute(
-                                  "SELECT COUNT(*) FROM bot_orders WHERE bot_id=? AND status='open' AND order_type IN ('entry','grid')",
-                                  (target_bot.bot_id,)
-                              )
-                              has_active_fill_order = (_chk_cur.fetchone()[0] > 0)
-                              _chk_conn.close()
-                          except Exception:
-                              has_active_fill_order = True  # Fail-safe: skip sync if check fails
-                          
-                          if has_active_fill_order:
-                              logger.warning(
-                                  f"⏳ [SYNC-TO-REALITY SKIPPED] Bot {target_bot.name}: virtual (${target_bot.total_invested:,.2f}) > "
-                                  f"physical (${total_physical_notional:,.2f}) but has open GRID/ENTRY order — partial fill in progress. Waiting."
-                              )
-                          else:
-                              new_invested = max(total_physical_notional, 0.0)
-                              logger.critical(f"👨‍⚕️ [SYNC-TO-REALITY] Bot {target_bot.name} (ID {target_bot.bot_id}) virtual (${target_bot.total_invested:,.2f}) > physical (${total_physical_notional:,.2f}). SYNCING down to ${new_invested:,.2f}.")
-                              try:
-                                  from .database import get_connection
-                                  conn = get_connection()
-                                  cursor = conn.cursor()
-                                  cursor.execute("UPDATE trades SET total_invested = ? WHERE bot_id = ?", (new_invested, target_bot.bot_id))
-                                  conn.commit()
-                                  
-                                  results.append(ReconciliationResult(
-                                      bot_id=target_bot.bot_id,
-                                      bot_name=target_bot.name,
-                                      pair=target_bot.pair,
-                                      action_taken=ReconciliationAction.SYSTEM_FIX_ZOMBIE,
-                                      details=f"Synced to Reality: Diminished virtual invested to ${new_invested:,.2f}.",
-                                      requires_manual_intervention=False
-                                  ))
-                              except Exception as e:
-                                  logger.error(f"❌ Sync-to-reality failed for Bot {target_bot.bot_id}: {e}")
-                              finally:
-                                  if 'conn' in locals(): conn.close()
-                      else:
-                          logger.warning(f"⚠️ [SYNC-TO-REALITY] Cannot auto-sync {pair} because there are {len(active_bots_on_pair)} active bots in trade. Requires manual intervention.")
-
+                 # 🚀 NEW ARCHITECTURE: EXCHANGE-ANCHORED HEALING
+                 # Instead of trying to guess whether we missed fills (Virtual < Physical)
+                 # or double-counted fills (Virtual > Physical) and doing broken local math,
+                 # we just ask the exchange what the real position is and overwrite our DB.
+                 try:
+                     ex_fut = self.exchanges.get('future')
+                     if ex_fut:
+                         logger.critical(f"👨‍⚕️ [RECON-HEAL] {pair} Gap detected. Triggering Exchange-Anchored Sync.")
+                         self._sync_positions_to_exchange(ex_fut)
+                         
+                         # Add a result so the UI knows a repair was attempted
+                         results.append(ReconciliationResult(
+                             bot_id=genuine_in_trade_bots[0].bot_id,
+                             bot_name=genuine_in_trade_bots[0].name,
+                             pair=pair,
+                             action_taken=ReconciliationAction.SYSTEM_FIX_ZOMBIE,
+                             details=f"Exchange-Anchored Sync triggered for {pair} due to ${delta_notional:.2f} Notional Gap.",
+                             requires_manual_intervention=False
+                         ))
+                 except Exception as heal_err:
+                     logger.error(f"❌ Exchange-Anchored Sync failed for {pair}: {heal_err}")
+            
             # ------------------------------------------------------------------
             # CASE D: NET-SUM GHOST DETECTION (Revised Fix #1)
             # ------------------------------------------------------------------
@@ -949,7 +1039,7 @@ class StateReconciler:
     def _find_proof_of_exit(self, bot: BotState) -> Optional[Dict]:
         """
         Searches exchange history for proof that the bot's position was closed.
-        Uses the clientOrderId DNA (CQB_BOTID_TP/SL/...)
+        Uses the clientOrderId DNA (CQB_BOTID_TP/SL/...) AND verifies the cycle_id against bot_orders.
         """
         for mt, ex in self.exchanges.items():
             if not ex: continue
@@ -959,12 +1049,33 @@ class StateReconciler:
                 if not isinstance(history, list):
                     continue
                 
+                conn = get_connection()
+                cur = conn.cursor()
+                
+                expected_cycle = bot.cycle_id
+                
                 for order in history:
                     cid = order.get('clientOrderId', '')
                     # We look for any exit order from this bot
                     if cid.startswith(f"CQB_{bot.bot_id}_TP_") or cid.startswith(f"CQB_{bot.bot_id}_SL_"):
                         if order.get('status') in ['closed', 'filled']:
-                            return order
+                            # 🛡️ CYCLE ID GUARD: Ask DB if this order belongs to the CURRENT cycle
+                            cur.execute("SELECT cycle_id, status FROM bot_orders WHERE order_id=? OR client_order_id=?", 
+                                        (order.get('id'), cid))
+                            row = cur.fetchone()
+                            
+                            if row:
+                                db_cycle = row[0]
+                                db_status = row[1]
+                                if db_cycle == expected_cycle and db_status not in ['reset_cleared', 'auto_closed']:
+                                    conn.close()
+                                    return order
+                                else:
+                                    logger.debug(f"🛑 [GHOST-EXIT-GUARD] Found TP {cid} but rejected: Belongs to cycle {db_cycle} (Current: {expected_cycle}) or status={db_status}")
+                            else:
+                                logger.debug(f"🛑 [GHOST-EXIT-GUARD] Found TP {cid} but rejected: Not found in bot_orders (Historical Run)")
+                
+                conn.close()
             except Exception as e:
                 logger.error(f"Failed to fetch exit proof for Bot {bot.bot_id}: {e}")
         return None

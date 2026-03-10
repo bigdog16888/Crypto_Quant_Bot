@@ -466,15 +466,17 @@ class BotExecutor:
                     trade_update_data = self.execute_exit_tp(bot_id, name, pair, direction, bot_status, current_price, exchange, market_type_snapshot, bot_config)
                 elif mission['action'] == 'exit_sl':
                     trade_update_data = self.execute_exit_sl(bot_id, name, pair, direction, bot_status, current_price, exchange, market_type_snapshot, bot_config)
-                
-                # Return recommended sleep from strategy, default to 5s if not specified
+                elif mission['action'] == 'hedge_open':
+                    trade_update_data = self.execute_hedge_lock(bot_id, name, pair, direction, bot_status, mission['price'], mission['qty'], mission['step'], exchange, bot_config)
+
                 return mission.get('sleep_interval', 5.0), trade_update_data
 
         except Exception as e:
             logger.error(f"Error processing bot {name} ({bot_id}): {e}")
             logger.error(traceback.format_exc())
             return None, None # Indicate an error occurred
-        return None, trade_update_data
+
+        return 5.0, None
 
     def execute_entry(self, bot_id, name, pair, side, amount, price=None, params=None, exchange=None, market_snapshot=None, bot_config=None, bot_status=None) -> Optional[Dict[str, Any]]:
         if not config.TRADING_ENABLED and not config.DRY_RUN:
@@ -585,6 +587,7 @@ class BotExecutor:
                         # 🚀 SURGICAL DB UPDATE: Record the order and lock the basket
                         # We do this directly here to avoid the Runner's stale overwrite loop.
                         try:
+                            from engine.database import get_connection
                             conn = get_connection()
                             cursor = conn.cursor()
                             # 1. Update trades table
@@ -723,17 +726,34 @@ class BotExecutor:
                 _, _, target_grid_price, _ = exchange.validate_order(pair, side, grid_amt_existing, target_grid_price)
                 
                 curr_grid_price = float(existing_grid_order.get('price', 0))
-                # Replace if price drifted > 0.1% (avoid floating-point noise triggers)
-                if abs(curr_grid_price - target_grid_price) / max(target_grid_price, 0.0001) > 0.001:
-                    logger.info(f"🔄 [GRID-SYNC] {name}: Grid drifted ({curr_grid_price:.4f} -> {target_grid_price:.4f}). Replacing.")
+                
+                # ATR-grid bots intentionally lock the ATR at grid placement time (locked_atr).
+                # Re-computing the ATR every cycle will always produce a slightly different price,
+                # so we SKIP GRID-SYNC for ATR grids to prevent the constant cancel/replace loop.
+                use_atr_grid = bot_config.get('UseATRGrid', False)
+                if use_atr_grid:
+                    # Only replace if price drifted by more than 2x the tick size (true correction only)
                     try:
-                        grid_order_id = existing_grid_order.get('order_id', existing_grid_order.get('id'))
-                        exchange.cancel_order(grid_order_id, pair)
-                        update_order_status(grid_order_id, 'cancelled', bot_id=bot_id)
-                        existing_grid_order = None # Force re-place in next cycle or later in this cycle?
-                        # For simplicity, we just set it to None and let the 'if not existing_grid_order' block handle it next scan
-                    except Exception as e_grid_sync:
-                        logger.error(f"❌ [GRID-SYNC] {name}: Failed to cancel drifted grid: {e_grid_sync}")
+                        _mkt = exchange.exchange.markets.get(pair, {})
+                        tick = float(_mkt.get('precision', {}).get('price') or 0.01)
+                    except Exception:
+                        tick = 0.01
+                    if abs(curr_grid_price - target_grid_price) <= 2 * tick:
+                        pass  # No replacement needed
+                    else:
+                        logger.debug(f"[GRID-SYNC] {name}: ATR-grid large drift ({curr_grid_price:.4f} -> {target_grid_price:.4f}). Skipping auto-replace (ATR-locked).")
+                        # Do NOT cancel — ATR grids are anchored at placement
+                else:
+                    # Non-ATR grids: replace if price drifted > 0.5% (was 0.1%, widened to stop noise triggers)
+                    if abs(curr_grid_price - target_grid_price) / max(target_grid_price, 0.0001) > 0.005:
+                        logger.info(f"🔄 [GRID-SYNC] {name}: Grid drifted ({curr_grid_price:.4f} -> {target_grid_price:.4f}). Replacing.")
+                        try:
+                            grid_order_id = existing_grid_order.get('order_id', existing_grid_order.get('id'))
+                            exchange.cancel_order(grid_order_id, pair)
+                            update_order_status(grid_order_id, 'cancelled', bot_id=bot_id)
+                            existing_grid_order = None
+                        except Exception as e_grid_sync:
+                            logger.error(f"❌ [GRID-SYNC] {name}: Failed to cancel drifted grid: {e_grid_sync}")
                         
         # 4. Cleanup any untracked open orders for this bot
         # 🚀 FIXED: Handle None for existing orders prevents AttributeError
@@ -823,10 +843,81 @@ class BotExecutor:
             # Do NOT force reset here, because the physical position is still open!
             # maintain_orders will place the TP order automatically on the next cycle.
 
+    def _manage_hedge_exit(self, bot_id: int, name: str, pair: str, direction: str, 
+                           bot_open_orders: List[dict], exchange: ExchangeInterface) -> None:
+        """
+        Manages the exit of a filled hedge position at BE price.
+        """
+        try:
+            from engine.database import get_connection, save_bot_order, update_order_status
+            conn = get_connection()
+            cur = conn.cursor()
+            
+            # 1. Fetch filled hedge orders for this bot
+            cur.execute(
+                "SELECT SUM(amount * price) / SUM(amount), SUM(amount), side FROM bot_orders "
+                "WHERE bot_id=? AND order_type='hedge' AND status='filled' GROUP BY side",
+                (bot_id,)
+            )
+            res = cur.fetchone()
+            conn.close()
+            
+            if not res or not res[1] or res[1] <= 0:
+                return
+
+            be_price = float(res[0])
+            hedge_qty = float(res[1])
+            hedge_side = str(res[2]).lower()
+            
+            # 2. Side of TP is opposite of hedge
+            exit_side = 'buy' if hedge_side == 'sell' else 'sell'
+            
+            # 3. Check for existing HEDGETP order
+            existing_h_tp = next((o for o in bot_open_orders if '_HEDGETP_' in o.get('clientOrderId', '')), None)
+            
+            if existing_h_tp:
+                # Order exists - check for drift
+                curr_p = float(existing_h_tp.get('price', 0))
+                if curr_p > 0 and abs(curr_p - be_price) / be_price > 0.005: 
+                    logger.info(f"🛡️ {name}: Hedge TP drifted. Replacing {existing_h_tp['id']}...")
+                    try:
+                        exchange.cancel_order(existing_h_tp['id'], pair)
+                        update_order_status(existing_h_tp['id'], 'cancelled', bot_id=bot_id)
+                        existing_h_tp = None 
+                    except: return
+                else:
+                    return # Already correct
+            
+            # 4. Place new HEDGETP if missing
+            if not existing_h_tp:
+                logger.warning(f"🛡️ {name}: Placing Hedge BE Exit (Limit Post-Only) {exit_side.upper()} {hedge_qty} @ {be_price:.4f}")
+                
+                cid = self._generate_deterministic_id(bot_id, 'HEDGETP', 0)
+                params = {'timeInForce': 'GTX', 'postOnly': True, 'newClientOrderId': cid}
+                
+                if not config.TRADING_ENABLED and not config.DRY_RUN:
+                    return
+                
+                order = None
+                if config.TRADING_ENABLED:
+                    order = self._place_gtx_order_with_retry(
+                        exchange, pair, exit_side, hedge_qty, be_price, params, label=f"HEDGE-EXIT-{name}"
+                    )
+                else:
+                    logger.info(f"🚫 Dry Run: Would place HEDGE-EXIT {hedge_qty} @ {be_price}")
+                    return
+
+                if order and order.get('id'):
+                    save_bot_order(bot_id, pair, str(order['id']), exit_side, hedge_qty, be_price, 
+                                   'open', 'hedge_tp', cid, cycle_id=None)
+        except Exception as e:
+            logger.error(f"Error managing hedge exit for {name}: {e}")
+
     def maintain_orders(self, bot_id, name, pair, direction, bot_status, current_price, exchange: ExchangeInterface, market_snapshot: Dict[str, Any], bot_config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
         Ensures TP and Grid orders are placed active trades.
         """
+        trade_update_data = {}
         if not config.TRADING_ENABLED and not config.DRY_RUN:
             logger.info(f"🛑 [MAINTAIN-BLOCKED] Trading disabled. Bot {name} cannot maintain orders.")
             return
@@ -902,6 +993,20 @@ class BotExecutor:
                     update_order_status(existing_tp_order['id'], 'cancelled', bot_id=bot_id)
                 except: pass
                 tp_orders = []
+
+            # 🛡️ HEDGE AUTO-CLEANUP: If SCANNING, purge dangling PENDING/OPEN hedges
+            # (Note: FILLED hedges are now managed by _manage_hedge_exit below)
+            hedge_orders = [o for o in bot_open_orders if '_HEDGE_' in o.get('clientOrderId', '')]
+            if hedge_orders:
+                logger.warning(f"🛡️ {name}: Found dangling PENDING HEDGE while SCANNING. Purging...")
+                for ho in hedge_orders:
+                    try:
+                        exchange.cancel_order(ho['id'], pair)
+                        update_order_status(ho['id'], 'cancelled', bot_id=bot_id)
+                    except: pass
+            
+            # 🚀 NEW: Call centralized hedge exit manager
+            self._manage_hedge_exit(bot_id, name, pair, direction, bot_open_orders, exchange)
 
         # 🚀 STEP-SYNC FIX: Ensure open orders match the CURRENT martingale step.
         # If we just had a grid fill, the old TP (from a previous step) is stale.
@@ -1276,21 +1381,169 @@ class BotExecutor:
                 _, _, target_grid_price, _ = exchange.validate_order(pair, side, grid_amt, target_grid_price)
                 
                 curr_grid_price = float(existing_grid_order.get('price', 0))
-                # Replace if price drifted > 0.1% (avoid floating-point noise triggers)
-                if abs(curr_grid_price - target_grid_price) / max(target_grid_price, 0.0001) > 0.001:
-                    logger.info(f"🔄 [GRID-SYNC] {name}: Grid drifted ({curr_grid_price:.4f} -> {target_grid_price:.4f}). Replacing.")
+                
+                # ATR-grid bots intentionally lock the ATR at grid placement time (locked_atr).
+                # Re-computing the ATR every cycle will always produce a slightly different price,
+                # so we SKIP GRID-SYNC for ATR grids to prevent the constant cancel/replace loop.
+                use_atr_grid = bot_config.get('UseATRGrid', False)
+                if use_atr_grid:
                     try:
-                        grid_order_id = existing_grid_order.get('order_id', existing_grid_order.get('id'))
-                        exchange.cancel_order(grid_order_id, pair)
-                        update_order_status(grid_order_id, 'cancelled', bot_id=bot_id)
-                        existing_grid_order = None # Force re-place in next cycle
-                    except Exception as e_grid_sync:
-                        logger.error(f"❌ [GRID-SYNC] {name}: Failed to cancel drifted grid: {e_grid_sync}")
+                        _mkt = exchange.exchange.markets.get(pair, {})
+                        tick = float(_mkt.get('precision', {}).get('price') or 0.01)
+                    except Exception:
+                        tick = 0.01
+                    if abs(curr_grid_price - target_grid_price) > 2 * tick:
+                        logger.debug(f"[GRID-SYNC] {name}: ATR-grid drift ({curr_grid_price:.4f} -> {target_grid_price:.4f}). Skipping auto-replace (ATR-locked).")
+                        # Do NOT cancel — ATR grids are anchored at placement
+                else:
+                    # Non-ATR grids: replace if price drifted > 0.5% (was 0.1%, widened to stop noise triggers)
+                    if abs(curr_grid_price - target_grid_price) / max(target_grid_price, 0.0001) > 0.005:
+                        logger.info(f"🔄 [GRID-SYNC] {name}: Grid drifted ({curr_grid_price:.4f} -> {target_grid_price:.4f}). Replacing.")
+                        try:
+                            grid_order_id = existing_grid_order.get('order_id', existing_grid_order.get('id'))
+                            exchange.cancel_order(grid_order_id, pair)
+                            update_order_status(grid_order_id, 'cancelled', bot_id=bot_id)
+                            existing_grid_order = None # Force re-place in next cycle
+                        except Exception as e_grid_sync:
+                            logger.error(f"❌ [GRID-SYNC] {name}: Failed to cancel drifted grid: {e_grid_sync}")
                         
         return None
 
 
+    def execute_hedge_lock(self, bot_id: int, name: str, pair: str, direction: str,
+                           bot_status: dict, lock_price: float, lock_qty: float, trigger_step: int,
+                           exchange: ExchangeInterface, bot_config: Dict[str, Any]):
+        """
+        Places a limit Post-Only (GTX) order on the OPPOSITE side at avg_entry_price
+        to lock in the maximum loss when the bot reaches HedgeStartStep.
+
+        Design:
+        - LONG bot → places a SELL limit at avg_entry_price (no worse than breakeven)
+        - SHORT bot → places a BUY limit at avg_entry_price
+        - Fully idempotent: skips if an open 'hedge' order already exists in bot_orders
+        - TP does NOT cancel this order — it requires manual intervention
+        """
+        try:
+            from engine.database import get_connection
+            
+            # 1. Fetch Current Hedge State (Open Orders and Filled Positions)
+            conn = get_connection()
+            cur = conn.cursor()
+            # Get latest open hedge order for this bot (if any)
+            cur.execute(
+                "SELECT order_id, amount, status FROM bot_orders WHERE bot_id=? AND order_type='hedge' AND status='open' ORDER BY id DESC LIMIT 1",
+                (bot_id,)
+            )
+            open_row = cur.fetchone()
+            
+            # Sum of all FILLED hedge amounts for this bot
+            cur.execute(
+                "SELECT SUM(amount) FROM bot_orders WHERE bot_id=? AND order_type='hedge' AND status='filled'",
+                (bot_id,)
+            )
+            filled_qty = cur.fetchone()[0] or 0.0
+            conn.close()
+
+            # 2. Logic: Parity Sync
+            # We want total_hedged (Filled + Open) to equal lock_qty (the bot's current total size)
+            total_hedged = filled_qty + (open_row[1] if open_row else 0)
+            
+            # If we are within 0.1%, we are synced
+            if abs(total_hedged - lock_qty) / max(lock_qty, 0.0001) < 0.001:
+                logger.debug(f"🛡️ {name}: Hedge state is synced ({total_hedged:.4f} hedged vs {lock_qty:.4f} bot).")
+                return None
+
+            # Case A: We have a pending order that is now too small (Bot moved steps)
+            if open_row:
+                existing_oid = open_row[0]
+                logger.info(f"🔄 {name}: Resizing PENDING hedge ({total_hedged:.4f} -> {lock_qty:.4f}). Cancelling {existing_oid}...")
+                try:
+                    exchange.cancel_order(existing_oid, pair)
+                    from engine.database import update_order_status
+                    update_order_status(existing_oid, 'canceled')
+                    # Now only filled_qty remains
+                    total_hedged = filled_qty
+                except Exception as e_cancel:
+                    logger.warning(f"Could not cancel pending hedge {existing_oid}: {e_cancel}")
+                    # Safety: If we can't cancel, don't place another to avoid double-locking
+                    return None
+
+            # Case B: Calculate Delta
+            # If bot size = 2.0 and we have 1.5 filled, we need +0.5
+            delta_qty = lock_qty - filled_qty
+            
+            if delta_qty <= 0:
+                logger.debug(f"🛡️ {name}: Hedge position already covers/exceeds bot size ({filled_qty:.4f} filled vs {lock_qty:.4f} bot).")
+                return None
+
+            if not config.TRADING_ENABLED and not config.DRY_RUN:
+                logger.info(f"🛡️ [HEDGE-BLOCKED] Trading disabled. Bot {name} needs {delta_qty:.4f} hedge for {pair}.")
+                return None
+
+            # 3. Execution Config
+            hedge_side = 'sell' if direction.upper() == 'LONG' else 'buy'
+            prec_data = exchange.get_precision(pair) or {}
+            price_prec = int(prec_data.get('price_precision', 2))
+            qty_prec = int(prec_data.get('qty_precision', 3))
+            step_size = float(prec_data.get('step_size', 0.001))
+
+            if step_size > 0:
+                delta_qty = math.floor(delta_qty / step_size) * step_size
+            delta_qty = round(delta_qty, qty_prec)
+            lock_price_r = round(lock_price, price_prec)
+
+            if delta_qty <= 0 or lock_price_r <= 0:
+                logger.error(f"🛡️ {name}: Invalid hedge delta params — qty={delta_qty}, price={lock_price_r}")
+                return None
+
+            logger.warning(
+                f"🛡️ [HEDGE-LOCK] Bot {name} (step {trigger_step}): Placing {hedge_side.upper()} "
+                f"{'DELTA ' if filled_qty > 0 else ''}limit GTX {delta_qty} @ {lock_price_r}"
+            )
+
+            # 4. Deterministic CID
+            cid = self._generate_deterministic_id(bot_id, 'HEDGE', trigger_step)
+            params = {'timeInForce': 'GTX', 'postOnly': True, 'newClientOrderId': cid}
+
+            order = self._place_gtx_order_with_retry(
+                exchange, pair, hedge_side, lock_qty, lock_price_r, params,
+                label=f"HEDGE-{name}"
+            )
+
+            if not order or not order.get('id'):
+                logger.error(f"🛡️ {name}: Hedge order placement failed.")
+                return None
+
+            exchange_order_id = str(order['id'])
+            logger.info(f"✅ [HEDGE-LOCK] Bot {name}: Hedge order placed. ID={exchange_order_id}")
+
+            # 5. Record in bot_orders
+            conn = get_connection()
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO bot_orders (bot_id, step, order_type, order_id, price, amount, status, created_at, client_order_id, notes)
+                VALUES (?, ?, 'hedge', ?, ?, ?, 'open', ?, ?, ?)
+            """, (bot_id, trigger_step, exchange_order_id, lock_price_r, lock_qty,
+                  int(time.time()), cid, f"Hedge lock at step {trigger_step}"))
+            conn.commit()
+            conn.close()
+
+            # 6. Log to trade_history
+            from engine.database import log_trade
+            log_trade(bot_id, 'HEDGE_OPEN', pair, lock_price_r, lock_qty,
+                      lock_price_r * lock_qty, exchange_order_id, trigger_step,
+                      f'{direction} bot hedged at step {trigger_step} via {hedge_side.upper()} @ {lock_price_r}', 0)
+
+            return order
+
+        except Exception as e:
+            logger.error(f"🛡️ {name}: execute_hedge_lock failed: {e}")
+            logger.error(traceback.format_exc())
+            return None
+
+
     def execute_exit_sl(self, bot_id, name, pair, direction, bot_status, current_price, exchange: ExchangeInterface, market_snapshot: Dict[str, Any], bot_config: Dict[str, Any]):
+
         if not config.TRADING_ENABLED and not config.DRY_RUN:
             logger.info(f"🛑 [EXIT-BLOCKED] Trading disabled. Bot {name} cannot execute SL for {pair}.")
             return
@@ -1341,6 +1594,86 @@ class BotExecutor:
 
         except Exception as e:
             logger.error(f"❌ {name}: Error executing SL for {pair}: {e}")
+
+    def _manage_hedge_exit(self, bot_id: int, name: str, pair: str, direction: str, 
+                           bot_open_orders: List[Dict], exchange: ExchangeInterface):
+        """
+        Manages the exit of FILLED hedge positions at Break-Even price.
+        Logic:
+        1. Check if we have any FILLED hedge orders in DB for this bot.
+        2. If YES, we MUST have a HEDGETP order open on the exchange.
+        3. If NO HEDGETP open, place one at the weighted avg price of the hedge.
+        4. If a HEDGETP order FILLED (determined by order status), mark old hedges as 'hedge_exited'.
+        """
+        try:
+            from engine.database import get_connection, update_order_status
+            conn = get_connection()
+            cursor = conn.cursor()
+
+            # A. Check for FILLED hedge orders that haven't been retired yet
+            cursor.execute("""
+                SELECT id, order_id, price, amount FROM bot_orders 
+                WHERE bot_id=? AND order_type='hedge' AND status='filled'
+            """, (bot_id,))
+            filled_hedges = cursor.fetchall()
+
+            if not filled_hedges:
+                conn.close()
+                return
+
+            # B. Check if a HEDGETP order already exists (open or filled)
+            cursor.execute("""
+                SELECT order_id, status FROM bot_orders 
+                WHERE bot_id=? AND order_type='hedgetp' ORDER BY id DESC LIMIT 1
+            """, (bot_id,))
+            last_tp = cursor.fetchone()
+
+            # C. Retirement Logic: If the last HEDGETP filled, retire the hedge orders
+            if last_tp and last_tp[1] in ('filled', 'closed'):
+                logger.info(f"🛡️ {name}: Hedge TP {last_tp[0]} confirmed filled. Retiring hedge positions.")
+                cursor.execute("""
+                    UPDATE bot_orders SET status='hedge_exited', updated_at=? 
+                    WHERE bot_id=? AND order_type='hedge' AND status='filled'
+                """, (int(time.time()), bot_id))
+                conn.commit()
+                conn.close()
+                return
+
+            # D. Maintenance: Ensure HEDGETP order exists on exchange
+            # Filter from current open orders
+            open_hedgetp = next((o for o in bot_open_orders if '_HEDGETP_' in o.get('clientOrderId', '')), None)
+
+            if not open_hedgetp:
+                # Calculate weighted average entry of the hedge
+                total_qty = sum(row[3] for row in filled_hedges)
+                total_cost = sum(row[2] * row[3] for row in filled_hedges)
+                hedge_avg_price = total_cost / total_qty if total_qty > 0 else 0
+
+                if total_qty > 0 and hedge_avg_price > 0:
+                    # Hedge side is SAME as original bot direction (to close the hedge which is opposite)
+                    tp_side = 'buy' if direction.upper() == 'LONG' else 'sell'
+                    
+                    # Deterministic ID for retirement tracking
+                    cid = self._generate_deterministic_id(bot_id, 'HEDGETP', 999) # 999 is reserved for hedge tp
+                    
+                    logger.warning(f"🛡️ {name}: Hedge filled but no HEDGETP found. Placing BE exit {tp_side.upper()} {total_qty} @ {hedge_avg_price}")
+                    
+                    params = {'timeInForce': 'GTC', 'clientOrderId': cid}
+                    order = exchange.create_order(pair, 'limit', tp_side, total_qty, hedge_avg_price, params=params)
+                    
+                    if order:
+                        cursor.execute("""
+                            INSERT INTO bot_orders (bot_id, step, order_type, order_id, price, amount, status, created_at, client_order_id, notes)
+                            VALUES (?, ?, 'hedgetp', ?, ?, ?, 'open', ?, ?, ?)
+                        """, (bot_id, 999, order['id'], hedge_avg_price, total_qty, int(time.time()), cid, "Hedge BE Exit"))
+                        conn.commit()
+                        logger.info(f"✅ {name}: Multi-step Hedge BE exit placed. ID={order['id']}")
+            
+            conn.close()
+
+        except Exception as e:
+            logger.error(f"🛡️ {name}: _manage_hedge_exit failed: {e}")
+            logger.error(traceback.format_exc())
 
     def check_for_safety_stop(self):
         """

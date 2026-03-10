@@ -1,0 +1,272 @@
+[
+  {
+    "ts": "2026-03-10 02:29:33",
+    "order_type": "tp",
+    "price": 67903.1,
+    "amount": 2.405,
+    "status": "open",
+    "client_order_id": "CQB_10022_TP_50_1773109773",
+    "filled_amount": 0.0
+  },
+  {
+    "ts": "2026-03-10 02:29:05",
+    "order_type": "grid",
+    "price": 69297.7,
+    "amount": 0.026,
+    "status": "cancelled",
+    "client_order_id": "CQB_10022_GRID_4_1773109744",
+    "filled_amount": 0.0
+  },
+  {
+    "ts": "2026-03-10 02:29:04",
+    "order_type": "tp",
+    "price": 67903.1,
+    "amount": 2.405,
+    "status": "cancelled",
+    "client_order_id": "CQB_10022_TP_3_1773109744",
+    "filled_amount": 0.0
+  },
+  {
+    "ts": "2026-03-10 02:28:49",
+    "order_type": "tp",
+    "price": 67901.3,
+    "amount": 2.391,
+    "status": "cancelled",
+    "client_order_id": "CQB_10022_TP_2_1773109728",
+    "filled_amount": 0.0
+  },
+  {
+    "ts": "2026-03-10 02:28:49",
+    "order_type": "grid",
+    "price": 69253.6,
+    "amount": 0.014,
+    "status": "cancelled",
+    "client_order_id": "CQB_10022_GRID_3_1773109729",
+    "filled_amount": 0.0
+  },
+  {
+    "ts": "2026-03-10 02:20:54",
+    "order_type": "grid",
+    "price": 69240.6,
+    "amount": 0.008,
+    "status": "cancelled",
+    "client_order_id": "CQB_10022_GRID_2_1773109253",
+    "filled_amount": 0.0
+  },
+  {
+    "ts": "2026-03-10 02:20:53",
+    "order_type": "tp",
+    "price": 67900.3,
+    "amount": 2.383,
+    "status": "canceled",
+    "client_order_id": "CQB_10022_TP_1_1773109253",
+    "filled_amount": 0.0
+  },
+  {
+    "ts": "2026-03-10 02:04:21",
+    "order_type": "entry",
+    "price": 69209.0,
+    "amount": 0.002,
+    "status": "cancelled",
+    "client_order_id": "CQB_10022_ENTRY_1_1773108261",
+    "filled_amount": 0.0
+  },
+  {
+    "ts": "2026-03-10 00:48:06",
+    "order_type": "grid",
+    "price": 69269.5,
+    "amount": 0.027,
+    "status": "canceled",
+    "client_order_id": "CQB_10022_GRID_4_1773103685",
+    "filled_amount": 0.0
+  },
+  {
+    "ts": "2026-03-10 00:48:05",
+    "order_type": "tp",
+    "price": 67900.0,
+    "amount": 2.44,
+    "status": "canceled",
+    "client_order_id": "CQB_10022_TP_3_1773103685",
+    "filled_amount": 0.0
+  },
+  {
+    "ts": "2026-03-10 00:46:29",
+    "order_type": "grid",
+    "price": 69210.5,
+    "amount": 0.014,
+    "status": "reset_cleared",
+    "client_order_id": "CQB_10022_GRID_3_1773103588",
+    "filled_amount": 0.0
+  },
+  {
+    "ts": "2026-03-10 00:46:28",
+    "order_type": "tp",
+    "price": 67898.5,
+    "amount": 2.426,
+    "status": "cancelled",
+    "client_order_id": "CQB_10022_TP_2_1773103588",
+    "filled_amount": 0.0
+  },
+  {
+    "ts": "2026-03-10 00:38:19",
+    "order_type": "tp",
+    "price": 67897.8,
+    "amount": 2.418,
+    "status": "canceled",
+    "client_order_id": "CQB_10022_TP_1_1773103099",
+    "filled_amount": 0.0
+  },
+  {
+    "ts": "2026-03-10 00:37:51",
+    "order_type": "tp",
+    "price": 68019.8,
+    "amount": 0.002,
+    "status": "cancelled",
+    "client_order_id": "CQB_10022_TP_1_1773103071",
+    "filled_amount": 0.0
+  },
+  {
+    "ts": "2026-03-10 00:37:51",
+    "order_type": "grid",
+    "price": 69147.8,
+    "amount": 0.008,
+    "status": "reset_cleared",
+    "client_order_id": "CQB_10022_GRID_2_1773103071",
+    "filled_amount": 0.0
+  },
+  {
+    "ts": "2026-03-10 00:37:37",
+    "order_type": "entry",
+    "price": 69055.6,
+    "amount": 0.002,
+    "status": "reset_cleared",
+    "client_order_id": "CQB_10022_ENTRY_1_1773103057",
+    "filled_amount": 0.0
+  },
+  {
+    "ts": "2026-03-10 00:35:49",
+    "order_type": "tp",
+    "price": 67897.6,
+    "amount": 2.42,
+    "status": "canceled",
+    "client_order_id": "CQB_10022_TP_10_1773102948",
+    "filled_amount": 0.0
+  },
+  {
+    "ts": "2026-03-10 00:35:19",
+    "order_type": "tp",
+    "price": 67897.6,
+    "amount": 2.42,
+    "status": "canceled",
+    "client_order_id": "CQB_10022_TP_10_1773102919",
+    "filled_amount": 0.0
+  },
+  {
+    "ts": "2026-03-10 00:30:01",
+    "order_type": "grid",
+    "price": 68982.9,
+    "amount": 1.138,
+    "status": "reset_cleared",
+    "client_order_id": "CQB_10022_GRID_10_1773102600",
+    "filled_amount": 0.0
+  },
+  {
+    "ts": "2026-03-10 00:30:00",
+    "order_type": "tp",
+    "price": 67852.8,
+    "amount": 1.283,
+    "status": "canceled",
+    "client_order_id": "CQB_10022_TP_9_1773102600",
+    "filled_amount": 0.0
+  },
+  {
+    "ts": "2026-03-10 00:29:32",
+    "order_type": "grid",
+    "price": 68932.4,
+    "amount": 0.609,
+    "status": "cancelled",
+    "client_order_id": "CQB_10022_GRID_9_1773102571",
+    "filled_amount": 0.0
+  },
+  {
+    "ts": "2026-03-10 00:29:31",
+    "order_type": "tp",
+    "price": 67811.8,
+    "amount": 0.674,
+    "status": "cancelled",
+    "client_order_id": "CQB_10022_TP_8_1773102571",
+    "filled_amount": 0.0
+  },
+  {
+    "ts": "2026-03-10 00:29:03",
+    "order_type": "tp",
+    "price": 67773.8,
+    "amount": 0.348,
+    "status": "cancelled",
+    "client_order_id": "CQB_10022_TP_7_1773102542",
+    "filled_amount": 0.0
+  },
+  {
+    "ts": "2026-03-10 00:29:03",
+    "order_type": "grid",
+    "price": 68885.9,
+    "amount": 0.326,
+    "status": "reset_cleared",
+    "client_order_id": "CQB_10022_GRID_8_1773102543",
+    "filled_amount": 0.0
+  },
+  {
+    "ts": "2026-03-10 00:28:34",
+    "order_type": "tp",
+    "price": 67738.3,
+    "amount": 0.175,
+    "status": "cancelled",
+    "client_order_id": "CQB_10022_TP_6_1773102513",
+    "filled_amount": 0.0
+  },
+  {
+    "ts": "2026-03-10 00:28:34",
+    "order_type": "grid",
+    "price": 68842.5,
+    "amount": 0.174,
+    "status": "reset_cleared",
+    "client_order_id": "CQB_10022_GRID_7_1773102514",
+    "filled_amount": 0.0
+  },
+  {
+    "ts": "2026-03-10 00:27:37",
+    "order_type": "tp",
+    "price": 67709.1,
+    "amount": 0.082,
+    "status": "canceled",
+    "client_order_id": "CQB_10022_TP_5_1773102456",
+    "filled_amount": 0.0
+  },
+  {
+    "ts": "2026-03-10 00:27:37",
+    "order_type": "grid",
+    "price": 68796.2,
+    "amount": 0.093,
+    "status": "cancelled",
+    "client_order_id": "CQB_10022_GRID_6_1773102457",
+    "filled_amount": 0.0
+  },
+  {
+    "ts": "2026-03-10 00:27:13",
+    "order_type": "tp",
+    "price": 67678.6,
+    "amount": 0.032,
+    "status": "cancelled",
+    "client_order_id": "CQB_10022_TP_4_1773102432",
+    "filled_amount": 0.0
+  },
+  {
+    "ts": "2026-03-10 00:27:13",
+    "order_type": "grid",
+    "price": 68760.2,
+    "amount": 0.05,
+    "status": "cancelled",
+    "client_order_id": "CQB_10022_GRID_5_1773102433",
+    "filled_amount": 0.0
+  }
+]

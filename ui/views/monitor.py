@@ -385,6 +385,12 @@ def render_monitor_view():
         # --- Prepare Data ---
         df_pos = pd.DataFrame()
         df_physical = pd.DataFrame()
+        virtual_net_usd = 0.0
+        virtual_gross_usd = 0.0
+        physical_net_usd = 0.0
+        virtual_by_pair = {}
+        physical_by_pair = {}
+        mismatched_pairs = []
         
         # --- Mismatch Alert Logic ---
         try:
@@ -420,7 +426,7 @@ def render_monitor_view():
             # Derive 'display_status' from total_invested to ensure UI is always accurate to reality
             def derive_status(row):
                 if not row['is_active']: return "⚪ STOPPED"
-                if row['total_invested'] > 0: return "🔴 IN TRADE"
+                if pd.notna(row['total_invested']) and float(row['total_invested']) > 0: return "🔴 IN TRADE"
                 # Check for 'Pending' based on order counts if needed, but 'Scanning' is safe default for active/non-invested
                 return "🟢 SCANNING"
 
@@ -446,35 +452,30 @@ def render_monitor_view():
             """
             df_virt = pd.read_sql(query_virtual, conn)
             
-            virtual_net_usd = 0.0
-            virtual_gross_usd = 0.0
-            virtual_by_pair = {}  # {normalized_pair: signed_usd}
-            
             if not df_virt.empty:
                 for _, row in df_virt.iterrows():
-                    amt_usd = row['total_invested']
-                    virtual_gross_usd += amt_usd
-                    pair_key = _norm(row['pair'])
-                    signed = amt_usd if row['direction'] == 'LONG' else -amt_usd
-                    virtual_net_usd += signed
-                    virtual_by_pair[pair_key] = virtual_by_pair.get(pair_key, 0.0) + signed
+                    if pd.notna(row['total_invested']):
+                        amt_usd = float(row['total_invested'])
+                        virtual_gross_usd += amt_usd
+                        pair_key = _norm(row['pair'])
+                        signed = amt_usd if row['direction'] == 'LONG' else -amt_usd
+                        virtual_net_usd += signed
+                        virtual_by_pair[pair_key] = virtual_by_pair.get(pair_key, 0.0) + signed
             
             # 2. Physical Positions (grouped by normalized pair)
-            physical_net_usd = 0.0
-            physical_by_pair = {}  # {normalized_pair: signed_usd}
             
             if not df_physical.empty:
                 for _, row in df_physical.iterrows():
-                    val = row['size'] * row['entry_price']
-                    side = str(row['side']).upper().strip()
-                    pair_key = _norm(row['pair'])
-                    signed = abs(val) if side in ['BUY', 'LONG'] else -abs(val)
-                    physical_net_usd += signed
-                    physical_by_pair[pair_key] = physical_by_pair.get(pair_key, 0.0) + signed
+                    if pd.notna(row['size']) and pd.notna(row['entry_price']):
+                        val = float(row['size']) * float(row['entry_price'])
+                        side = str(row['side']).upper().strip()
+                        pair_key = _norm(row['pair'])
+                        signed = abs(val) if side in ['BUY', 'LONG'] else -abs(val)
+                        physical_net_usd += signed
+                        physical_by_pair[pair_key] = physical_by_pair.get(pair_key, 0.0) + signed
             
             # 3. Per-pair comparison (1% tolerance, min $5 floor)
             all_pairs = set(list(virtual_by_pair.keys()) + list(physical_by_pair.keys()))
-            mismatched_pairs = []
             for p in all_pairs:
                 v = virtual_by_pair.get(p, 0.0)
                 ph = physical_by_pair.get(p, 0.0)
@@ -497,7 +498,7 @@ def render_monitor_view():
             order_status_color = "green"
             
             # --- STATUS CONSISTENCY FIX ---
-            in_trade_bots = df_pos[df_pos['total_invested'] > 0]
+            in_trade_bots = df_pos[pd.notna(df_pos['total_invested']) & (df_pos['total_invested'] > 0)]
             total_orders = len(market_orders)
             
             # Calculate Expected Orders dynamically per bot
@@ -825,9 +826,8 @@ def render_monitor_view():
                     res['Grid_Amount'] = 0.0
 
                     if my_orders:
-                        types = [o['type'].upper() for o in my_orders]
-                        # Try to identify TP/Grid/Entry based on ID
                         detailed = []
+                        is_hedged = False
                         for o in my_orders:
                             cid = o.get('clientOrderId', '')
                             price_val = float(o.get('price', 0.0) or 0.0)
@@ -838,10 +838,16 @@ def render_monitor_view():
                                 detailed.append('GRID')
                                 res['Grid_Price'] = price_val
                                 res['Grid_Amount'] = float(o.get('origQty', o.get('amount', 0.0)) or 0.0)
+                            elif 'HEDGE' in cid:
+                                detailed.append('HEDGE')
+                                is_hedged = True
                             elif 'ENTRY' in cid: detailed.append('ENTRY')
                             else: detailed.append('LIMIT')
                         
-                        res['Orders'] = f"{len(my_orders)} " + (f"({', '.join(detailed)})" if detailed else "")
+                        count_str = f"{len(my_orders)} " + (f"({', '.join(detailed)})" if detailed else "")
+                        res['Orders'] = count_str
+                        if is_hedged:
+                             res['Trigger'] = f"🛡️ HEDGED | {res['Trigger']}"
                     else:
                         res['Orders'] = "0"
                             

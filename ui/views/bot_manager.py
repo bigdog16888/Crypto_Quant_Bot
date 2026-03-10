@@ -792,18 +792,23 @@ def render_edit_form(bot_id):
             st.markdown("#### Entry Triggers (8-Switch Confluence)")
             t_col1, t_col2, t_col3, t_col4 = st.columns(4)
             with t_col1:
-                config_dict['mode_cci'] = st.selectbox("CCI Switch", [0, 1, 2], index=int(config_dict.get('mode_cci', 0)), format_func=lambda x: {0: "OFF", 1: "Above", 2: "Below"}[x])
-                config_dict['cci_level'] = st.number_input("CCI Level", value=float(config_dict.get('cci_level', 100)))
+                config_dict['mode_cci'] = st.selectbox("CCI Switch", [0, 1, 2], index=int(config_dict.get('mode_cci', 0)), format_func=lambda x: {0: "OFF", 1: "Above", 2: "Below"}[x],
+                    help="Commodity Channel Index. Mode 1 (Above) = bullish momentum; Mode 2 (Below) = oversold/pullback entry.")
+                config_dict['cci_level'] = st.number_input("CCI Level", value=float(config_dict.get('cci_level', 100)),
+                    help="Typically oscillates between -200 and +200. Oversold entry: Below -100. Overbought: Above +100.")
                 config_dict['cci_tf'] = st.selectbox("CCI TF", ["1m","5m","15m","1h","4h","1d"], index=["1m","5m","15m","1h","4h","1d"].index(config_dict.get('cci_tf', "15m")))
             with t_col2:
                 config_dict['mode_boll'] = st.selectbox("Boll Switch", [0, 1, 2], index=int(config_dict.get('mode_boll', 0)), format_func=lambda x: {0: "OFF", 1: "Outside Lower", 2: "Outside Upper"}[x])
                 config_dict['boll_tf'] = st.selectbox("Boll TF", ["1m","5m","15m","1h","4h","1d"], index=["1m","5m","15m","1h","4h","1d"].index(config_dict.get('boll_tf', "15m")))
             with t_col3:
-                config_dict['mode_stoch'] = st.selectbox("Stoch Switch", [0, 1, 2], index=int(config_dict.get('mode_stoch', 0)), format_func=lambda x: {0: "OFF", 1: "Oversold", 2: "Overbought"}[x])
+                config_dict['mode_stoch'] = st.selectbox("Stoch Switch", [0, 1, 2], index=int(config_dict.get('mode_stoch', 0)), format_func=lambda x: {0: "OFF", 1: "Oversold", 2: "Overbought"}[x],
+                    help="Stochastic Oscillator. Range: 0–100. Oversold = below 20; Overbought = above 80.")
                 config_dict['stoch_tf'] = st.selectbox("Stoch TF", ["1m","5m","15m","1h","4h","1d"], index=["1m","5m","15m","1h","4h","1d"].index(config_dict.get('stoch_tf', "15m")))
             with t_col4:
-                config_dict['mode_rsi'] = st.selectbox("RSI Switch", [0, 1, 2], index=int(config_dict.get('mode_rsi', 0)), format_func=lambda x: {0: "OFF", 1: "Below", 2: "Above"}[x])
-                config_dict['rsi_level'] = st.number_input("RSI Level", value=float(config_dict.get('rsi_level', 30)))
+                config_dict['mode_rsi'] = st.selectbox("RSI Switch", [0, 1, 2], index=int(config_dict.get('mode_rsi', 0)), format_func=lambda x: {0: "OFF", 1: "Below", 2: "Above"}[x],
+                    help="Relative Strength Index. Range: 0–100. Mode 1 (Below) = oversold entry. Typical level: 30. Mode 2 (Above) = overbought entry. Typical level: 70.")
+                config_dict['rsi_level'] = st.number_input("RSI Level", value=float(config_dict.get('rsi_level', 30)), min_value=0.0, max_value=100.0,
+                    help="RSI range is 0–100. Classic thresholds: 30 = oversold (LONG entry), 70 = overbought (SHORT entry).")
                 config_dict['rsi_tf'] = st.selectbox("RSI TF", ["1m","5m","15m","1h","4h","1d"], index=["1m","5m","15m","1h","4h","1d"].index(config_dict.get('rsi_tf', "15m")))
 
             st.markdown("#### Price & Volatility Triggers (9 & 10)")

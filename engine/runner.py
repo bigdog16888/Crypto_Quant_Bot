@@ -832,10 +832,12 @@ class BotRunner:
                         try:
                             # 🚀 FIXED: Ensure symbol is normalized for the specific exchange (e.g. BTC/USDC)
                             norm_pair = pair
-                            # Check if the pair needs slashes (CCXT standard)
+                            # Ensure it has a slash for CCXT standard if it's a known USDC/USDT pair
                             if '/' not in norm_pair:
-                                if 'USDC' in norm_pair: norm_pair = norm_pair.replace('USDC', '/USDC')
-                                elif 'USDT' in norm_pair: norm_pair = norm_pair.replace('USDT', '/USDT')
+                                if 'USDC' in norm_pair: 
+                                    norm_pair = norm_pair.replace('USDC', '/USDC')
+                                elif 'USDT' in norm_pair: 
+                                    norm_pair = norm_pair.replace('USDT', '/USDT')
                             
                             ohlcv = ex.fetch_ohlcv(norm_pair, timeframe='1m', limit=50)
                             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']) # type: ignore
@@ -887,6 +889,7 @@ class BotRunner:
                         cache_dir = os.path.join(config.ROOT_DIR, 'data')
                         os.makedirs(cache_dir, exist_ok=True)
                         cache_file = os.path.join(cache_dir, 'market_cache.json')
+                        tmp_cache_file = os.path.join(cache_dir, 'market_cache_tmp.json')
                         
                         # We need to convert Pandas DataFrames into simple JSON dicts
                         json_ready_cache = {}
@@ -895,11 +898,13 @@ class BotRunner:
                             for tf, df in tf_dict.items():
                                 json_ready_cache[pair][tf] = df.to_dict(orient='records')
                         
-                        with open(cache_file, 'w') as f:
+                        # ATOMIC WRITE: Write to tmp file, then atomic rename
+                        with open(tmp_cache_file, 'w') as f:
                             json.dump(json_ready_cache, f)
-                        # logger.debug(f"💾 Saved Market Data Cache to {cache_file}")
+                        os.replace(tmp_cache_file, cache_file)
                     except Exception as cache_err:
                         logger.warning(f"Failed to save market cache for UI: {cache_err}")
+
 
                     exchange_snapshot[mt] = {
                         'positions': snap_pos,

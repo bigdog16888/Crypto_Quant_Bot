@@ -435,42 +435,52 @@ class MartingaleStrategy(BaseStrategy):
                  grid_dist = current_price * (dist_pct/100.0)
                  explanation.append(f"Fixed {dist_pct}%")
 
-            # 2. Calculate CUMULATIVE distance (sum of all step distances)
-            # Each step i has distance: grid_dist * (grid_mult ^ i)
-            # Total = sum from i=0 to step of grid_dist * grid_mult^i
+            # 2. Calculate NEXT-STEP distance only (not cumulative)
+            # Each grid order is placed 1 step-distance from the avg_entry, not a sum of all steps.
+            # Cumulative approach caused the grid price to overshoot the market, triggering the GAP RECOVERY
+            # loop which then re-placed at the same invalid offset every cycle.
             grid_mult = float(self.params.get('GridMultiplier', 1.0))
-            cumulative_dist = 0.0
-            for s in range(step + 1):
-                cumulative_dist += grid_dist * (grid_mult ** s)
-            final_dist = cumulative_dist
+            # Apply multiplier for the NEXT step only (step is already the current step count)
+            next_step_dist = grid_dist * (grid_mult ** step)
+            final_dist = next_step_dist
             if grid_mult != 1.0:
-                explanation.append(f"Cumulative {step+1} steps (mult={grid_mult})")
+                explanation.append(f"Step {step} dist (mult={grid_mult}^{step})")
 
-            # 3. Calculate Price from reference (avg_entry or current_price)
+            # 3. Calculate Price from reference (avg_entry is most stable, falls back to current_price)
             ref_price = avg_entry if avg_entry > 0 else current_price
             
-            # Calculate initial grid price from reference + distance
+            # Calculate next grid order price: 1 step beyond the current avg entry
             if direction == 'LONG':
                 price = ref_price - final_dist
             else:
                 price = ref_price + final_dist
 
-            # 🚀 GAP RECOVERY: If the calculated grid price would cross market,
-            # place at current_price ± dist instead (a BETTER price for the bot).
+            # 🚀 GAP RECOVERY: If calculated grid crossed market (e.g. after a fast move),
+            # use 1 step-distance from current_price instead (still a valid, BETTER price for the bot).
             is_invalid = False
             if direction == 'LONG' and price > current_price:
-                 is_invalid = True # Buy Order ABOVE Market → use recovery
+                 is_invalid = True  # Buy Order ABOVE Market → use recovery
             elif direction == 'SHORT' and price < current_price:
-                 is_invalid = True # Sell Order BELOW Market → use recovery
+                 is_invalid = True  # Sell Order BELOW Market → use recovery
             
             if is_invalid:
                 def _p(v): return f"{v:.6f}".rstrip('0').rstrip('.') if v < 1.0 else f"{v:.4f}" if v < 10.0 else f"{v:,.2f}"
-                logger.info(f"📐 Gap Recovery: Grid {_p(price)} crossed Market {_p(current_price)}. Placing at better price.")
+                # Recovery: use a SINGLE-step offset from the current market price
+                # This produces a valid limit order that is 1 ATR-step beyond current price
                 if direction == 'LONG':
                     price = current_price - final_dist
                 else:
                     price = current_price + final_dist
+                logger.info(f"📐 Gap Recovery: Grid {_p(ref_price - final_dist if direction == 'LONG' else ref_price + final_dist)} crossed Market {_p(current_price)}. Recovery → {_p(price)}.")
                 explanation.append("GapRecovery")
+                
+                # Final safety: if recovery price still invalid (e.g. extreme volatility), skip
+                if direction == 'LONG' and price > current_price:
+                    logger.warning(f"⛔ Gap Recovery still invalid for {direction}. Skipping grid placement.")
+                    return 0.0, "GapRecovery-INVALID"
+                elif direction == 'SHORT' and price < current_price:
+                    logger.warning(f"⛔ Gap Recovery still invalid for {direction}. Skipping grid placement.")
+                    return 0.0, "GapRecovery-INVALID"
 
             # 🚀 DYNAMIC ROUNDING
             final_price = round(price, self.price_precision)
@@ -489,8 +499,45 @@ class MartingaleStrategy(BaseStrategy):
         # Reuse lot size logic
         return self.calculate_lot_size(step + 1, 10000, market_data=current_price)
 
+    def _apply_volatility_sizing(self, base_size: float, market_data: Any) -> float:
+        """
+        Adjusts the position size based on relative volatility.
+        Ratio = ATR(100) / ATR(14). 
+        - High Vol (ATR > AVG) -> Smaller Size
+        - Low Vol (ATR < AVG) -> Larger Size
+        """
+        if not self.params.get('UseVolSizing', False):
+            return base_size
+            
+        if not isinstance(market_data, pd.DataFrame) or market_data.empty:
+            return base_size
+            
+        try:
+            atr_period = int(self.params.get('ATRPeriods', 14))
+            # Baseline (SMA 100) vs Short-term (SMA 14)
+            baseline_atr = iATR(market_data['high'], market_data['low'], market_data['close'], 100)
+            current_atr = iATR(market_data['high'], market_data['low'], market_data['close'], atr_period)
+            
+            if baseline_atr > 0 and current_atr > 0:
+                vol_mult = baseline_atr / current_atr
+                # Safety Clamp: don't let size swing more than 5x or less than 0.2x
+                vol_mult = max(0.2, min(vol_mult, 5.0))
+                
+                adjusted_size = base_size * vol_mult
+                logger.info(f"📊 Vol Sizing: Base ${base_size:.2f} * {vol_mult:.2f}x (ATR100/ATR{atr_period}) -> ${adjusted_size:.2f}")
+                return adjusted_size
+        except Exception as e:
+            logger.error(f"Volatility sizing calculation failed: {e}")
+            
+        return base_size
+
     def calculate_lot_size(self, current_step: int, balance: float, market_data=None) -> float:
         base_size_usd = float(self.params.get('base_size', 150.0))
+        
+        # Apply Volatility Sizing if enabled (only affects the base calculation)
+        if market_data is not None:
+             base_size_usd = self._apply_volatility_sizing(base_size_usd, market_data)
+             
         multiplier = float(self.params.get('martingale_multiplier', 2.0))
         size_usd = base_size_usd * (multiplier ** current_step)
         

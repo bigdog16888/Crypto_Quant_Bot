@@ -1,0 +1,167 @@
+[
+  {
+    "timestamp": 1773108467,
+    "action": "GHOST_RESET",
+    "step": 1,
+    "pnl": 0.0,
+    "symbol": "BTC/USDC:USDC",
+    "price": 0.0,
+    "amount": 0.0,
+    "cost_usdc": 0.0,
+    "notes": "System reset: GHOST_EXIT_294664869"
+  },
+  {
+    "timestamp": 1773108417,
+    "action": "WS_ENTRY_FILL",
+    "step": 1,
+    "pnl": 0.0,
+    "symbol": "BTCUSDC",
+    "price": 69110.0,
+    "amount": 0.002,
+    "cost_usdc": 138.22,
+    "notes": ""
+  },
+  {
+    "timestamp": 1773108397,
+    "action": "GHOST_RESET",
+    "step": 3,
+    "pnl": 0.0,
+    "symbol": "BTC/USDC:USDC",
+    "price": 0.0,
+    "amount": 0.0,
+    "cost_usdc": 0.0,
+    "notes": "System reset: GHOST_EXIT_294664869"
+  },
+  {
+    "timestamp": 1773108370,
+    "action": "WS_GRID_FILL",
+    "step": 3,
+    "pnl": 0.0,
+    "symbol": "BTCUSDC",
+    "price": 69131.6,
+    "amount": 0.01,
+    "cost_usdc": 691.316,
+    "notes": ""
+  },
+  {
+    "timestamp": 1773108346,
+    "action": "WS_GRID_FILL",
+    "step": 2,
+    "pnl": 0.0,
+    "symbol": "BTCUSDC",
+    "price": 69166.3,
+    "amount": 0.005,
+    "cost_usdc": 345.8315,
+    "notes": ""
+  },
+  {
+    "timestamp": 1773108278,
+    "action": "WS_ENTRY_FILL",
+    "step": 1,
+    "pnl": 0.0,
+    "symbol": "BTCUSDC",
+    "price": 69209.0,
+    "amount": 0.002,
+    "cost_usdc": 138.418,
+    "notes": ""
+  },
+  {
+    "timestamp": 1773108212,
+    "action": "GHOST_RESET",
+    "step": 1,
+    "pnl": 0.0,
+    "symbol": "BTC/USDC:USDC",
+    "price": 0.0,
+    "amount": 0.0,
+    "cost_usdc": 0.0,
+    "notes": "System reset: GHOST_EXIT_294664869"
+  },
+  {
+    "timestamp": 1773108096,
+    "action": "WS_ENTRY_FILL",
+    "step": 1,
+    "pnl": 0.0,
+    "symbol": "BTCUSDC",
+    "price": 69272.6,
+    "amount": 0.002,
+    "cost_usdc": 138.54520000000002,
+    "notes": ""
+  },
+  {
+    "timestamp": 1773108063,
+    "action": "GHOST_RESET",
+    "step": 3,
+    "pnl": 0.0,
+    "symbol": "BTC/USDC:USDC",
+    "price": 0.0,
+    "amount": 0.0,
+    "cost_usdc": 0.0,
+    "notes": "System reset: GHOST_EXIT_294664869"
+  },
+  {
+    "timestamp": 1773106745,
+    "action": "WS_GRID_FILL",
+    "step": 3,
+    "pnl": 0.0,
+    "symbol": "BTCUSDC",
+    "price": 68852.8,
+    "amount": 0.01,
+    "cost_usdc": 688.528,
+    "notes": ""
+  },
+  {
+    "timestamp": 1773106717,
+    "action": "WS_GRID_FILL",
+    "step": 2,
+    "pnl": 0.0,
+    "symbol": "BTCUSDC",
+    "price": 68900.3,
+    "amount": 0.005,
+    "cost_usdc": 344.5015,
+    "notes": ""
+  },
+  {
+    "timestamp": 1773106217,
+    "action": "WS_ENTRY_FILL",
+    "step": 1,
+    "pnl": 0.0,
+    "symbol": "BTCUSDC",
+    "price": 68937.3,
+    "amount": 0.002,
+    "cost_usdc": 137.87460000000002,
+    "notes": ""
+  },
+  {
+    "timestamp": 1773106194,
+    "action": "GHOST_RESET",
+    "step": 2,
+    "pnl": 0.0,
+    "symbol": "BTC/USDC:USDC",
+    "price": 0.0,
+    "amount": 0.0,
+    "cost_usdc": 0.0,
+    "notes": "System reset: GHOST_EXIT_294664869"
+  },
+  {
+    "timestamp": 1773106119,
+    "action": "WS_GRID_FILL",
+    "step": 2,
+    "pnl": 0.0,
+    "symbol": "BTCUSDC",
+    "price": 68943.3,
+    "amount": 0.005,
+    "cost_usdc": 344.7165,
+    "notes": ""
+  },
+  {
+    "timestamp": 1773106063,
+    "action": "WS_ENTRY_FILL",
+    "step": 1,
+    "pnl": 0.0,
+    "symbol": "BTCUSDC",
+    "price": 68970.0,
+    "amount": 0.002,
+    "cost_usdc": 137.94,
+    "notes": ""
+  }
+]

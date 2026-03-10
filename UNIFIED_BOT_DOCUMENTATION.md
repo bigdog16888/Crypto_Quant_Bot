@@ -1,7 +1,8 @@
 # Crypto Quant Bot: Unified Documentation
 
-**Version:** 1.3.0 (Stabilized Engine & Recovery v2.1)  
-**Status:** Highly Stable, Auto-Healing Active
+**Version:** 1.4.0 (Exchange-Anchored Reconciler)  
+**Status:** Highly Stable, Auto-Healing Active  
+**Last Updated:** 2026-03-09
 
 This document provides a unified, comprehensive overview of the Crypto Quant Bot, its architecture, setup, and operational best practices. It consolidates the key information from over 20 separate markdown files.
 
@@ -43,14 +44,18 @@ In a simple trading bot, if you have two strategies on the same pair (e.g., Bot 
     -   `cancel_orders_by_bot_id()` is used to safely cancel only one bot's orders.
     -   **Crucial Rule:** Global `cancel_all_orders()` calls are forbidden in standard bot logic as they would wipe out other bots' orders.
 
-### 2.3. Multi-Bot Virtual Positioning (Final Release 2026-02-12)
+### 2.3. Multi-Bot Virtual Positioning & Reconciliation
 
-The architecture has achieved its final form: **True Virtual Position Independence.**
+Each bot's state is tracked in the `trades` table. The `reconciler.py` aggregates virtual positions and runs a 3-phase **Exchange-Anchored** sync on every cycle:
 
-- **No Ownership System:** The "Owner/Passenger" model has been entirely purged from the codebase. There are no "owners" or "passengers"—only independent bots.
-- **Independent Management:** Each bot manages its own entry, take-profit, and grid orders using its unique `CQB_{bot_id}_` prefix. 
-- **Database as Source of Truth:** A bot's trade status is determined exclusively by its record in the `trades` table and the presence of its specific orders on the exchange.
-- **Aggregate Position Reconciliation:** The `reconciler.py` handles One-Way mode by summing all virtual positions on a pair to verify against the physical exchange position, ensuring stability even when multiple bots trade the same side.
+| Phase | What it does |
+|-------|--------------|
+| **Preflight Sync** | Before reading any fill history, `_sync_positions_to_exchange()` compares `trades.avg_entry_price` and `trades.total_invested` against Binance live positions. Drift >0.5% → overwrites DB with exchange truth. |
+| **Idempotency Guard** | Every offline fill is double-checked against `bot_orders.order_id` AND `trade_history` (price+qty) before being applied. No fill is ever counted twice. |
+| **Post-Fill Anchor** | After any offline fill is recorded, the system immediately re-fetches the exchange position and overwrites `avg_entry_price`/`total_invested`. Arithmetic drift is impossible. |
+| **TP Safety Guard** | Before calling `reset_bot_after_tp` on a found closed TP, the system verifies the exchange position is actually flat. If a live position still exists, the TP is marked stale and the reset is aborted. |
+
+> **Key Invariant:** The exchange's live position is the ground truth. The DB always syncs to match. Fill arithmetic is only used as a fallback.
 
 ---
 
@@ -150,13 +155,23 @@ The bot has recently undergone a fundamental stabilization phase to ensure multi
 ### 4.3. Troubleshooting
 
 -   **UI Won't Start:** Check if the port (usually 8501) is in use.
--   **P/L Shows But No Exchange Position:** State mismatch. Restart the engine to trigger re-sync.
--   **Bots Auto-Resetting to IDLE:** Check `basket_start_time` in the `trades` table. If it's `0`, the "Ghost Fix" will trigger a reset. This was addressed in the v1.0.0 fix.
--   **Orders Rejected (Min Notional):** Ensure `base_size` is at least $150 (especially on USDC testnet).
+-   **P/L Shows But No Exchange Position:** State mismatch. The next reconciler cycle (runs every few minutes) will auto-heal via Preflight Sync. No restart needed.
+-   **Bots Auto-Resetting to IDLE:** Check `reconciliation_logs` table for `GHOST_RESET` or `PHANTOM_RESET` entries — details column explains why.
+-   **Bot Zeroed While Exchange Has Live Position:** A Previous-cycle TP order was in the 168h history window. This is now blocked by the Exchange-Position Guard in the reconciler. If it happened: re-link the bot via the Manual Link tool in the UI — it will now correctly recover the original step from `bot_orders`.
+-   **Orders Rejected (Min Notional):** Ensure `base_size` is at least $150 (especially on USDC mainnet).
 
 ---
 
 ## 5. Changelog Summary
+
+### Version 1.4.0 (2026-03-09)
+**Exchange-Anchored Reconciler & Root Cause Fixes**
+- **Exchange-Anchored Reconciliation:** Replaced event-replay architecture with a 3-phase system. Exchange live position is now ground truth. Eliminates `avg_entry` halving, double-counting, and arithmetic drift permanently.
+- **False OFFLINE_TP Guard:** Reconciler now verifies the exchange position is flat before firing `reset_bot_after_tp`. Stale/cancelled TPs from history no longer zero live positions.
+- **Dynamic Step Recovery on Manual Adoption:** `import_position_from_exchange` now queries `bot_orders` to restore the correct Martingale step instead of hardcoding Step 1.
+- **XAU Grid Vibration Fix:** ATR-based grids exempt from GRID-SYNC drift check. Non-ATR tolerance widened to 0.5%.
+- **UI Profit Display:** Added ROE% (leverage-adjusted) alongside ROI%. EE display uses actual `calculate_early_exit_decay` function.
+- **NOTIONAL-GAP Healing:** Replaced 100-line event-replay auto-repair with direct call to `_sync_positions_to_exchange()`.
 
 ### Version 1.3.0 (2026-03-03)
 **Order Sync & Race Condition Stabilization**
@@ -179,7 +194,7 @@ The bot has recently undergone a fundamental stabilization phase to ensure multi
 - **Reconciler Decoupling:** Removed ownership state dependencies.
 
 ---
-This unified document was last updated on 2026-02-12.
+This unified document was last updated on **2026-03-09** (v1.4.0).
 
 ## 6. Database Architecture & Concurrency (Added 2026-02-17)
 The system uses **SQLite** in **WAL (Write-Ahead Logging)** mode for high-performance concurrency.

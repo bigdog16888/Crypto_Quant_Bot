@@ -61,7 +61,7 @@ One row per bot — **always exists**, even when bot is scanning. Resets on TP/e
 | `close_type` | TEXT | How last cycle closed: `TP`, `EE`, `SL`, `MANUAL`, etc. |
 | `cycle_id` | INTEGER | Increments on each TP/reset. Used to fence `bot_orders` by cycle so old fills aren't re-adopted. |
 
-> **⚠️ Key invariant:** `total_invested` must always match physical exchange position notional. Divergence triggers `NOTIONAL-GAP` in the reconciler.
+> **⚠️ Key Invariant (v1.4.0):** `avg_entry_price` and `total_invested` are always authoritative from the exchange. The `_sync_positions_to_exchange()` reconciler preflight overwrites DB values if drift exceeds 0.5%. Never compute position size from `total_invested` without also checking `active_positions`.
 
 ---
 
@@ -131,7 +131,9 @@ Append-only log of every significant trade event. Never updated, never deleted.
 | `id` | INTEGER PK | Auto-increment |
 | `bot_id` | INTEGER | FK → `bots.id` |
 | `timestamp` | INTEGER | Epoch |
-| `action` | TEXT | Event type: `ENTRY`, `GRID_FILL`, `TP`, `EE`, `GHOST_RESET`, `PHANTOM_RESET`, `SYNC_DOWN`, etc. |
+| `action` | TEXT | Event type: `ENTRY`, `GRID_FILL`, `TP`, `EE`, `GHOST_RESET`, `PHANTOM_RESET`, `SYNC_DOWN`, `POSITION_SYNC`, `OFFLINE_GRID`, `OFFLINE_TP`, `OFFLINE_ENTRY` |
+| `step` | INTEGER | Grid step at time of event |
+| `pnl` | REAL | Realised PnL for this event (0 for entries) |
 | `symbol` | TEXT | Trading pair |
 | `price` | REAL | Price at event |
 | `amount` | REAL | Quantity |
@@ -153,8 +155,8 @@ Every action the reconciler takes. Useful for diagnosing why a bot was reset or 
 | `timestamp` | INTEGER | Epoch |
 | `bot_id` | INTEGER | FK → `bots.id` |
 | `pair` | TEXT | Trading pair |
-| `action` | TEXT | e.g. `GHOST_RESET`, `PHANTOM_RESET`, `RECON_REPAIR`, `SYNC_TO_REALITY` |
-| `details` | TEXT | Full description of what was done and why |
+| `action` | TEXT | e.g. `GHOST_RESET`, `PHANTOM_RESET`, `RECON_REPAIR`, `SYNC_TO_REALITY`, `POSITION_SYNC`, `RECON_HEAL` |
+| `details` | TEXT | Full description of what was done and why. For `POSITION_SYNC`: shows drift % before anchoring. |
 | `proof_order_id` | TEXT | Exchange order ID used as evidence for the action |
 
 ---
