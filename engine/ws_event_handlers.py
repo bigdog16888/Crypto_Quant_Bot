@@ -182,12 +182,12 @@ def _handle_order_partial_fill(bot_id: int, order_type: str, event: Dict):
                 added_invested=avg_price * incremental_qty,
                 added_qty=incremental_qty,
                 avg_price=avg_price,
-                new_step=partial_step,   # 🚀 Fix: Advance step state even mid-fill
+                new_step=None,   # Do NOT advance step state mid-fill (leaves Grid active until fully completed)
                 tp_price=None,
                 is_entry=(order_type == 'ENTRY')
             )
             log_trade(bot_id, f'WS_{order_type}_PARTIAL', symbol, avg_price, incremental_qty,
-                      avg_price * incremental_qty, order_type, new_step=partial_step)
+                      avg_price * incremental_qty, order_type, step=partial_step)
             # 🚀 PERSIST partial progress for UI
             update_order_fill(order_id, cumulative_filled, bot_id=bot_id)
         except Exception as e:
@@ -274,10 +274,12 @@ def _handle_order_filled(bot_id: int, order_type: str, event: Dict):
     
     # 🛡️ FIX: Mark order as 'filled' (NOT cancelled) so reconciler & integrity
     # checks can distinguish a completed fill from an orphan or cancelled order.
+    # 🚀 NEW: Pass the final true cumulative fill quantity to avoid math inflation.
     try:
         from engine.database import update_order_status
-        update_order_status(order_id, 'filled')
-        logger.debug(f"Marked order {order_id} as filled in DB.")
+        cumulative_fill = float(event.get('filled_qty', 0) or 0)
+        update_order_status(order_id, 'filled', bot_id=bot_id, filled_qty=cumulative_fill)
+        logger.debug(f"Marked order {order_id} as filled in DB (Final Qty: {cumulative_fill}).")
     except Exception as e:
         logger.debug(f"Could not mark order {order_id} as filled in DB: {e}")
 
@@ -328,14 +330,17 @@ def _update_trade_state_from_fill(bot_id: int, order_type: str, symbol: str, avg
 
 
 def _handle_order_canceled(bot_id: int, order_type: str, event: Dict):
-    """Process a canceled order - update DB."""
-    from engine.database import cancel_order_in_db
+    """Process a canceled order - update DB, ensuring any partial fill is recorded."""
+    from engine.database import update_order_status
     
     order_id = event.get('order_id')
-    logger.info(f"❌ WS Cancel: Bot {bot_id} {order_type} order {order_id} canceled")
+    cumulative_fill = float(event.get('filled_qty', 0) or 0)
+    
+    logger.info(f"❌ WS Cancel: Bot {bot_id} {order_type} order {order_id} canceled (Partial Fill: {cumulative_fill})")
     
     try:
-        cancel_order_in_db(order_id)
+        # 🚀 FUNDAMENTAL FIX: capture partial fills before cancellation in bot_orders history
+        update_order_status(order_id, 'cancelled', bot_id=bot_id, filled_qty=cumulative_fill)
     except Exception as e:
         logger.debug(f"Could not close canceled order {order_id} in DB: {e}")
 

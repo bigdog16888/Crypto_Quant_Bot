@@ -913,28 +913,24 @@ def import_position_from_exchange(bot_id: int, pair: str, position_size: float, 
             db_mult = float(cfg.get('martingale_multiplier', db_mult))
         
         if db_base_size > 0 and total_invested > 0:
-            import math
             if total_invested <= db_base_size * 1.1:
                 calculated_step = 1
             elif db_mult > 1:
-                # Math: Total invested = Base * (1 - r^n) / (1 - r) where r = multiplier, n = step
-                # A simpler approximation is to just keep adding steps until we reach total_invested
-                simulated_total = db_base_size
-                simulated_step = 1
-                current_order_size = db_base_size
-                
-                while simulated_total < (total_invested * 0.95): # 5% tolerance for slippage
-                    simulated_step += 1
-                    current_order_size *= db_mult
-                    simulated_total += current_order_size
-                    if simulated_step >= 50: # infinite loop safety
+                # Math: Total invested = Base * (1 - r^step) / (1 - r) where r = multiplier
+                # Simulation is more robust to rounding/min-lot-size drift.
+                simulated_cumulative = 0.0
+                current_layer_size = db_base_size
+                for s in range(1, 51): # Cap at 50 to prevent infinite loops
+                    simulated_cumulative += current_layer_size
+                    if simulated_cumulative >= total_invested * 0.98: # 2% tolerance for fees/rounding
+                        calculated_step = s
                         break
-                        
-                calculated_step = simulated_step
-                logger.info(f"🔄 [STEP-RECOVERY] Bot {bot_id} mathematically derived Step {calculated_step} from ${total_invested:.2f} invested.")
+                    current_layer_size *= db_mult
             else:
-                calculated_step = max(1, round(total_invested / db_base_size))
-                logger.info(f"🔄 [STEP-RECOVERY] Bot {bot_id} linearly derived Step {calculated_step} from ${total_invested:.2f} invested.")
+                # Linear progression (mult = 1)
+                calculated_step = max(1, int(round(total_invested / db_base_size)))
+        
+        logger.info(f"🔄 [STEP-RECOVERY] Bot {bot_id} mathematically derived Step {calculated_step} from ${total_invested:.2f} invested.")
     except Exception as e:
         logger.warning(f"Mathematical step recovery failed for bot {bot_id}: {e}")
     try:
@@ -963,19 +959,20 @@ def import_position_from_exchange(bot_id: int, pair: str, position_size: float, 
         # --- FUNDAMENTAL ARCHITECTURE FIX: EVIDENCE-PROOF ADOPTION ---
         # The Reconciler demands cryptographic proof of legal ownership.
         # We must generate an iron-clad fill record, or it will be wiped as a "Ghost".
+        # 📝 LEDGER FIX: Explicitly set filled_amount to match amount.
         evidence_cid = f"CQB_{bot_id}_ADOPT_{int(time.time())}"
         cursor.execute("""
             INSERT INTO bot_orders (
-                bot_id, step, order_type, order_id, price, amount, 
+                bot_id, step, order_type, order_id, price, amount, filled_amount,
                 status, created_at, updated_at, client_order_id, notes
-            ) VALUES (?, ?, 'adoption', ?, ?, ?, 'filled', ?, ?, ?, ?)
+            ) VALUES (?, ?, 'adoption', ?, ?, ?, ?, 'filled', ?, ?, ?, ?)
         """, (
             bot_id, 
             calculated_step, 
             evidence_cid,            # Use CID as Exchange ID to guarantee uniqueness 
             float(entry_price), 
-            adopted_size,         # Proportional — NOT the full exchange position_size
-
+            adopted_size,            # Proportional — NOT the full exchange position_size
+            adopted_size,            # filled_amount MUST match amount for True Math
             int(time.time()), 
             int(time.time()), 
             evidence_cid, 
@@ -1120,7 +1117,7 @@ def cleanup_pending_orders(exchange):
     cursor = conn.cursor()
     threshold_time = int(time.time()) - 30
     try:
-        cursor.execute("SELECT id, bot_id, order_type, client_order_id FROM bot_orders WHERE status = 'open' AND created_at < ?", (threshold_time,))
+        cursor.execute("SELECT id, bot_id, order_type, client_order_id FROM bot_orders WHERE status IN ('open', 'new') AND created_at < ?", (threshold_time,))
         pending = cursor.fetchall()
         if not pending: return {'total': 0}
         ex_orders = exchange.exchange.fetch_open_orders()
@@ -1588,26 +1585,25 @@ def get_trade_history(bot_id=None, limit=100):
 # NOTE: import_position_from_exchange is defined earlier (L765) — correct version with full schema.
 # NOTE: update_bot_display_status is defined earlier (L728) — correct version with error handling.
         
-def update_order_status(order_id, status, bot_id=None):
-    """Updates the status of an order in bot_orders."""
+def update_order_status(order_id, status, bot_id=None, filled_qty=None):
+    """Updates the status of an order in bot_orders, optionally updating filled_amount."""
     try:
         conn = get_connection()
         cursor = conn.cursor()
         
-        # If bot_id represents a stronger filter, use it
-        if bot_id:
-            cursor.execute("""
-                UPDATE bot_orders 
-                SET status = ?, updated_at = ?
-                WHERE order_id = ? AND bot_id = ?
-            """, (status, int(time.time()), str(order_id), bot_id))
+        # Build SQL dynamically based on filled_qty
+        if filled_qty is not None:
+            sql = "UPDATE bot_orders SET status = ?, filled_amount = ?, updated_at = ? WHERE order_id = ?"
+            params = [status, filled_qty, int(time.time()), str(order_id)]
         else:
-            cursor.execute("""
-                UPDATE bot_orders 
-                SET status = ?, updated_at = ?
-                WHERE order_id = ?
-            """, (status, int(time.time()), str(order_id)))
+            sql = "UPDATE bot_orders SET status = ?, updated_at = ? WHERE order_id = ?"
+            params = [status, int(time.time()), str(order_id)]
+
+        if bot_id:
+            sql += " AND bot_id = ?"
+            params.append(bot_id)
             
+        cursor.execute(sql, tuple(params))
         conn.commit()
     except Exception as e:
         logger.error(f"Failed to update order status {order_id}: {e}")

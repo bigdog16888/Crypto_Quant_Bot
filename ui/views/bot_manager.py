@@ -857,32 +857,11 @@ def render_edit_form(bot_id):
 
 
         st.markdown("#### Risk Management")
-        rm1, rm2, rm3 = st.columns(3)
-        with rm1:
-            config_dict['UseATRGrid'] = st.checkbox("Use ATR Grid", value=config_dict.get('UseATRGrid', True))
-            if config_dict['UseATRGrid']:
-                atr_tf_risk = st.selectbox(
-                    "ATR TF", 
-                    ["1m", "5m", "15m", "1h", "4h", "1d"], 
-                    index=["1m", "5m", "15m", "1h", "4h", "1d"].index(config_dict.get('ATR_Timeframe', '1h')),
-                    key=f"risk_atr_tf_{bot_id}"
-                )
-
-                config_dict['ATR_Timeframe'] = atr_tf_risk
-        with rm2:
-                config_dict['ATRGridFactor'] = st.number_input("ATR Factor", value=float(config_dict.get('ATRGridFactor', 1.0)))
-        with rm3:
-            config_dict['daily_loss_limit'] = st.number_input("Daily Loss Limit ($)", value=float(config_dict.get('daily_loss_limit', 0.0)), help="Pause bot if daily realized loss exceeds this amount.")
-
         rm_r1, rm_r2 = st.columns(2)
         with rm_r1:
+            config_dict['daily_loss_limit'] = st.number_input("Daily Loss Limit ($)", value=float(config_dict.get('daily_loss_limit', 0.0)), help="Pause bot if daily realized loss exceeds this amount.")
             config_dict['MaxDrawdownPct'] = st.number_input("Max Drawdown (%)", value=float(config_dict.get('MaxDrawdownPct', 0.0)), help="Trigger partial close if drawdown exceeds this %.")
         with rm_r2:
-            if not config_dict.get('UseATRGrid'):
-                config_dict['base_grid'] = st.number_input("Fixed Step", value=float(config_dict.get('base_grid', 100.0)))
-            else:
-                pass
-            
             config_dict['UseVolSizing'] = st.checkbox("Volatility Position Sizing", value=config_dict.get('UseVolSizing', False), help="Adjusts lot size based on ATR (High Vol = Smaller Size).")
 
         st.markdown("#### Advanced Exit & Hedge Settings")

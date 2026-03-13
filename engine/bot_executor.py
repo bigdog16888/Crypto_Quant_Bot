@@ -50,10 +50,10 @@ class BotExecutor:
     def _generate_deterministic_id(self, bot_id: int, type_str: str, step_index: int) -> str:
         """
         Generates a deterministic clientOrderId for orders.
-        Format: CQB_{bot_id}_{TYPE}_{STEP}_{TIMESTAMP_SECONDS}
+        Format: CQB_{bot_id}_{TYPE}_{STEP}_{TIMESTAMP_MS}
         """
-        timestamp_seconds = int(time.time())
-        return f"CQB_{bot_id}_{type_str.upper()}_{step_index}_{timestamp_seconds}"
+        timestamp_ms = int(time.time() * 1000)
+        return f"CQB_{bot_id}_{type_str.upper()}_{step_index}_{timestamp_ms}"
 
     def _get_strategy_instance(self, bot_id: int, config_dict: Dict[str, Any], config_json_str: Optional[str] = None) -> MartingaleStrategy:
         # Check if config has changed
@@ -102,7 +102,15 @@ class BotExecutor:
                     # To be maker on a SELL, place AT or ABOVE the best ask
                     retry_price = exchange.ceil_to_step(ask, tick)
                 logger.info(f"🔄 [{label}] Retrying {pair} {side} @ {retry_price:.4f} (bid={bid:.4f} ask={ask:.4f})")
-                return exchange.create_order(pair, 'limit', side, amount, retry_price, params=params)
+                
+                # Fix for Duplicate ClientOrderId on Retry
+                retry_params = dict(params) if params else {}
+                if 'clientOrderId' in retry_params:
+                    retry_params['clientOrderId'] = f"{retry_params['clientOrderId']}_R"
+                if 'newClientOrderId' in retry_params:
+                    retry_params['newClientOrderId'] = f"{retry_params['newClientOrderId']}_R"
+
+                return exchange.create_order(pair, 'limit', side, amount, retry_price, params=retry_params)
             raise  # Re-raise if it's a different error
 
     # ---------------------------------------------------------------------------
@@ -154,23 +162,8 @@ class BotExecutor:
                           db_tp: float, db_qty: float,
                           existing_tp_order: dict) -> Optional[dict]:
         """Cancel the out-of-date TP order and place a fresh one at db_tp / db_qty.
-        Automatically applies reduceOnly when this bot is the sole active bot on the pair.
         Returns the new order dict, or None on failure."""
         try:
-            # Determine reduceOnly — only when sole bot on this pair
-            try:
-                _c2 = get_connection()
-                _cur2 = _c2.cursor()
-                _cur2.execute(
-                    "SELECT COUNT(*) FROM bots b JOIN trades t ON b.id=t.bot_id "
-                    "WHERE b.pair=? AND t.total_invested>0 AND b.id!=?",
-                    (pair, bot_id)
-                )
-                should_reduce = (_cur2.fetchone()[0] == 0)
-                _c2.close()
-            except Exception:
-                should_reduce = False
-
             tp_order_id = existing_tp_order.get('order_id', existing_tp_order.get('id'))
             exchange.cancel_order(tp_order_id, pair)
             update_order_status(tp_order_id, 'cancelled', bot_id=bot_id)
@@ -179,15 +172,13 @@ class BotExecutor:
                 return None
 
             side = 'sell' if direction == 'LONG' else 'buy'
-            valid, db_qty, db_tp, msg = exchange.validate_order(pair, side, db_qty, db_tp)
+            valid, db_qty, db_tp, msg = exchange.validate_order(pair, side, db_qty, db_tp, is_closing=True)
             if not valid:
                 logger.warning(f"[TP-SYNC] {name}: Validation failed — {msg}")
                 return None
 
             client_order_id = self._generate_deterministic_id(bot_id, 'TP', bot_status['current_step'])
             tp_params = {'clientOrderId': client_order_id, 'postOnly': True, 'timeInForce': 'GTX'}
-            if should_reduce:
-                tp_params['reduceOnly'] = True
 
             order = self._place_gtx_order_with_retry(
                 exchange, pair, side, db_qty, db_tp, params=tp_params, label=f"{name}-TP-SYNC"
@@ -580,7 +571,7 @@ class BotExecutor:
                     order = self._place_gtx_order_with_retry(exchange, pair, side, amount, price, params={'clientOrderId': client_order_id, 'postOnly': True, 'timeInForce': 'GTX'}, label=f"{name}-ENTRY")
                     if order:
                         try:
-                            save_bot_order(bot_id, 'entry', order['id'], price, amount, 1, 'open', client_order_id=client_order_id)
+                            save_bot_order(bot_id, 'entry', order['id'], price, amount, 1, order.get('status', 'open'), client_order_id=client_order_id)
                         except Exception as save_err:
                             logger.error(f"❌ {name}: Failed to save entry order to bot_orders: {save_err}")
                             
@@ -636,7 +627,8 @@ class BotExecutor:
                     logger.info(f"📊 [DRY-RUN] Bot {name} would place TP order for {pair} @ {tp_price}")
                 else:
                     # Validate TP order
-                    valid, tp_amount, tp_price, msg = exchange.validate_order(pair, 'sell' if direction == 'LONG' else 'buy', tp_amount, tp_price)
+                    # 🚀 CLOSING FLAG: Prevents the ExchangeInterface from upscaling TP orders strictly for Min Notional rules.
+                    valid, tp_amount, tp_price, msg = exchange.validate_order(pair, 'sell' if direction == 'LONG' else 'buy', tp_amount, tp_price, is_closing=True)
                     if not valid:
                         logger.error(f"❌ TP Order validation failed for {name} {pair}: {msg}")
                         update_bot_error(bot_id, f"TP Order validation failed: {msg}")
@@ -648,7 +640,7 @@ class BotExecutor:
                         side = 'sell' if direction == 'LONG' else 'buy'
                         order = self._place_gtx_order_with_retry(exchange, pair, side, tp_amount, tp_price, params={'clientOrderId': client_order_id, 'postOnly': True, 'timeInForce': 'GTX'}, label=f"{name}-TP")
                         if order:
-                            save_bot_order(bot_id, 'tp', order['id'], tp_price, tp_amount, bot_status['current_step'], 'open', client_order_id=client_order_id)
+                            save_bot_order(bot_id, 'tp', order['id'], tp_price, tp_amount, bot_status['current_step'], order.get('status', 'open'), client_order_id=client_order_id)
                             logger.info(f"✅ {name}: Placed TP order for {pair} @ {tp_price} (ID: {order['id']})")
                             
                             # 🚀 GAP RECOVERY FIX: Sync the reconstructed live TP back to trades.target_tp_price
@@ -707,7 +699,7 @@ class BotExecutor:
                         client_order_id_grid = self._generate_deterministic_id(bot_id, 'GRID', bot_status['current_step'] + 1)
                         order = self._place_gtx_order_with_retry(exchange, pair, side, grid_amount, grid_price, params={'clientOrderId': client_order_id_grid, 'postOnly': True, 'timeInForce': 'GTX'}, label=f"{name}-GRID-{bot_status['current_step'] + 1}")
                         if order:
-                            save_bot_order(bot_id, 'grid', order['id'], grid_price, grid_amount, bot_status['current_step'] + 1, 'open', client_order_id=client_order_id_grid, notes=grid_explain)
+                            save_bot_order(bot_id, 'grid', order['id'], grid_price, grid_amount, bot_status['current_step'] + 1, order.get('status', 'open'), client_order_id=client_order_id_grid, notes=grid_explain)
                             logger.info(f"✅ {name}: Placed Grid order for {pair} @ {grid_price} (ID: {order['id']})")
                             existing_grid_order = order
                     except Exception as e:
@@ -820,7 +812,7 @@ class BotExecutor:
                         conn = get_connection()
                         cursor = conn.cursor()
                         cursor.execute("UPDATE trades SET tp_order_id = NULL WHERE bot_id = ?", (bot_id,))
-                        cursor.execute("UPDATE bot_orders SET status = 'cancelled' WHERE order_id = ?", (tp_order_id,))
+                        cursor.execute("UPDATE bot_orders SET status = 'cancelled', filled_amount = ? WHERE order_id = ?", (filled, tp_order_id,))
                         conn.commit()
                         conn.close()
                     else:
@@ -922,6 +914,13 @@ class BotExecutor:
             logger.info(f"🛑 [MAINTAIN-BLOCKED] Trading disabled. Bot {name} cannot maintain orders.")
             return
 
+        # 🚀 STRICT SYNCHRONOUS STATE LOCK
+        # Query what the DB thinks is currently open right now before acting on CCXT.
+        from engine.database import get_bot_order_ids
+        local_db_ids = get_bot_order_ids(bot_id)
+        local_tp_id = local_db_ids.get('tp_order_id')
+        local_grid_ids = [g['order_id'] for g in local_db_ids.get('grid_orders', []) if isinstance(g, dict) and 'order_id' in g]
+
         # 🚀 MARKET DATA SETUP
         # We need market data here for ATR and Grid Drift calculations. 
         # In maintain_orders, 'market_snapshot' is passed.
@@ -975,24 +974,21 @@ class BotExecutor:
         # but `current_step > 0` or we JUST placed an Entry order, it is actively in a trade.
         # Do NOT purge orders in this state.
         if bot_status['total_invested'] <= 10.0 and bot_status['current_step'] == 0:
-            existing_grid_order = next((o for o in grid_orders), None)
-            existing_tp_order = next((o for o in tp_orders), None)
-
-            if existing_grid_order:
-                logger.warning(f"👻 {name}: Found dangling GRID order while SCANNING (Invested=0.0). Purging...")
+            for stale_grid in grid_orders:
+                logger.warning(f"👻 {name}: Found dangling GRID order {stale_grid['id']} while SCANNING (Invested=0.0). Purging...")
                 try:
-                    exchange.cancel_order(existing_grid_order['id'], pair)
-                    update_order_status(existing_grid_order['id'], 'cancelled', bot_id=bot_id)
+                    exchange.cancel_order(stale_grid['id'], pair)
+                    update_order_status(stale_grid['id'], 'cancelled', bot_id=bot_id)
                 except: pass
-                grid_orders = [] # Clear local list
+            grid_orders = [] # Clear local list
             
-            if existing_tp_order:
-                logger.warning(f"👻 {name}: Found dangling TP order while SCANNING (Invested=0.0). Purging...")
+            for stale_tp in tp_orders:
+                logger.warning(f"👻 {name}: Found dangling TP order {stale_tp['id']} while SCANNING (Invested=0.0). Purging...")
                 try:
-                    exchange.cancel_order(existing_tp_order['id'], pair)
-                    update_order_status(existing_tp_order['id'], 'cancelled', bot_id=bot_id)
+                    exchange.cancel_order(stale_tp['id'], pair)
+                    update_order_status(stale_tp['id'], 'cancelled', bot_id=bot_id)
                 except: pass
-                tp_orders = []
+            tp_orders = []
 
             # 🛡️ HEDGE AUTO-CLEANUP: If SCANNING, purge dangling PENDING/OPEN hedges
             # (Note: FILLED hedges are now managed by _manage_hedge_exit below)
@@ -1053,37 +1049,101 @@ class BotExecutor:
                 except Exception as e:
                     logger.error(f"Failed to cancel stale {o['id']}: {e}")
 
-        # Ensure only 1 valid TP and 1 valid Grid exist (Deduplication)
-        if len(valid_grid_orders) > 1:
-            logger.warning(f"⚠️ {name}: Found {len(valid_grid_orders)} duplicate GRID orders for step {current_step+1}. Cleaning...")
-            valid_grid_orders.sort(key=lambda x: str(x['id']), reverse=True)
-            for o in valid_grid_orders[1:]:
+        # Ensure only 1 valid TP and 1 valid Grid exist (Deduplication / Ghost Sweeping)
+        if len(grid_orders) > 1:
+            logger.warning(f"⚠️ {name}: Found {len(grid_orders)} total GRID orders. Restricting to strict 1 max...")
+            # Sort to prefer the matching step, otherwise just keep newest
+            grid_orders.sort(key=lambda x: 1 if grid_tag in x.get('clientOrderId', '') else 0, reverse=True)
+            for o in grid_orders[1:]:
                 try: 
                     exchange.cancel_order(o['id'], pair)
                     update_order_status(o['id'], 'cancelled', bot_id=bot_id)
                 except: pass
-            valid_grid_orders = [valid_grid_orders[0]]
+            valid_grid_orders = [grid_orders[0]] if grid_tag in grid_orders[0].get('clientOrderId','') else []
+            existing_grid_order = grid_orders[0]
+        else:
+            existing_grid_order = valid_grid_orders[0] if valid_grid_orders else None
 
-        if len(valid_tp_orders) > 1:
-            logger.warning(f"⚠️ {name}: Found {len(valid_tp_orders)} duplicate TP orders for step {current_step}. Cleaning...")
-            valid_tp_orders.sort(key=lambda x: str(x['id']), reverse=True)
-            for o in valid_tp_orders[1:]:
+        if len(tp_orders) > 1:
+            logger.warning(f"⚠️ {name}: Found {len(tp_orders)} total TP orders. Restricting to strict 1 max (Sweeping Ghosts)...")
+            # Sort to prefer the matching step, otherwise just keep newest
+            tp_orders.sort(key=lambda x: 1 if tp_tag in x.get('clientOrderId', '') else 0, reverse=True)
+            for o in tp_orders[1:]:
                 try: 
                     exchange.cancel_order(o['id'], pair)
                     update_order_status(o['id'], 'cancelled', bot_id=bot_id)
                 except: pass
-            valid_tp_orders = [valid_tp_orders[0]]
-
-        existing_grid_order = valid_grid_orders[0] if valid_grid_orders else None
-        existing_tp_order = valid_tp_orders[0] if valid_tp_orders else None
+            valid_tp_orders = [tp_orders[0]] if tp_tag in tp_orders[0].get('clientOrderId','') else []
+            existing_tp_order = tp_orders[0]
+        else:
+            existing_tp_order = valid_tp_orders[0] if valid_tp_orders else None
         # ----------------------------------------
 
         strategy = self._get_strategy_instance(bot_id, bot_config)
 
         # 2. Check for missing / filled TP order
         if not existing_tp_order:
-            tp_price = strategy.calculate_take_profit_price(bot_status, current_price)
-            tp_amount = strategy.calculate_take_profit_amount(bot_status, current_price, pair, exchange)
+            if local_tp_id:
+                # 🚀 STALEMATE EVICTOR:
+                # CCXT indicates missing TP, but DB confirms local_tp_id exists.
+                # We must verify if the ID is actually DEAD before blocking re-placement.
+                logger.warning(f"⏳ {name}: CCXT says TP is missing, but DB has {local_tp_id}. Verifying status...")
+                try:
+                    order_status = exchange.fetch_order(local_tp_id, pair)
+                    status_str = order_status.get('status') if order_status else 'unknown'
+                    
+                    if status_str in ['canceled', 'cancelled', 'expired', 'rejected']:
+                        logger.info(f"🚫 {name}: Stored TP ID {local_tp_id} is CANCELLED on exchange. Evicting from DB state.")
+                        from engine.database import get_connection as _gc
+                        from engine.database import update_order_status as _uos
+                        _uos(local_tp_id, 'cancelled', bot_id=bot_id)
+                        _c = _gc()
+                        _c.execute("UPDATE trades SET tp_order_id = NULL WHERE bot_id = ?", (bot_id,))
+                        _c.commit(); _c.close()
+                        local_tp_id = None # Allow placement below
+                    elif status_str == 'filled' or (status_str == 'closed' and float(order_status.get('filled', 0) or 0) > 0 and float(order_status.get('filled', 0) or 0) >= float(order_status.get('amount', 0) or 0) * 0.99):
+                        logger.info(f"✅ {name}: Stored TP ID {local_tp_id} is FILLED. Triggering reset.")
+                        reset_bot_after_tp(bot_id, current_price, direction=direction)
+                        return None # Exit cycle
+                    else:
+                         # Still 'new' or 'unknown' but missing from global open_orders list. 
+                         # This is a Ghost Order (API Cache Desync). Force cancel it to be safe.
+                         logger.warning(f"⏳ {name}: Stored TP {local_tp_id} status is {status_str}, but missing from global open_orders. Forcing CANCEL and Eviction.")
+                         try:
+                             exchange.cancel_order(local_tp_id, pair)
+                         except: pass
+                         from engine.database import get_connection as _gc
+                         from engine.database import update_order_status as _uos
+                         _uos(local_tp_id, 'cancelled', bot_id=bot_id) # 🚀 FUNDAMENTAL FIX: Clear bot_orders state
+                         _c = _gc()
+                         _c.execute("UPDATE trades SET tp_order_id = NULL WHERE bot_id = ?", (bot_id,))
+                         _c.commit(); _c.close()
+                         local_tp_id = None # Allow immediate replacement below!
+                except Exception as _evict_err:
+                     err_str = str(_evict_err).lower()
+                     if "not found" in err_str or "-2013" in err_str:
+                         logger.warning(f"🚫 {name}: Stored TP ID {local_tp_id} NOT FOUND on exchange. Evicting from DB state.")
+                         from engine.database import get_connection as _gc
+                         from engine.database import update_order_status as _uos
+                         _uos(local_tp_id, 'cancelled', bot_id=bot_id) # 🚀 FUNDAMENTAL FIX: Clear bot_orders state
+                         _c = _gc()
+                         _c.execute("UPDATE trades SET tp_order_id = NULL WHERE bot_id = ?", (bot_id,))
+                         _c.commit(); _c.close()
+                         local_tp_id = None # Allow placement below
+                     else:
+                         logger.error(f"❌ {name}: Failed to evict stalemate TP ID {local_tp_id}: {_evict_err}")
+                         # Also forcefully clear to prevent deadlock if API throws strange errors repeatedly
+                         from engine.database import get_connection as _gc
+                         from engine.database import update_order_status as _uos
+                         _uos(local_tp_id, 'cancelled', bot_id=bot_id)
+                         _c = _gc()
+                         _c.execute("UPDATE trades SET tp_order_id = NULL WHERE bot_id = ?", (bot_id,))
+                         _c.commit(); _c.close()
+                         local_tp_id = None
+            
+            if local_tp_id is None:
+                tp_price = strategy.calculate_take_profit_price(bot_status, current_price)
+                tp_amount = strategy.calculate_take_profit_amount(bot_status, current_price, pair, exchange)
             
             # 🚀 OFFLINE PROFIT GAP FIX (Maker Edition)
             # To prevent Binance Maker-Only ('GTX') -2010 rejections when filling offline gaps,
@@ -1123,23 +1183,18 @@ class BotExecutor:
                 if config.DRY_RUN:
                     logger.info(f"📊 [DRY-RUN] Bot {name} maintains TP for {pair} @ {tp_price}")
                 else:
-                    valid, tp_amount, tp_price, msg = exchange.validate_order(pair, 'sell' if direction == 'LONG' else 'buy', tp_amount, tp_price)
+                    valid, tp_amount, tp_price, msg = exchange.validate_order(pair, 'sell' if direction == 'LONG' else 'buy', tp_amount, tp_price, is_closing=True)
                     if valid:
                         try:
                             client_order_id = self._generate_deterministic_id(bot_id, 'TP', bot_status['current_step'])
                             side = 'sell' if direction == 'LONG' else 'buy'
                             
-                            ccxt_params = {'clientOrderId': client_order_id, 'postOnly': True, 'timeInForce': 'GTX'}
+                            ccxt_params = {'clientOrderId': client_order_id}
                             
-                            # 🚀 SPREAD-CROSS FIX: If the price was dynamically adjusted to `current_price` due to an Offline Gap,
-                            # a Maker-Only GTX flag will guarantee Binance rejects it with `-2010`. We fallback to a standard GTC Limit.
-                            if tp_price == exchange.round_to_step(current_price, exchange.get_symbol_precision(pair)['tick_size']):
-                                logger.warning(f"⚠️ {name}: TP price matches active market gap. Dropping GTX Maker flag to allow execution.")
-                                ccxt_params = {'clientOrderId': client_order_id, 'timeInForce': 'GTC'}
-                            
-                            # 🍰 REDUCE-ONLY DUST FIX: If this is the only active bot on this pair,
-                            # mark the TP as reduceOnly so any tiny precision residual on the exchange
-                            # gets fully closed — no sub-$5 dust is left behind.
+                            # 🍰 REDUCE-ONLY VS POST-ONLY DYNAMIC TOGGLE
+                            # As per rule: If this is the ONLY bot trading this pair, use reduceOnly (ensures dust flattening).
+                            # If there are MULTIPLE bots trading the same pair, reduceOnly is dangerous (cancels/clashes with sister bots).
+                            # In that case, we default to postOnly (Maker) without reduceOnly.
                             try:
                                 from engine.database import get_connection as _gc
                                 _c = _gc()
@@ -1147,15 +1202,31 @@ class BotExecutor:
                                 _cur.execute("SELECT COUNT(*) FROM bots b JOIN trades t ON b.id=t.bot_id WHERE b.pair=? AND t.total_invested>0 AND b.id!=?", (pair, bot_id))
                                 other_bots_on_pair = _cur.fetchone()[0]
                                 _c.close()
-                                if other_bots_on_pair == 0:
-                                    ccxt_params['reduceOnly'] = True
-                                    logger.info(f"🍰 {name}: Sole bot on {pair} — TP set to reduceOnly to flatten any dust residual.")
-                            except Exception:
-                                pass  # Non-critical, don't block TP placement
                                 
+                                if other_bots_on_pair == 0:
+                                    logger.info(f"🍰 {name}: Sole bot on {pair} — applying reduceOnly for optimal dust flattening.")
+                                    ccxt_params['reduceOnly'] = True
+                                    # Optional: Can also include timeInForce GTC
+                                else:
+                                    logger.info(f"⚖️ {name}: Multiple bots detected on {pair} ({other_bots_on_pair} others). Using standard postOnly (no reduceOnly).")
+                                    ccxt_params['postOnly'] = True
+                                    ccxt_params['timeInForce'] = 'GTX'
+                            except Exception as e:
+                                logger.warning(f"⚠️ {name}: Dynamic reduceOnly check failed ({e}). Defaulting to postOnly.")
+                                ccxt_params['postOnly'] = True
+                                ccxt_params['timeInForce'] = 'GTX'
+                            
+                            # 🚀 SPREAD-CROSS FIX: If the price was dynamically adjusted to `current_price` due to an Offline Gap,
+                            # a Maker-Only GTX flag will guarantee Binance rejects it with `-2010`. We fallback to a standard GTC Limit.
+                            if ccxt_params.get('postOnly') and tp_price == exchange.round_to_step(current_price, exchange.get_symbol_precision(pair)['tick_size']):
+                                logger.warning(f"⚠️ {name}: TP price matches active market gap. Dropping GTX Maker flag to allow execution.")
+                                ccxt_params.pop('postOnly', None)
+                                ccxt_params['timeInForce'] = 'GTC'
+                                ccxt_params.pop('reduceOnly', None) # If we cross spread, reduceOnly might be safe, but keep it simple.
+                            
                             order = self._place_gtx_order_with_retry(exchange, pair, side, tp_amount, tp_price, params=ccxt_params, label=f"{name}-MAINTAIN-TP")
                             if order:
-                                save_bot_order(bot_id, 'tp', order['id'], tp_price, tp_amount, bot_status['current_step'], 'open', client_order_id=client_order_id)
+                                save_bot_order(bot_id, 'tp', order['id'], tp_price, tp_amount, bot_status['current_step'], order.get('status', 'open'), client_order_id=client_order_id)
                                 logger.info(f"✅ {name}: Maintained TP order for {pair} @ {tp_price}")
                         except Exception as e:
                              logger.error(f"❌ {name}: Error maintaining TP: {e}")
@@ -1164,6 +1235,15 @@ class BotExecutor:
         elif existing_tp_order and bot_status.get('total_invested', 0) > 0:
             db_tp  = self._compute_effective_tp(bot_id, name, bot_status, bot_config, strategy)
             db_qty = strategy.calculate_take_profit_amount(bot_status, current_price, pair, exchange)
+            
+            # 🚀 ALIGNMENT FIX: Run the theoretical target through the exchange validator
+            # This ensures if the exchange auto-scaled the amount upward (e.g. for Min Notional on Demo),
+            # we compare the exchange's scaled amount against our own validated scaled amount, preventing loops.
+            valid, val_qty, val_tp, _ = exchange.validate_order(pair, 'sell' if direction == 'LONG' else 'buy', db_qty, db_tp, is_closing=True)
+            if valid:
+                db_qty = val_qty
+                db_tp = val_tp
+                
             exchange_tp  = float(existing_tp_order.get('price') or existing_tp_order.get('stopPrice') or 0)
             exchange_qty = self._get_order_amount(existing_tp_order)
 
@@ -1171,19 +1251,21 @@ class BotExecutor:
             if db_tp == 0 and bot_status.get('avg_entry_price', 0) > 0:
                 db_tp = strategy.calculate_take_profit_price(bot_status, bot_status.get('avg_entry_price', 0))
                 logger.info(f"[TP-RECOVER] {name}: db_tp was 0, recalculated to {db_tp:.4f} from avg_entry.")
-                try:
-                    _c = get_connection()
-                    _c.execute("UPDATE trades SET target_tp_price=? WHERE bot_id=?", (db_tp, bot_id))
-                    _c.commit(); _c.close()
-                except Exception:
-                    pass
 
             if db_tp > 0 and exchange_tp > 0:
-                tp_drift_pct  = abs(db_tp  - exchange_tp)  / db_tp
-                qty_drift_pct = abs(db_qty - exchange_qty) / max(db_qty, 0.0001)
-                if tp_drift_pct > 0.001 or qty_drift_pct > 0.01:
-                    logger.info(f"[SYNC-DRIFT] {name}: TP drifted price {tp_drift_pct*100:.4f}% qty {qty_drift_pct*100:.2f}%. Replacing.")
-                    existing_tp_order = self._sync_replace_tp(
+                # Diff matching
+                # Drift bounds (0.05% for price to tolerate tiny rounding, 1% for qty)
+                drift_tp  = abs(db_tp - exchange_tp) / max(db_tp, 0.01)
+                drift_qty = abs(db_qty - exchange_qty) / max(db_qty, 0.0001)
+
+                tp_tolerance = 0.0005  # 0.05%
+                # 🚀 ROUNDING FIX: Increase qty tolerance to 5% to account for lot-size reduction 
+                # on small position sizes (e.g. 0.071 -> 0.070 is a 1.4% drift)
+                qty_tolerance = 0.05   # 5%
+
+                if drift_tp > tp_tolerance or drift_qty > qty_tolerance:
+                    logger.info(f"[SYNC-DRIFT] {name}: TP drifted price {drift_tp*100:.4f}% (DB:{db_tp:.4f} vs EX:{exchange_tp:.4f}) qty {drift_qty*100:.2f}% (DB:{db_qty:.4f} vs EX:{exchange_qty:.4f}). Replacing.")
+                    tp_order = self._sync_replace_tp(
                         bot_id, name, pair, direction, bot_status, exchange,
                         db_tp, db_qty, existing_tp_order
                     )
@@ -1303,13 +1385,59 @@ class BotExecutor:
                      if bot_config.get('base_size', 0) < 100.0:
                          bot_config['base_size'] = 105.0
             
-             grid_res = strategy.calculate_grid_order_price(bot_status, current_price, market_data=current_market_data)
-             if isinstance(grid_res, tuple):
-                  grid_price, grid_explain = grid_res
-             else:
-                  grid_price, grid_explain = grid_res, ""
+             # 🚀 STRICT SYNCHRONOUS STATE LOCK (GRID)
+             # Wait if the DB already thinks a Grid is open, but CCXT was just too slow to show it.
+             if len(local_grid_ids) > 0:
+                  logger.warning(f"⏳ {name}: CCXT indicates missing Grid, but DB confirms {local_grid_ids} was placed. Verifying status...")
+                  # 🚀 STALEMATE EVICTOR (GRID): Verify if it's dead before blocking
+                  try:
+                      latest_grid_id = local_grid_ids[-1]
+                      order_status = exchange.fetch_order(latest_grid_id, pair)
+                      status_str = order_status.get('status') if order_status else 'unknown'
+                      filled_qty = order_status.get('filled', 0.0) if order_status else 0.0
+                      
+                      if status_str in ['canceled', 'cancelled', 'expired', 'rejected']:
+                          logger.info(f"🚫 {name}: Stored GRID ID {latest_grid_id} is CANCELLED on exchange. Evicting from DB state. Preserving {filled_qty} fill.")
+                          from engine.database import update_order_status as _uos
+                          _uos(latest_grid_id, 'cancelled', bot_id=bot_id, filled_qty=filled_qty)
+                          local_grid_ids = [] # Clear locals to unblock
+                      elif status_str in ['filled', 'closed']:
+                          logger.info(f"✅ {name}: Stored GRID ID {latest_grid_id} is FILLED. Offline sync will handle this.")
+                          # It's filled, let the offline sync processor handle it. Wait.
+                      else:
+                          logger.warning(f"⏳ {name}: Stored Grid {latest_grid_id} status is {status_str}, but missing from open_orders! Forcing CANCEL and Eviction.")
+                          try:
+                              exchange.cancel_order(latest_grid_id, pair)
+                          except: pass
+                          from engine.database import update_order_status as _uos
+                          _uos(latest_grid_id, 'cancelled', bot_id=bot_id, filled_qty=filled_qty)
+                          _uos(latest_grid_id, 'cancelled', bot_id=bot_id)
+                          local_grid_ids = [] # Clear to allow grid logic below to immediately fire
+                  except Exception as _evict_err:
+                      err_str = str(_evict_err).lower()
+                      if "not found" in err_str or "-2013" in err_str:
+                          logger.warning(f"🚫 {name}: Stored GRID ID {local_grid_ids[-1]} NOT FOUND on exchange. Evicting from DB state.")
+                          from engine.database import update_order_status as _uos
+                          _uos(local_grid_ids[-1], 'cancelled', bot_id=bot_id)
+                          local_grid_ids = []
+                      else:
+                          logger.error(f"❌ {name}: Failed to evict stalemate GRID ID: {_evict_err}")
+                          # Free the local hold regardless, let the engine rebuild it.
+                          from engine.database import update_order_status as _uos
+                          _uos(local_grid_ids[-1], 'cancelled', bot_id=bot_id)
+                          local_grid_ids = []
 
-             grid_amount = strategy.calculate_grid_order_amount(bot_status, current_price, pair, exchange)
+             if len(local_grid_ids) > 0:
+                  grid_price = 0
+                  grid_explain = "Blocked by Local DB Lock"
+                  grid_amount = 0
+             else:
+                  grid_res = strategy.calculate_grid_order_price(bot_status, current_price, market_data=current_market_data)
+                  if isinstance(grid_res, tuple):
+                       grid_price, grid_explain = grid_res
+                  else:
+                       grid_price, grid_explain = grid_res, ""
+                  grid_amount = strategy.calculate_grid_order_amount(bot_status, current_price, pair, exchange)
              
              # 🚀 OFFLINE GRID GAP FIX (Maker Edition)
              # If the market swept past our intended grid target, placing a standard grid limit order
@@ -1358,7 +1486,7 @@ class BotExecutor:
                                 
                             order = self._place_gtx_order_with_retry(exchange, pair, side, grid_amount, grid_price, params=ccxt_grid_params, label=f"{name}-MAINTAIN-GRID")
                             if order:
-                                save_bot_order(bot_id, 'grid', order['id'], grid_price, grid_amount, bot_status['current_step'] + 1, 'open', client_order_id=client_order_id_grid, notes=grid_explain)
+                                save_bot_order(bot_id, 'grid', order['id'], grid_price, grid_amount, bot_status['current_step'] + 1, order.get('status', 'open'), client_order_id=client_order_id_grid, notes=grid_explain)
                                 logger.info(f"✅ {name}: Maintained Grid order for {pair} @ {grid_price}")
                         except Exception as e:
                             err_msg = str(e)
@@ -1368,7 +1496,23 @@ class BotExecutor:
                             else:
                                 logger.error(f"❌ {name}: Error maintaining Grid: {e}")
                             
-        # 3b. GRID SYNC-DRIFT: If grid exists but price is imprecise or drifted
+        # 3b. MAX-STEP LOCK: If we reached max steps, there should be NO Grid orders. Clean them completely!
+        elif bot_status['current_step'] >= strategy.max_steps:
+             if existing_grid_order:
+                 logger.warning(f"🛑 {name}: Max steps reached ({strategy.max_steps}) but Grid exists! Cancelling physical Grid {existing_grid_order['id']}.")
+                 try:
+                     exchange.cancel_order(existing_grid_order['id'], pair)
+                     from engine.database import update_order_status as _uos
+                     _uos(existing_grid_order['id'], 'cancelled', bot_id=bot_id)
+                 except: pass
+             
+             if len(local_grid_ids) > 0:
+                 logger.warning(f"🧹 {name}: Max steps reached but DB lists Grid ghosts {local_grid_ids}. Sweeping DB cleanly.")
+                 from engine.database import update_order_status as _uos
+                 for ghost_id in local_grid_ids:
+                     _uos(ghost_id, 'cancelled', bot_id=bot_id)
+
+        # 3c. GRID SYNC-DRIFT: If grid exists but price is imprecise or drifted
         elif existing_grid_order and bot_status['total_invested'] > 0:
             grid_res = strategy.calculate_grid_order_price(bot_status, current_price, market_data=current_market_data)
             target_grid_price, grid_explain = grid_res if isinstance(grid_res, tuple) else (grid_res, "")

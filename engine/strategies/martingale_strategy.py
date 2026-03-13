@@ -19,7 +19,7 @@ def iRSI(data: pd.Series, period: int) -> float:
     return rsi_series.iloc[-1]
 
 class MartingaleStrategy(BaseStrategy):
-    MIN_INVESTMENT = 2.0 # USDT/USDC - Dust threshold
+    MIN_INVESTMENT = 0.01 # USDT/USDC - Support fractional micro-altcoin dust
 
     def __init__(self, params: Optional[dict] = None):
         super().__init__("Martingale_Grid", params if params is not None else {})

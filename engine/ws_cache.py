@@ -29,23 +29,26 @@ class WSCache:
 
     def update_position(self, symbol: str, position_data: Dict):
         """Update or insert a position from WS event."""
+        from engine.exchange_interface import normalize_symbol
+        norm_sym = normalize_symbol(symbol)
         with self.data_lock:
             if position_data.get('contracts', 0) == 0:
                 # Position closed, remove from cache
-                self.positions.pop(symbol, None)
+                self.positions.pop(norm_sym, None)
             else:
-                self.positions[symbol] = position_data
+                self.positions[norm_sym] = position_data
             self.last_update_time = time.time()
 
     def populate_from_rest(self, positions: List[Dict], orders: List[Dict]):
         """Seed the cache with a full REST snapshot (e.g. on startup or after staleness)."""
+        from engine.exchange_interface import normalize_symbol
         with self.data_lock:
             self.positions.clear()
             self.open_orders.clear()
             
             for p in (positions or []):
                 sym = p.get('symbol')
-                if sym: self.positions[sym] = p
+                if sym: self.positions[normalize_symbol(sym)] = p
                 
             for o in (orders or []):
                 oid = o.get('id')

@@ -533,10 +533,10 @@ class ExchangeInterface:
                  return None
             return self.exchange.fetch_order(order_id, symbol)
         except Exception as e:
-            self.logger.error(f"Fetch Order Error: {e}")
-            return None
+            self.logger.error(f"Fetch Order Error for {order_id} (Symbol: {symbol}): {e}")
+            raise e
 
-    def validate_order(self, symbol: str, side: str, amount: float, price: Optional[float] = None):
+    def validate_order(self, symbol: str, side: str, amount: float, price: Optional[float] = None, is_closing: bool = False):
         """Standardizes order validation before sending to exchange."""
         try:
             # Ensure markets are loaded before validation
@@ -568,19 +568,22 @@ class ExchangeInterface:
             if price and amount:
                  notional = price * amount
                  if notional < min_notional:
-                     # 🚀 AUTO-SCALE: Dynamically increase the amount to meet the exchange's minimum notional limit
-                     # Add a $2.00 buffer to ensure slight price drops don't cause instant rejection during network transit
-                     needed_notional = min_notional + 2.0
-                     adjusted_amount = needed_notional / price
-                     
-                     # Ceil to exchange step size so we never round back below the notional threshold
-                     try:
-                         prec = self.get_symbol_precision(symbol)
-                         amount = self.ceil_to_step(adjusted_amount, prec['step_size'])
-                     except:
-                         amount = adjusted_amount
-                     
-                     self.logger.warning(f"⚠️ [AUTO-SCALE] Order value ${notional:.2f} < Min Notional ${min_notional}. Auto-scaled amount to target ${needed_notional:.2f} ({amount} units).")
+                     if is_closing:
+                         self.logger.info(f"🛡️ [MIN-NOTIONAL] Order value ${notional:.2f} < ${min_notional}. Skipping auto-scale because this is a closing/TP order.")
+                     else:
+                         # 🚀 AUTO-SCALE: Dynamically increase the amount to meet the exchange's minimum notional limit
+                         # Add a $2.00 buffer to ensure slight price drops don't cause instant rejection during network transit
+                         needed_notional = min_notional + 2.0
+                         adjusted_amount = needed_notional / price
+                         
+                         # Ceil to exchange step size so we never round back below the notional threshold
+                         try:
+                             prec = self.get_symbol_precision(symbol)
+                             amount = self.ceil_to_step(adjusted_amount, prec['step_size'])
+                         except:
+                             amount = adjusted_amount
+                         
+                         self.logger.warning(f"⚠️ [AUTO-SCALE] Order value ${notional:.2f} < Min Notional ${min_notional}. Auto-scaled amount to target ${needed_notional:.2f} ({amount} units).")
 
             # Basic Validation Passed
             return True, amount, price, ""

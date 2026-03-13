@@ -61,58 +61,71 @@ def flag_unmatched_positions(runner, snapshot: Dict[str, Any]):
                 physical_map[pair] = {'long': 0.0, 'short': 0.0}
 
             side = 'long' if amt > 0 else 'short'
-            notional = abs(amt) * entry
-            physical_map[pair][side] += notional
+            physical_map[pair][side] += abs(amt)
 
-    # 2. Aggregate Virtual Positions (only from bots with actual trade records)
-    bots = runner.get_active_bots()
-    virtual_map = {}  # {norm_pair: {'long': invested_usd, 'short': invested_usd}}
+    # 2. Aggregate Virtual Positions (Query directly from DB for accurate avg_entry_price)
+    virtual_map = {}  # {norm_pair: {'long': qty, 'short': qty}}
+    
+    conn = database.get_connection()
+    c = conn.cursor()
+    c.execute("""
+        SELECT b.pair, b.direction, t.total_invested, t.avg_entry_price 
+        FROM bots b 
+        JOIN trades t ON b.id = t.bot_id 
+        WHERE b.is_active = 1 AND t.total_invested > 0
+    """)
+    active_bot_trades = c.fetchall()
 
-    for bot in bots:
-        # Robust access to handle varying column counts from different get_active_bots versions
-        b_id = bot[0]
-        b_name = bot[1]
-        b_pair = bot[2]
-        b_dir = bot[3]
-        b_invested = float(bot[6]) if len(bot) > 6 else 0.0
+    for row in active_bot_trades:
+        b_pair, b_dir, b_invested, b_avg_entry = row
         pair = normalize_symbol(b_pair)
         direction = b_dir.lower()
         invested = float(b_invested or 0)
+        avg_entry = float(b_avg_entry or 0)
 
         if pair not in virtual_map:
             virtual_map[pair] = {'long': 0.0, 'short': 0.0}
 
-        if invested > 10:  # meaningful amount
-            virtual_map[pair][direction] += invested
+        if invested > 0 and avg_entry > 0:
+            qty = invested / avg_entry
+            virtual_map[pair][direction] += qty
 
-    # 3. Compare — flag only, never modify
-    for pair, phys_data in physical_map.items():
-        for side in ['long', 'short']:
-            phys_val = phys_data[side]
-            if phys_val < 10:
-                continue  # dust
+    # 3. Compare — Calculate NET positions (One-Way mode)
+    # The physical map naturally has a net position for one-way (e.g. either long or short, never both)
+    # So we should compare the Net Virtual vs Net Physical.
+    
+    all_pairs = set(list(physical_map.keys()) + list(virtual_map.keys()))
+    
+    for pair in all_pairs:
+        # Calculate Virtual Net (Long + / Short -)
+        v_data = virtual_map.get(pair, {'long': 0.0, 'short': 0.0})
+        v_net = v_data['long'] - v_data['short']
+        
+        # Calculate Physical Net
+        p_data = physical_map.get(pair, {'long': 0.0, 'short': 0.0})
+        p_net = p_data['long'] - p_data['short']
+        
+        diff_qty = abs(p_net - v_net)
+        
+        # If absolute difference in quantity is basically 0, skip
+        # Note: 1e-4 is standard rounding dust. If it's more than dust, it's a real mismatch.
+        if diff_qty > _MISMATCH_TOLERANCE_QTY:
+            if abs(v_net) < _MISMATCH_TOLERANCE_QTY:
+                logger.warning(
+                    f"⚠️ UNMATCHED POSITION: {pair} NET "
+                    f"PhysQty={p_net:.4f} VirtQty={v_net:.4f} — "
+                    f"Possibly manual trade. NO ACTION TAKEN."
+                )
+            else:
+                logger.warning(
+                    f"⚠️ SIZE DISCREPANCY: {pair} NET "
+                    f"PhysQty={p_net:.4f} VirtQty={v_net:.4f} "
+                    f"(Diff: {diff_qty:.4f} qty). NO ACTION TAKEN."
+                )
 
-            virt_val = virtual_map.get(pair, {}).get(side, 0.0)
-            diff_val = phys_val - virt_val
 
-            if diff_val > _MISMATCH_TOLERANCE_USD:
-                if virt_val < 10:
-                    # Complete zombie — no bot claims this at all
-                    logger.warning(
-                        f"⚠️ UNMATCHED POSITION: {pair} {side.upper()} "
-                        f"Phys=${phys_val:.2f} Virt=${virt_val:.2f} — "
-                        f"Possibly manual trade. NO ACTION TAKEN."
-                    )
-                else:
-                    # Partial mismatch — bot tracks some, but exchange has more
-                    logger.warning(
-                        f"⚠️ SIZE DISCREPANCY: {pair} {side.upper()} "
-                        f"Phys=${phys_val:.2f} Virt=${virt_val:.2f} "
-                        f"(+${diff_val:.2f} untracked). NO ACTION TAKEN."
-                    )
-
-
-_MISMATCH_TOLERANCE_USD = 25.0
+# Use strict quantity rounding tolerance to avoid floating point math errors
+_MISMATCH_TOLERANCE_QTY = 0.0001
 
 
 def fix_stuck_orders(runner, snapshot: Dict[str, Any]):

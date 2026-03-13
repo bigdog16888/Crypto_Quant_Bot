@@ -1,8 +1,8 @@
 # Crypto Quant Bot: Unified Documentation
 
-**Version:** 1.4.1 (Mathematical Step Recovery & Hedge Bypass)  
-**Status:** Highly Stable, Auto-Healing Active  
-**Last Updated:** 2026-03-10
+**Version:** 1.4.4 (Partial Fill Resilience — Ghost order Pruning)  
+**Status:** Highly Stable, Strict Proof-Only Active  
+**Last Updated:** 2026-03-13
 
 This document provides a unified, comprehensive overview of the Crypto Quant Bot, its architecture, setup, and operational best practices. It consolidates the key information from over 20 separate markdown files.
 
@@ -50,12 +50,12 @@ Each bot's state is tracked in the `trades` table. The `reconciler.py` aggregate
 
 | Phase | What it does |
 |-------|--------------|
-| **Preflight Sync** | Before reading any fill history, `_sync_positions_to_exchange()` compares `trades.avg_entry_price` and `trades.total_invested` against Binance live positions. Drift >0.5% → overwrites DB with exchange truth. |
-| **Idempotency Guard** | Every offline fill is double-checked against `bot_orders.order_id` AND `trade_history` (price+qty) before being applied. No fill is ever counted twice. |
+| **Preflight Sync** | Before reading any fill history, `_sync_positions_to_exchange()` compares DB against Binance live positions. **Crucial One-Way Guard**: If multiple bots are active on the same pair, the bot strictly ignores Binance's aggregated position (to prevent math-stealing between Longs/Shorts) and relies purely on individual order receipts (`clientOrderId`). If it is the sole bot, it anchors perfectly to the exchange. |
+| **Idempotency & Partial Guard** | Every offline fill is double-checked against `bot_orders.order_id` AND `trade_history`. The system proactively fetches `fetch_open_orders` alongside closed history to correctly attribute mathematically live fractions of **Partial Fills** that occurred while the DB was asleep/offline. |
 | **Post-Fill Anchor** | After any offline fill is recorded, the system immediately re-fetches the exchange position and overwrites `avg_entry_price`/`total_invested`. Arithmetic drift is impossible. |
 | **TP Safety Guard** | Before calling `reset_bot_after_tp` on a found closed TP, the system verifies the exchange position is actually flat. If a live position still exists, the TP is marked stale and the reset is aborted. |
 
-> **Key Invariant:** The exchange's live position is the ground truth. The DB always syncs to match. Fill arithmetic is only used as a fallback.
+> **Key Invariant:** The exchange's live position is the ground truth. The DB always syncs to match, provided the bot has absolute mathematical ownership of the pair. Fractional math is always tracked directly via explicit order IDs.
 
 ---
 
@@ -135,12 +135,14 @@ streamlit run ui/app.py
 
 **Never use `cancel_all_orders(pair)`. Always use `cancel_orders_by_bot_id(bot_id, pair)`.** The former will cause catastrophic interference between bots; the latter is the foundation of the Virtual Position Manager.
 
-### 4.2. The Strict Ban on `reduceOnly`
+### 4.2. Dynamic `reduceOnly` Logic (Updated: 2026-03-12)
 
-**Never use the `reduceOnly: True` order parameter in a Multi-Bot environment.**
-Because multiple bots (both LONG and SHORT) can share the same currency pair, the exchange's "Physical Net Position" might be LONG while a specific bot is trying to close its SHORT position. If that bot sends a Take Profit 'buy' order with `reduceOnly=True`, Binance will strictly check the exchange's net position. Because the net position is already LONG, Binance will reject the order with `-2022 ReduceOnly Order is rejected`, preventing the bot from ever taking profit and leaving a naked mathematically-unhedged position. 
+**The system now dynamically handles `reduceOnly: True` order parameters based on active pair population.**
+Previously, using `reduceOnly: True` in a Multi-Bot environment was strictly banned because if a specific bot sends a Take Profit 'buy' order with `reduceOnly=True` while the exchange's aggregate physical position is opposite (e.g. LONG), Binance will reject the order with `-2022 ReduceOnly Order is rejected`. This would prevent the bot from ever taking profit.
 
-In this system, because all bots share a physical position, **Take Profit orders must be mathematical limit orders without `reduceOnly`**. Order duplication is prevented exclusively by local state (checking `bot_orders` for an active `CQB_{bot_id}_TP_x`).
+In this upgraded system, **Take Profit orders automatically evaluate sibling bot counts**:
+- **Single-Bot Active (1 Bot on Pair)**: The system applies `reduceOnly=True` to the Take Profit order. This safely ensures any fractional dust limits are natively cleaned by the exchange upon exiting the position.
+- **Multi-Bot Active (>1 Bots on Pair)**: The system automatically drops the `reduceOnly` flag and falls back to a structural algorithmic Limit order (`postOnly=True`, or GTC if crossing spread) utilizing `bot_orders` memory to prevent position doubling. This avoids `-2022` rejection collisions while guaranteeing profits are always successfully secured no matter the net balance orientation!
 
 ### 4.2. Recent Stability & Bug Fixes (Updated: 2026-02-12)
 
@@ -163,6 +165,24 @@ The bot has recently undergone a fundamental stabilization phase to ensure multi
 ---
 
 ## 5. Changelog Summary
+
+### Version 1.4.4 (2026-03-13)
+**Partial Fill Resilience — Ghost Order Pruning**
+- **Partial Fill Resilience:** Patched `bot_executor.py` to capture and preserve `filled` quantities from Binance before canceling stagnant grid or take-profit orders. This ensures that even if an order is cancelled while partially filled, the filled amount is recorded in the bot's mathematical ledger (`bot_orders`), preventing "phantom" USD mismatches in the UI.
+- **Stray Ghost Order Pruning:** Updated `cleanup_pending_orders` in `engine/database.py` to target both `open` and `new` statuses. Previously, orders that crashed during the creation phase (stuck as `new`) were ignored by the cleanup sweeper, leading to "Stray Orders" alerts in the dashboard.
+- **Ledger Math Normalization:** Manually reconciled the SUI/SOL ledger gaps by injecting the exact missing fractional quantities to align Virtual (DB) state with Exchange (CCXT) physical limits.
+
+### Version 1.4.3 (2026-03-13)
+**WebSocket Cache Split-Brain Resolution — Phantom Position Elimination**
+- **Root Cause Identified:** The `WSCache` in `engine/ws_cache.py` stored position data under two different key formats: REST positions from CCXT used slash-format (`BTC/USDC`) while live WebSocket `ACCOUNT_UPDATE` events used raw Binance format (`BTCUSDC`). This caused the cache to accumulate *both* entries simultaneously instead of overwriting, doubling the virtual physical notional when the integrity checker compared positions. The mismatch always equalled *exactly* the Entry Order 1 value — a reliable signature of this bug.
+- **Fix:** `update_position()` and `populate_from_rest()` in `ws_cache.py` now call `normalize_symbol()` on every position key before storage. REST and WS data now correctly resolve to the same dict key, ensuring deduplication.
+- **Impact:** All `SIZE DISCREPANCY` and `UNMATCHED POSITION` warnings in `engine.log` have been completely eliminated.
+
+### Version 1.4.2 (2026-03-12)
+**Multi-Bot Architecture Isolation & Ledger Math Integrity**
+- **Strict Proof-Only Independence:** Reverted proportional guessing mechanics within `reconciler.py` where overlapping bots mapping identical pairs attempted to mathematically assume ownership of physical exchange gaps. Overlapping bots now exclusively rebuild internal limits using physical `client_order_id` receipt tracking via `bot_orders`, completely solving the massive phantom $30,000 `adoption_add` ghost scaling loops.
+- **Take Profit Ledger Integrity:** Fixed a profound structural flaw in offline sync logic where `tp` (`Take Profit`) execution logs were natively written back into the new DB Cycle Scope directly *after* grid history wipes. This left un-matched negative quantities in active balance traces that provoked the auto-healer. TP receipts are now dynamically stored as `reset_cleared` synchronously to halt infinite array loops immediately.
+- **Dynamic TP reduceOnly Logic:** Upgraded `bot_executor.py` so that Single-Bot states map TP limits dynamically via `reduceOnly=True` to clear fractional token dust silently, while Multi-Bot states safely rely on native Limit Orders (`postOnly=True`, or GTC if crossing spread) avoiding `-2022` Exchange collisions.
 
 ### Version 1.4.1 (2026-03-10)
 **Virtual Hedge Guarding & Step Integrity**
@@ -200,7 +220,7 @@ The bot has recently undergone a fundamental stabilization phase to ensure multi
 - **Reconciler Decoupling:** Removed ownership state dependencies.
 
 ---
-This unified document was last updated on **2026-03-09** (v1.4.0).
+This unified document was last updated on **2026-03-13** (v1.4.3).
 
 ## 6. Database Architecture & Concurrency (Added 2026-02-17)
 The system uses **SQLite** in **WAL (Write-Ahead Logging)** mode for high-performance concurrency.

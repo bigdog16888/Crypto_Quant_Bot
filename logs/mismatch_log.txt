@@ -1,6 +1,0 @@
-﻿2026-02-20 12:36:05,343 - BotRunner - CRITICAL - ⚠️ [DIRECTION-MISMATCH] System Net=265.492 vs Exchange Net=-269.10653333332. Bot Recovered_Bot_10006 is confused.
-2026-02-20 12:36:05,343 - BotRunner - CRITICAL - 🔧 [MISMATCH-FIX] Resetting Bot Recovered_Bot_10006 to IDLE to resolve direction conflict.
-2026-02-20 12:36:05,358 - BotRunner - INFO - ✅ [MISMATCH-FIXED] Bot Recovered_Bot_10006 reset. Exchange position remains for Adoption/Clearing.
-2026-02-20 12:36:05,358 - BotRunner - CRITICAL - ⚠️ [DIRECTION-MISMATCH] System Net=265.492 vs Exchange Net=-269.10653333332. Bot Recovered_Bot_10009 is confused.
-2026-02-20 12:36:05,359 - BotRunner - CRITICAL - 🔧 [MISMATCH-FIX] Resetting Bot Recovered_Bot_10009 to IDLE to resolve direction conflict.
-2026-02-20 12:36:05,370 - BotRunner - INFO - ✅ [MISMATCH-FIXED] Bot Recovered_Bot_10009 reset. Exchange position remains for Adoption/Clearing.

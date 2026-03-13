@@ -314,7 +314,7 @@ class BotRunner:
                 if reconciler:
                     for m_type, ex in self.exchanges.items():
                         if ex:
-                            offline_stats = reconciler.detect_offline_fills(since_hours=48)
+                            offline_stats = reconciler.reconstruct_offline_fills(since_hours=48)
                             if offline_stats['grid_fills'] + offline_stats['tp_fills'] + offline_stats['entry_fills'] > 0:
                                 logger.info(f"📋 Offline Fills ({m_type}): {offline_stats['entry_fills']} entries, {offline_stats['grid_fills']} grids, {offline_stats['tp_fills']} TPs")
             except Exception as e:
@@ -384,7 +384,7 @@ class BotRunner:
             if self._reconciler:
                 try:
                     logger.info("🔍 [STARTUP-SYNC] Running offline fill detection (48h window)...")
-                    stats = self._reconciler.detect_offline_fills(since_hours=48)
+                    stats = self._reconciler.reconstruct_offline_fills(since_hours=48)
                     logger.info(f"✅ [STARTUP-SYNC] Offline fills credited: {stats}")
                 except Exception as _rf_err:
                     logger.warning(f"⚠️ [STARTUP-SYNC] Offline fill detection failed (non-fatal): {_rf_err}")
@@ -644,7 +644,7 @@ class BotRunner:
         if self.cycle_count % 10 == 0 and self._reconciler:
             try:
                 logger.info(f"[PERIODIC] Running offline fill scan (2h window, cycle {self.cycle_count})...")
-                _pof_stats = self._reconciler.detect_offline_fills(since_hours=2)
+                _pof_stats = self._reconciler.reconstruct_offline_fills(since_hours=2)
                 if _pof_stats.get('total', 0) > 0:
                     logger.info(f"✅ [PERIODIC] Offline fills credited: {_pof_stats}")
                 else:
@@ -697,7 +697,7 @@ class BotRunner:
                     # 🚀 FAST-PATH: Use WebSocket Memory Cache if fresh
                     ws_cache = get_ws_cache()
                     
-                    if ws_cache.is_fresh(max_age_seconds=300):
+                    if ws_cache.is_fresh(max_age_seconds=30):
                         logger.debug(f"⚡ [WS-CACHE] Reading positions and orders from memory for {mt}")
                         snap_pos = ws_cache.get_all_positions()
                         snap_orders = ws_cache.get_all_open_orders()
@@ -705,15 +705,21 @@ class BotRunner:
                         snap_pos = ex.fetch_positions()
                         
                         # 🚀 BUG FIX: Binance Demo FAPI truncates fetch_open_orders() without symbol to ~12 orders!
-                        # This HIDES existing orders from the engine, tricking it into placing duplicates!
                         # We must fetch open orders explicitly for every active pair on this market type.
+                        # 🔥 OPTIMIZATION: Do this in parallel to prevent API latency from crashing the engine loop!
                         snap_orders = []
                         mt_active_pairs = set([b[2] for b in bots if b[5] and normalize_market_type(json.loads(b[5]).get('market_type', config.MARKET_TYPE)) == mt])
                         if not mt_active_pairs: mt_active_pairs = set([b[2] for b in bots]) # Fallback
                         
-                        for pair_symbol in mt_active_pairs:
-                            pair_orders = ex.fetch_open_orders(pair_symbol)
-                            if pair_orders: snap_orders.extend(pair_orders)
+                        def _fetch_pair_orders(pair_symbol):
+                            try:
+                                return ex.fetch_open_orders(pair_symbol)
+                            except Exception:
+                                return []
+                                
+                        with ThreadPoolExecutor(max_workers=5) as executor:
+                            for pair_orders in executor.map(_fetch_pair_orders, mt_active_pairs):
+                                if pair_orders: snap_orders.extend(pair_orders)
                         
                         # 🚀 PRE-POPULATE WS CACHE to avoid data loss on startup
                         if snap_pos is not None and snap_orders is not None:
@@ -820,69 +826,59 @@ class BotRunner:
                     market_data = {}
                     multi_tf_data = {}  # { pair: { "15m": df, "1h": df, ... } }
                     active_pairs = set([b[2] for b in bots])
-                    # from engine.exchange_interface import normalize_symbol (REMOVED - Use global)
                     
                     # TTL mapping: how many seconds before each TF's cache expires
                     _TF_TTL = {
                         '1m': 55, '5m': 280, '15m': 840, '30m': 1700,
                         '1h': 3500, '4h': 14000, '1d': 82800
                     }
-                    
-                    for pair in active_pairs:
+
+                    def _fetch_all_tfs_for_pair(p):
                         try:
-                            # 🚀 FIXED: Ensure symbol is normalized for the specific exchange (e.g. BTC/USDC)
-                            norm_pair = pair
-                            # Ensure it has a slash for CCXT standard if it's a known USDC/USDT pair
-                            if '/' not in norm_pair:
-                                if 'USDC' in norm_pair: 
-                                    norm_pair = norm_pair.replace('USDC', '/USDC')
-                                elif 'USDT' in norm_pair: 
-                                    norm_pair = norm_pair.replace('USDT', '/USDT')
+                            norm_p = p
+                            if '/' not in norm_p:
+                                if 'USDC' in norm_p: norm_p = norm_p.replace('USDC', '/USDC')
+                                elif 'USDT' in norm_p: norm_p = norm_p.replace('USDT', '/USDT')
                             
-                            ohlcv = ex.fetch_ohlcv(norm_pair, timeframe='1m', limit=50)
-                            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']) # type: ignore
-                            market_data[pair] = df
+                            p_ohlcv = ex.fetch_ohlcv(norm_p, timeframe='1m', limit=50)
+                            p_df = pd.DataFrame(p_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                             
-                            # 🚀 Multi-TF fetch with TTL cache
-                            # Collect unique TFs needed by bots on this pair
-                            needed_tfs = set()
-                            for b in bots:
-                                if b[2] == pair:
-                                    cfg = json.loads(b[5]) if b[5] else {}
-                                    for key in ['cci_tf', 'rsi_tf', 'boll_tf', 'stoch_tf',
-                                                'pat_1_tf', 'pat_2_tf', 'pat_3_tf', 'pat_4_tf',
-                                                'MTF_Timeframe']:
-                                        tf_val = cfg.get(key)
-                                        if tf_val and tf_val != '1m':
-                                            needed_tfs.add(tf_val)
+                            needed = set()
+                            for b_bot in bots:
+                                if b_bot[2] == p and b_bot[5]:
+                                    c_cfg = json.loads(b_bot[5])
+                                    for key in ['cci_tf', 'rsi_tf', 'boll_tf', 'stoch_tf', 'pat_1_tf', 'pat_2_tf', 'pat_3_tf', 'pat_4_tf', 'MTF_Timeframe']:
+                                        if c_cfg.get(key) and c_cfg.get(key) != '1m':
+                                            needed.add(c_cfg.get(key))
                             
-                            pair_tf_data = {'1m': df}
-                            now = time.time()
-                            for tf in needed_tfs:
-                                cache_key = (pair, tf)
-                                ttl = _TF_TTL.get(tf, 300)
-                                cached = self._tf_cache.get(cache_key)
+                            p_tf_d = {'1m': p_df}
+                            now_t = time.time()
+                            for tf_val in needed:
+                                c_key = (p, tf_val)
+                                m_ttl = _TF_TTL.get(tf_val, 300)
+                                _cached = self._tf_cache.get(c_key)
                                 
-                                if cached and (now - cached['fetched_at']) < ttl:
-                                    # Cache hit — reuse
-                                    pair_tf_data[tf] = cached['data']
+                                if _cached and (now_t - _cached['fetched_at']) < m_ttl:
+                                    p_tf_d[tf_val] = _cached['data']
                                 else:
-                                    # Cache miss or stale — fetch fresh
                                     try:
-                                        tf_ohlcv = ex.fetch_ohlcv(norm_pair, timeframe=tf, limit=100)
-                                        tf_df = pd.DataFrame(tf_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                                        pair_tf_data[tf] = tf_df
-                                        self._tf_cache[cache_key] = {'data': tf_df, 'fetched_at': now}
-                                        logger.debug(f"📊 Fetched {tf} data for {pair} ({len(tf_df)} candles)")
-                                    except Exception as e:
-                                        logger.warning(f"Failed to fetch {tf} data for {pair}: {e}")
-                                        # Use stale cache if available
-                                        if cached:
-                                            pair_tf_data[tf] = cached['data']
+                                        t_ohlcv = ex.fetch_ohlcv(norm_p, timeframe=tf_val, limit=100)
+                                        t_df = pd.DataFrame(t_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                                        p_tf_d[tf_val] = t_df
+                                        self._tf_cache[c_key] = {'data': t_df, 'fetched_at': now_t}
+                                    except Exception as tf_err:
+                                        if _cached: p_tf_d[tf_val] = _cached['data']
                             
-                            multi_tf_data[pair] = pair_tf_data
+                            return p, p_df, p_tf_d
                         except Exception as e:
-                            logger.error(f"Failed to fetch market data for {pair}: {e}")
+                            logger.error(f"Failed to fetch market data for {p}: {e}")
+                            return p, None, None
+
+                    with ThreadPoolExecutor(max_workers=6) as tp_executor:
+                        for p_res, p_df_res, p_tf_d_res in tp_executor.map(_fetch_all_tfs_for_pair, active_pairs):
+                            if p_df_res is not None:
+                                market_data[p_res] = p_df_res
+                                multi_tf_data[p_res] = p_tf_d_res
 
                     # 🚀 UI PERFORMANCE BATCHING: Save the OHLCV Cache to JSON for the Dashboard
                     try:
