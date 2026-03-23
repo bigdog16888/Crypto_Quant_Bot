@@ -113,11 +113,14 @@ class ExchangeInterface:
                     raw_sym = sym_info.get('symbol', '')  # e.g. BNBUSDC
                     step_size = 0.001
                     tick_size = 0.01
+                    min_notional = 5.0  # Binance FAPI default fallback
                     for f in sym_info.get('filters', []):
                         if f['filterType'] == 'LOT_SIZE':
                             step_size = float(f['stepSize'])
                         elif f['filterType'] == 'PRICE_FILTER':
                             tick_size = float(f['tickSize'])
+                        elif f['filterType'] == 'MIN_NOTIONAL':
+                            min_notional = float(f.get('notional', f.get('minNotional', 5.0)))
                     qty_precision = (int(-math.log10(step_size)) if 0 < step_size < 1 else 0)
                     price_precision = (int(-math.log10(tick_size)) if 0 < tick_size < 1 else 0)
                     cls._exchange_info_cache[raw_sym] = {
@@ -125,6 +128,7 @@ class ExchangeInterface:
                         'tick_size': tick_size,
                         'qty_precision': qty_precision,
                         'price_precision': price_precision,
+                        'min_notional': min_notional,
                     }
                 cls._exchange_info_loaded = True
                 logger.info(f"📐 Exchange precision cache loaded for {len(cls._exchange_info_cache)} symbols from {'Demo' if config.DEMO_TRADING or config.TESTNET else 'Mainnet'} FAPI.")
@@ -562,8 +566,11 @@ class ExchangeInterface:
             market = self.exchange.markets[m_key]
             
             # Min Notional Auto-Adjustment
-            # Binance Futures Mainnet is usually $5 min. Testnet/Demo is often $100 min.
-            min_notional = 100.0 if (config.TESTNET or config.DEMO_TRADING) else 5.0
+            # 🚀 FUNDAMENTAL FIX: Use the real per-symbol value from the exchange info cache
+            # (already populated from Binance fapi/v1/exchangeInfo at startup).
+            # This correctly handles all pairs on both Demo and Mainnet without any hardcoding.
+            _sym_info = self.get_symbol_precision(symbol)
+            min_notional = _sym_info.get('min_notional', 5.0)
             
             if price and amount:
                  notional = price * amount

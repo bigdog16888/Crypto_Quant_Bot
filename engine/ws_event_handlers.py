@@ -182,8 +182,8 @@ def _handle_order_partial_fill(bot_id: int, order_type: str, event: Dict):
                 added_invested=avg_price * incremental_qty,
                 added_qty=incremental_qty,
                 avg_price=avg_price,
-                new_step=None,   # Do NOT advance step state mid-fill (leaves Grid active until fully completed)
-                tp_price=None,
+                new_step=partial_step,   # 🚀 ROOT CAUSE FIX: Proactively advance step even for partial fills
+                tp_price=None,            # Maintain existing TP price calculation logic
                 is_entry=(order_type == 'ENTRY')
             )
             log_trade(bot_id, f'WS_{order_type}_PARTIAL', symbol, avg_price, incremental_qty,
@@ -235,6 +235,35 @@ def _handle_order_filled(bot_id: int, order_type: str, event: Dict):
     _notified_fills.add(notification_key)
     _cleanup_notified_fills()  # Periodic cleanup
     
+    # 🛡️ FIX: Mark order as 'filled' (NOT cancelled) so reconciler & integrity
+    # checks can distinguish a completed fill from an orphan or cancelled order.
+    # 🚀 NEW: Pass the final true cumulative fill quantity to avoid math inflation.
+    # 🔑 CRITICAL FIX: If Binance 'z' field was 0 at event time (common for ACCOUNT_UPDATE flow),
+    # fall back to the bot_orders.amount column as filled_amount so the virtual ledger is never 0.
+    try:
+        from engine.database import update_order_status, get_connection
+        cumulative_fill = float(event.get('filled_qty', 0) or 0)
+        update_order_status(order_id, 'filled', bot_id=bot_id, filled_qty=cumulative_fill)
+        
+        # Safety net: if filled_qty was 0 from WS event, use the order's own amount as the fill quantity
+        # Must cast order_id to str() to match SQLite TEXT column correctly just like update_order_status does
+        if cumulative_fill <= 0:
+            conn_fix = get_connection()
+            client_oid = event.get('client_order_id')
+            
+            # Using both order_id and client_order_id ensures we match it even if order_id is late to sync
+            conn_fix.execute(
+                "UPDATE bot_orders SET filled_amount = amount WHERE (order_id = ? OR client_order_id = ?) AND bot_id = ? AND filled_amount = 0 AND amount > 0",
+                (str(order_id), str(client_oid), bot_id)
+            )
+            conn_fix.commit()
+            conn_fix.close()
+            logger.debug(f"[FILL-SAFETY] Used order.amount as filled_amount for order {order_id} (WS filled_qty was 0)")
+        
+        logger.debug(f"Marked order {order_id} as filled in DB (Final Qty: {cumulative_fill}).")
+    except Exception as e:
+        logger.debug(f"Could not mark order {order_id} as filled in DB: {e}")
+
     if order_type == 'TP':
         # Take Profit hit - reset bot
         logger.info(f"✅ WS TP Hit for Bot {bot_id}! Resetting trade...")
@@ -271,17 +300,7 @@ def _handle_order_filled(bot_id: int, order_type: str, event: Dict):
                 _notified_fills_timestamps[fill_key] = current_time
         except Exception as e:
             logger.error(f"Failed to process Entry fill for bot {bot_id}: {e}")
-    
-    # 🛡️ FIX: Mark order as 'filled' (NOT cancelled) so reconciler & integrity
-    # checks can distinguish a completed fill from an orphan or cancelled order.
-    # 🚀 NEW: Pass the final true cumulative fill quantity to avoid math inflation.
-    try:
-        from engine.database import update_order_status
-        cumulative_fill = float(event.get('filled_qty', 0) or 0)
-        update_order_status(order_id, 'filled', bot_id=bot_id, filled_qty=cumulative_fill)
-        logger.debug(f"Marked order {order_id} as filled in DB (Final Qty: {cumulative_fill}).")
-    except Exception as e:
-        logger.debug(f"Could not mark order {order_id} as filled in DB: {e}")
+
 
 
 def _update_trade_state_from_fill(bot_id: int, order_type: str, symbol: str, avg_price: float, filled_qty: float, event: Dict = None):

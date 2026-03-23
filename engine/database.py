@@ -7,7 +7,7 @@ import logging
 import uuid
 import shutil
 import datetime
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 
 # Setup logger
 logger = logging.getLogger(__name__)
@@ -84,6 +84,63 @@ def backup_database():
             
     except Exception as e:
         logger.error(f"❌ Database backup failed: {e}")
+
+def heal_zombie_bots(conn):
+    """
+    On startup, structurally repairs any bot that has become mathematical 'zombies'.
+    This covers 1. bots with total_invested > 0 but ledger evaluates to 0,
+    and 2. bots with current_step > 0 but total_invested is 0.
+    """
+    try:
+        c = conn.cursor()
+        c.execute('''
+            SELECT t.bot_id, b.pair, t.total_invested, t.avg_entry_price, t.current_step, t.cycle_id 
+            FROM trades t JOIN bots b ON t.bot_id = b.id 
+        ''')
+        trades = c.fetchall()
+        for t in trades:
+            bot_id, pair, invested, avg_price, step, cycle_id = t
+            invested = float(invested or 0)
+            avg_price = float(avg_price or 0)
+            step = int(step or 0)
+            
+            # Scenario 1: Ghost step stuck (0 physical investment, but step > 0)
+            # This causes the "0/2 limit orders missing" alert
+            if step > 0 and invested <= 0.0001:
+                c.execute("UPDATE trades SET current_step = 0, total_invested = 0, avg_entry_price = 0, target_tp_price = 0, cycle_id = NULL WHERE bot_id = ?", (bot_id,))
+                logger.info(f"🩹 [HEALED] Bot {bot_id} ({pair}): Reset stranded ghost step back to 0. Cleared metrics.")
+                continue
+
+            # Scenario 3: Phantom Invested Amount (Stuck metrics on a Scanning Bot)
+            # This corrects databases where the user manually reverted step=0 but forgot to zero metrics.
+            if step == 0 and (invested > 0.001 or avg_price > 0.001):
+                c.execute("UPDATE trades SET total_invested = 0, avg_entry_price = 0, target_tp_price = 0, cycle_id = NULL WHERE bot_id = ?", (bot_id,))
+                logger.info(f"🩹 [HEALED] Bot {bot_id} ({pair}): Purged phantom ${invested:.2f} invested memory on a SCANNING bot.")
+                continue
+                
+            if invested > 0.0001 and avg_price > 0:
+                expected_qty = invested / avg_price
+                c.execute('''
+                    SELECT COALESCE(SUM(CASE WHEN order_type IN ('entry', 'grid', 'adoption_add') THEN filled_amount ELSE 0 END), 0) -
+                           COALESCE(SUM(CASE WHEN order_type IN ('tp', 'close', 'adoption_reduce', 'dust_close', 'sl') THEN filled_amount ELSE 0 END), 0)
+                    FROM bot_orders WHERE bot_id = ? AND filled_amount > 0 AND (cycle_id = ? OR cycle_id IS NULL)
+                    AND status NOT IN ('reset_cleared', 'auto_closed')
+                ''', (bot_id, cycle_id))
+                ledger_qty = float(c.fetchone()[0] or 0.0)
+                
+                # Scenario 2: Physical inventory exists, but ledger evaluates as empty (or wrong)
+                if abs(ledger_qty - expected_qty) > 0.001:
+                    qty_to_add = expected_qty - ledger_qty
+                    cid = f'CQB_{bot_id}_HEAL_{int(time.time()*1000)}'
+                    order_type = 'adoption_add' if qty_to_add > 0 else 'adoption_reduce'
+                    amount_abs = abs(qty_to_add)
+                    c.execute('''
+                        INSERT INTO bot_orders (bot_id, step, order_type, order_id, price, amount, filled_amount, status, created_at, updated_at, client_order_id, notes, cycle_id)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, 'filled', ?, ?, ?, 'Self-healed corrupted ledger limit bug (Boot Phase)', ?)
+                    ''', (bot_id, step, order_type, cid, avg_price, amount_abs, amount_abs, int(time.time()), int(time.time()), cid, cycle_id))
+                    logger.info(f"🩹 [HEALED] Bot {bot_id} ({pair}): Re-aligned corrupted ledger math. Added {qty_to_add:.4f} units.")
+    except Exception as e:
+        logger.error(f"Error during zombie bot healing: {e}")
 
 def init_db():
     """Initializes the database schema and performs necessary migrations."""
@@ -231,6 +288,15 @@ def init_db():
             cursor.execute("ALTER TABLE bots ADD COLUMN manual_close_pct REAL DEFAULT 100.0")
             conn.commit()
 
+        # Migration for position limit hit flag (v0.9.0)
+        # Set when Binance rejects a grid due to max position notional / margin constraints.
+        # Cleared automatically on TP reset or when a new fill arrives.
+        try:
+            cursor.execute('SELECT pos_limit_hit FROM bots LIMIT 1')
+        except sqlite3.OperationalError:
+            cursor.execute("ALTER TABLE bots ADD COLUMN pos_limit_hit INTEGER DEFAULT 0")
+            conn.commit()
+
         # Create separate table for grid orders
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS bot_orders (
@@ -334,6 +400,7 @@ def init_db():
         # This prevents the UI from showing "Green" (Synced) against old data before the first poll cycle
         cursor.execute('DELETE FROM active_positions')
 
+        heal_zombie_bots(conn)
         conn.commit()
     except Exception as e:
         try:
@@ -475,6 +542,27 @@ def update_bot_config_value(bot_id, key, value):
         logger.error(f"Failed to update bot config value for {bot_id}: {e}")
         return False
 
+def flag_bot_pos_limit(bot_id: int, state: bool) -> None:
+    """Set or clear the position-limit-hit flag for a bot.
+    
+    When Binance rejects a grid order with any position-cap error (400 Margin
+    insufficient, -2027, -2019, etc.) the engine calls this to set state=True.
+    The flag is automatically cleared by reset_bot_after_tp on TP hit.
+    """
+    try:
+        conn = get_connection()
+        conn.execute(
+            "UPDATE bots SET pos_limit_hit = ? WHERE id = ?",
+            (1 if state else 0, bot_id)
+        )
+        conn.commit()
+        if state:
+            logger.warning(f"🚫 [POS-LIMIT] Bot {bot_id} flagged — exchange position cap reached.")
+        else:
+            logger.info(f"✅ [POS-LIMIT] Bot {bot_id} position limit flag cleared.")
+    except Exception as e:
+        logger.error(f"Failed to set pos_limit_hit for bot {bot_id}: {e}")
+
 def get_bot_status(bot_id):
     conn = get_connection()
     cursor = conn.cursor()
@@ -489,7 +577,8 @@ def get_bot_status(bot_id):
                COALESCE(t.basket_start_time, 0) as basket_start_time,
                b.direction, b.is_active,
                COALESCE(t.entry_confirmed, 0) as entry_confirmed,
-               COALESCE(t.cycle_id, 1) as cycle_id
+               COALESCE(t.cycle_id, 1) as cycle_id,
+               COALESCE(b.pos_limit_hit, 0) as pos_limit_hit
         FROM bots b 
         LEFT JOIN trades t ON b.id = t.bot_id 
         WHERE b.id = ?
@@ -513,6 +602,7 @@ def get_bot_status(bot_id):
         'is_active': row[11],
         'entry_confirmed': row[12],
         'cycle_id': row[13],
+        'pos_limit_hit': bool(row[14]),
     }
 
     # --- SAFETY GUARD: Log suspicious entry prices but do NOT wipe state ---
@@ -617,15 +707,30 @@ def deactivate_bot(bot_id, reason="Unknown Error"):
         logger.error(f"Failed to deactivate bot {bot_id}: {e}")
         return False
 
-def calculate_step_from_position(position_size: float, base_size: float, multiplier: float) -> int:
-    if position_size <= 0 or base_size <= 0 or multiplier <= 1:
+def calculate_step_from_position(total_invested: float, base_size: float, multiplier: float) -> int:
+    """
+    Reverse-engineers the Martingale Step based on the cumulative total_invested.
+    Since total_invested = Σ(base_size * multiplier^i), it is a geometric series.
+    """
+    if total_invested <= 0 or base_size <= 0:
         return 0
-    ratio = position_size / base_size
+        
+    ratio = total_invested / base_size
     if ratio <= 1:
         return 0
+        
     import math
-    step = math.log(ratio) / math.log(multiplier)
-    return max(0, round(step))
+    if multiplier <= 1.0001:
+        # Linear sum: total = base * (step + 1)
+        step = ratio - 1
+    else:
+        # Geometric sum: total = base * (1 - multiplier^(step+1)) / (1 - multiplier)
+        # Therefore: multiplier^(step+1) = 1 + (total/base)*(multiplier-1)
+        inner = 1 + ratio * (multiplier - 1)
+        if inner <= 0: return 0
+        step = (math.log(inner) / math.log(multiplier)) - 1
+        
+    return max(0, int(round(step)))
 
 def reset_bot_after_tp(bot_id, exit_price, direction=None, action_label='TP_HIT', notes=''):
     conn = get_connection()
@@ -647,11 +752,64 @@ def reset_bot_after_tp(bot_id, exit_price, direction=None, action_label='TP_HIT'
             else:
                 pnl = (avg_entry_price - exit_price) * est_qty
         log_trade(bot_id, action_label, pair, exit_price, total_invested / avg_entry_price if avg_entry_price > 0 else 0, total_invested, step=current_step, pnl=pnl, notes=notes)
-        cursor.execute("UPDATE trades SET current_step = 0, total_invested = 0, avg_entry_price = 0, target_tp_price = 0, last_exit_price = ?, last_exit_time = ?, basket_start_time = ?, entry_confirmed = 0, entry_order_id = NULL, tp_order_id = NULL, bot_position_id = NULL, close_type = ?, cycle_id = COALESCE(cycle_id, 1) + 1 WHERE bot_id = ?", (exit_price, int(time.time()), int(time.time()), action_label, bot_id))
+        
+        # 🚀 FUNDAMENTAL FIX: Cross-cycle Carry-over for Orphaned Partial Fills.
+        # Before wiping the ledger, check if the bot_orders ledger sum is non-zero.
+        # This happens if an entry/grid was partially filled, then cancelled, and never reached TP size.
+        cursor.execute("SELECT cycle_id FROM trades WHERE bot_id = ?", (bot_id,))
+        old_cycle = int(cursor.fetchone()[0] or 1)
+        new_cycle = old_cycle + 1
+
+        # Calculate the mathematical net quantity of the OLD cycle before archiving
+        # 🚀 FUNDAMENTAL FIX: Unified True Math for both LONG and SHORT
+        # Both directions use `entries - exits` to find the remaining positive unclosed positional magnitude.
+        # 🚀 CARRY-LOOP FIX: Explicitly exclude cross-cycle carry rows (client_order_id LIKE '%_CARRY_%')
+        # from this calculation. Including them causes a runaway feedback loop where each reset
+        # computes old_net_qty from the carry row, inserts a new carry of the same size, and repeats.
+        cursor.execute("""
+            SELECT COALESCE(SUM(CASE WHEN order_type IN ('entry', 'grid', 'adoption_add') THEN filled_amount ELSE 0 END), 0) -
+                   COALESCE(SUM(CASE WHEN order_type IN ('tp', 'close', 'adoption_reduce', 'dust_close', 'sl') THEN filled_amount ELSE 0 END), 0)
+            FROM bot_orders WHERE bot_id = ? AND filled_amount > 0 AND (cycle_id = ? OR cycle_id IS NULL)
+            AND status NOT IN ('reset_cleared', 'auto_closed')
+            AND (client_order_id NOT LIKE '%_CARRY_%' OR client_order_id IS NULL)
+        """, (bot_id, old_cycle))
+        
+        # 🚀 FUNDAMENTAL FIX: Clamp negative values to 0 to prevent structural deficits
+        old_net_qty = max(0.0, float(cursor.fetchone()[0] or 0.0))
+
         # 🔑 CYCLE-ID ARCHIVE: Mark ALL bot_orders from the OLD cycle as reset_cleared.
-        # The Reconciler strictly filters by cycle_id, so these will never be re-adopted.
+        # This is done BEFORE inserting the carry-over row so the old math is safely hidden.
         cursor.execute("UPDATE bot_orders SET status = 'auto_closed', updated_at = ? WHERE bot_id = ? AND status = 'open'", (int(time.time()), bot_id))
-        cursor.execute("UPDATE bot_orders SET status = 'reset_cleared', updated_at = ? WHERE bot_id = ? AND status IN ('filled', 'closed', 'missing') AND order_type != 'hedge'", (int(time.time()), bot_id))
+        cursor.execute("UPDATE bot_orders SET status = 'reset_cleared', updated_at = ? WHERE bot_id = ? AND status IN ('filled', 'closed', 'missing', 'cancelled', 'canceled') AND order_type != 'hedge'", (int(time.time()), bot_id))
+
+        # Carry-over Logic: If net_qty is significant, bridge it into the new cycle.
+        # 🚀 FUNDAMENTAL FIX: Never carry over ghost mass during a catastrophic system reset.
+        if abs(old_net_qty) > 0.0001 and action_label not in ['RESET_VANISHED_POSITION', 'RESET_STRUCTURAL_GHOST', 'RESET_PHANTOM_ENTRY']:
+            logger.info(f"🌉 [CARRY-OVER] Bot {bot_id}: Carrying over {old_net_qty:.4f} {pair} units into Cycle {new_cycle}.")
+            carry_otype = 'adoption_add' if old_net_qty > 0 else 'adoption_reduce'
+            carry_cid = f"CQB_{bot_id}_CARRY_{int(time.time() * 1000)}"
+            cursor.execute("""
+                INSERT INTO bot_orders (
+                    bot_id, step, order_type, order_id, price, amount, filled_amount,
+                    status, created_at, updated_at, client_order_id, notes, cycle_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'reset_cleared', ?, ?, ?, ?, ?)
+            """, (
+                bot_id, 0, carry_otype, carry_cid, exit_price, abs(old_net_qty), abs(old_net_qty),
+                int(time.time()), int(time.time()), carry_cid, 
+                f"Cross-cycle carry over of prior partial fills ({old_net_qty:.4f} units)",
+                new_cycle
+            ))
+            # Note: Carry-over row is marked 'reset_cleared' so it doesn't inflate 'total_invested' 
+            # in trades table calculation yet, but the monitor.py JOIN will include it in virtual net sum.
+            # wait, if it's 'reset_cleared' then monitor.py skips it logic: status NOT IN ('reset_cleared', 'auto_closed')
+            # So it MUST be 'filled'.
+            cursor.execute("UPDATE bot_orders SET status = 'filled' WHERE client_order_id = ?", (carry_cid,))
+
+        cursor.execute("UPDATE trades SET current_step = 0, total_invested = 0, avg_entry_price = 0, target_tp_price = 0, last_exit_price = ?, last_exit_time = ?, basket_start_time = ?, entry_confirmed = 0, entry_order_id = NULL, tp_order_id = NULL, bot_position_id = NULL, close_type = ?, cycle_id = ? WHERE bot_id = ?", 
+                        (exit_price, int(time.time()), int(time.time()), action_label, new_cycle, bot_id))
+            
+        # 🚫 POS-LIMIT FLAG: Always clear on TP reset so the new cycle starts fresh.
+        cursor.execute("UPDATE bots SET pos_limit_hit = 0 WHERE id = ?", (bot_id,))
         
         # Check Stop After Cycle
         stop_after_cycle = False
@@ -1168,17 +1326,11 @@ def update_active_positions_snapshot(positions: list):
         
         for p in positions:
             raw_symbol = p.get('symbol', 'UNKNOWN')
-            # Normalize symbol to match DB format (BTCUSDC -> BTC/USDC)
-            # This is critical for the UI to match Virtual vs Physical
-            if '/' in raw_symbol:
-                 # Already normalized (e.g. BTC/USDC from ExchangeInterface)
-                 symbol = raw_symbol
-            elif raw_symbol.endswith('USDC'):
-                symbol = f"{raw_symbol[:-4]}/USDC"
-            elif raw_symbol.endswith('USDT'):
-                symbol = f"{raw_symbol[:-4]}/USDT"
-            else:
-                symbol = raw_symbol
+            
+            # 🚀 FUNDAMENTAL FIX: Use central normalizer to cleanly handle all variations
+            # (Mainnet 'BTC/USDT', Demo 'BTC/USDT:USDT', Spot 'BTCUSDT', etc.)
+            from engine.exchange_interface import normalize_symbol
+            symbol = normalize_symbol(raw_symbol)
 
             amount = float(p.get('contracts', 0) or p.get('size', 0) or 0)
             entry_price = float(p.get('entryPrice', 0))
@@ -1188,22 +1340,37 @@ def update_active_positions_snapshot(positions: list):
             # The ONLY reliable indicator is the SIGN of contracts:
             #   contracts > 0  →  LONG
             #   contracts < 0  →  SHORT
-            # We derive side from the sign and store abs(amount) for clean maths.
-            if amount > 0:
-                side = 'LONG'
-            elif amount < 0:
+            #   We explicitly check the raw 'side' param just in case the exchange is returning absolute sizes
+            
+            p_side = p.get('side', '').lower()
+            if p_side == 'short':
                 side = 'SHORT'
+            elif p_side == 'long':
+                side = 'LONG'
             else:
+                side = 'LONG' if amount > 0 else 'SHORT'
+
+            if amount == 0:
                 continue  # Zero position — skip entirely
 
-            abs_amount = abs(amount)
+            if abs(amount) > 0:
+                # 🚀 FUNDAMENTAL FIX: Stop defaulting to bot_id=0 (The Orphan Maker)
+                # Instead, we proactively look up which active bot owns this physical footprint.
+                # If no bot is active for this symbol/direction, we use 0 to signal 'Ghost/Manual Position'.
+                bot_id = get_active_bot_id_by_symbol_direction(symbol, side) or 0
+                
+                if bot_id > 0:
+                    # 🚀 AUTO-RECOVERY: If we found an owner, purge any existing 'bot_id=0' orphan for this symbol
+                    # to prevent the Reconciler from seeing double reality.
+                    conn.execute("DELETE FROM active_positions WHERE pair = ? AND side = ? AND bot_id = 0", (symbol, side))
+                    logger.info(f"📍 [REALITY-AUTO-MAP] Linked physical {side} {symbol} to logical Bot {bot_id}. Purged old orphans.")
+                else:
+                    logger.warning(f"⚠️ [REALITY-ORPHAN] Physical {side} {symbol} has no owner. Saved with bot_id=0.")
 
-            if abs_amount > 0:
-                # We use bot_id=0 to represent 'Physical Exchange' (no specific bot owner implied here)
                 conn.execute("""
                     INSERT OR REPLACE INTO active_positions (bot_id, pair, side, size, entry_price, last_checked)
-                    VALUES (0, ?, ?, ?, ?, ?)
-                """, (symbol, side, abs_amount, entry_price, int(time.time())))
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (bot_id, symbol, side, abs(amount), entry_price, int(time.time())))
         
         conn.commit()
     except Exception as e:
@@ -1292,7 +1459,7 @@ def close_bot_position(bot_id, close_type='MANUAL', close_price=0.0, close_pct=1
         return {'success': False, 'error': str(e)}
 
 
-def accumulate_trade_fill(bot_id: int, added_invested: float, added_qty: float, avg_price: float, new_step, tp_price, is_entry: bool = False):
+def accumulate_trade_fill(bot_id: int, added_invested: float, added_qty: float, avg_price: float, new_step, tp_price, is_entry: bool = False, force_step: bool = False):
     """
     Atomically accumulates a fill into the trade state using SQL math.
     new_step may be None (from partial fills) — in that case step is not changed.
@@ -1312,7 +1479,7 @@ def accumulate_trade_fill(bot_id: int, added_invested: float, added_qty: float, 
             # ATOMIC UPDATE:
             # 1. total_invested = current + added
             # 2. avg_entry_price = weighted average
-            # 3. current_step = only updated if new_step is not None
+            # 3. current_step = updated if force_step=True OR if new_step > current
             # 4. target_tp_price = only updated if tp_price is not None
             if safe_tp is not None:
                 cursor.execute("""
@@ -1326,6 +1493,7 @@ def accumulate_trade_fill(bot_id: int, added_invested: float, added_qty: float, 
                         END,
                         current_step = CASE
                             WHEN ? THEN ?
+                            WHEN ? THEN ?
                             WHEN ? AND ? > current_step THEN ?
                             ELSE current_step
                         END,
@@ -1338,6 +1506,7 @@ def accumulate_trade_fill(bot_id: int, added_invested: float, added_qty: float, 
                     avg_price,
                     added_invested, added_invested, avg_price,
                     avg_price,
+                    force_step, safe_step,           # ROOT CAUSE FIX: Reconciler can force alignment
                     is_entry and not step_is_none, safe_step,
                     not step_is_none, safe_step, safe_step,
                     safe_tp,
@@ -1355,6 +1524,7 @@ def accumulate_trade_fill(bot_id: int, added_invested: float, added_qty: float, 
                             ELSE ?
                         END,
                         current_step = CASE
+                            WHEN ? THEN ?
                             WHEN ? AND ? > current_step THEN ?
                             ELSE current_step
                         END,
@@ -1366,6 +1536,7 @@ def accumulate_trade_fill(bot_id: int, added_invested: float, added_qty: float, 
                     avg_price,
                     added_invested, added_invested, avg_price,
                     avg_price,
+                    force_step, safe_step,           # ROOT CAUSE FIX: Reconciler can force alignment
                     not step_is_none, safe_step, safe_step,
                     bot_id
                 ))
@@ -1392,7 +1563,39 @@ def accumulate_trade_fill(bot_id: int, added_invested: float, added_qty: float, 
     finally:
         conn.close()
 
-def get_bot_position_id(bot_id):
+def get_active_bot_id_by_symbol_direction(symbol: str, direction: str) -> Optional[int]:
+    """
+    Look up the bot ID that currently 'owns' a physical footprint on the exchange.
+    Matches based on normalized symbol and direction (LONG/SHORT).
+    Uses standardized normalization to handle 'SUI/USDC:USDC' vs 'SUIUSDC'.
+    """
+    from engine.exchange_interface import normalize_symbol
+    norm_symbol = normalize_symbol(symbol)
+    norm_direction = direction.upper()
+
+    conn = get_connection()
+    try:
+        # Find active bots for this symbol.
+        # We must normalize the 'pair' column from the DB during search.
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, pair, direction FROM bots WHERE is_active = 1")
+        active_bots = cursor.fetchall()
+
+        for bid, bpair, bdir in active_bots:
+            # 🚀 HARDENED COMPARISON: Ensure case-insensitivity and trim whitespace
+            target_norm = normalize_symbol(bpair).strip().upper()
+            found_norm = norm_symbol.strip().upper()
+            
+            if target_norm == found_norm and bdir.strip().upper() == norm_direction:
+                return bid
+        return None
+    except Exception as e:
+        logger.error(f"Error in get_active_bot_id_by_symbol_direction: {e}")
+        return None
+    # FUNDAMENTAL FIX: Removed conn.close()
+    # get_connection() returns a thread-local persistent connection.
+    # Closing it here destroys the connection for the entire active_positions snapshot thread!
+
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute('SELECT bot_position_id FROM trades WHERE bot_id = ?', (bot_id,))
@@ -1586,18 +1789,34 @@ def get_trade_history(bot_id=None, limit=100):
 # NOTE: update_bot_display_status is defined earlier (L728) — correct version with error handling.
         
 def update_order_status(order_id, status, bot_id=None, filled_qty=None):
-    """Updates the status of an order in bot_orders, optionally updating filled_amount."""
+    """
+    Updates the status of an order in bot_orders.
+    🚀 EVIDENCE PROTECTION: Only updates filled_amount if the new qty is >= existing.
+    Prevents late exchange reports (0 quantity remaining) from erasing proven fill history.
+    """
     try:
         conn = get_connection()
         cursor = conn.cursor()
         
-        # Build SQL dynamically based on filled_qty
+        # Current time as timestamp
+        now_ts = int(time.time())
+
         if filled_qty is not None:
-            sql = "UPDATE bot_orders SET status = ?, filled_amount = ?, updated_at = ? WHERE order_id = ?"
-            params = [status, filled_qty, int(time.time()), str(order_id)]
+            # Conditional update: only update filled_amount if it increases or matches (never downgrade evidence)
+            sql = """
+                UPDATE bot_orders 
+                SET status = ?, 
+                    filled_amount = CASE 
+                        WHEN ? >= COALESCE(filled_amount, 0) THEN ? 
+                        ELSE filled_amount 
+                    END,
+                    updated_at = ? 
+                WHERE order_id = ?
+            """
+            params = [status, float(filled_qty), float(filled_qty), now_ts, str(order_id)]
         else:
             sql = "UPDATE bot_orders SET status = ?, updated_at = ? WHERE order_id = ?"
-            params = [status, int(time.time()), str(order_id)]
+            params = [status, now_ts, str(order_id)]
 
         if bot_id:
             sql += " AND bot_id = ?"
@@ -1648,7 +1867,13 @@ def save_bot_order(bot_id, order_type, exchange_order_id, price, amount, step, s
         row = cursor.fetchone()
         cycle_id = row[0] if row and row[0] else 1
 
-        cursor.execute("INSERT INTO bot_orders (bot_id, step, order_type, order_id, price, amount, status, created_at, client_order_id, notes, cycle_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (bot_id, step, order_type, exchange_order_id, price, amount, status, int(time.time()), client_order_id, notes, cycle_id))
+        # 🚀 FUNDAMENTAL FIX: If the exchange immediately returns 'closed' or 'filled' on placement
+        # (e.g. crossing the spread as a taker), we must stamp filled_amount immediately so 
+        # the net_qty math in reset_bot_after_tp is balanced, even if websockets/reconciler misses it.
+        initial_fill = amount if status.lower() in ('filled', 'closed') else 0.0
+
+        cursor.execute("INSERT INTO bot_orders (bot_id, step, order_type, order_id, price, amount, filled_amount, status, created_at, client_order_id, notes, cycle_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (bot_id, step, order_type, exchange_order_id, price, amount, initial_fill, status, int(time.time()), client_order_id, notes, cycle_id))
+        row_id = cursor.lastrowid
         
         # CRITICAL FIX: Also update trades table so get_bot_order_ids() / Guardian can see them.
         # Previously only bot_orders was written, but Guardian reads trades.entry_order_id/tp_order_id.
@@ -1658,12 +1883,38 @@ def save_bot_order(bot_id, order_type, exchange_order_id, price, amount, step, s
             cursor.execute("UPDATE trades SET tp_order_id = ? WHERE bot_id = ?", (exchange_order_id, bot_id))
         
         conn.commit()
-        return True
+        return row_id  # 🚀 Return row ID for pre-commit update pattern (callers use this to stamp the real order_id after exchange call)
     except Exception as e:
         logger.error(f"Failed to save bot order: {e}")
-        return False
+        return None
 
 # NOTE: update_order_status is defined earlier (L1393) — correct version with updated_at timestamp.
+
+def update_bot_order_exchange_id(db_row_id, exchange_order_id, status='open'):
+    """
+    🚀 PRE-COMMIT PATTERN: After placing an order on the exchange, call this to stamp the real
+    exchange order_id onto the 'placing' row that was pre-committed before the exchange call.
+    If exchange_order_id is None (order placement failed), marks the row as 'failed'.
+    """
+    if db_row_id is None:
+        return False
+    try:
+        conn = get_connection()
+        if exchange_order_id:
+            conn.execute(
+                "UPDATE bot_orders SET order_id=?, status=?, updated_at=? WHERE id=?",
+                (exchange_order_id, status, int(time.time()), db_row_id)
+            )
+        else:
+            conn.execute(
+                "UPDATE bot_orders SET status='failed', updated_at=? WHERE id=?",
+                (int(time.time()), db_row_id)
+            )
+        conn.commit()
+        return True
+    except Exception as e:
+        logger.error(f"Failed to update bot order exchange id: {e}")
+        return False
 
 def cancel_order_in_db(order_id):
     try:
@@ -1765,25 +2016,24 @@ def update_full_snapshot(trade_updates: List[Dict[str, Any]], physical_positions
         # print("DEBUG: Active Positions Deleted")
         
         for p in physical_positions:
-            # Robust Symbol Normalization
             raw_symbol = p.get('symbol', 'UNKNOWN')
-            # Handle CCXT Linear format: "BTC/USDT:USDT" -> "BTC/USDT"
-            if ':' in raw_symbol:
-                clean_symbol = raw_symbol.split(':')[0]
-            else:
-                clean_symbol = raw_symbol
             
-            # Ensure standard slash format if missing (e.g. BTCUSDT -> BTC/USDT - rare in CCXT but possible)
-            if '/' not in clean_symbol:
-                 # Fallback assumption, risky but better than nothing
-                 if clean_symbol.endswith('USDT'): clean_symbol = f"{clean_symbol[:-4]}/USDT"
-                 elif clean_symbol.endswith('USDC'): clean_symbol = f"{clean_symbol[:-4]}/USDC"
-            
-            symbol = clean_symbol
+            # 🚀 FUNDAMENTAL FIX: Use central normalizer
+            from engine.exchange_interface import normalize_symbol
+            symbol = normalize_symbol(raw_symbol)
             
             # Use 'contracts' (futures) or 'amount' (spot) or 'size'
             amount = float(p.get('contracts', 0) or p.get('amount', 0) or p.get('size', 0) or 0)
-            side = 'LONG' if amount > 0 else 'SHORT'
+            
+            # ⚠️ CRITICAL FIX: explicit side
+            p_side = p.get('side', '').lower()
+            if p_side == 'short':
+                side = 'SHORT'
+            elif p_side == 'long':
+                side = 'LONG'
+            else:
+                side = 'LONG' if amount > 0 else 'SHORT'
+                
             entry_price = float(p.get('entryPrice', 0) or 0)
             
             # print(f"DEBUG: Processing {symbol} Amount: {amount}")

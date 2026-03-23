@@ -16,7 +16,6 @@ from engine.database import get_connection, init_db, get_bot_status, update_mart
 import sqlite3
 from engine.exchange_interface import ExchangeInterface, normalize_symbol, normalize_market_type
 from engine.strategies.martingale_strategy import MartingaleStrategy
-from engine.manager import manage_trade
 from engine.bot_executor import BotExecutor
 import engine.bot_executor
 from engine.metrics import MetricsServer, BOT_CYCLE_TIME
@@ -261,15 +260,13 @@ class BotRunner:
 
             # 3. Deep Reconciliation (Auto-Healing & Smart Adoption)
             # Must run AFTER exchanges are up but BEFORE bots start processing.
-            # ULW-Sisyphus: DISABLED. This is redundant with the main `sync_all_bots()` call
-            # which now runs the same logic. Keeping it creates startup race conditions.
-            # from engine.reconciler import DeepReconciler
-            # reconciler = None
-            # try:
-            #     reconciler = DeepReconciler(self.exchanges)
-            #     reconciler.run() # Triggers Phase 6 Smart Adoption
-            # except Exception as e:
-            #     logger.error(f"Failed to run Deep Reconciliation: {e}")
+            from engine.reconciler import DeepReconciler
+            try:
+                logger.info("🚀 [STARTUP] Running Deep Reconciliation & Smart Adoption...")
+                recon = DeepReconciler(self.exchanges)
+                recon.run() 
+            except Exception as e:
+                logger.error(f"Failed to run Deep Reconciliation: {e}")
             
             # Use a single reconciler instance for subsequent checks
             from engine.reconciler import StateReconciler
@@ -762,6 +759,13 @@ class BotRunner:
                     
                     logger.debug(f"DEBUG: Processing {len(snap_pos)} positions for {mt}")
                     
+                    # 🚀 FUNDAMENTAL FIX: Ensure we actually populate the snapshot dict!
+                    exchange_snapshot[mt] = {
+                        'positions': snap_pos,
+                        'orders': snap_orders,
+                        'balance': snap_bal
+                    }
+                    
                     # Fix 4: Write active_positions snapshot EVERY cycle so UI always has fresh data
                     try:
                         from engine.database import update_active_positions_snapshot
@@ -847,7 +851,7 @@ class BotRunner:
                             for b_bot in bots:
                                 if b_bot[2] == p and b_bot[5]:
                                     c_cfg = json.loads(b_bot[5])
-                                    for key in ['cci_tf', 'rsi_tf', 'boll_tf', 'stoch_tf', 'pat_1_tf', 'pat_2_tf', 'pat_3_tf', 'pat_4_tf', 'MTF_Timeframe']:
+                                    for key in ['cci_tf', 'rsi_tf', 'boll_tf', 'stoch_tf', 'pat_1_tf', 'pat_2_tf', 'pat_3_tf', 'pat_4_tf', 'MTF_Timeframe', 'ATR_Timeframe', 'ATRTimeframe', 'atr_tf']:
                                         if c_cfg.get(key) and c_cfg.get(key) != '1m':
                                             needed.add(c_cfg.get(key))
                             

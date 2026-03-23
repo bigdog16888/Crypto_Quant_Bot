@@ -375,7 +375,7 @@ class MartingaleStrategy(BaseStrategy):
         # 🚀 DYNAMIC ROUNDING
         return round(float(bot_status.get('total_invested', 0)) / avg_price, self.qty_precision)
 
-    def calculate_grid_order_price(self, bot_status: Dict, current_price: float, market_data: Any = None) -> Tuple[float, str]:
+    def calculate_grid_order_price(self, bot_status: Dict, current_price: float, market_data: Any = None, multi_tf_data: dict = None) -> Tuple[float, str]:
         """
         Calculates the next grid price using configured logic (Fixed or ATR).
         Returns: (price, explanation_string)
@@ -395,26 +395,48 @@ class MartingaleStrategy(BaseStrategy):
             explanation = []
             
             # 1. Calculate Base Distance
-            if use_atr and hasattr(market_data, 'empty') and not market_data.empty:
+            if use_atr:
                  try:
                      atr_period = int(self.params.get('ATRPeriods', 14))
-                     atr_val = iATR(market_data['high'], market_data['low'], market_data['close'], atr_period)
                      atr_factor = float(self.params.get('ATRGridFactor', 1.0))
-                     
+
+                     # 🚀 FUNDAMENTAL FIX: Use the CONFIGURED ATR timeframe, not just the 1-min feed.
+                     # The bot config has 'ATR_Timeframe' (e.g. '15m', '1h'). If multi_tf_data is provided,
+                     # select the correct candle series. Otherwise fall back to the 1-min market_data.
+                     # Note: support 'ATR_Timeframe' (UI key), 'ATRTimeframe', and 'atr_tf' as fallbacks.
+                     atr_tf = (self.params.get('ATR_Timeframe')
+                               or self.params.get('ATRTimeframe')
+                               or self.params.get('atr_tf', ''))
+                     atr_df = None
+                     if multi_tf_data and atr_tf and atr_tf in multi_tf_data:
+                         candidate = multi_tf_data[atr_tf]
+                         if hasattr(candidate, 'empty') and not candidate.empty and len(candidate) >= atr_period:
+                             atr_df = candidate
+                     if atr_df is None and hasattr(market_data, 'empty') and not market_data.empty:
+                         atr_df = market_data
+
                      # Smart display: use enough decimal places to show a non-zero value
                      def _fmt(v): return f"{v:.6f}".rstrip('0').rstrip('.') if v < 0.01 else f"{v:.4f}" if v < 1.0 else f"{v:.2f}"
-                     
-                     # Safety floor: if ATR is too small (< 0.01% of price), fall back to price-relative distance
-                     min_atr_floor = current_price * 0.0001  # 0.01% of price
-                     if atr_val <= 0 or atr_val < min_atr_floor:
-                         # Fallback to percentage-relative distance (safe for any price magnitude)
-                         pct_fallback = current_price * (dist_pct / 100.0)
-                         logger.warning(f"ATR({atr_period})={_fmt(atr_val)} below floor ({_fmt(min_atr_floor)}), using {dist_pct}% = {_fmt(pct_fallback)} instead.")
-                         grid_dist = pct_fallback
-                         explanation.append(f"ATR({atr_period})={_fmt(atr_val)} [FLOOR->{dist_pct}%={_fmt(pct_fallback)}]")
+
+                     if atr_df is not None and len(atr_df) >= atr_period:
+                         atr_val = iATR(atr_df['high'], atr_df['low'], atr_df['close'], atr_period)
+                         # Safety floor: if ATR is too small (< 0.01% of price), fall back to price-relative distance
+                         min_atr_floor = current_price * 0.0001  # 0.01% of price
+                         if atr_val <= 0 or atr_val < min_atr_floor:
+                             # Fallback to percentage-relative distance (safe for any asset)
+                             pct_fallback = current_price * (dist_pct / 100.0)
+                             logger.warning(f"ATR({atr_period},{atr_tf or '1m'})={_fmt(atr_val)} below floor ({_fmt(min_atr_floor)}), using {dist_pct}% = {_fmt(pct_fallback)} instead.")
+                             grid_dist = pct_fallback
+                             explanation.append(f"ATR({atr_period},{atr_tf or '1m'})={_fmt(atr_val)} [FLOOR->{dist_pct}%={_fmt(pct_fallback)}]")
+                         else:
+                             grid_dist = atr_val * atr_factor
+                             explanation.append(f"ATR({atr_period},{atr_tf or '1m'})={_fmt(atr_val)} * {atr_factor}")
                      else:
-                         grid_dist = atr_val * atr_factor
-                         explanation.append(f"ATR({atr_period})={_fmt(atr_val)} * {atr_factor}")
+                         # Not enough candle data yet — fall back to % distance
+                         pct_fallback = current_price * (dist_pct / 100.0)
+                         logger.warning(f"ATR: insufficient {atr_tf or '1m'} data, using {dist_pct}% = {_fmt(pct_fallback)}.")
+                         grid_dist = pct_fallback
+                         explanation.append(f"ATR no-data [FALLBACK {dist_pct}%]")
                  except Exception as e:
                      logger.error(f"ATR Calc failed: {e}")
                      grid_dist = current_price * (dist_pct / 100.0)  # Safe fallback for any asset

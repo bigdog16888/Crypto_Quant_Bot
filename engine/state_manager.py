@@ -573,18 +573,11 @@ class StateManager:
     
     def _normalize_pair(self, pair: str) -> str:
         """
-        Normalize pair symbol for comparison.
-        Handles futures suffixes like :USDC, :USDT which indicate the settlement currency.
-        
-        Examples:
-            'BTC/USDC' -> 'BTCUSDC'
-            'BTC/USDC:USDC' -> 'BTCUSDC'
-            'XAU/USDT:USDT' -> 'XAUUSDT'
+        Standardized normalization using the engine's central routine.
+        Ensures consistency between StateManager and ExchangeInterface.
         """
-        # Remove the settlement suffix (e.g., :USDC, :USDT) first
-        if ':' in pair:
-            pair = pair.split(':')[0]
-        return pair.replace('/', '').replace('-', '').upper()
+        from engine.exchange_interface import normalize_symbol
+        return normalize_symbol(pair)
 
 
 # Module-level singleton

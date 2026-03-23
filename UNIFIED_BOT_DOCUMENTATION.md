@@ -1,6 +1,6 @@
 # Crypto Quant Bot: Unified Documentation
 
-**Version:** 1.4.4 (Partial Fill Resilience — Ghost order Pruning)  
+**Version:** 1.4.6 (Stale Order Partial Fill Preservation)  
 **Status:** Highly Stable, Strict Proof-Only Active  
 **Last Updated:** 2026-03-13
 
@@ -166,6 +166,21 @@ The bot has recently undergone a fundamental stabilization phase to ensure multi
 
 ## 5. Changelog Summary
 
+### Version 1.4.7 (2026-03-19)
+**Multi-Bot Perfect Hedge Survival & Dust Chaser Upgrades**
+- **Perfect Hedge Vanishing Bug:** Fixed a critical flaw in `reconciler.py` where two bots perfectly hedging each other (e.g., $5k LONG and $5k SHORT yielding $0 physical on exchange) were mathematically flagged as a "Vanished Position" and systematically wiped. The guard now checks absolute `virtual_net_usd` instead of gross `total_virtual_invested` to cleanly preserve perfectly neutralized bots.
+- **DUST_CHASER `reduceOnly` Mandate:** Upgraded `bot_executor.py` `DUST_CHASER` orders with `reduceOnly=True` to explicitly bypass Binance's $5 minimum notional rejections for dust clearing.
+- **Grid Placement Unblocking:** Removed the early `return None` aborts after TP placement/dust sweeping in `maintain_orders`, permanently ensuring that Grid orders are independently placed every cycle.
+
+### Version 1.4.6 (2026-03-13)
+**Stale Order Partial Fill Preservation**
+- **Complete Cancel Loop Patch:** Updated all 4 cancellation loops in `bot_executor.py` (Stale Step Orders, Grid Duplicates, TP Ghost Sweeping, and Grid Drift) to dynamically extract the `filled` variable from CCXT order objects before issuing a local DB `update_order_status(..., 'cancelled')`. This patches the final mathematical leak where fractionally filled orders right on the boundary of a step progression were losing their executed volume on the transition.
+
+### Version 1.4.5 (2026-03-13)
+**Cycle-Aware Reconciliation — Multi-Bot Accuracy**
+- **Cycle-Aware Ledger Sync:** Patched `engine/reconciler.py` and `ui/views/monitor.py` to filter `bot_orders` by `cycle_id` from the `trades` table. This prevents "zombie volume" from previous completed trades (e.g., $57k SUI mismatch) from being counted toward the current active system net.
+- **Overlapping Bot Isolation:** Refined `_sync_positions_to_exchange` to strictly avoid mathematical "math-healing" of physical positions when multiple bots are active on the same pair (One-Way Margin mode).
+
 ### Version 1.4.4 (2026-03-13)
 **Partial Fill Resilience — Ghost Order Pruning**
 - **Partial Fill Resilience:** Patched `bot_executor.py` to capture and preserve `filled` quantities from Binance before canceling stagnant grid or take-profit orders. This ensures that even if an order is cancelled while partially filled, the filled amount is recorded in the bot's mathematical ledger (`bot_orders`), preventing "phantom" USD mismatches in the UI.
@@ -220,7 +235,7 @@ The bot has recently undergone a fundamental stabilization phase to ensure multi
 - **Reconciler Decoupling:** Removed ownership state dependencies.
 
 ---
-This unified document was last updated on **2026-03-13** (v1.4.3).
+This unified document was last updated on **2026-03-19** (v1.4.7).
 
 ## 6. Database Architecture & Concurrency (Added 2026-02-17)
 The system uses **SQLite** in **WAL (Write-Ahead Logging)** mode for high-performance concurrency.
@@ -240,3 +255,55 @@ If the UI reports "Exchange wallet is empty", it means the `active_positions` ta
 This checks:
 1.  Check `engine.log` for `✅ Active Positions Synced: X`.
 2.  If Synced > 0 but UI is empty, ensure `runner.py` is running and `crypto_bot.db-wal` exists.
+
+---
+
+## 8. VIRTUAL LEDGER MISMATCH — ROOT CAUSES AND PERMANENT FIXES
+
+The UI shows `System X vs Exchange Y (Diff $Z)` when `bot_orders.SUM(filled_amount)` diverges from `active_positions.size * entry_price`. There are exactly **4 code-level root causes** discovered and fixed. Future agents: do NOT patch the DB directly. Fix the code and backfill properly.
+
+### Root Cause 1: `adoption_add` rows had NULL cycle_id
+- **Where**: `engine/reconciler.py` → `_sync_positions_to_exchange()` INSERT
+- **Symptom**: UI mismatch for XRP/SUI/BTC even though fills existed in bot_orders
+- **Why**: `monitor.py` virtual ledger JOIN was `bo.cycle_id = t.cycle_id` (strict). NULL rows were silently dropped.
+- **Fix applied**: Changed JOIN to `(bo.cycle_id = t.cycle_id OR bo.cycle_id IS NULL)` in `monitor.py`. Also stamped `cycle_id=db_cycle` on the INSERT in `reconciler.py`.
+
+### Root Cause 2: Offline fill reconstruction: INSERT missing `filled_amount`
+- **Where**: `engine/reconciler.py` → `reconstruct_offline_fills()` INSERT at line ≈604
+- **Symptom**: `trades.total_invested` shows 0.479 BTC but `bot_orders` sum shows only 0.189 BTC. Gap matches exactly the untracked grids.
+- **Why**: The INSERT for reconstructed offline fills omitted the `filled_amount` column. SQLite defaulted it to 0. `accumulate_trade_fill` correctly updated `trades`, but `bot_orders.filled_amount=0` so the virtual ledger missed them.
+- **Fix applied**: Changed INSERT to include `filled_amount=fill_qty` and `cycle_id=_bot_cycle`.
+
+### Root Cause 3: WS FILLED event sets status but not filled_amount
+- **Where**: `engine/ws_event_handlers.py` → `_handle_order_filled()` → `update_order_status()`
+- **Symptom**: Rows with `status=filled` but `filled_amount=0` exactly matching the live gap.
+- **Why**: Binance `ORDER_TRADE_UPDATE` WS event's `z` field (cumulative qty) can be 0 when the event fires. The call `update_order_status(..., filled_qty=0)` correctly sets `status=filled` but sets `filled_amount=0`.
+- **Fix applied**: Added safety net in `_handle_order_filled`: if `filled_qty <= 0`, run `UPDATE bot_orders SET filled_amount = amount WHERE order_id = ? AND filled_amount = 0`.
+
+### Root Cause 4: Monitoring ref_price uses virtual avg, not physical
+- **Where**: `engine/ui/views/monitor.py` → pair_prices dict
+- **Symptom**: Identical qty gaps show inflated USD diff because virtual avg_entry ≠ physical entry_price.
+- **Detail**: `pair_prices` is set from `avg_entry_price` first (virtual loop), then not overridden by physical. Both sides use this same ref_price to compute USD. Minor issue — doesn't cause false positives for qty-level mismatches.
+
+### Root Cause 5: Cross-cycle orphan partial-fills lost on reset
+- **Where**: `engine/database.py` → `reset_bot_after_tp()`
+- **Symptom**: The bot resets after TP, but the virtual ledger suddenly misses a fractional amount of contracts that the physical exchange still holds open.
+- **Why**: If a grid was *partially* filled before being cancelled, the physical exchange holds those contracts. When TP is hit, `reset_bot_after_tp` indiscriminately marked ALL old bot_orders as `reset_cleared`, effectively wiping them from the virtual ledger mathematical sum. Because `is_sole_bot` prevents math adoption where multiple sister-bots run (e.g., SOL/USDC and SHORT SOL/USDC), the reconciler refused to sweep these orphaned contracts into the new cycle. 
+- **Fix applied**: Modified `reset_bot_after_tp` to calculate the mathematical net quantity of the old cycle before wiping it. If net_qty > 0, it explicitly creates an `adoption_add` row tagged into the *new* `cycle_id` so the old partial fills natively carry over into the new cycle.
+
+### How to Diagnose Future Mismatches
+1. Run `python tmp_monitor_debug.py` (check the `tmp_` templates in the doc comments) to see exact qty gaps.
+2. Check `bot_orders` for rows with `status='filled' AND filled_amount=0 AND amount>0` — these are the offenders.
+3. Backfill with: `UPDATE bot_orders SET filled_amount=amount WHERE status='filled' AND filled_amount=0 AND amount>0`
+4. Check if the code fixes in reconciler.py and ws_event_handlers.py are in place.
+5. **Never** run `DELETE FROM bot_orders` without first flattening the exchange physically.
+
+
+**Never use manual SQL `DELETE` or `TRUNCATE` scripts (e.g., `DELETE FROM bot_orders`) to "fix" the bot's state, reset trials, or clear the dashboard.**
+
+If you delete rows from `bot_orders` or `trade_history` while the Exchange API still holds physical positions or limit orders, you give the bot **Amnesia**. When it restarts, it will fetch the exchange's physical reality, compare it against its blank DB, and immediately throw catastrophic `NOTIONAL-GAP` and `STRAY ORDERS` errors because Physics != Memory. The bot will explicitly refuse to manage these orphaned positions because it assumes a human placed them manually.
+
+### How to Fundamentally Fix State:
+1. **Never "patch" the symptoms.** If the DB says $0 and the exchange says $100k, find out *why* the DB failed to record the fill (e.g., a logic bug in `reconstruct_offline_fills`).
+2. **To legitimately start fresh:** Use the bot's built-in UI "Manual Link Recovery / Market Close" tools. This ensures the bot's engine gracefully market-closes the physical position on Binance *and* writes the closed ledger mathematical receipt to the database harmoniously.
+3. **If you MUST wipe (absolute last resort):** You must execute a script that actively queries the `ccxt` APIs to cancel ALL open orders and market close ALL physical contracts to exactly $0.00 `BEFORE` you wipe the SQLite database. If the physical exchange is not 100% flattened, the SQLite database must be retained. 
