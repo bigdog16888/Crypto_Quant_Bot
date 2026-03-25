@@ -349,7 +349,10 @@ def init_db():
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_trade_history_bot ON trade_history(bot_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_trade_history_time ON trade_history(timestamp)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_bots_active ON bots(is_active)')
-
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_trades_bot_id ON trades(bot_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_bots_pair ON bots(pair)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_bot_orders_status ON bot_orders(status)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_bot_orders_type ON bot_orders(order_type)')
         # Notifications table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS notifications (
@@ -771,7 +774,6 @@ def reset_bot_after_tp(bot_id, exit_price, direction=None, action_label='TP_HIT'
                    COALESCE(SUM(CASE WHEN order_type IN ('tp', 'close', 'adoption_reduce', 'dust_close', 'sl') THEN filled_amount ELSE 0 END), 0)
             FROM bot_orders WHERE bot_id = ? AND filled_amount > 0 AND (cycle_id = ? OR cycle_id IS NULL)
             AND status NOT IN ('reset_cleared', 'auto_closed')
-            AND (client_order_id NOT LIKE '%_CARRY_%' OR client_order_id IS NULL)
         """, (bot_id, old_cycle))
         
         # 🚀 FUNDAMENTAL FIX: Clamp negative values to 0 to prevent structural deficits
@@ -784,7 +786,8 @@ def reset_bot_after_tp(bot_id, exit_price, direction=None, action_label='TP_HIT'
 
         # Carry-over Logic: If net_qty is significant, bridge it into the new cycle.
         # 🚀 FUNDAMENTAL FIX: Never carry over ghost mass during a catastrophic system reset.
-        if abs(old_net_qty) > 0.0001 and action_label not in ['RESET_VANISHED_POSITION', 'RESET_STRUCTURAL_GHOST', 'RESET_PHANTOM_ENTRY']:
+        excluded_carry_labels = ['RESET_VANISHED_POSITION', 'RESET_STRUCTURAL_GHOST', 'RESET_PHANTOM_ENTRY', 'SYSTEM_WIPE', 'MANUAL_CLOSE', 'STOP_LOSS_EXIT']
+        if abs(old_net_qty) > 0.0001 and action_label not in excluded_carry_labels:
             logger.info(f"🌉 [CARRY-OVER] Bot {bot_id}: Carrying over {old_net_qty:.4f} {pair} units into Cycle {new_cycle}.")
             carry_otype = 'adoption_add' if old_net_qty > 0 else 'adoption_reduce'
             carry_cid = f"CQB_{bot_id}_CARRY_{int(time.time() * 1000)}"
@@ -808,8 +811,14 @@ def reset_bot_after_tp(bot_id, exit_price, direction=None, action_label='TP_HIT'
         cursor.execute("UPDATE trades SET current_step = 0, total_invested = 0, avg_entry_price = 0, target_tp_price = 0, last_exit_price = ?, last_exit_time = ?, basket_start_time = ?, entry_confirmed = 0, entry_order_id = NULL, tp_order_id = NULL, bot_position_id = NULL, close_type = ?, cycle_id = ? WHERE bot_id = ?", 
                         (exit_price, int(time.time()), int(time.time()), action_label, new_cycle, bot_id))
             
-        # 🚫 POS-LIMIT FLAG: Always clear on TP reset so the new cycle starts fresh.
         cursor.execute("UPDATE bots SET pos_limit_hit = 0 WHERE id = ?", (bot_id,))
+
+        # 🚀 FUNDAMENTAL FIX: Remove the active_positions row for this bot on reset.
+        # Without this, the mismatch monitor accumulates stale rows from previous cycles.
+        try:
+            clear_active_position_for_bot(bot_id, pair)
+        except Exception as e_ap:
+            logger.warning(f"[ACTIVE-POS] Could not clear active_positions for bot {bot_id}: {e_ap}")
         
         # Check Stop After Cycle
         stop_after_cycle = False
@@ -984,7 +993,76 @@ def get_bot_order_ids(bot_id):
     orders['grid_orders'] = [{'order_id': r[0]} for r in cursor.fetchall() if r[0]]
     return orders
 
+def upsert_active_position_for_bot(bot_id: int, pair: str, direction: str, avg_fill_price: float) -> None:
+    """
+    Write (or update) the active_positions row for this bot using its virtual ledger.
+
+    ROOT-CAUSE FIX for multi-bot One-Way mode: previously active_positions was only written
+    by import_position_from_exchange (REALITY-AUTO-MAP path), which only fires for the one bot
+    whose proof-order the reconciler can match. Every other same-direction bot on the pair was
+    left without an active_positions row, so the mismatch monitor fired every cycle.
+
+    Now called from ws_event_handlers after every fill so every bot with a position
+    always has its own active_positions row immediately.
+
+    NOTE: does NOT call conn.close() — get_connection() is a thread-local singleton;
+    closing it would break all subsequent DB calls on this thread.
+    """
+    try:
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT total_invested, avg_entry_price FROM trades WHERE bot_id = ?",
+            (bot_id,)
+        ).fetchone()
+        if not row or float(row[0] or 0) <= 0:
+            return
+        total_invested = float(row[0])
+        avg_price = float(row[1]) if row[1] and float(row[1]) > 0 else avg_fill_price
+        if avg_price <= 0:
+            return
+        virtual_qty = total_invested / avg_price
+
+        from engine.exchange_interface import normalize_symbol
+        clean_pair = normalize_symbol(pair)
+        side = direction.upper()
+
+        conn.execute(
+            """INSERT INTO active_positions (bot_id, pair, side, size, entry_price, last_checked, last_updated)
+               VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+               ON CONFLICT(bot_id, pair, side)
+               DO UPDATE SET size=excluded.size, entry_price=excluded.entry_price,
+                             last_checked=excluded.last_checked, last_updated=excluded.last_updated""",
+            (bot_id, clean_pair, side, virtual_qty, avg_price, int(time.time()))
+        )
+        conn.commit()
+        logger.debug(f"[ACTIVE-POS] Bot {bot_id} ({clean_pair} {side}): upserted qty={virtual_qty:.6f} @ {avg_price:.4f}")
+    except Exception as e:
+        logger.error(f"[ACTIVE-POS] Failed to upsert active_positions for bot {bot_id}: {e}")
+
+
+def clear_active_position_for_bot(bot_id: int, pair: str = None) -> None:
+    """
+    Remove the active_positions row(s) for this bot when it resets after TP/close.
+    Called from reset_bot_after_tp so the entry disappears when the position is gone.
+
+    NOTE: does NOT call conn.close() — get_connection() is a thread-local singleton.
+    """
+    try:
+        conn = get_connection()
+        if pair:
+            from engine.exchange_interface import normalize_symbol
+            clean_pair = normalize_symbol(pair)
+            conn.execute("DELETE FROM active_positions WHERE bot_id = ? AND pair = ?", (bot_id, clean_pair))
+        else:
+            conn.execute("DELETE FROM active_positions WHERE bot_id = ?", (bot_id,))
+        conn.commit()
+        logger.debug(f"[ACTIVE-POS] Bot {bot_id}: cleared active_positions for pair={pair or 'all'}")
+    except Exception as e:
+        logger.error(f"[ACTIVE-POS] Failed to clear active_positions for bot {bot_id}: {e}")
+
+
 def import_position_from_exchange(bot_id: int, pair: str, position_size: float, entry_price: float, direction: str) -> Tuple[bool, str]:
+
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT direction, martingale_multiplier, base_size, config FROM bots WHERE id = ?", (bot_id,))
@@ -1123,7 +1201,7 @@ def import_position_from_exchange(bot_id: int, pair: str, position_size: float, 
             INSERT INTO bot_orders (
                 bot_id, step, order_type, order_id, price, amount, filled_amount,
                 status, created_at, updated_at, client_order_id, notes
-            ) VALUES (?, ?, 'adoption', ?, ?, ?, ?, 'filled', ?, ?, ?, ?)
+            ) VALUES (?, ?, 'adoption_add', ?, ?, ?, ?, 'filled', ?, ?, ?, ?)
         """, (
             bot_id, 
             calculated_step, 
@@ -1212,10 +1290,11 @@ def update_active_positions(positions: List[Dict]):
         # Insert cleanly aggregated positions
         for (pair, side), data in agg_positions.items():
             avg_price = data['value'] / data['size'] if data['size'] > 0 else 0
+            owner_id = get_active_bot_id_by_symbol_direction(pair, side) or 0
             cursor.execute("""
                 INSERT INTO active_positions (bot_id, pair, side, size, entry_price, last_checked)
-                VALUES (0, ?, ?, ?, ?, ?)
-            """, (pair, side, data['size'], avg_price, timestamp))
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (owner_id, pair, side, data['size'], avg_price, timestamp))
             
         cursor.execute("COMMIT")
     except Exception as e:
@@ -1318,30 +1397,19 @@ def update_active_positions_snapshot(positions: list):
         else:
             _EMPTY_SNAP_COUNTER = 0  # Reset on non-empty snapshot
         
-        # Use a transaction to ensure atomicity
-        conn.execute("BEGIN IMMEDIATE")
+        # Extract purely unowned orphans from the snapshot.
+        # We do NOT wipe `active_positions`. Individual bots manage their own rows natively.
         
-        # Clear old snapshot
-        conn.execute("DELETE FROM active_positions")
-        
+        # Determine all raw physical positions
+        current_orphans = []
         for p in positions:
             raw_symbol = p.get('symbol', 'UNKNOWN')
-            
-            # 🚀 FUNDAMENTAL FIX: Use central normalizer to cleanly handle all variations
-            # (Mainnet 'BTC/USDT', Demo 'BTC/USDT:USDT', Spot 'BTCUSDT', etc.)
             from engine.exchange_interface import normalize_symbol
             symbol = normalize_symbol(raw_symbol)
 
             amount = float(p.get('contracts', 0) or p.get('size', 0) or 0)
             entry_price = float(p.get('entryPrice', 0))
 
-            # ⚠️ CRITICAL FIX: In Binance one-way mode the 'side' field from CCXT
-            # is unreliable — it may say 'long' even for a short position.
-            # The ONLY reliable indicator is the SIGN of contracts:
-            #   contracts > 0  →  LONG
-            #   contracts < 0  →  SHORT
-            #   We explicitly check the raw 'side' param just in case the exchange is returning absolute sizes
-            
             p_side = p.get('side', '').lower()
             if p_side == 'short':
                 side = 'SHORT'
@@ -1351,26 +1419,22 @@ def update_active_positions_snapshot(positions: list):
                 side = 'LONG' if amount > 0 else 'SHORT'
 
             if amount == 0:
-                continue  # Zero position — skip entirely
+                continue  
 
-            if abs(amount) > 0:
-                # 🚀 FUNDAMENTAL FIX: Stop defaulting to bot_id=0 (The Orphan Maker)
-                # Instead, we proactively look up which active bot owns this physical footprint.
-                # If no bot is active for this symbol/direction, we use 0 to signal 'Ghost/Manual Position'.
-                bot_id = get_active_bot_id_by_symbol_direction(symbol, side) or 0
-                
-                if bot_id > 0:
-                    # 🚀 AUTO-RECOVERY: If we found an owner, purge any existing 'bot_id=0' orphan for this symbol
-                    # to prevent the Reconciler from seeing double reality.
-                    conn.execute("DELETE FROM active_positions WHERE pair = ? AND side = ? AND bot_id = 0", (symbol, side))
-                    logger.info(f"📍 [REALITY-AUTO-MAP] Linked physical {side} {symbol} to logical Bot {bot_id}. Purged old orphans.")
-                else:
-                    logger.warning(f"⚠️ [REALITY-ORPHAN] Physical {side} {symbol} has no owner. Saved with bot_id=0.")
+            # If NO bot owns this pair/side, it is an orphan.
+            if get_active_bot_id_by_symbol_direction(symbol, side) is None:
+                current_orphans.append((symbol, side, abs(amount), entry_price))
 
-                conn.execute("""
-                    INSERT OR REPLACE INTO active_positions (bot_id, pair, side, size, entry_price, last_checked)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """, (bot_id, symbol, side, abs(amount), entry_price, int(time.time())))
+        # We first purge all existing orphans (bot_id = 0) so we can insert the fresh ones
+        conn.execute("DELETE FROM active_positions WHERE bot_id = 0")
+        
+        for orphan in current_orphans:
+            symbol, side, size, entry_price = orphan
+            logger.warning(f"⚠️ [REALITY-ORPHAN] Physical {side} {symbol} has no owner. Saved with bot_id=0 for UI.")
+            conn.execute("""
+                INSERT OR REPLACE INTO active_positions (bot_id, pair, side, size, entry_price, last_checked)
+                VALUES (0, ?, ?, ?, ?, ?)
+            """, (symbol, side, size, entry_price, int(time.time())))
         
         conn.commit()
     except Exception as e:
@@ -1566,38 +1630,254 @@ def accumulate_trade_fill(bot_id: int, added_invested: float, added_qty: float, 
 def get_active_bot_id_by_symbol_direction(symbol: str, direction: str) -> Optional[int]:
     """
     Look up the bot ID that currently 'owns' a physical footprint on the exchange.
-    Matches based on normalized symbol and direction (LONG/SHORT).
-    Uses standardized normalization to handle 'SUI/USDC:USDC' vs 'SUIUSDC'.
+
+    Primary proof  : A FILLED bot_order with client_order_id='CQB_{bot_id}_...' for this
+                     symbol in the bot's current cycle. This is the ONLY reliable signal —
+                     a physical position exists because our system created it via a known order.
+    Fallback (weak): If no order proof found, match on symbol + direction for a bot that is
+                     actively IN TRADE (total_invested > 0). Direction alone is NOT sufficient
+                     because two bots on the same pair can have opposite directions.
+
+    A bot can NEVER claim a position it did not create. "Same pair, same direction" is not proof.
     """
     from engine.exchange_interface import normalize_symbol
-    norm_symbol = normalize_symbol(symbol)
+    norm_symbol = normalize_symbol(symbol).upper()
     norm_direction = direction.upper()
 
     conn = get_connection()
     try:
-        # Find active bots for this symbol.
-        # We must normalize the 'pair' column from the DB during search.
         cursor = conn.cursor()
-        cursor.execute("SELECT id, pair, direction FROM bots WHERE is_active = 1")
-        active_bots = cursor.fetchall()
 
-        for bid, bpair, bdir in active_bots:
-            # 🚀 HARDENED COMPARISON: Ensure case-insensitivity and trim whitespace
-            target_norm = normalize_symbol(bpair).strip().upper()
-            found_norm = norm_symbol.strip().upper()
-            
-            if target_norm == found_norm and bdir.strip().upper() == norm_direction:
+        # --- PRIMARY: Order-ID Proof ---
+        # Find any bot_order with a CQB client_order_id whose bot is active on this symbol.
+        # The prefix CQB_{bot_id}_ is deterministic and unique per bot — this is ground truth.
+        cursor.execute("""
+            SELECT DISTINCT bo.bot_id
+            FROM bot_orders bo
+            JOIN bots b ON bo.bot_id = b.id
+            JOIN trades t ON b.id = t.bot_id
+            WHERE b.is_active = 1
+              AND t.total_invested > 0
+              AND bo.status IN ('filled', 'open', 'new', 'reset_cleared')
+              AND bo.filled_amount > 0
+              AND bo.client_order_id LIKE 'CQB_%'
+        """)
+        candidate_bots = [r[0] for r in cursor.fetchall()]
+
+        for bid in candidate_bots:
+            cursor.execute("SELECT pair, direction FROM bots WHERE id = ?", (bid,))
+            row = cursor.fetchone()
+            if not row:
+                continue
+            bpair, bdir = row
+            if normalize_symbol(bpair).upper() == norm_symbol and bdir.strip().upper() == norm_direction:
+                # Confirmed: this bot placed a real order for this symbol AND matches the position direction.
                 return bid
+
+        # --- FALLBACK: Direction + In-Trade check ---
+        # Only accept if the bot is genuinely IN TRADE (has invested capital).
+        # This catches cases where WS filled the entry but bot_orders row has no CQB prefix.
+        cursor.execute("""
+            SELECT b.id, b.pair, b.direction, t.total_invested
+            FROM bots b
+            JOIN trades t ON b.id = t.bot_id
+            WHERE b.is_active = 1
+              AND t.total_invested > 0
+        """)
+        for bid, bpair, bdir, invested in cursor.fetchall():
+            if (normalize_symbol(bpair).upper() == norm_symbol
+                    and bdir.strip().upper() == norm_direction):
+                return bid
+
         return None
     except Exception as e:
         logger.error(f"Error in get_active_bot_id_by_symbol_direction: {e}")
         return None
-    # FUNDAMENTAL FIX: Removed conn.close()
-    # get_connection() returns a thread-local persistent connection.
-    # Closing it here destroys the connection for the entire active_positions snapshot thread!
+    # NOTE: No conn.close() — get_connection() returns a thread-local persistent connection.
 
+
+def recompute_invested_from_orders(bot_id: int) -> tuple:
+    """
+    Derive (total_invested, avg_entry_price, current_step) from confirmed filled
+    bot_orders for the bot's current cycle.
+
+    This is the ORDER-ID-ANCHORED ground truth.  The trades table is a cache;
+    this function always reads the underlying confirmed fills directly.
+
+    Two-pass approach:
+    Pass 1 — Count regular entry/grid fills (price > 0, no CARRY rows).
+              Normal case: bot entered fresh this cycle.
+
+    Pass 2 — If Pass 1 returns 0 AND the cycle has a CARRY row (qty > 0):
+              The bot completed a TP and carried residual qty into this cycle.
+              CARRY rows have price=0 (bookkeeping only, not an exchange fill).
+              Use CARRY qty + active_positions avg_price to reconstruct invested.
+
+    Returns (0.0, 0.0, 0) if the bot truly has no confirmed position this cycle.
+    """
     conn = get_connection()
-    cursor = conn.cursor()
+    try:
+        cursor = conn.cursor()
+        # Resolve current cycle_id from trades table
+        row = cursor.execute(
+            "SELECT COALESCE(cycle_id, 1) FROM trades WHERE bot_id = ?", (bot_id,)
+        ).fetchone()
+        if not row:
+            return 0.0, 0.0, 0
+        cycle_id = row[0]
+
+        cursor.execute("""
+            SELECT
+                COALESCE(SUM(bo.filled_amount * bo.price), 0.0) AS total_cost,
+                COALESCE(SUM(bo.filled_amount),             0.0) AS total_qty,
+                COALESCE(MAX(bo.step),                      0)   AS max_step
+            FROM bot_orders bo
+            WHERE bo.bot_id  = ?
+              AND bo.cycle_id = ?
+              AND bo.order_type IN ('entry', 'grid', 'adoption_add', 'adoption')
+              AND bo.filled_amount > 0
+              AND bo.price > 0
+              AND bo.client_order_id LIKE 'CQB_%'
+              AND bo.client_order_id NOT LIKE '%_CARRY_%'
+              AND bo.status NOT IN ('open', 'new', 'placing', 'failed', 'auto_closed', 'reset_cleared')
+              -- ↑ Count filled_amount from ALL terminal statuses (filled, cancelled, closed).
+              -- Cancelled orders with filled_amount > 0 are real partial fills from the exchange.
+              -- We exclude only orders still open/pending or explicitly system-cleared.
+        """, (bot_id, cycle_id))
+        r = cursor.fetchone()
+        total_cost = float(r[0] or 0.0)
+        total_qty  = float(r[1] or 0.0)
+        max_step   = int(r[2] or 0)
+
+        if total_qty > 1e-8:
+            avg_price = total_cost / total_qty
+            return total_cost, avg_price, max_step
+
+        # ------------------------------------------------------------------
+        # PASS 2: CARRY-only cycle (bot just reset from a TP, no new fills yet)
+        # CARRY rows have price=0 — they record residual qty carried forward,
+        # not a new exchange execution. Use active_positions for the avg price.
+        # ------------------------------------------------------------------
+        carry_row = cursor.execute("""
+            SELECT COALESCE(SUM(filled_amount), 0.0)
+            FROM bot_orders
+            WHERE bot_id  = ?
+              AND cycle_id = ?
+              AND client_order_id LIKE 'CQB_%'
+              AND client_order_id LIKE '%_CARRY_%'
+              AND filled_amount > 0
+              AND status NOT IN ('open', 'new', 'placing', 'failed')
+        """, (bot_id, cycle_id)).fetchone()
+        carry_qty = float(carry_row[0] or 0.0)
+
+        if carry_qty <= 1e-8:
+            return 0.0, 0.0, 0  # Truly no position this cycle
+
+        # Look up active_positions snapshot for entry_price
+        bot_row = cursor.execute(
+            "SELECT pair, direction FROM bots WHERE id = ?", (bot_id,)
+        ).fetchone()
+        if not bot_row:
+            return 0.0, 0.0, 0
+
+        pair, direction = bot_row
+        norm_pair = pair.split(':')[0].replace('/', '')
+        snap_side  = 'LONG' if str(direction).upper() == 'LONG' else 'SHORT'
+        snap_row = cursor.execute(
+            "SELECT entry_price FROM active_positions WHERE pair=? AND side=?",
+            (norm_pair, snap_side)
+        ).fetchone()
+
+        if snap_row and float(snap_row[0] or 0) > 0:
+            carry_avg_price = float(snap_row[0])
+            carry_cost = carry_qty * carry_avg_price
+            logger.info(
+                f"[RECOMPUTE-CARRY] Bot {bot_id} cycle {cycle_id}: "
+                f"CARRY qty={carry_qty:.8f} @ entry_price={carry_avg_price:.4f} "
+                f"(from active_positions). total_invested={carry_cost:.4f}"
+            )
+            return carry_cost, carry_avg_price, 1  # step=1 (carry-forward)
+
+        logger.warning(
+            f"[RECOMPUTE-CARRY] Bot {bot_id}: CARRY qty={carry_qty:.8f} but "
+            f"no active_positions snapshot found. Cannot price position."
+        )
+        return 0.0, 0.0, 0
+
+    except Exception as e:
+        logger.error(f"Error in recompute_invested_from_orders (bot {bot_id}): {e}")
+        return 0.0, 0.0, 0
+
+
+def sync_trades_from_orders(bot_id: int) -> bool:
+    """
+    Compare trades.total_invested against the order-ID-anchored ground truth.
+
+    Comparison is done in QUANTITY space (not dollars) to avoid price noise:
+        recomputed_qty  = SUM(filled_amount) from confirmed order IDs
+        cached_qty      = trades.total_invested / trades.avg_entry_price
+
+    If |recomputed_qty - cached_qty| > 1e-6 (float epsilon for quantity),
+    the trades row is updated to match the recomputed values.
+
+    Returns True if a correction was written, False if already in sync.
+
+    Safe to call frequently — it is a no-op when the bot is healthy.
+    Only writes to the DB when a real discrepancy is detected.
+    """
+    QTY_EPSILON = 1e-6  # float addition rounding tolerance in units (not dollars)
+
+    try:
+        recomputed_cost, recomputed_avg, recomputed_step = recompute_invested_from_orders(bot_id)
+
+        conn = get_connection()
+        cursor = conn.cursor()
+        row = cursor.execute(
+            "SELECT total_invested, avg_entry_price, current_step FROM trades WHERE bot_id = ?",
+            (bot_id,)
+        ).fetchone()
+        if not row:
+            return False
+
+        cached_invested, cached_avg, cached_step = float(row[0] or 0), float(row[1] or 0), int(row[2] or 0)
+
+        # Derive quantity from each source
+        recomputed_qty = (recomputed_cost / recomputed_avg) if recomputed_avg > 0 else 0.0
+        cached_qty     = (cached_invested / cached_avg)     if cached_avg > 0     else 0.0
+
+        delta_qty = abs(recomputed_qty - cached_qty)
+
+        if delta_qty <= QTY_EPSILON:
+            return False  # Already in sync — no write needed
+
+        # Discrepancy detected — recomputed fills are authoritative
+        logger.warning(
+            f"🔧 [LEDGER-SYNC] Bot {bot_id}: qty drift detected. "
+            f"Cached={cached_qty:.8f} vs Confirmed={recomputed_qty:.8f} (Δ={delta_qty:.8f}). "
+            f"Correcting trades row from order fills."
+        )
+        cursor.execute("""
+            UPDATE trades
+            SET total_invested  = ?,
+                avg_entry_price = ?,
+                current_step    = ?,
+                entry_confirmed = CASE WHEN ? > 0 THEN 1 ELSE entry_confirmed END
+            WHERE bot_id = ?
+        """, (
+            round(recomputed_cost, 8),
+            round(recomputed_avg, 8),
+            max(recomputed_step, cached_step),   # never go backwards on step
+            recomputed_cost,
+            bot_id
+        ))
+        conn.commit()
+        return True
+
+    except Exception as e:
+        logger.error(f"Error in sync_trades_from_orders (bot {bot_id}): {e}")
+        return False
+
+
     cursor.execute('SELECT bot_position_id FROM trades WHERE bot_id = ?', (bot_id,))
     res = cursor.fetchone()
     return res[0] if res else None
@@ -2039,12 +2319,13 @@ def update_full_snapshot(trade_updates: List[Dict[str, Any]], physical_positions
             # print(f"DEBUG: Processing {symbol} Amount: {amount}")
             
             if amount != 0:
-                # We use bot_id=0 to represent 'Physical Exchange' (no specific bot owner implied here)
+                # Proactively link physical positions to active bots instead of defaulting to 0
+                owner_id = get_active_bot_id_by_symbol_direction(symbol, side) or 0
                 try:
                     conn.execute("""
                         INSERT OR REPLACE INTO active_positions (bot_id, pair, side, size, entry_price, last_checked)
-                        VALUES (0, ?, ?, ?, ?, ?)
-                    """, (symbol, side, abs(amount), entry_price, int(time.time())))
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, (owner_id, symbol, side, abs(amount), entry_price, int(time.time())))
                     # print(f"DEBUG: Inserted {symbol}")
                 except Exception as insert_err:
                     logger.error(f"❌ INSERT FAILED for {symbol}: {insert_err}")

@@ -201,8 +201,25 @@ class BotExecutor:
         
         notional = tp_qty * (tp_price or current_price or 1.0)
         if notional < _min_notional:
-            logger.warning(f"DUST {name}: TP notional ${notional:.2f} < min ${_min_notional:.2f}. Triggering DUST_CHASER.")
-            return 'DUST_CHASER', tp_qty
+            logger.warning(f"DUST {name}: TP notional ${notional:.2f} < min ${_min_notional:.2f}. Adjusting TP price to meet min notional.")
+            # Rather than wash-trading instantly, we clamp the TP price so the order is validly placed for *some* profit.
+            # To meet the minimum notional, tp_price must be at least _min_notional / tp_qty.
+            required_price = (_min_notional * 1.002) / tp_qty  # Add tiny 0.2% buffer
+            
+            # For SHORTs, increasing the tp_price means taking less profit.
+            # But if required_price > current_price, taking profit means actually losing money!
+            if side == 'buy' and required_price >= current_price:
+                 logger.warning(f"🛑 {name}: Minimum notional clamp ({required_price:.4f}) breaches current price ({current_price:.4f}). Cannot TP profitably.")
+                 # Fallback: Place at exactly current maker boundary to escape the trapped size
+                 return 'DUST_CHASER', tp_qty
+                 
+            try:
+                prec = exchange.get_symbol_precision(pair)
+                tp_price = exchange.ceil_to_step(required_price, prec['tick_size']) if side == 'buy' else exchange.round_to_step(required_price, prec['tick_size'])
+            except:
+                tp_price = required_price
+                
+            logger.info(f"✨ {name}: Clamped TP to {tp_price:.4f} to satisfy min notional of ${_min_notional:.2f}.")
 
         # 6. Spread-Cross Fix: TP at market price must be GTC taker
         try:
@@ -710,7 +727,7 @@ class BotExecutor:
                     # Reset the bot internally - if unfilled, this returns it to Scanning
                     # We pass exit_price=0 to indicate abandonment
                     from engine.database import reset_bot_after_tp
-                    reset_bot_after_tp(bot_id, exit_price=0.0)
+                    reset_bot_after_tp(bot_id, exit_price=0.0, action_label='ENTRY_TIMEOUT')
                     logger.info(f"✅ Bot {name}: Strategy reset to SCANNING after Entry Hard-Cap.")
                     return None
                 except Exception as e_cap:
@@ -982,6 +999,7 @@ class BotExecutor:
                     else:
                         logger.debug(f"[GRID-SYNC] {name}: ATR-grid large drift ({curr_grid_price:.4f} -> {target_grid_price:.4f}). Skipping auto-replace (ATR-locked).")
                         # Do NOT cancel — ATR grids are anchored at placement
+                else:
                     # Non-ATR grids: replace if price drifted > 0.5% (was 0.1%, widened to stop noise triggers)
                     if abs(curr_grid_price - target_grid_price) / max(target_grid_price, 0.0001) > 0.005:
                         # 🚀 ROOT CAUSE FIX: Check for partial fills before cancelling!
@@ -1055,9 +1073,12 @@ class BotExecutor:
                     amount = float(order_status.get('amount', 0))
                     
                     if status == 'filled' or (status == 'closed' and filled > 0 and filled >= amount * 0.99):
-                        actual_exit = float(order_status.get('average') or order_status.get('price') or current_price)
-                        logger.info(f"✅ {name}: TP order {tp_order_id} filled at {actual_exit}. Resetting bot.")
-                        reset_bot_after_tp(bot_id, actual_exit, direction=direction)
+                        if float(bot_status.get('total_invested', 0)) > 0:
+                            actual_exit = float(order_status.get('average') or order_status.get('price') or current_price)
+                            logger.info(f"✅ {name}: TP order {tp_order_id} filled at {actual_exit}. Resetting bot.")
+                            reset_bot_after_tp(bot_id, actual_exit, direction=direction)
+                        else:
+                            logger.debug(f"⏭️ {name}: TP order {tp_order_id} is filled, but bot state is already zeroed (handled by WS). Skipping redundant reset.")
                     elif status in ['canceled', 'rejected'] or (status == 'closed' and filled == 0):
                         logger.warning(f"⚠️ {name}: TP order {tp_order_id} was canceled. Bot remains in trade.")
                         # Clear tp_order_id from DB so maintain_orders creates a new one
@@ -1399,10 +1420,19 @@ class BotExecutor:
             logger.warning(f"🧹 {name}: Found {len(stale_orders)} STALE orders from previous steps. Purging to sync with Step {current_step}...")
             for o in stale_orders:
                 try:
-                    exchange.cancel_order(o['id'], pair)
+                    # 🛡️ PARTIAL-FILL GUARD: Never cancel a partially filled order as stale.
+                    # A partial fill is real capital deployed on the exchange — cancelling it
+                    # orphans that position. Only skip if there is a measurable fill.
                     filled_qty = float(o.get('filled', 0) or 0)
+                    if filled_qty > 0:
+                        logger.warning(
+                            f"⚠️ SKIPPING stale cancel for {o.get('clientOrderId')} — has partial fill of {filled_qty}. "
+                            f"Will be reconciled by reconciler when step genuinely advances."
+                        )
+                        continue
+                    exchange.cancel_order(o['id'], pair)
                     update_order_status(o['id'], 'cancelled', bot_id=bot_id, filled_qty=filled_qty)
-                    logger.info(f"🔥 Cancelled stale {o.get('clientOrderId')} (Preserved Fill: {filled_qty})")
+                    logger.info(f"🔥 Cancelled stale {o.get('clientOrderId')} (No fill, safe to purge)")
                 except Exception as e:
                     logger.error(f"Failed to cancel stale {o['id']}: {e}")
 
@@ -1451,6 +1481,10 @@ class BotExecutor:
         # ----------------------------------------
 
         strategy = self._get_strategy_instance(bot_id, bot_config)
+        # 🚀 CRITICAL: Force-sync strategy.params with bot_config every cycle.
+        # The strategy instance is cached and may have stale params (e.g. base_size=150 default)
+        # if it was created before the DB column values were injected into bot_config.
+        strategy.params.update(bot_config)
 
         # 2. Check for missing / filled TP order
         if not existing_tp_order:
@@ -1473,9 +1507,12 @@ class BotExecutor:
                         _c.commit(); _c.close()
                         local_tp_id = None # Allow placement below
                     elif status_str == 'filled' or (status_str == 'closed' and float(order_status.get('filled', 0) or 0) > 0 and float(order_status.get('filled', 0) or 0) >= float(order_status.get('amount', 0) or 0) * 0.99):
-                        actual_exit = float(order_status.get('average') or order_status.get('price') or current_price)
-                        logger.info(f"✅ {name}: Stored TP ID {local_tp_id} is FILLED at {actual_exit}. Triggering reset.")
-                        reset_bot_after_tp(bot_id, actual_exit, direction=direction)
+                        if float(bot_status.get('total_invested', 0)) > 0:
+                            actual_exit = float(order_status.get('average') or order_status.get('price') or current_price)
+                            logger.info(f"✅ {name}: Stored TP ID {local_tp_id} is FILLED at {actual_exit}. Triggering reset.")
+                            reset_bot_after_tp(bot_id, actual_exit, direction=direction)
+                        else:
+                            logger.debug(f"⏭️ {name}: Stored TP ID {local_tp_id} is FILLED, but bot state already zeroed. Skipping.")
                         return None # Exit cycle
                     else:
                          # Still 'new' or 'unknown' but missing from global open_orders list. 
@@ -1525,19 +1562,22 @@ class BotExecutor:
             if (direction == 'LONG' and current_price > tp_price) or (direction == 'SHORT' and current_price < tp_price):
                 gap_occurred = True
                 try:
-                    ticker = exchange.fetch_ticker(pair)
+                    bid, ask = exchange.get_best_bid_ask(pair)
+                    if bid is None or ask is None:
+                        raise ValueError("Failed to fetch bid/ask")
+                    
                     # We are Selling to close a Long. Must join the Asks.
                     if direction == 'LONG':
-                        ask = float(ticker.get('ask') or current_price)
-                        tp_price = max(tp_price, ask)
+                        ask_val = float(ask) if ask else current_price
+                        tp_price = max(tp_price, ask_val)
                         logger.info(f"🚀 {name}: Offline Gap! Current price > TP. Adjusting TP to Ask {tp_price} to preserve Maker.")
                     # We are Buying to close a Short. Must join the Bids.
                     else:
-                        bid = float(ticker.get('bid') or current_price)
-                        tp_price = min(tp_price, bid)
+                        bid_val = float(bid) if bid else current_price
+                        tp_price = min(tp_price, bid_val)
                         logger.info(f"🚀 {name}: Offline Gap! Current price < TP. Adjusting TP to Bid {tp_price} to preserve Maker.")
                 except Exception as e:
-                    logger.warning(f"⚠️ {name}: Offline Gap, but fetch_ticker failed ({e}). Falling back to Taker gap adjustment.")
+                    logger.warning(f"⚠️ {name}: Offline Gap, but fetching bid/ask failed ({e}). Falling back to Taker gap adjustment.")
                     tp_price = current_price
 
             # Re-round just in case
@@ -1568,45 +1608,21 @@ class BotExecutor:
                             if ccxt_params is None:
                                 return None  # Position fully covered by siblings
 
-                            # 🎯 DUST CHASER: position notional below minimum — place postOnly
-                            # limit at best bid/ask instead of a TP at an arbitrary price.
                             if ccxt_params == 'DUST_CHASER':
-                                try:
-                                    bid, ask = exchange.get_best_bid_ask(pair)
-                                    if bid is None or ask is None:
-                                        logger.warning(f"⚠️ {name}: Cannot fetch bid/ask for dust chaser on {pair}. Deferring.")
-                                    else:
-                                        prec_d = exchange.get_symbol_precision(pair)
-                                        # LONG position closes with SELL at bid; SHORT closes with BUY at ask
-                                        chaser_price = exchange.round_to_step(bid if side == 'sell' else ask, prec_d['tick_size'])
-                                        chaser_params = {'postOnly': True, 'timeInForce': 'GTX'}
-                                        # 🚀 FIX: Compact CID that stays under Binance's 36-char limit while
-                                        # still encoding bot_id + step for per-bot tracking.
-                                        chaser_cid = f"CQB_{bot_id}_DUST_{bot_status['current_step']}"
-                                        chaser_params['newClientOrderId'] = chaser_cid
-                                        chaser_order = self._place_gtx_order_with_retry(
-                                            exchange, pair, side, tp_amount, chaser_price,
-                                            params=chaser_params, label=f"{name}-DUST-CHASER"
-                                        )
-                                        if chaser_order:
-                                            save_bot_order(bot_id, 'dust_close', chaser_order['id'], chaser_price,
-                                                           tp_amount, bot_status['current_step'],
-                                                           chaser_order.get('status','open'), client_order_id=chaser_cid)
-                                            logger.info(f"✅ {name}: Dust chaser placed {tp_amount:.4f} {pair} @ {chaser_price} (bid/ask maker)")
-                                except Exception as ce:
-                                    logger.error(f"❌ {name}: Dust chaser error for {pair}: {ce}")
-                            else:
-                                # ---------------------------------
-                                # STANDARD TP PLACEMENT
-                                # ---------------------------------
-                                # 🔑 CRITICAL FIX: Embed the CQB_ clientOrderId so that
-                                # maintain_orders can find this TP in the next open_orders fetch.
-                                ccxt_params['newClientOrderId'] = client_order_id
-    
-                                order = self._place_gtx_order_with_retry(exchange, pair, side, tp_amount, tp_price, params=ccxt_params, label=f"{name}-MAINTAIN-TP")
-                                if order:
-                                    save_bot_order(bot_id, 'tp', order['id'], tp_price, tp_amount, bot_status['current_step'], order.get('status', 'open'), client_order_id=client_order_id)
-                                    logger.info(f"✅ {name}: Maintained TP order for {pair} @ {tp_price}")
+                                logger.error(f"❌ {name}: Reached unreachable DUST_CHASER execution block. Proceeding as if nothing happened.")
+                                return None
+
+                            # ---------------------------------
+                            # STANDARD TP PLACEMENT
+                            # ---------------------------------
+                            # 🔑 CRITICAL FIX: Embed the CQB_ clientOrderId so that
+                            # maintain_orders can find this TP in the next open_orders fetch.
+                            ccxt_params['newClientOrderId'] = client_order_id
+
+                            order = self._place_gtx_order_with_retry(exchange, pair, side, tp_amount, tp_price, params=ccxt_params, label=f"{name}-MAINTAIN-TP")
+                            if order:
+                                save_bot_order(bot_id, 'tp', order['id'], tp_price, tp_amount, bot_status['current_step'], order.get('status', 'open'), client_order_id=client_order_id)
+                                logger.info(f"✅ {name}: Maintained TP order for {pair} @ {tp_price}")
                         except Exception as e:
                             err_msg = str(e)
                             # Handle margin rejections that slip through clipping (e.g. rapid market moves)
@@ -1753,6 +1769,10 @@ class BotExecutor:
                      min_cost_notional = 5.0 if market_type == 'future' else 10.0
                      
                  bot_config['base_size'] = max(min_cost_qty, min_cost_notional) * 1.05
+                 # 🚀 CRITICAL: Keep strategy.params in sync with the use_min_size override.
+                 # Without this, calculate_grid_order_amount reads stale strategy.params['base_size']
+                 # (e.g. 150.0 default) rather than the correctly computed min notional size.
+                 strategy.params['base_size'] = bot_config['base_size']
              else:
                  if getattr(config, 'TESTNET', False) or getattr(config, 'DEMO_TRADING', False):
                      if bot_config.get('base_size', 0) < 100.0:
@@ -1817,19 +1837,22 @@ class BotExecutor:
              # will cross the spread and trigger a -2010 GTX Maker-Only rejection.
              if (direction == 'LONG' and current_price < grid_price) or (direction == 'SHORT' and current_price > grid_price):
                  try:
-                     ticker = exchange.fetch_ticker(pair)
+                     bid, ask = exchange.get_best_bid_ask(pair)
+                     if bid is None or ask is None:
+                         raise ValueError("Failed to fetch bid/ask")
+                     
                      # We are Buying to open a Long grid. Must join the Bids.
                      if direction == 'LONG':
-                         bid = float(ticker.get('bid') or current_price)
-                         grid_price = min(grid_price, bid)
+                         bid_val = float(bid) if bid else current_price
+                         grid_price = min(grid_price, bid_val)
                          logger.info(f"🚀 {name}: Grid Gap! Price Dropped. Adjusting Grid to Bid {grid_price} to preserve Maker.")
                      # We are Selling to open a Short grid. Must join the Asks.
                      else:
-                         ask = float(ticker.get('ask') or current_price)
-                         grid_price = max(grid_price, ask)
+                         ask_val = float(ask) if ask else current_price
+                         grid_price = max(grid_price, ask_val)
                          logger.info(f"🚀 {name}: Grid Gap! Price Rallied. Adjusting Grid to Ask {grid_price} to preserve Maker.")
                  except Exception as e:
-                     logger.warning(f"⚠️ {name}: Grid Gap, but fetch_ticker failed ({e}). Falling back to Taker grid adjustment.")
+                     logger.warning(f"⚠️ {name}: Grid Gap, but fetching bid/ask failed ({e}). Falling back to Taker grid adjustment.")
                      grid_price = current_price
                      
              logger.info(f"🔍 [GRID-MAINTENANCE] {name}: Target=${grid_price} | {grid_explain}")
@@ -2149,7 +2172,7 @@ class BotExecutor:
         
         if config.DRY_RUN:
             log_trade(bot_id, 'STOP_LOSS', pair, current_price, bot_status['total_invested'] / bot_status['avg_entry_price'], bot_status['total_invested'], f'DRY_RUN_SL_{bot_id}', bot_status['current_step'], "Dry run SL", (current_price - bot_status['avg_entry_price']) * bot_status['total_invested'] / bot_status['avg_entry_price'])
-            reset_bot_after_tp(bot_id, current_price, direction=direction)
+            reset_bot_after_tp(bot_id, current_price, direction=direction, action_label='DRY_RUN_SL')
             logger.info(f"📊 [DRY-RUN] Bot {name} would have exited SL for {pair}")
             return
         
@@ -2178,16 +2201,16 @@ class BotExecutor:
                     order = exchange.create_order(pair, 'market', position_side, actual_size)
                     if order:
                         log_trade(bot_id, 'STOP_LOSS_EXIT', pair, current_price, actual_size, current_price * actual_size, f'SL_MARKET_{bot_id}', bot_status['current_step'], "SL Market Exit", (current_price - bot_status['avg_entry_price']) * actual_size)
-                        reset_bot_after_tp(bot_id, current_price, direction=direction)
+                        reset_bot_after_tp(bot_id, current_price, direction=direction, action_label='STOP_LOSS_EXIT')
                         logger.info(f"✅ {name}: Market order placed to close SL for {pair} (ID: {order['id']})")
                     else:
                         logger.error(f"❌ {name}: Failed to place market order for SL exit for {pair}")
                 else:
                     logger.info(f"ℹ️ {name}: No active position found on exchange for {pair} to close. Resetting DB state.")
-                    reset_bot_after_tp(bot_id, current_price, direction=direction)
+                    reset_bot_after_tp(bot_id, current_price, direction=direction, action_label='SYSTEM_WIPE')
             else:
                 logger.info(f"ℹ️ {name}: Bot has 0 avg_entry_price. Resetting DB state without market order.")
-                reset_bot_after_tp(bot_id, current_price, direction=direction)
+                reset_bot_after_tp(bot_id, current_price, direction=direction, action_label='SYSTEM_WIPE')
 
         except Exception as e:
             logger.error(f"❌ {name}: Error executing SL for {pair}: {e}")

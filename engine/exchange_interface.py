@@ -530,12 +530,21 @@ class ExchangeInterface:
         try:
             if config.TESTNET or config.DEMO_TRADING:
                  endpoint = '/fapi/v1/order'
-                 params = {'symbol': normalize_symbol(symbol), 'orderId': order_id}
+                 params = {'symbol': normalize_symbol(symbol)}
+                 if str(order_id).isdigit():
+                     params['orderId'] = order_id
+                 else:
+                     params['origClientOrderId'] = order_id
+                     
                  res = self._raw_request(endpoint, params=params)
                  if res:
-                     return {'id': res['orderId'], 'status': res['status'].lower()}
+                     return {'id': res.get('orderId', order_id), 'status': res.get('status', 'unknown').lower(), 'filled': float(res.get('executedQty', 0)), 'amount': float(res.get('origQty', 0))}
                  return None
-            return self.exchange.fetch_order(order_id, symbol)
+                 
+            if str(order_id).isdigit():
+                return self.exchange.fetch_order(order_id, symbol)
+            else:
+                return self.exchange.fetch_order(order_id, symbol, params={'origClientOrderId': order_id})
         except Exception as e:
             self.logger.error(f"Fetch Order Error for {order_id} (Symbol: {symbol}): {e}")
             raise e

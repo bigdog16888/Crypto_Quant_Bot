@@ -39,29 +39,42 @@ Crypto_Quant_Bot/
 
 **NEVER violate these. Each one was added to fix a real catastrophic bug.**
 
-### 2.1. Symbol Normalization
+### 2.1. Proof-Only Consensus (V1.4.4 Core Rule)
+- **Do NOT trust aggregate exchange notional sums** to make decisions about individual bots.
+- The Engine purely trusts **explicit Order ID proofs (Client Order IDs)** tied to bot executions.
+- If a bot's `total_invested` is out of sync, it MUST be corrected via direct CID `bot_orders` match in the `reconciler.py`. Heuristic-based tracking causes UI ghost position inflation.
+
+### 2.2. Gross-Directional Tracking (V1.4.4)
+- **DO NOT** use signed net math for comparison (e.g. `$0 - (-$143k) = $143k mismatch`).
+- The system groups positions by direction (LONG vs SHORT). If checking a SHORT, we compare the absolute physical exchange value against the absolute sum of all SHORT `trades.total_invested`.
+- This ensures multi-bot strategies covering opposite directions on the same pair do not cannibalize each other safely.
+
+### 2.3. Symbol Normalization
 - **Always** use `normalize_symbol(sym)` from `exchange_interface.py` before comparing or storing symbols.
 - Binance REST/CCXT returns `"BTC/USDC"` (slash). Binance WebSocket pushes `"BTCUSDC"` (no slash).
-- **The ws_cache (V1.4.3 fix) normalizes all keys.** If you bypass this, you'll get duplicate position entries and false Size Discrepancy alerts. This was the V1.4.3 bug.
+- **The ws_cache normalizes all keys.** Bypassing this duplicates positions and triggers Size Discrepancy alerts.
 
-### 2.2. Order Isolation (Multi-Bot Core Rule)
+### 2.4. Order Isolation (Multi-Bot Core Rule)
 - **NEVER call `cancel_all_orders(pair)`** in bot logic. Always use `cancel_orders_by_bot_id(bot_id, pair)`.
 - Every order is tagged with `CQB_{bot_id}_{type}_{step}_{uuid}` as `clientOrderId`.
-- The reconciler and integrity checks use this CID fingerprint as the *only* proof of bot ownership.
+- Database SQLite indexes on `idx_bot_orders_status`, `idx_bot_orders_type`, `idx_bots_pair` are paramount for the 1s sub-loop performance.
 
-### 2.3. Database Is Source of Truth — But Exchange Anchors It
-- The `trades` table tracks each bot's virtual position independently.
-- The exchange snapshot anchors the DB: if `trades.avg_entry_price` drifts >0.5% from Binance's live data, the reconciler overwrites the DB with exchange truth.
-- **Do NOT trust aggregate exchange notional sums** to make decisions about individual bots. Always validate against `bot_orders.client_order_id`.
+### 2.5. TP Reset Synchronization
+- When a TP fills offline, `reconciler.py` calls `reset_bot_after_tp()`.
+- **The action_label MUST be precise** (e.g., `'SYSTEM_WIPE'`, `'ENTRY_TIMEOUT'`). Otherwise, the UI history logs phantom "$0.00 profit TP_HIT" events, polluting the trade journal.
 
-### 2.4. TP Reset Synchronization
-- When a TP fills offline, `reconciler.py` calls `reset_bot_after_tp()` which wipes all `bot_orders` for that cycle to `reset_cleared`.
-- **The TP fill record itself must also be saved as `reset_cleared`**, not `'filled'`. Otherwise the reconciler math loop sees a dangling negative quantity and injects phantom "adoption_add" ghosts. This was the V1.4.2 bug.
-
-### 2.5. reduceOnly Logic
+### 2.6. reduceOnly Logic & OHLCV Caching
 - `reduceOnly=True` on TP orders is ONLY safe when exactly **1 bot** is active on a pair.
-- With >1 bots on a pair, Binance will reject the TP with `-2022 ReduceOnly Order is rejected` if the net aggregate position points the wrong way.
-- `bot_executor.py` dynamically counts sibling bots per pair and chooses accordingly.
+- With >1 bots on a pair, Binance rejects TP with `-2022 ReduceOnly Order is rejected` if the net aggregate position points the wrong way.
+- **OHLCV Caching**: The engine caches 1m candles for ~25s in `runner.py`. NEVER fetch 1m candles un-cached inside `run_cycle` or it will burn through Binance rate limits.
+
+### 2.7. Carry-Over Ghost Mass Protection
+- When a bot is aggressively wiped by the Reconciler (`SYSTEM_WIPE`), `reset_bot_after_tp` **MUST NOT** carry over the mathematical deficit into the next cycle. 
+- Administrative actions (`SYSTEM_WIPE`, `MANUAL_CLOSE`, `STOP_LOSS_EXIT`) are permanently blacklisted from generating `_CARRY_` orders. Breaking this rule causes infinite UI inflation loops.
+
+### 2.8. TP Reset Double-Execution Guard
+- The REST API polling loop in `bot_executor.execute_tp` can and will race against the `ws_event_handlers`.
+- You MUST wrap any manual TP reset with `if total_invested > 0:` to prevent duplicating the reset. Without this limit, the REST loop hits the bot milliseconds after the WS zeroed it, generating false `$0.00 TP_HIT` log entries in the UI.
 
 ---
 

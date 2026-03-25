@@ -68,6 +68,21 @@ def handle_order_update(event: Dict):
         order_type = parts[2]  # ENTRY, TP, GRID
         
         logger.debug(f"📬 WS Processing {order_type} for Bot {bot_id} (Status: {status})")
+
+        # 🕒 HISTORICAL EVENT GUARD: Reject events that occurred before engine startup
+        # CCXT watch_orders() frequently emits recent historical bounds on initial connection.
+        # The StateReconciler already handles these silently. Emitting them here causes double-processing
+        # and triggers false "Entry Filled" notification popups for offline activity.
+        event_timestamp = event.get('timestamp')
+        if event_timestamp:
+            try:
+                from engine.reconciler import ENGINE_START_TIME
+                # Provide a 5-second buffer for connection drift
+                if event_timestamp < (ENGINE_START_TIME * 1000) - 5000:
+                    logger.debug(f"⏭️ WS Ignoring historical order {order_id} (Timestamp: {event_timestamp}) since it predates Engine Start.")
+                    return
+            except ImportError:
+                pass
         
         # FUNDAMENTAL SAFETY CHECK: Is Bot Active?
         # If we process a fill for an inactive bot, we might trigger new orders (Grid/TP)
@@ -89,6 +104,17 @@ def handle_order_update(event: Dict):
             # Final fill — clean up partial tracker and calculate final incremental piece
             tracker_key = f"{bot_id}_{order_id}"
             cumulative_filled = float(event.get('filled_qty', 0) or 0)
+            
+            if tracker_key not in _partial_fill_tracker:
+                try:
+                    from engine.database import get_connection
+                    conn = get_connection()
+                    db_filled = conn.execute("SELECT filled_amount FROM bot_orders WHERE order_id = ? OR client_order_id = ?", (str(order_id), str(client_id))).fetchone()
+                    if db_filled and db_filled[0] is not None:
+                        _partial_fill_tracker[tracker_key] = float(db_filled[0])
+                except Exception as e_pf:
+                    logger.debug(f"[PF-SYNC] Failed to sync tracker for {tracker_key}: {e_pf}")
+                    
             prev_filled = _partial_fill_tracker.pop(tracker_key, 0.0)
             incremental_qty = cumulative_filled - prev_filled
             
@@ -155,6 +181,19 @@ def _handle_order_partial_fill(bot_id: int, order_type: str, event: Dict):
         return
 
     tracker_key = f"{bot_id}_{order_id}"
+    
+    if tracker_key not in _partial_fill_tracker:
+        try:
+            from engine.database import get_connection
+            conn = get_connection()
+            # client_order_id might not always be in event dict, protect with get
+            client_id = str(event.get('client_order_id', event.get('clientOrderId', '')))
+            db_filled = conn.execute("SELECT filled_amount FROM bot_orders WHERE order_id = ? OR client_order_id = ?", (str(order_id), client_id)).fetchone()
+            if db_filled and db_filled[0] is not None:
+                _partial_fill_tracker[tracker_key] = float(db_filled[0])
+        except Exception as e_pf:
+            logger.debug(f"[PF-SYNC] Failed to sync tracker for {tracker_key}: {e_pf}")
+            
     prev_filled = _partial_fill_tracker.get(tracker_key, 0.0)
     incremental_qty = cumulative_filled - prev_filled
 
@@ -176,7 +215,7 @@ def _handle_order_partial_fill(bot_id: int, order_type: str, event: Dict):
 
         # Accumulate the incremental portion into trade state
         try:
-            from engine.database import accumulate_trade_fill, log_trade, update_order_fill
+            from engine.database import accumulate_trade_fill, log_trade, update_order_fill, upsert_active_position_for_bot
             accumulate_trade_fill(
                 bot_id=bot_id,
                 added_invested=avg_price * incremental_qty,
@@ -188,6 +227,16 @@ def _handle_order_partial_fill(bot_id: int, order_type: str, event: Dict):
             )
             log_trade(bot_id, f'WS_{order_type}_PARTIAL', symbol, avg_price, incremental_qty,
                       avg_price * incremental_qty, order_type, step=partial_step)
+            # 🚀 FUNDAMENTAL FIX: Write active_positions for this bot immediately after every partial fill.
+            # Previously only REALITY-AUTO-MAP wrote active_positions — leaving all other same-direction
+            # bots on the same pair without a row, causing permanent mismatch alerts.
+            try:
+                from engine.database import get_connection as _gc
+                _conn = _gc()
+                _bot_dir = (_conn.execute('SELECT direction FROM bots WHERE id=?', (bot_id,)).fetchone() or ['LONG'])[0]
+                upsert_active_position_for_bot(bot_id, symbol, _bot_dir, avg_price)
+            except Exception as e_ap:
+                logger.warning(f"[ACTIVE-POS] partial fill upsert failed for bot {bot_id}: {e_ap}")
             # 🚀 PERSIST partial progress for UI
             update_order_fill(order_id, cumulative_filled, bot_id=bot_id)
         except Exception as e:
@@ -257,7 +306,6 @@ def _handle_order_filled(bot_id: int, order_type: str, event: Dict):
                 (str(order_id), str(client_oid), bot_id)
             )
             conn_fix.commit()
-            conn_fix.close()
             logger.debug(f"[FILL-SAFETY] Used order.amount as filled_amount for order {order_id} (WS filled_qty was 0)")
         
         logger.debug(f"Marked order {order_id} as filled in DB (Final Qty: {cumulative_fill}).")
@@ -342,6 +390,16 @@ def _update_trade_state_from_fill(bot_id: int, order_type: str, symbol: str, avg
         tp_price=tp_price,
         is_entry=is_entry
     )
+    
+    # 🚀 FUNDAMENTAL FIX: Write active_positions for this bot immediately after every full fill.
+    # Same root-cause fix as the partial fill path: every bot with a position needs its own row.
+    try:
+        from engine.database import upsert_active_position_for_bot as _uap, get_connection as _gc
+        _conn = _gc()
+        _bot_dir = (_conn.execute('SELECT direction FROM bots WHERE id=?', (bot_id,)).fetchone() or ['LONG'])[0]
+        _uap(bot_id, symbol, _bot_dir, avg_price)
+    except Exception as e_ap:
+        logger.warning(f"[ACTIVE-POS] full fill upsert failed for bot {bot_id}: {e_ap}")
     
     # Log to history
     log_type = f'WS_{order_type}_FILL'

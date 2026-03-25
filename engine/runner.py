@@ -358,7 +358,22 @@ class BotRunner:
             zombie_fixes = sum(1 for r in results if r.action_taken.value == "reset_to_idle")
             manual_warnings = sum(1 for r in results if r.requires_manual_intervention)
             
-            logger.info(f"Reconciliation complete: {actions_count} actions taken ({zombie_fixes} zombie resets), {manual_warnings} system warnings.")
+            logger.info(f"Reconciliation complete: {actions_count} actions taken ({zombie_fixes} zombie resets), {manual_warnings} manual warnings needed.")
+            
+            # 🚨 Emit loud alerts for anything requiring manual intervention
+            for r in results:
+                if r.requires_manual_intervention:
+                    logger.warning(
+                        f"\n"
+                        f"════════════════════════════════════════════════════\n"
+                        f" ⚠️  MANUAL INTERVENTION REQUIRED: {r.pair}  ⚠️\n"
+                        f"════════════════════════════════════════════════════\n"
+                        f" Reason: {r.details}\n"
+                        f" Action: Go to Binance Web UI → Positions → {r.pair}\n"
+                        f"         Identify which bot (by CQB_ order DNA) owns the gap.\n"
+                        f"         Then manually reset the correct bot to match exchange reality.\n"
+                        f"════════════════════════════════════════════════════"
+                    )
             
         except Exception as e:
             logger.error(f"❌ Critical Error during State Reconciliation: {e}")
@@ -386,7 +401,26 @@ class BotRunner:
                 except Exception as _rf_err:
                     logger.warning(f"⚠️ [STARTUP-SYNC] Offline fill detection failed (non-fatal): {_rf_err}")
 
-            # 1. Get Active Bots (The "Allowed" List)
+            # 🔑 ORDER-ID LEDGER VERIFICATION
+            # After crediting any offline fills, recompute each bot's invested amount
+            # from confirmed CQB_{id}_ order fills. This self-heals any counter drift
+            # caused by WS drops, engine crashes, or mid-update restarts — no manual
+            # DB patching required.
+            try:
+                from engine.database import sync_trades_from_orders
+                _conn = get_connection()
+                _active_ids = [r[0] for r in _conn.execute(
+                    "SELECT id FROM bots WHERE is_active=1"
+                ).fetchall()]
+                _fixes = sum(sync_trades_from_orders(bid) for bid in _active_ids)
+                if _fixes:
+                    logger.info(f"✅ [STARTUP-LEDGER-VERIFY] Corrected {_fixes} bot(s) with ledger drift from order fills.")
+                else:
+                    logger.info("✅ [STARTUP-LEDGER-VERIFY] All bot ledgers are in sync with confirmed order fills.")
+            except Exception as _lv_err:
+                logger.warning(f"⚠️ [STARTUP-LEDGER-VERIFY] Ledger verification failed (non-fatal): {_lv_err}")
+
+
             active_bots = self.get_active_bots()
             allowed_bot_ids = {str(b[0]) for b in active_bots if b[9] == 1} # Only Active bots
             logger.info(f"   > Active Bots Allowed: {allowed_bot_ids}")
@@ -844,8 +878,17 @@ class BotRunner:
                                 if 'USDC' in norm_p: norm_p = norm_p.replace('USDC', '/USDC')
                                 elif 'USDT' in norm_p: norm_p = norm_p.replace('USDT', '/USDT')
                             
-                            p_ohlcv = ex.fetch_ohlcv(norm_p, timeframe='1m', limit=50)
-                            p_df = pd.DataFrame(p_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                            now_t = time.time()
+                            c_key_1m = (p, '1m')
+                            _cached_1m = self._tf_cache.get(c_key_1m)
+                            
+                            # Cache 1m timeframe for 25 seconds to drastically cut REST API pings
+                            if _cached_1m and (now_t - _cached_1m['fetched_at']) < 25:
+                                p_df = _cached_1m['data']
+                            else:
+                                p_ohlcv = ex.fetch_ohlcv(norm_p, timeframe='1m', limit=50)
+                                p_df = pd.DataFrame(p_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                                self._tf_cache[c_key_1m] = {'data': p_df, 'fetched_at': now_t}
                             
                             needed = set()
                             for b_bot in bots:
@@ -856,7 +899,6 @@ class BotRunner:
                                             needed.add(c_cfg.get(key))
                             
                             p_tf_d = {'1m': p_df}
-                            now_t = time.time()
                             for tf_val in needed:
                                 c_key = (p, tf_val)
                                 m_ttl = _TF_TTL.get(tf_val, 300)
@@ -1067,7 +1109,7 @@ class BotRunner:
                                     # We use reset_bot_after_tp to clear the trade record
                                     # Passing 0 as exit price since it's a panic close (or use current price if available)
                                     try:
-                                        reset_bot_after_tp(id, exit_price=0.0)
+                                        reset_bot_after_tp(id, exit_price=0.0, action_label='EMERGENCY_CLOSE')
                                         logger.warning(f"✅ Bot {name} Database Reset after Emergency Close")
                                     except Exception as db_err:
                                         logger.error(f"Failed to reset DB for {name}: {db_err}")
