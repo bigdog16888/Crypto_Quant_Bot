@@ -4,6 +4,8 @@ import threading
 import time
 import sys
 import os
+import logging
+logging.basicConfig(level=logging.INFO, format="%(message)s")
 
 # Add project root to sys.path
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -27,8 +29,26 @@ class MockExchangeInterface:
     def cancel_orders_by_bot_id(self, bot_id, symbol):
         return 0
 
-    def validate_order(self, pair, side, qty, price):
+    def validate_order(self, pair, side, qty, price, **kwargs):
         return True, qty, price, ""
+
+    def get_symbol_precision(self, pair):
+        return {
+            'price_precision': 2,
+            'qty_precision': 3,
+            'step_size': 0.001,
+            'tick_size': 0.01,
+            'min_notional': 5.0
+        }
+
+    def round_to_step(self, value, step=None):
+        return value
+
+    def ceil_to_step(self, value, step=None):
+        return value
+
+    def get_best_bid_ask(self, pair):
+        return 50000.0, 50000.0
 
     def fetch_open_orders(self, pair, force_refresh=False):
         # Return a list of orders for this pair
@@ -37,7 +57,7 @@ class MockExchangeInterface:
 
     def create_order(self, pair, type, side, amount, price=None, params=None, bot_id=None, order_type=None):
         params = params or {}
-        client_oid = params.get('clientOrderId')
+        client_oid = params.get('clientOrderId') or params.get('newClientOrderId')
         
         # Simulate Network Latency to encourage Race Conditions
         time.sleep(0.05) 
@@ -193,22 +213,57 @@ class TestRaceCondition(unittest.TestCase):
             'basket_start_time': 0
         }
         
-        with patch('engine.bot_executor.get_bot_status', return_value=mock_status):
+        # Configure global mocks
+        # Configure global mocks
+        TestRaceCondition.mocks['engine.database'].get_bot_status.return_value = mock_status
+        TestRaceCondition.mocks['engine.database'].get_bot_order_ids.return_value = {}
+        TestRaceCondition.mocks['engine.database'].update_bot_order_exchange_id.return_value = True
+        TestRaceCondition.mocks['engine.database'].save_bot_order.return_value = 1
+        TestRaceCondition.mocks['engine.database'].update_order_status.return_value = True
+        
+        # SQLite connection mocks for internal math
+        mock_cursor = MagicMock()
+        mock_cursor.fetchone.side_effect = [(1,), (0.001, 0.0)] * 100
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value = mock_cursor
+        mock_conn.__enter__.return_value = mock_conn
+        TestRaceCondition.mocks['engine.database'].get_connection.return_value = mock_conn
+
+        # Setup a mock strategy
+        mock_strategy = MagicMock()
+        mock_strategy.calculate_grid_order_price.return_value = (49000.0, "Testing")
+        mock_strategy.calculate_grid_order_amount.return_value = 0.001
+        mock_strategy.calculate_take_profit_price.return_value = 51000.0
+        mock_strategy.calculate_take_profit_amount.return_value = 0.001
+        mock_strategy.max_steps = 5
+
+        with patch.object(self.bot_executor, '_get_strategy_instance', return_value=mock_strategy), \
+             patch.object(self.bot_executor, '_get_phys_pos', return_value={'side': 'LONG', 'size': 0.001, 'contracts': 0.001, 'positionAmt': 0.001}):
             def worker():
-                self.bot_executor.execute_mission(mission, exchange=self.mock_exchange, open_orders_snapshot=None)
+                self.bot_executor.maintain_orders(
+                    bot_id=bot_id,
+                    name=bot_name,
+                    pair=pair,
+                    direction=direction,
+                    bot_status=mock_status,
+                    current_price=50000.0,
+                    exchange=self.mock_exchange,
+                    market_snapshot={},
+                    bot_config={'base_size': 100.0}
+                )
 
             threads = []
             for _ in range(10):
                 t = threading.Thread(target=worker)
                 threads.append(t)
                 t.start()
-            
+                
             for t in threads:
                 t.join()
 
         # ASSERTIONS
-        grid_orders = [o for o in self.shared_orders.values() if '_GRID_' in o.get('clientOrderId', '')]
-        tp_orders = [o for o in self.shared_orders.values() if '_TP_' in o.get('clientOrderId', '')]
+        grid_orders = [o for o in self.shared_orders.values() if '_GRID_' in (o.get('clientOrderId') or '')]
+        tp_orders = [o for o in self.shared_orders.values() if '_TP_' in (o.get('clientOrderId') or '')]
         
         self.assertEqual(len(grid_orders), 1)
         self.assertEqual(len(tp_orders), 1)

@@ -44,18 +44,22 @@ In a simple trading bot, if you have two strategies on the same pair (e.g., Bot 
     -   `cancel_orders_by_bot_id()` is used to safely cancel only one bot's orders.
     -   **Crucial Rule:** Global `cancel_all_orders()` calls are forbidden in standard bot logic as they would wipe out other bots' orders.
 
-### 2.3. Multi-Bot Virtual Positioning & Reconciliation
+### 2.3. Multi-Bot Virtual Positioning & Reconciliation (V1.5.1)
 
-Each bot's state is tracked in the `trades` table. The `reconciler.py` aggregates virtual positions and runs a 3-phase **Exchange-Anchored** sync on every cycle:
+Each bot's state is tracked in the `trades` table. The `reconciler.py` runs a 3-tier Exchange-Anchored sync:
 
-| Phase | What it does |
-|-------|--------------|
-| **Preflight Sync** | Before reading any fill history, `_sync_positions_to_exchange()` compares DB against Binance live positions. **Crucial One-Way Guard**: If multiple bots are active on the same pair, the bot strictly ignores Binance's aggregated position (to prevent math-stealing between Longs/Shorts) and relies purely on individual order receipts (`clientOrderId`). If it is the sole bot, it anchors perfectly to the exchange. |
-| **Idempotency & Partial Guard** | Every offline fill is double-checked against `bot_orders.order_id` AND `trade_history`. The system proactively fetches `fetch_open_orders` alongside closed history to correctly attribute mathematically live fractions of **Partial Fills** that occurred while the DB was asleep/offline. |
-| **Post-Fill Anchor** | After any offline fill is recorded, the system immediately re-fetches the exchange position and overwrites `avg_entry_price`/`total_invested`. Arithmetic drift is impossible. |
-| **TP Safety Guard** | Before calling `reset_bot_after_tp` on a found closed TP, the system verifies the exchange position is actually flat. If a live position still exists, the TP is marked stale and the reset is aborted. |
+| Tier | Trigger | What it does |
+|------|---------|--------------|
+| **T0 — Startup** | Engine start | `prime_startup_snapshot()` → `reconstruct_offline_fills(48h)` → `_align_memory_to_ledger()` → `resolve_net_mismatch()` |
+| **T1 — Fast** | Every ~10 cycles | `reconstruct_offline_fills(2h)` |
+| **T2 — Slow** | Every 60 cycles | `self._reconciler.reconcile_all()` — persistent instance, CARRY_PENDING aware |
 
-> **Key Invariant:** The exchange's live position is the ground truth. The DB always syncs to match, provided the bot has absolute mathematical ownership of the pair. Fractional math is always tracked directly via explicit order IDs.
+**V1.5.1 Safety Gates & Strict Exactness:**
+- **`safe_wipe_bot()`** is the sole authorized path for any destructive bot reset. It enforces 3 guards: CARRY_PENDING phase, physical qty > 0.0005, ledger net qty > 0.0005. Direct calls to `reset_bot_after_tp(..., 'SYSTEM_WIPE')` are forbidden.
+- **`cycle_phase`** column in `trades` distinguishes carried positions from ghosts: `CARRY_PENDING` bots are skipped by ghost detection.
+- **Strict Mathematical Exactness:** If the physical position on the exchange deviates from the DB ledger, the engine looks for organic `CQB_` limit order proofs. **It permanently refuses to inject "synthetic" or fake gap adoptions to make the numbers match artificially.** Any non-proven gap (like drifting fees or manual closes) will persist as a `[FLOAT-DRIFT]` warning on the console, ensuring a professional, 100% proof-based system architecture. The bot safely caps outgoing TP values at `min(virtual, physical)` to prevent direction flips.
+
+> **Key Invariant:** The DB syncs to match physical reality via strict `clientOrderId` proofs ONLY — never via silent aggregate math overwrites or synthetic masking.
 
 ---
 
@@ -162,9 +166,24 @@ The bot has recently undergone a fundamental stabilization phase to ensure multi
 -   **Bot Zeroed While Exchange Has Live Position:** A Previous-cycle TP order was in the 168h history window. This is now blocked by the Exchange-Position Guard in the reconciler. If it happened: re-link the bot via the Manual Link tool in the UI — it will now correctly recover the original step from `bot_orders`.
 -   **Orders Rejected (Min Notional):** Ensure `base_size` is at least $150 (especially on USDC mainnet).
 
+### 4.4. Step Hedge Drawdown Protection Lifecycle (Added 2026-04-09)
+
+The bots feature an advanced "Step Hedge" mechanism protecting against extreme drawdowns, triggered mathematically at a predetermined Martingale Step. Future developers must respect following execution pipeline:
+
+1. **Missing Activation Trigger:** The `check_hedge_entry()` function mathematically calculates the exact crossover threshold inside `engine/manager.py`. This is evaluated by the primary control loop inside `martingale_strategy.py`'s `decide_action()`. 
+2. **Order Emit:** Upon breach, it halts downstream Grid interpolations and emits a unique `hedge_open` command containing scaled `qty` and `price` limits.
+3. **Execution & Idempotency:** The Executor (`bot_executor.py` -> `execute_hedge_lock()`) receives the command. It executes a 1:1 opposing Post-Only LIMIT order to halt absolute net PNL slide. This function loops silently; it computes exactly how much `hedge_qty` currently exists, dynamically injecting Delta limits to perfectly size up.
+4. **Maintenance & TP Ignorance:** The main Take Profit logic (`maintain_orders`) entirely ignores `hedge` orders. Hedge positions sit dormant while the primary position Grid/TP hunts for a standard mathematical exit.
+5. **Retirement & Break-Even Closing:** Once the primary position achieves TP, the bot zeroes out its `total_invested` and drops to a `SCANNING` (Step 0) status. On its next cycle, the specific `_manage_hedge_exit()` interceptor fires. It automatically isolates all surviving `FILLED` hedge orders, generates a weighted Break-Even price, and places a dedicated `HEDGETP` limit order designed to exit the protection sequence perfectly at cost. Once filled, physical hedges are retired via DB updates.
+
 ---
 
 ## 5. Changelog Summary
+
+### Version 1.5.2 (2026-04-09)
+**Strict Proof-Only Enforcement & Float Drift Stabilization**
+- **Permanent Ban on Synthetic Gap Healing:** The "Pass 3" fallback synthesis block in `reconciler.py` has been explicitly deleted. The engine now rigidly adheres to the "Strict Mathematical Exactness" doctrine. Any discrepancies between the physical exchange and the verified `bot_orders` ledger are logged as unprovable `[FLOAT-DRIFT]` warnings but will *never* be patched into the DB artificially.
+- **Physical TP Capping (`min(virtual, physical)`):** Added safety bounds to `bot_executor.py` during Take Profit placement and grid drift-synchronization. If `[FLOAT-DRIFT]` occurs and the internal mathematical target exceeds the physical availability on the exchange, the TP order is clipped to the precise physical position balance. This mathematically prevents `-2022 ReduceOnly` rejections and direction flips while maintaining perfect DB purity.
 
 ### Version 1.4.7 (2026-03-19)
 **Multi-Bot Perfect Hedge Survival & Dust Chaser Upgrades**
@@ -235,11 +254,12 @@ The bot has recently undergone a fundamental stabilization phase to ensure multi
 - **Reconciler Decoupling:** Removed ownership state dependencies.
 
 ---
-This unified document was last updated on **2026-03-19** (v1.4.7).
+This unified document was last updated on **2026-04-09** (v1.5.2).
 
 ## 6. Database Architecture & Concurrency (Added 2026-02-17)
 The system uses **SQLite** in **WAL (Write-Ahead Logging)** mode for high-performance concurrency.
--   **File**: `crypto_bot.db` in the root directory.
+-   **File**: `crypto_bot.db` in the root directory. This is the **SINGULAR, definitive source of truth**. 
+    -  *Note:* If you see files named `database.db`, `trading_bot.db`, or `database.sqlite3`, these are **OBSOLETE** and completely unused by the engine. They are likely remnants of older versions or testing scripts and should be deleted to prevent confusion.
 -   **Concurrency**: 
     -   `runner.py` writes to the DB using `isolation_level=None` and `BEGIN IMMEDIATE` transactions to prevent locking issues.
     -   Streamlit UI reads from the DB in a separate process.

@@ -13,6 +13,7 @@ from engine.database import (
     update_martingale_step,
     log_trade,
     reset_bot_after_tp,
+    safe_wipe_bot,
     save_bot_order,
     update_bot_order_exchange_id,
     get_bot_order_ids,
@@ -82,25 +83,48 @@ class BotExecutor:
             
         return self.strategies[bot_id]
 
-    def _get_phys_pos(self, pair: str) -> Optional[Dict[str, Any]]:
+    def _get_phys_pos(self, pair: str, direction: str = None) -> Optional[Dict[str, Any]]:
         """
         Retrieves the physical exchange position for a pair from the active_positions table.
-        Standardizes symbol lookup via normalize_symbol to match the active_positions storage format.
-        Returns {'size': float, 'side': str} or None.
+        
+        NOTE: active_positions stores ONE row per pair (last reconciled state). In Hedge Mode,
+        the exchange holds LONG and SHORT separately, but only the dominant/last side is in this table.
+        
+        When direction is given: tries exact side match first, then falls back to any row for the pair.
+        This prevents blocking (e.g. short btc can't find its SHORT row because only LONG is stored)
+        while still being direction-aware when both sides are stored separately.
         """
         try:
             from engine.exchange_interface import normalize_symbol
             clean_pair = normalize_symbol(pair)
             from engine.database import get_connection
             with get_connection() as conn:
-                row = conn.execute("SELECT size, side, entry_price FROM active_positions WHERE pair = ?", (clean_pair,)).fetchone()
-                logger.info(f"[PHYS-TRACE] _get_phys_pos called for {pair} -> {clean_pair} | ROW: {row}")
+                if direction:
+                    expected_side = 'LONG' if direction.upper() == 'LONG' else 'SHORT'
+                    # Try exact side match first
+                    row = conn.execute(
+                        "SELECT size, side, entry_price FROM active_positions WHERE pair = ? AND side = ?",
+                        (clean_pair, expected_side)
+                    ).fetchone()
+                    if not row:
+                        # Fall back: active_positions has only one row per pair — use it regardless of side
+                        row = conn.execute(
+                            "SELECT size, side, entry_price FROM active_positions WHERE pair = ?",
+                            (clean_pair,)
+                        ).fetchone()
+                else:
+                    row = conn.execute(
+                        "SELECT size, side, entry_price FROM active_positions WHERE pair = ?",
+                        (clean_pair,)
+                    ).fetchone()
+                logger.info(f"[PHYS-TRACE] _get_phys_pos called for {pair} -> {clean_pair} dir={direction} | ROW: {row}")
                 if row:
                     return {'size': float(row[0]), 'side': str(row[1]).upper(), 'entry_price': float(row[2])}
             return None
         except Exception as e:
             logger.warning(f"⚠️ [PHYS-SENSE] Lookup failed for {pair}: {e}")
             return None
+
 
     def _is_order_net_reducing(self, pair, side, qty):
         """
@@ -137,13 +161,17 @@ class BotExecutor:
         """
         ccxt_params = {'postOnly': True, 'timeInForce': 'GTX'}
 
-        # 1. Get physical reality for sanity cap
-        pos_info = self._get_phys_pos(pair)
+        # 1. Get physical reality for sanity cap (direction-filtered for Hedge Mode)
+        # Pass the bot's direction so in Hedge Mode we only see OUR side's row,
+        # not a sibling bot's opposing position.
+        bot_direction = 'LONG' if side.lower() == 'sell' else 'SHORT'
+        pos_info = self._get_phys_pos(pair, direction=bot_direction)
         phys_qty = pos_info['size'] if pos_info else 0.0
 
         if phys_qty <= 0.0:
-            logger.info(f"INFO {name}: No physical position on exchange for {pair}. TP not needed.")
+            logger.info(f"INFO {name}: No physical {bot_direction} position on exchange for {pair}. TP not needed.")
             return None, None
+
 
         # 2. Calculate THIS bot's own virtual open qty from its ledger
         # This is the authoritative source for how much THIS bot should close.
@@ -159,7 +187,7 @@ class BotExecutor:
                 # Sum this bot's own filled entries minus exits for the current cycle
                 _cur.execute("""
                     SELECT 
-                        COALESCE(SUM(CASE WHEN order_type IN ('entry', 'grid', 'adoption_add') THEN filled_amount ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN order_type IN ('entry', 'grid', 'adoption_add', 'adoption') THEN filled_amount ELSE 0 END), 0),
                         COALESCE(SUM(CASE WHEN order_type IN ('tp', 'close', 'adoption_reduce', 'dust_close', 'sl') THEN filled_amount ELSE 0 END), 0)
                     FROM bot_orders
                     WHERE bot_id = ? 
@@ -421,6 +449,44 @@ class BotExecutor:
 
             exchange = self._get_thread_exchange(market_type) # Use thread-specific exchange
             
+            # 🚀 FUNDAMENTAL FIX: Drain the WS TP deferred cancel registry.
+            # When a TP fills via WebSocket (ws_event_handlers._handle_order_filled),
+            # there is no exchange object available to cancel lingering grid orders.
+            # The handler registers (bot_id, pair) in get_pending_cancel_after_tp().
+            # Here — on the very next bot tick — we have exchange access and drain it:
+            # any open bot-tagged orders on the pair are cancelled, preventing orphaned fills.
+            try:
+                from engine.ws_event_handlers import get_pending_cancel_after_tp
+                pending = get_pending_cancel_after_tp()
+                if (bot_id, pair) in pending:
+                    logger.info(f"🧹 [DEFERRED-CANCEL] Draining WS TP cancel registry for bot {name} ({bot_id}) / {pair}.")
+                    try:
+                        open_orders = exchange.fetch_open_orders(pair)
+                        bot_tag = f"CQB_{bot_id}_"
+                        for o in open_orders:
+                            cid = o.get('clientOrderId', '')
+                            oid = o.get('id')
+                            if not cid.startswith(bot_tag):
+                                continue
+                            logger.info(f"🧹 [DEFERRED-CANCEL] Cancelling orphan-risk order {oid} ({cid}) for {name}.")
+                            try:
+                                exchange.cancel_order(oid, pair)
+                                from engine.database import update_order_status as _uos_dc
+                                _uos_dc(oid, 'cancelled', bot_id=bot_id)
+                            except Exception as e_dc_cancel:
+                                logger.warning(f"⚠️ [DEFERRED-CANCEL] Could not cancel {oid}: {e_dc_cancel}")
+                    except Exception as e_dc_fetch:
+                        logger.warning(f"⚠️ [DEFERRED-CANCEL] fetch_open_orders failed: {e_dc_fetch}")
+                    # Re-register others that were not for this bot (avoid consuming their entry)
+                    # Note: get_pending_cancel_after_tp() already clears the full set.
+                    # Re-add entries that don't belong to this bot so they get processed on their own tick.
+                    for entry in pending:
+                        if entry != (bot_id, pair):
+                            from engine.ws_event_handlers import _pending_cancel_after_tp
+                            _pending_cancel_after_tp.add(entry)
+            except Exception as e_drain:
+                logger.debug(f"[DEFERRED-CANCEL] Registry drain error: {e_drain}")
+            
             current_price = exchange.get_last_price(pair) # Get current price
             if not current_price:
                 logger.warning(f"Could not get current price for {pair}. Skipping bot {name}.")
@@ -443,14 +509,15 @@ class BotExecutor:
                 bot_config['base_size'] = auto_min_size
                 logger.debug(f"AUTO-MIN-SIZE {pair}: exchange_min=${exchange_min_notional:.2f} → base_size=${auto_min_size:.2f}")
             else:
-                # Safety clamp: if configured base_size is below the exchange real minimum, enforce it
+                # 🚀 STRICT VALIDATION: If configured base_size is below exchange real minimum, HALT.
                 prec = exchange.get_symbol_precision(pair)
                 exchange_min_notional = prec.get('min_notional', None)
                 if exchange_min_notional is None:
                     exchange_min_notional = 100.0 if (getattr(config, 'TESTNET', False) or getattr(config, 'DEMO_TRADING', False)) else 5.0
                 if bot_config.get('base_size', 0) < exchange_min_notional:
-                    logger.warning(f"⚠️ {pair}: Configured base_size=${bot_config.get('base_size',0):.2f} below exchange min ${exchange_min_notional:.2f}. Auto-correcting.")
-                    bot_config['base_size'] = exchange_min_notional * 1.05
+                    logger.error(f"⛔ CONFIG ERROR [{pair}]: Configured base_size=${bot_config.get('base_size',0):.2f} is below exchange minimum ${exchange_min_notional:.2f}. Halting bot. Please update config.")
+                    update_bot_error(bot_id, "Config Error")
+                    return None, None
 
             # Inject the fully hydrated config into strategy calculation
             strategy = self._get_strategy_instance(bot_id, bot_config, json.dumps(bot_config))
@@ -605,25 +672,47 @@ class BotExecutor:
                                    from engine.database import get_all_active_trades_for_pair
                                    sibling_bots = get_all_active_trades_for_pair(pair)
                                    
-                                   # Calculate total signed virtual USD for this pair from all active siblings
-                                   sib_net_usd = 0.0
-                                   for b in sibling_bots:
-                                        if b['direction'].upper() == 'LONG':
-                                            sib_net_usd += float(b.get('total_invested', 0))
-                                        else:
-                                            sib_net_usd -= float(b.get('total_invested', 0))
+                                   # 🚀 Calculate exact signed virtual quantities directly from the ledger
+                                   # This prevents floating point division drift from historical invested vs live notional
+                                   from engine.database import get_connection
+                                   sib_net_qty = 0.0
+                                   conn = get_connection()
+                                   try:
+                                        cursor = conn.cursor()
+                                        for b in sibling_bots:
+                                            sibling_id = b['bot_id']
+                                            cursor.execute("""
+                                                SELECT COALESCE(SUM(
+                                                    CASE 
+                                                        WHEN order_type IN ('entry', 'grid', 'adoption_add', 'adoption') THEN filled_amount
+                                                        WHEN order_type IN ('adoption_reduce', 'tp', 'close', 'dust_close', 'sl') THEN -filled_amount
+                                                        ELSE 0.0
+                                                    END
+                                                ), 0.0) 
+                                                FROM bot_orders 
+                                                WHERE bot_id = ? AND status NOT IN ('reset_cleared', 'auto_closed', 'canceled', 'rejected')
+                                                AND (cycle_id = (SELECT MAX(cycle_id) FROM bot_orders WHERE bot_id = ?) OR cycle_id IS NULL)
+                                            """, (sibling_id, sibling_id))
+                                            row = cursor.fetchone()
+                                            q = float(row[0]) if row else 0.0
                                             
-                                   # 🚀 SIGN CONVENTION FIX: Compare magnitudes not signed USD values.
-                                   # 'size' from CCXT is signed (negative for SHORT positions),
-                                   # but sib_net_usd uses unsigned total_invested values.
-                                   # Comparing signed vs unsigned caused ($0 - (-$143k)) = $143k mismatch,
-                                   # blocking all new entries whenever ANY short position existed on a pair.
-                                   phys_net_usd_abs = abs(size) * current_price
-                                   sib_net_usd_abs  = abs(sib_net_usd)
+                                            if b['direction'].upper() == 'LONG':
+                                                sib_net_qty += q
+                                            else:
+                                                sib_net_qty -= q
+                                   finally:
+                                        conn.close()
+                                            
+                                   # 🚀 Compare actual quantities to ignore market price fluctuations
+                                   phys_net_qty_abs = abs(size)
+                                   sib_net_qty_abs  = abs(sib_net_qty)
                                    
-                                   # If physical magnitude exceeds virtual by > $50, it's an orphaned/manual position.
-                                   if abs(sib_net_usd_abs - phys_net_usd_abs) > 50.0:
-                                        logger.critical(f"🛑 {name}: Blocked NEW ENTRY! Exchange magnitude ${phys_net_usd_abs:.2f} vs System ${sib_net_usd_abs:.2f} mismatch > $50. Resolve Mismatch first!")
+                                   # Convert quantity drift back to USD simply to keep the threshold metric ($50 tolerance)
+                                   drift_qty = abs(sib_net_qty_abs - phys_net_qty_abs)
+                                   drift_usd = drift_qty * current_price
+                                   
+                                   if drift_usd > 50.0:
+                                        logger.critical(f"🛑 {name}: Blocked NEW ENTRY! Exchange magnitude {phys_net_qty_abs:.6f} vs System {sib_net_qty_abs:.6f} mismatch > $50. Resolve Mismatch first!")
                                         can_enter = False
                                    else:
                                         from engine.database import get_last_filled_order
@@ -723,6 +812,14 @@ class BotExecutor:
                 logger.critical(f"🛑 [ENTRY-GIVEUP] Bot {name}: Entry attempt cycle stale for > 30m ({attempt_time_sec:.1f}s). Abandoning.")
                 try:
                     exchange.cancel_order(existing_entry_order['id'], pair)
+                    time.sleep(1)
+                    
+                    # 🚀 FORENSIC FIX: Verify the order wasn't filled perfectly inline with our cancel
+                    final_status = exchange.fetch_order(existing_entry_order['id'], pair)
+                    if final_status and float(final_status.get('filled', 0)) > 0:
+                        logger.warning(f"🚨 [RACE-CONDITION PREVENTED] Bot {name}: Hard-cap cancelled entry was ACTUALLY filled for {final_status.get('filled')}! Adopting fill instead of abandoning.")
+                        return None
+                        
                     update_order_status(existing_entry_order['id'], 'cancelled', bot_id=bot_id)
                     # Reset the bot internally - if unfilled, this returns it to Scanning
                     # We pass exit_price=0 to indicate abandonment
@@ -731,7 +828,7 @@ class BotExecutor:
                     logger.info(f"✅ Bot {name}: Strategy reset to SCANNING after Entry Hard-Cap.")
                     return None
                 except Exception as e_cap:
-                    logger.error(f"❌ Bot {name}: Failed to execute hard-cap entry reset: {e_cap}")
+                    logger.error(f"❌ Bot {name}: Failed to execute hard-cap entry reset (might already be filled): {e_cap}")
                     return None
 
             if order_age_sec > CHASE_TIMEOUT_SEC:
@@ -746,10 +843,20 @@ class BotExecutor:
                 logger.info(f"⏱️ Bot {name}: Entry order {existing_entry_order['id']} is {order_age_sec:.1f}s old. Cancelling to CHASE price...")
                 try:
                     exchange.cancel_order(existing_entry_order['id'], pair)
-                    existing_entry_order = None # Reset so we place a new one below
                     time.sleep(1) # Brief pause to ensure cancellation propagates
+                    
+                    # 🚀 FORENSIC FIX: Verify the order wasn't filled the millisecond before we canceled it
+                    final_status = exchange.fetch_order(existing_entry_order['id'], pair)
+                    if final_status and float(final_status.get('filled', 0)) > 0:
+                        logger.warning(f"🚨 [RACE-CONDITION PREVENTED] Bot {name}: Cancelled entry {existing_entry_order['id']} was ACTUALLY filled for {final_status.get('filled')}! Adopting fill.")
+                        return None
+                    else:
+                        existing_entry_order = None # Safely reset so we place a new one below
+                        
                 except Exception as e:
-                    logger.error(f"❌ Bot {name}: Failed to cancel stale entry order: {e}")
+                    logger.error(f"❌ Bot {name}: Failed to cancel stale entry order (might already be filled): {e}")
+                    # If we failed to cancel, it might have filled. DO NOT REPLACE IT!
+                    return None
             else:
                 logger.info(f"⏳ Bot {name}: Entry order {existing_entry_order['id']} is {order_age_sec:.1f}s old (Timeout: {CHASE_TIMEOUT_SEC}s). Waiting...")
                 return None
@@ -871,175 +978,7 @@ class BotExecutor:
                     update_bot_error(bot_id, f"Entry Error: {error_msg}")
                     return
 
-        # 2. Check for missing / filled TP order
-        if not existing_tp_order and bot_status['total_invested'] > 0: # Only place TP if in trade
-            # Determine TP details
-            tp_price = strategy.calculate_take_profit_price(bot_status, current_price)
-            tp_amount = strategy.calculate_take_profit_amount(bot_status, current_price, pair, exchange) # Pass exchange
 
-            if tp_amount > 0 and tp_price > 0:
-                if config.DRY_RUN:
-                    logger.info(f"📊 [DRY-RUN] Bot {name} would place TP order for {pair} @ {tp_price}")
-                else:
-                    # Validate TP order
-                    # 🚀 CLOSING FLAG: Prevents the ExchangeInterface from upscaling TP orders strictly for Min Notional rules.
-                    valid, tp_amount, tp_price, msg = exchange.validate_order(pair, 'sell' if direction == 'LONG' else 'buy', tp_amount, tp_price, is_closing=True)
-                    if not valid:
-                        logger.error(f"❌ TP Order validation failed for {name} {pair}: {msg}")
-                        update_bot_error(bot_id, f"TP Order validation failed: {msg}")
-                        return
-                    
-                    try:
-                        client_order_id = self._generate_deterministic_id(bot_id, 'TP', bot_status['current_step'])
-                        # 🚀 FIXED: Map direction to exchange side for TP
-                        side = 'sell' if direction == 'LONG' else 'buy'
-                        order = self._place_gtx_order_with_retry(exchange, pair, side, tp_amount, tp_price, params={'clientOrderId': client_order_id, 'postOnly': True, 'timeInForce': 'GTX'}, label=f"{name}-TP")
-                        if order:
-                            save_bot_order(bot_id, 'tp', order['id'], tp_price, tp_amount, bot_status['current_step'], order.get('status', 'open'), client_order_id=client_order_id)
-                            logger.info(f"✅ {name}: Placed TP order for {pair} @ {tp_price} (ID: {order['id']})")
-                            
-                            # 🚀 GAP RECOVERY FIX: Sync the reconstructed live TP back to trades.target_tp_price
-                            try:
-                                from engine.database import get_connection
-                                _upd_conn = get_connection()
-                                _upd_conn.execute("UPDATE trades SET target_tp_price=? WHERE bot_id=?", (tp_price, bot_id))
-                                _upd_conn.commit()
-                                _upd_conn.close()
-                                bot_status['target_tp_price'] = tp_price # update local memory too
-                            except Exception as _sync_err:
-                                logger.warning(f"Failed to sync reconstructed TP to DB for {name}: {_sync_err}")
-
-                            existing_tp_order = order # 🚀 FIXED: Assign to memory so Step 4 doesn't delete it
-                            update_bot_error(bot_id, None) # Clear any previous error
-                    except Exception as e:
-                        error_msg = str(e)
-                        logger.error(f"❌ {name}: Error placing TP order for {pair}: {error_msg}")
-                        update_bot_error(bot_id, f"TP Order Error: {error_msg}")
-
-        # 2b. EE/SYNC DRIFT CHECK: existing TP at wrong price or qty
-        elif existing_tp_order and bot_status.get('total_invested', 0) > 0:
-            db_tp  = self._compute_effective_tp(bot_id, name, bot_status, bot_config, strategy)
-            db_qty = strategy.calculate_take_profit_amount(bot_status, current_price, pair, exchange)
-            exchange_tp  = float(existing_tp_order.get('price') or existing_tp_order.get('stopPrice') or 0)
-            exchange_qty = self._get_order_amount(existing_tp_order)
-
-            if db_tp > 0 and exchange_tp > 0:
-                tp_drift_pct  = abs(db_tp  - exchange_tp)  / db_tp
-                qty_drift_pct = abs(db_qty - exchange_qty) / max(db_qty, 0.0001)
-                if tp_drift_pct > 0.001 or qty_drift_pct > 0.01:
-                    logger.info(f"[SYNC-DRIFT] {name}: TP drifted price {tp_drift_pct*100:.4f}% qty {qty_drift_pct*100:.2f}%. Replacing.")
-                    existing_tp_order = self._sync_replace_tp(
-                        bot_id, name, pair, direction, bot_status, exchange,
-                        db_tp, db_qty, existing_tp_order
-                    )
-
-        # 3. Check for missing / filled Grid order
-        if not existing_grid_order and bot_status['current_step'] < strategy.max_steps and bot_status['total_invested'] > 0:
-            # Determine Grid details
-            grid_res = strategy.calculate_grid_order_price(bot_status, current_price, market_data=bot_market_data, multi_tf_data=bot_multi_tf)
-            grid_price, grid_explain = grid_res if isinstance(grid_res, tuple) else (grid_res, "")
-            grid_amount = strategy.calculate_grid_order_amount(bot_status, current_price, pair, exchange)
-
-            if grid_amount > 0 and grid_price > 0:
-                if config.DRY_RUN:
-                    logger.info(f"📊 [DRY-RUN] Bot {name} would place Grid order for {pair} @ {grid_price}")
-                else:
-                    side = 'buy' if direction == 'LONG' else 'sell'
-                    valid, grid_amount, grid_price, msg = exchange.validate_order(pair, side, grid_amount, grid_price)
-                    if not valid:
-                        logger.error(f"❌ Grid Order validation failed for {name} {pair}: {msg}")
-                        return
-                    
-                    try:
-                        client_order_id_grid = self._generate_deterministic_id(bot_id, 'GRID', bot_status['current_step'] + 1)
-                        # 🚀 PRE-COMMIT: Write 'placing' row to DB BEFORE exchange call.
-                        # If engine shuts down between here and the save below, the reconciler
-                        # finds this row by clientOrderId and recovers the fill automatically.
-                        _grid_pre_id = save_bot_order(bot_id, 'grid', f'PLACING_{client_order_id_grid}', grid_price, grid_amount,
-                                                      bot_status['current_step'] + 1, 'placing', client_order_id=client_order_id_grid,
-                                                      notes=grid_explain)
-                        order = self._place_gtx_order_with_retry(exchange, pair, side, grid_amount, grid_price, params={'clientOrderId': client_order_id_grid, 'postOnly': True, 'timeInForce': 'GTX'}, label=f"{name}-GRID-{bot_status['current_step'] + 1}")
-                        if order:
-                            update_bot_order_exchange_id(_grid_pre_id, order['id'], order.get('status', 'open'))
-                            logger.info(f"✅ {name}: Placed Grid order for {pair} @ {grid_price} (ID: {order['id']})")
-                            existing_grid_order = order
-                        else:
-                            update_bot_order_exchange_id(_grid_pre_id, None, 'failed')
-                    except Exception as e:
-                        logger.error(f"❌ {name}: Error placing Grid order for {pair}: {e}")
-
-        
-        # 3b. GRID SYNC-DRIFT: If grid exists but price is imprecise or drifted
-        elif existing_grid_order and bot_status['total_invested'] > 0:
-            grid_res = strategy.calculate_grid_order_price(bot_status, current_price, market_data=bot_market_data, multi_tf_data=bot_multi_tf)
-            target_grid_price, grid_explain = grid_res if isinstance(grid_res, tuple) else (grid_res, "")
-            
-            if target_grid_price > 0:
-                side = 'buy' if direction == 'LONG' else 'sell'
-                # Safe fallback for amount key — varies by source (CCXT vs DB cache)
-                grid_amt_existing = float(existing_grid_order.get('amount') or existing_grid_order.get('origQty') or existing_grid_order.get('qty') or 0)
-                # Pass through validation to get correct precision
-                _, _, target_grid_price, _ = exchange.validate_order(pair, side, grid_amt_existing, target_grid_price)
-                
-                curr_grid_price = float(existing_grid_order.get('price', 0))
-                
-                # ATR-grid bots intentionally lock the ATR at grid placement time (locked_atr).
-                # Re-computing the ATR every cycle will always produce a slightly different price,
-                # so we SKIP GRID-SYNC for ATR grids to prevent the constant cancel/replace loop.
-                use_atr_grid = bot_config.get('UseATRGrid', False)
-                if use_atr_grid:
-                    # Only replace if price drifted by more than 2x the tick size (true correction only)
-                    try:
-                        _mkt = exchange.exchange.markets.get(pair, {})
-                        tick = float(_mkt.get('precision', {}).get('price') or 0.01)
-                    except Exception:
-                        tick = 0.01
-                    if abs(curr_grid_price - target_grid_price) <= 2 * tick:
-                        pass  # No replacement needed
-                    else:
-                        logger.debug(f"[GRID-SYNC] {name}: ATR-grid large drift ({curr_grid_price:.4f} -> {target_grid_price:.4f}). Skipping auto-replace (ATR-locked).")
-                        # Do NOT cancel — ATR grids are anchored at placement
-                else:
-                    # Non-ATR grids: replace if price drifted > 0.5% (was 0.1%, widened to stop noise triggers)
-                    if abs(curr_grid_price - target_grid_price) / max(target_grid_price, 0.0001) > 0.005:
-                        # 🚀 ROOT CAUSE FIX: Check for partial fills before cancelling!
-                        # We cannot cancel a grid that has money in it, or we delete the evidence footprint.
-                        current_fill = float(existing_grid_order.get('filled', 0))
-                        if current_fill > 0:
-                             logger.info(f"🛡️ [GRID-SYNC] {name}: Grid drifted, but has partial fill ({current_fill}). CANCEL BLOCKED.")
-                        else:
-                            logger.info(f"🔄 [GRID-SYNC] {name}: Grid drifted ({curr_grid_price:.4f} -> {target_grid_price:.4f}). Replacing.")
-                            try:
-                                grid_order_id = existing_grid_order.get('order_id', existing_grid_order.get('id'))
-                                exchange.cancel_order(grid_order_id, pair)
-                                update_order_status(grid_order_id, 'cancelled', bot_id=bot_id)
-                                existing_grid_order = None
-                            except Exception as e_grid_sync:
-                                logger.error(f"❌ [GRID-SYNC] {name}: Failed to cancel drifted grid: {e_grid_sync}")
-                        
-        # 4. Cleanup any untracked open orders for this bot
-        # 🚀 FIXED: Handle None for existing orders prevents AttributeError
-        # 🚀 FIXED: Order IDs in local DB are under `order_id`, while local row primary keys are `id`. We must default to `order_id` to compare physical IDs properly.
-        known_order_ids = []
-        if existing_tp_order: known_order_ids.append(existing_tp_order.get('order_id', existing_tp_order.get('id')))
-        if existing_grid_order: known_order_ids.append(existing_grid_order.get('order_id', existing_grid_order.get('id')))
-        
-        # Also protect the Entry order from being cancelled as "untracked"
-        if existing_entry_order:
-             known_order_ids.append(existing_entry_order.get('order_id', existing_entry_order.get('id')))
-        
-        for order in bot_open_orders:
-            # Skip if it is an Entry order (handled primarily by strategy logic)
-            if '_ENTRY_' in order.get('clientOrderId', ''):
-                continue
-                
-            if order['id'] not in known_order_ids:
-                logger.warning(f"⚠️ {name}: Untracked open order {order['id']} for {pair}. Cancelling.")
-                try:
-                    exchange.cancel_order(order['id'], pair) # Use exchange's cancel_order, not specific bot
-                    update_order_status(order['id'], 'cancelled', bot_id=bot_id)
-                except Exception as e:
-                    logger.error(f"Failed to cancel untracked order {order['id']}: {e}")
 
     def execute_exit_tp(self, bot_id, name, pair, direction, bot_status, current_price, exchange: ExchangeInterface, market_snapshot: Dict[str, Any], bot_config: Dict[str, Any]):
         if not config.TRADING_ENABLED and not config.DRY_RUN:
@@ -1076,6 +1015,36 @@ class BotExecutor:
                         if float(bot_status.get('total_invested', 0)) > 0:
                             actual_exit = float(order_status.get('average') or order_status.get('price') or current_price)
                             logger.info(f"✅ {name}: TP order {tp_order_id} filled at {actual_exit}. Resetting bot.")
+                            
+                            # 🚀 FUNDAMENTAL FIX: Cancel ALL remaining open orders for this bot
+                            # on the exchange BEFORE resetting the DB cycle.
+                            #
+                            # Root cause of XRP orphan: after step-5 TP fills, bot had a step-6 GRID
+                            # already resting on the exchange. reset_bot_after_tp only resets the DB —
+                            # it cannot cancel exchange orders. The step-6 grid continued filling
+                            # post-cycle-reset, creating 6430 XRP with no DB record.
+                            #
+                            # Solution: any open orders except the filled TP itself must be purged
+                            # from the exchange before the cycle rolls to N+1.
+                            try:
+                                all_open = exchange.fetch_open_orders(pair)
+                                bot_tag = f"CQB_{bot_id}_"
+                                for o in all_open:
+                                    cid = o.get('clientOrderId', '')
+                                    oid = o.get('id')
+                                    if not cid.startswith(bot_tag):
+                                        continue
+                                    if str(oid) == str(tp_order_id):
+                                        continue  # Skip the TP that just filled (may still appear briefly)
+                                    logger.info(f"🧹 {name}: Purging orphan-risk order {oid} ({cid}) from exchange before cycle reset.")
+                                    try:
+                                        exchange.cancel_order(oid, pair)
+                                        update_order_status(oid, 'cancelled', bot_id=bot_id)
+                                    except Exception as e_cancel:
+                                        logger.warning(f"⚠️ {name}: Could not cancel lingering order {oid}: {e_cancel}")
+                            except Exception as e_fetch:
+                                logger.warning(f"⚠️ {name}: Could not fetch open orders before reset: {e_fetch}")
+                            
                             reset_bot_after_tp(bot_id, actual_exit, direction=direction)
                         else:
                             logger.debug(f"⏭️ {name}: TP order {tp_order_id} is filled, but bot state is already zeroed (handled by WS). Skipping redundant reset.")
@@ -1120,6 +1089,24 @@ class BotExecutor:
             cur = conn.cursor()
             
             # 1. Fetch filled hedge orders for this bot
+            
+            # C. Retirement Logic: If the last HEDGETP filled, retire the hedge orders BEFORE generating new ones
+            cur.execute(
+                "SELECT status FROM bot_orders WHERE bot_id=? AND order_type='hedge_tp' ORDER BY id DESC LIMIT 1",
+                (bot_id,)
+            )
+            last_tp = cur.fetchone()
+            if last_tp and last_tp[0] in ('filled', 'closed'):
+                logger.info(f"🛡️ {name}: Hedge TP confirmed filled. Retiring hedge positions.")
+                cur.execute(
+                    "UPDATE bot_orders SET status='hedge_exited', updated_at=? "\
+                    "WHERE bot_id=? AND order_type='hedge' AND status='filled'",
+                    (int(time.time()), bot_id)
+                )
+                conn.commit()
+                conn.close()
+                return
+
             cur.execute(
                 "SELECT SUM(amount * price) / SUM(amount), SUM(amount), side FROM bot_orders "
                 "WHERE bot_id=? AND order_type='hedge' AND status='filled' GROUP BY side",
@@ -1368,6 +1355,18 @@ class BotExecutor:
             # 🚀 NEW: Call centralized hedge exit manager
             self._manage_hedge_exit(bot_id, name, pair, direction, bot_open_orders, exchange)
 
+            # 🛡️ STEP-0 EARLY RETURN (Fix 3 — Infinite Cancellation Loop Prevention)
+            # The bot is SCANNING: no position is open, total_invested ≤ 10, step == 0.
+            # All dangling ghost orders above have been purged. We MUST return NOW.
+            # Without this return, the function falls through to TP/Grid placement code
+            # and immediately creates new orders, which the next cycle will detect and purge —
+            # an infinite cancel-and-recreate loop that floods Binance with cancellations.
+            logger.debug(
+                f"✅ {name}: Step-0 / scanning state — all ghost orders purged. "
+                f"Returning early (no TP/Grid placement for scanning bots)."
+            )
+            return None
+
         # 🚀 STEP-SYNC FIX: Ensure open orders match the CURRENT martingale step.
         # If we just had a grid fill, the old TP (from a previous step) is stale.
         current_step = bot_status['current_step']
@@ -1509,7 +1508,41 @@ class BotExecutor:
                     elif status_str == 'filled' or (status_str == 'closed' and float(order_status.get('filled', 0) or 0) > 0 and float(order_status.get('filled', 0) or 0) >= float(order_status.get('amount', 0) or 0) * 0.99):
                         if float(bot_status.get('total_invested', 0)) > 0:
                             actual_exit = float(order_status.get('average') or order_status.get('price') or current_price)
-                            logger.info(f"✅ {name}: Stored TP ID {local_tp_id} is FILLED at {actual_exit}. Triggering reset.")
+                            filled_amount = float(order_status.get('filled', 0) or order_status.get('amount', 0))
+                            logger.info(f"✅ {name}: Stored TP ID {local_tp_id} is FILLED at {actual_exit} (Qty: {filled_amount}). Triggering reset.")
+                            
+                            # 🚀 CRITICAL DB FIX: Record the TP fill in bot_orders BEFROE resetting!
+                            # If the REST API caught this fill before the WebSocket did, the database doesn't
+                            # know the TP filled. If we call 'reset_bot_after_tp' now, the old cycle math
+                            # will show Entries > Exits, and it will erroneously CARRY OVER the full position
+                            # forever. We MUST mark this specific local_tp_id as filled + amount.
+                            try:
+                                from engine.database import update_order_status as _uos
+                                _uos(local_tp_id, 'filled', bot_id=bot_id, filled_qty=filled_amount)
+                                logger.debug(f"🧹 {name}: Force-marked TP {local_tp_id} as filled in DB to prevent CARRY bugs.")
+                            except Exception as e_uos:
+                                logger.warning(f"⚠️ {name}: Failed to mark TP {local_tp_id} as filled: {e_uos}")
+                            
+                            # 🚀 FUNDAMENTAL FIX: purge all remaining open orders before cycle reset
+                            try:
+                                all_open = exchange.fetch_open_orders(pair)
+                                bot_tag = f"CQB_{bot_id}_"
+                                for o in all_open:
+                                    cid = o.get('clientOrderId', '')
+                                    oid = o.get('id')
+                                    if not cid.startswith(bot_tag):
+                                        continue
+                                    if str(oid) == str(local_tp_id):
+                                        continue
+                                    logger.info(f"🧹 {name}: Purging orphan-risk order {oid} ({cid}) before cycle reset.")
+                                    try:
+                                        exchange.cancel_order(oid, pair)
+                                        update_order_status(oid, 'cancelled', bot_id=bot_id)
+                                    except Exception as e_c:
+                                        logger.warning(f"⚠️ {name}: Could not cancel {oid}: {e_c}")
+                            except Exception as e_f:
+                                logger.warning(f"⚠️ {name}: fetch_open_orders before reset failed: {e_f}")
+                            
                             reset_bot_after_tp(bot_id, actual_exit, direction=direction)
                         else:
                             logger.debug(f"⏭️ {name}: Stored TP ID {local_tp_id} is FILLED, but bot state already zeroed. Skipping.")
@@ -1683,14 +1716,24 @@ class BotExecutor:
              # CRITICAL FIX: total_invested and avg_entry_price are in TRADES table, not BOTS.
              try:
                  phys_positions = market_snapshot.get('positions', []) if market_snapshot else []
-                 phys_net = 0.0
+                 phys_long = 0.0
+                 phys_short = 0.0
                  for p in phys_positions:
                      if normalize_symbol(p.get('symbol', '')) == normalize_symbol(pair):
-                         size = float(p.get('contracts', 0) or 0)
-                         if p.get('side', '').upper() == 'SHORT':
-                             phys_net -= size
-                         else:
-                             phys_net += size
+                         size = float(p.get('contracts', 0) or abs(float(p.get('positionAmt', 0))))
+                         
+                         side = p.get('side', '').upper()
+                         if not side: # fallback for one-way mode where side might be missing
+                             pos_amount = float(p.get('positionAmt', 0))
+                             if pos_amount < 0:
+                                 side = 'SHORT'
+                             elif pos_amount > 0:
+                                 side = 'LONG'
+                                 
+                         if side == 'SHORT':
+                             phys_short += size
+                         elif side == 'LONG':
+                             phys_long += size
 
                  from engine.database import get_connection as _gc_guard
                  _conn_g = _gc_guard()
@@ -1704,27 +1747,30 @@ class BotExecutor:
                  active_bots_guard = _cur_g.fetchall()
                  _conn_g.close()
 
-                 virtual_net = 0.0
+                 virtual_long = 0.0
+                 virtual_short = 0.0
                  for b_dir, b_inv, b_avg in active_bots_guard:
                      if b_inv and b_avg and float(b_avg) > 0:
                          b_qty = float(b_inv) / float(b_avg)
                          if str(b_dir).upper() == 'LONG':
-                             virtual_net += b_qty
+                             virtual_long += b_qty
                          else:
-                             virtual_net -= b_qty
+                             virtual_short += b_qty
 
-                 if abs(virtual_net) > 0.001:
-                     if abs(phys_net) > abs(virtual_net) * 1.10:
+                 phys_net = phys_long if direction == 'LONG' else phys_short
+                 virtual_net = virtual_long if direction == 'LONG' else virtual_short
+
+                 if virtual_net > 0.001:
+                     if phys_net > virtual_net * 1.10:
                          logger.warning(
-                             f"🛑 {name}: Physical net {phys_net:.4f} >> virtual net {virtual_net:.4f} "
-                             f"(+{((abs(phys_net)/abs(virtual_net))-1)*100:.0f}%). "
+                             f"🛑 {name}: Physical {direction} {phys_net:.4f} >> virtual {direction} {virtual_net:.4f} "
+                             f"(+{(phys_net/virtual_net - 1)*100:.0f}%). "
                              f"Offline fill unprocessed. SKIPPING grid until reconciler catches up."
                          )
                          return None
                  else:
-                     # virtual_net ≈ 0: fully hedged multi-bot pair. Normal. Only block if phys is very large.
-                     if abs(phys_net) > 0.01:
-                         logger.warning(f"🛑 {name}: Physical net {phys_net:.4f} but virtual net ~0 (fully hedged). SKIPPING grid.")
+                     if phys_net > 0.01:
+                         logger.warning(f"🛑 {name}: Physical {direction} {phys_net:.4f} but virtual {direction} ~0. SKIPPING grid.")
                          return None
              except Exception as _guard_err:
                  logger.debug(f"Physical-size guard check failed for {name}: {_guard_err}")
@@ -1763,21 +1809,24 @@ class BotExecutor:
                  prec = exchange.get_symbol_precision(pair)
                  step_size = prec.get('step_size', 0.001)
                  min_cost_qty = step_size * current_price
-                 if getattr(config, 'TESTNET', False) or getattr(config, 'DEMO_TRADING', False):
-                     min_cost_notional = 100.0
-                 else:
-                     min_cost_notional = 5.0 if market_type == 'future' else 10.0
+                 
+                 exchange_min_notional = prec.get('min_notional', None)
+                 if exchange_min_notional is None:
+                     exchange_min_notional = 100.0 if (getattr(config, 'TESTNET', False) or getattr(config, 'DEMO_TRADING', False)) else 5.0
                      
-                 bot_config['base_size'] = max(min_cost_qty, min_cost_notional) * 1.05
+                 bot_config['base_size'] = max(min_cost_qty, exchange_min_notional) * 1.05
                  # 🚀 CRITICAL: Keep strategy.params in sync with the use_min_size override.
                  # Without this, calculate_grid_order_amount reads stale strategy.params['base_size']
                  # (e.g. 150.0 default) rather than the correctly computed min notional size.
                  strategy.params['base_size'] = bot_config['base_size']
              else:
-                 if getattr(config, 'TESTNET', False) or getattr(config, 'DEMO_TRADING', False):
-                     if bot_config.get('base_size', 0) < 100.0:
-                         bot_config['base_size'] = 105.0
-            
+                 prec = exchange.get_symbol_precision(pair)
+                 exchange_min_notional = prec.get('min_notional', None)
+                 if exchange_min_notional is None:
+                     exchange_min_notional = 100.0 if (getattr(config, 'TESTNET', False) or getattr(config, 'DEMO_TRADING', False)) else 5.0
+                 if bot_config.get('base_size', 0) < exchange_min_notional:
+                     logger.error(f"⛔ CONFIG ERROR [{pair}]: Configured base_size=${bot_config.get('base_size',0):.2f} is below exchange minimum ${exchange_min_notional:.2f}. Halting grid.")
+                     return
              # 🚀 STRICT SYNCHRONOUS STATE LOCK (GRID)
              # Wait if the DB already thinks a Grid is open, but CCXT was just too slow to show it.
              if len(local_grid_ids) > 0:
@@ -1950,16 +1999,48 @@ class BotExecutor:
                 else:
                     # Non-ATR grids: replace if price drifted > 0.5% (was 0.1%, widened to stop noise triggers)
                     if abs(curr_grid_price - target_grid_price) / max(target_grid_price, 0.0001) > 0.005:
-                        logger.info(f"🔄 [GRID-SYNC] {name}: Grid drifted ({curr_grid_price:.4f} -> {target_grid_price:.4f}). Replacing.")
-                        try:
-                            grid_order_id = existing_grid_order.get('order_id', existing_grid_order.get('id'))
-                            exchange.cancel_order(grid_order_id, pair)
-                            filled_qty = float(existing_grid_order.get('filled', 0) or 0)
-                            update_order_status(grid_order_id, 'cancelled', bot_id=bot_id, filled_qty=filled_qty)
-                            existing_grid_order = None # Force re-place in next cycle
-                        except Exception as e_grid_sync:
-                            logger.error(f"❌ [GRID-SYNC] {name}: Failed to cancel drifted grid: {e_grid_sync}")
+                        # 🚀 ROOT CAUSE FIX (mirrored from Block 1, line ~1009):
+                        # A grid with a partial fill MUST NOT be cancelled — the filled portion
+                        # is evidence of real inventory. Cancelling it wipes that proof from the ledger
+                        # and leaves the bot without a grid order (e.g. SUI GRID_9: 53.1 filled, then
+                        # cancelled by this block which lacked this guard).
+                        current_fill = float(existing_grid_order.get('filled', 0) or 0)
+                        if current_fill > 0:
+                            logger.info(f"🛡️ [GRID-SYNC] {name}: Grid drifted, but has partial fill ({current_fill}). CANCEL BLOCKED — partial fill is real inventory.")
+                        else:
+                            logger.info(f"🔄 [GRID-SYNC] {name}: Grid drifted ({curr_grid_price:.4f} -> {target_grid_price:.4f}). Replacing.")
+                            try:
+                                grid_order_id = existing_grid_order.get('order_id', existing_grid_order.get('id'))
+                                exchange.cancel_order(grid_order_id, pair)
+                                filled_qty = float(existing_grid_order.get('filled', 0) or 0)
+                                update_order_status(grid_order_id, 'cancelled', bot_id=bot_id, filled_qty=filled_qty)
+                                existing_grid_order = None # Force re-place in next cycle
+                            except Exception as e_grid_sync:
+                                logger.error(f"❌ [GRID-SYNC] {name}: Failed to cancel drifted grid: {e_grid_sync}")
                         
+        # 🚀 HEDGE CHECK: If we reached the Hedge Step, evaluate and dynamically lock size.
+        # Evaluated purely parallel to TP/Grid maintenance to preserve the core ecosystem.
+        try:
+            from engine.manager import check_hedge_entry, calculate_hedge_lot
+            hedge_mission = check_hedge_entry(int(bot_status.get('current_step', 0)), bot_config)
+            if hedge_mission:
+                avg_price = max(float(bot_status.get('avg_entry_price', 1)), 1e-9)
+                raw_invested_qty = float(bot_status.get('total_invested', 0)) / avg_price
+                hedge_qty = calculate_hedge_lot(raw_invested_qty, bot_config)
+                
+                prec = exchange.get_symbol_precision(pair)
+                qty_step = prec.get('step_size', 0.001)
+                hedge_qty = exchange.round_to_step(hedge_qty, qty_step)
+                
+                if hedge_qty > 0:
+                    logger.info(f"🛡️ {name}: Hedge threshold active (Step {bot_status['current_step']}). Executing Hedge Lock...")
+                    self.execute_hedge_lock(
+                        bot_id, name, pair, direction, bot_status, current_price, hedge_qty,
+                        hedge_mission['trigger_step'], exchange, bot_config
+                    )
+        except Exception as e_hedge_eval:
+             logger.error(f"❌ {name}: Failed to evaluate hedge lock in maintain_orders: {e_hedge_eval}")
+
         return None
 
 
@@ -2206,94 +2287,18 @@ class BotExecutor:
                     else:
                         logger.error(f"❌ {name}: Failed to place market order for SL exit for {pair}")
                 else:
-                    logger.info(f"ℹ️ {name}: No active position found on exchange for {pair} to close. Resetting DB state.")
-                    reset_bot_after_tp(bot_id, current_price, direction=direction, action_label='SYSTEM_WIPE')
+                    logger.info(f"ℹ️ {name}: No active position found on exchange for {pair} to close. Running wipe guard before DB reset.")
+                    # 🗡️ ARCHITECTURAL: Gate through safe_wipe_bot() — blocks CARRY_PENDING or if ledger still shows net units
+                    safe_wipe_bot(bot_id, pair, direction, reason="SL_EXIT_NO_POSITION: exchange has 0 units to close", exit_price=current_price)
             else:
-                logger.info(f"ℹ️ {name}: Bot has 0 avg_entry_price. Resetting DB state without market order.")
-                reset_bot_after_tp(bot_id, current_price, direction=direction, action_label='SYSTEM_WIPE')
+                logger.info(f"ℹ️ {name}: Bot has 0 avg_entry_price. Running wipe guard before DB reset.")
+                # 🗡️ ARCHITECTURAL: Gate through safe_wipe_bot() — blocks CARRY_PENDING or if ledger still shows net units
+                safe_wipe_bot(bot_id, pair, direction, reason="SL_EXIT_ZERO_PRICE: avg_entry_price is 0, no market order needed", exit_price=current_price)
 
         except Exception as e:
             logger.error(f"❌ {name}: Error executing SL for {pair}: {e}")
 
-    def _manage_hedge_exit(self, bot_id: int, name: str, pair: str, direction: str, 
-                           bot_open_orders: List[Dict], exchange: ExchangeInterface):
-        """
-        Manages the exit of FILLED hedge positions at Break-Even price.
-        Logic:
-        1. Check if we have any FILLED hedge orders in DB for this bot.
-        2. If YES, we MUST have a HEDGETP order open on the exchange.
-        3. If NO HEDGETP open, place one at the weighted avg price of the hedge.
-        4. If a HEDGETP order FILLED (determined by order status), mark old hedges as 'hedge_exited'.
-        """
-        try:
-            from engine.database import get_connection, update_order_status
-            conn = get_connection()
-            cursor = conn.cursor()
 
-            # A. Check for FILLED hedge orders that haven't been retired yet
-            cursor.execute("""
-                SELECT id, order_id, price, amount FROM bot_orders 
-                WHERE bot_id=? AND order_type='hedge' AND status='filled'
-            """, (bot_id,))
-            filled_hedges = cursor.fetchall()
-
-            if not filled_hedges:
-                conn.close()
-                return
-
-            # B. Check if a HEDGETP order already exists (open or filled)
-            cursor.execute("""
-                SELECT order_id, status FROM bot_orders 
-                WHERE bot_id=? AND order_type='hedgetp' ORDER BY id DESC LIMIT 1
-            """, (bot_id,))
-            last_tp = cursor.fetchone()
-
-            # C. Retirement Logic: If the last HEDGETP filled, retire the hedge orders
-            if last_tp and last_tp[1] in ('filled', 'closed'):
-                logger.info(f"🛡️ {name}: Hedge TP {last_tp[0]} confirmed filled. Retiring hedge positions.")
-                cursor.execute("""
-                    UPDATE bot_orders SET status='hedge_exited', updated_at=? 
-                    WHERE bot_id=? AND order_type='hedge' AND status='filled'
-                """, (int(time.time()), bot_id))
-                conn.commit()
-                conn.close()
-                return
-
-            # D. Maintenance: Ensure HEDGETP order exists on exchange
-            # Filter from current open orders
-            open_hedgetp = next((o for o in bot_open_orders if '_HEDGETP_' in o.get('clientOrderId', '')), None)
-
-            if not open_hedgetp:
-                # Calculate weighted average entry of the hedge
-                total_qty = sum(row[3] for row in filled_hedges)
-                total_cost = sum(row[2] * row[3] for row in filled_hedges)
-                hedge_avg_price = total_cost / total_qty if total_qty > 0 else 0
-
-                if total_qty > 0 and hedge_avg_price > 0:
-                    # Hedge side is SAME as original bot direction (to close the hedge which is opposite)
-                    tp_side = 'buy' if direction.upper() == 'LONG' else 'sell'
-                    
-                    # Deterministic ID for retirement tracking
-                    cid = self._generate_deterministic_id(bot_id, 'HEDGETP', 999) # 999 is reserved for hedge tp
-                    
-                    logger.warning(f"🛡️ {name}: Hedge filled but no HEDGETP found. Placing BE exit {tp_side.upper()} {total_qty} @ {hedge_avg_price}")
-                    
-                    params = {'timeInForce': 'GTC', 'clientOrderId': cid}
-                    order = exchange.create_order(pair, 'limit', tp_side, total_qty, hedge_avg_price, params=params)
-                    
-                    if order:
-                        cursor.execute("""
-                            INSERT INTO bot_orders (bot_id, step, order_type, order_id, price, amount, status, created_at, client_order_id, notes)
-                            VALUES (?, ?, 'hedgetp', ?, ?, ?, 'open', ?, ?, ?)
-                        """, (bot_id, 999, order['id'], hedge_avg_price, total_qty, int(time.time()), cid, "Hedge BE Exit"))
-                        conn.commit()
-                        logger.info(f"✅ {name}: Multi-step Hedge BE exit placed. ID={order['id']}")
-            
-            conn.close()
-
-        except Exception as e:
-            logger.error(f"🛡️ {name}: _manage_hedge_exit failed: {e}")
-            logger.error(traceback.format_exc())
 
     def check_for_safety_stop(self):
         """

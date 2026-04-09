@@ -258,38 +258,22 @@ class BotRunner:
                     logger.error(f"❌ Failed to initialize {m_type} exchange: {e}")
                     # Continue - don't crash engine just because one market failed
 
-            # 3. Deep Reconciliation (Auto-Healing & Smart Adoption)
-            # Must run AFTER exchanges are up but BEFORE bots start processing.
-            from engine.reconciler import DeepReconciler
-            try:
-                logger.info("🚀 [STARTUP] Running Deep Reconciliation & Smart Adoption...")
-                recon = DeepReconciler(self.exchanges)
-                recon.run() 
-            except Exception as e:
-                logger.error(f"Failed to run Deep Reconciliation: {e}")
+            # 3. Deep Reconciliation is handled by prime_startup_snapshot below.
+            # DeepReconciler.run() was removed (2026-04): it made a redundant fetch_positions
+            # call before prime_startup_snapshot(), causing a sequential startup delay and
+            # double-reconciliation. prime_startup_snapshot() + reconstruct_offline_fills()
+            # are the authoritative startup reconciliation path.
             
             # Use a single reconciler instance for subsequent checks
-            from engine.reconciler import StateReconciler
+            # 📸 PHASE 2: prime_startup_snapshot() fetches positions ONCE atomically.
+            # This replaces the separate fetch_positions loop that used to fire here
+            # AND the duplicate fetch inside reconstruct_offline_fills below.
             reconciler = StateReconciler(self.exchanges)
-            
-            # FUNDAMENTAL FIX: Force Instant DB Snapshot
-            # Populate active_positions table IMMEDIATELY so UI shows "Red" (Syncing) or Real Data, not "Green" (Empty)
             try:
-                logger.info("📸 [STARTUP] Forcing immediate exchange snapshot...")
-                snapshot_positions = []
-                for mt, ex in self.exchanges.items():
-                    if ex:
-                        pos = ex.fetch_positions()
-                        if pos: snapshot_positions.extend(pos)
-                
-                # Write to DB immediately
-                if snapshot_positions:
-                    update_active_positions_snapshot(snapshot_positions)
-                    logger.info(f"✅ [STARTUP] Active Positions Table updated with {len(snapshot_positions)} positions.")
-                else:
-                    logger.info("✅ [STARTUP] Active Positions Table cleared (No positions found).")
+                logger.info("📸 [STARTUP] Priming single exchange snapshot (Phase 2 architecture)...")
+                reconciler.prime_startup_snapshot()
             except Exception as e:
-                logger.error(f"❌ [STARTUP] Failed to force initial snapshot: {e}")
+                logger.error(f"❌ [STARTUP] Failed to prime startup snapshot: {e}")
             
             # 4. Write-Ahead Logging Cleanup (Phase 3)
             # Recover any pending orders from previous crashed session.
@@ -305,17 +289,8 @@ class BotRunner:
                 logger.error(f"Failed to run WAL cleanup: {e}")
             
             # 5. Offline Fill Detection (Phase 4)
-            # Check if any orders filled while bot was offline.
-            try:
-                # Offline fills need to be checked per exchange
-                if reconciler:
-                    for m_type, ex in self.exchanges.items():
-                        if ex:
-                            offline_stats = reconciler.reconstruct_offline_fills(since_hours=48)
-                            if offline_stats['grid_fills'] + offline_stats['tp_fills'] + offline_stats['entry_fills'] > 0:
-                                logger.info(f"📋 Offline Fills ({m_type}): {offline_stats['entry_fills']} entries, {offline_stats['grid_fills']} grids, {offline_stats['tp_fills']} TPs")
-            except Exception as e:
-                logger.error(f"Failed to detect offline fills: {e}")
+            # NOTE: reconstruct_offline_fills is called ONCE in startup_sync().
+            # Removed duplicate call here (Phase 2 architecture — single offline-fill pass).
             
             
             # 6. WebSocket Stream Initialization moved to explicit startup or run_cycle
@@ -419,6 +394,41 @@ class BotRunner:
                     logger.info("✅ [STARTUP-LEDGER-VERIFY] All bot ledgers are in sync with confirmed order fills.")
             except Exception as _lv_err:
                 logger.warning(f"⚠️ [STARTUP-LEDGER-VERIFY] Ledger verification failed (non-fatal): {_lv_err}")
+
+            # 🚀 ROOT CAUSE FIX: After crediting offline fills and verifying the ledger,
+            # run _align_memory_to_ledger() to ensure the trades table exactly matches
+            # the bot_orders ledger before any trading decisions are made.
+            # This is the definitive self-heal for the System vs Exchange discrepancies.
+            try:
+                if self._reconciler:
+                    self._reconciler._align_memory_to_ledger()
+                    logger.info("✅ [STARTUP] Memory-to-ledger alignment complete.")
+            except Exception as _smal_err:
+                logger.warning(f"⚠️ [STARTUP] Memory-to-ledger alignment failed (non-fatal): {_smal_err}")
+
+            # 🔬 BIDIRECTIONAL PROOF RECONCILIATION — run at every startup.
+            # Verifies all ledger orders against exchange (PASS 1) and scans exchange
+            # fills for DNA-matched orders not yet in bot_orders (PASS 2).
+            # This is the definitive fix for SUI/XRP/BTC ghost-position discrepancies.
+            try:
+                if self._reconciler:
+                    logger.info("🔬 [STARTUP] Running bidirectional physical position reconciliation...")
+                    _adopt_results = self._reconciler.adopt_from_physical_positions(limit_per_symbol=500)
+                    if _adopt_results:
+                        for _bid, _res in _adopt_results.items():
+                            logger.info(
+                                f"  📊 Bot {_bid} ({_res.get('symbol')} {_res.get('side')}): "
+                                f"phys={_res.get('phys_qty'):.4f} "
+                                f"proved={_res.get('proved_qty', 0):.4f} "
+                                f"healed={_res.get('p1_healed', 0)} "
+                                f"adopted={_res.get('p2_adopted', 0)} "
+                                f"match={_res.get('qty_matched')}"
+                            )
+                    else:
+                        logger.info("  [STARTUP] No physical positions to reconcile.")
+            except Exception as _adopt_err:
+                logger.warning(f"⚠️ [STARTUP] Physical adoption scan failed (non-fatal): {_adopt_err}")
+
 
 
             active_bots = self.get_active_bots()
@@ -671,17 +681,64 @@ class BotRunner:
 
         # 🛡️ PERIODIC OFFLINE FILL DETECTION (every 10 cycles ≈ every 5 min)
         # Safety net for Demo WS which can silently miss fill events.
-        # Runs fast (2h window) to keep latency low.
+        # 🚀 ROOT CAUSE FIX: Use 24h window every 50th cycle (≈25 min) to catch fills
+        # that happened more than 2h ago — these were permanently missed by the rolling 2h scan.
         if self.cycle_count % 10 == 0 and self._reconciler:
             try:
-                logger.info(f"[PERIODIC] Running offline fill scan (2h window, cycle {self.cycle_count})...")
-                _pof_stats = self._reconciler.reconstruct_offline_fills(since_hours=2)
+                # Use 24h window once per hour (every 50 cycles) to catch old fills
+                scan_hours = 24 if self.cycle_count % 50 == 0 else 2
+                logger.info(f"[PERIODIC] Running offline fill scan ({scan_hours}h window, cycle {self.cycle_count})...")
+                _pof_stats = self._reconciler.reconstruct_offline_fills(since_hours=scan_hours)
                 if _pof_stats.get('total', 0) > 0:
                     logger.info(f"✅ [PERIODIC] Offline fills credited: {_pof_stats}")
                 else:
                     logger.info(f"✅ [PERIODIC] No new fills found in scan.")
             except Exception as _pof_err:
                 logger.warning(f"Periodic offline fill scan failed (non-fatal): {_pof_err}")
+
+        # 🔧 PERIODIC LEDGER ALIGNMENT (every 30 cycles ≈ every 15 min)
+        # 🚀 ROOT CAUSE FIX: _align_memory_to_ledger() compares trades table against bot_orders ledger
+        # and corrects any drift. Without this, ledger gaps accumulate silently forever.
+        if self.cycle_count % 30 == 0 and self._reconciler:
+            try:
+                logger.info(f"[PERIODIC] Running memory-to-ledger alignment (cycle {self.cycle_count})...")
+                self._reconciler._align_memory_to_ledger()
+                logger.info("✅ [PERIODIC] Memory-to-ledger alignment complete.")
+            except Exception as _mal_err:
+                logger.warning(f"Periodic memory-to-ledger alignment failed (non-fatal): {_mal_err}")
+
+        # 🔬 PERIODIC BIDIRECTIONAL PROOF RECONCILIATION (every 60 cycles ≈ every 30 min)
+        # Runs adopt_from_physical_positions() to:
+        #   PASS 0: Auto-reset bots whose position was externally closed (exchange=0, DB=open)
+        #   PASS 1: Verify existing bot_orders fills against exchange reality (heal fill amounts)
+        #   PASS 2: Scan exchange fill history for DNA-matching fills not yet in ledger (adopt carry-overs)
+        # This runs continuously so gaps are auto-healed without requiring engine restarts.
+        if self.cycle_count % 60 == 0 and self._reconciler:
+            try:
+                logger.info(f"[PERIODIC] Running bidirectional proof reconciliation (cycle {self.cycle_count})...")
+                _adopt_results = self._reconciler.adopt_from_physical_positions()
+                resets    = sum(1 for r in _adopt_results.values() if r.get('action') == 'auto_reset')
+                p1_healed = sum(r.get('p1_healed', 0) for r in _adopt_results.values())
+                p2_adopted = sum(r.get('p2_adopted', 0) for r in _adopt_results.values())
+                logger.info(
+                    f"✅ [PERIODIC] Proof reconciliation: {resets} auto-resets, "
+                    f"{p1_healed} P1-healed, {p2_adopted} P2-adopted."
+                )
+            except Exception as _adopt_err:
+                logger.warning(f"Periodic bidirectional proof reconciliation failed (non-fatal): {_adopt_err}")
+
+        # 📸 PERIODIC SNAPSHOT REFRESH (every 60 cycles ≈ every 30 min)
+        # Re-primes the WS cache with a fresh exchange position snapshot.
+        # Keeps UI dashboard positions current without needing full restart.
+        if self.cycle_count % 60 == 0 and self._reconciler:
+            try:
+                logger.debug(f"[PERIODIC] Refreshing exchange position snapshot (cycle {self.cycle_count})...")
+                self._reconciler.prime_startup_snapshot()
+                logger.debug("✅ [PERIODIC] Exchange snapshot refreshed successfully.")
+            except Exception as _snap_err:
+                logger.warning(f"Periodic snapshot refresh failed (non-fatal): {_snap_err}")
+
+
 
         # 🚀 [WS-HEALTH-CHECK] Ensure real-time stream is active
         try:
@@ -1030,12 +1087,12 @@ class BotRunner:
         # Catches any state desyncs that slipped through Layers 1 and 2
         # ============================================================
         self.cycle_count += 1
-        if self.cycle_count % 60 == 0:
+        if self.cycle_count % 60 == 0 and self._reconciler:
             try:
-                from engine.reconciler import StateReconciler
-                logger.info("🔄 Running periodic position reconciliation...")
-                recon = StateReconciler(self.exchanges)
-                recon.reconcile_all()
+                # 🏗️ PHASE 4: Use persistent self._reconciler — no new instantiation.
+                # The persistent instance carries CARRY_PENDING state awareness.
+                logger.info("🔄 Running periodic position reconciliation (persistent reconciler)...")
+                self._reconciler.reconcile_all()
                 logger.info("🔄 Periodic position reconciliation complete")
             except Exception as e:
                 logger.warning(f"Periodic reconciliation failed: {e}")

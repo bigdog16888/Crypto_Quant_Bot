@@ -44,9 +44,9 @@ class TestStateManager(unittest.TestCase):
         self.sm.exchange.exchange.fetch_positions.return_value = [
             {'symbol': 'BTC/USDT', 'contracts': 0.002, 'entryPrice': 50000.0}
         ]
-        # open orders
+        # open orders (must have bot's clientOrderId to be recognized as TP)
         self.sm.exchange.exchange.fetch_open_orders.return_value = [
-            {'id': '123', 'symbol': 'BTC/USDT'}
+            {'id': '123', 'symbol': 'BTC/USDT', 'clientOrderId': 'CQB_1_TP_TEST'}
         ]
         
         state = self.sm.get_bot_state(1)

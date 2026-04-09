@@ -145,6 +145,7 @@ class BinanceUserDataStream:
                     'price': float(order_data.get('p', 0)),
                     'qty': float(order_data.get('q', 0)),
                     'filled_qty': float(order_data.get('z', 0)),
+                    'incremental_qty': float(order_data.get('l', 0)),
                     'avg_price': float(order_data.get('ap', 0)),
                     'realized_pnl': float(order_data.get('rp', 0)),
                     'timestamp': data.get('E')

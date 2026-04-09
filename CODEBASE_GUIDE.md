@@ -1,5 +1,5 @@
 # Crypto Quant Bot — AI Agent Codebase Guide
-**Version: 1.4.3 | Last Updated: 2026-03-13**
+**Version: 1.5.0 | Last Updated: 2026-04-07**
 
 > **READ THIS FIRST** before touching any code. This guide documents the critical architectural invariants, known failure patterns, and correct debugging procedures for the system.
 
@@ -39,10 +39,10 @@ Crypto_Quant_Bot/
 
 **NEVER violate these. Each one was added to fix a real catastrophic bug.**
 
-### 2.1. Proof-Only Consensus (V1.4.4 Core Rule)
-- **Do NOT trust aggregate exchange notional sums** to make decisions about individual bots.
-- The Engine purely trusts **explicit Order ID proofs (Client Order IDs)** tied to bot executions.
-- If a bot's `total_invested` is out of sync, it MUST be corrected via direct CID `bot_orders` match in the `reconciler.py`. Heuristic-based tracking causes UI ghost position inflation.
+### 2.1. Rejection of Heuristics and Artificial Masking (V1.5.1)
+- In **V1.5.1**, all "heuristic-based" guessing, float-drift tolerances, and artificial "gap adoption" rows have been **strictly eliminated**.
+- A professional quant system requires $0.00 difference between its internal ledger and verified exchange proofs. If a gap emerges between the physical exchange mass and the database virtual mass, the engine will search Binance's trade history for exact `CQB_` ClientOrderID proofs.
+- **If no exact proof is found, the system completely refuses to synthetically mask the gap.** The discrepancy is openly warned as `[FLOAT-DRIFT]` or `[NET-MISMATCH]`, forcing organic resolution (manual user closure or natural 0-state wiping upon TP fill). The bot safely caps its TP orders to `min(virtual_qty, physical_qty)` to prevent ghost direction flips.
 
 ### 2.2. Gross-Directional Tracking (V1.4.4)
 - **DO NOT** use signed net math for comparison (e.g. `$0 - (-$143k) = $143k mismatch`).
@@ -76,7 +76,39 @@ Crypto_Quant_Bot/
 - The REST API polling loop in `bot_executor.execute_tp` can and will race against the `ws_event_handlers`.
 - You MUST wrap any manual TP reset with `if total_invested > 0:` to prevent duplicating the reset. Without this limit, the REST loop hits the bot milliseconds after the WS zeroed it, generating false `$0.00 TP_HIT` log entries in the UI.
 
----
+### 2.9. Pre-Reset Exchange Purge
+- Before calling `reset_bot_after_tp()`, the system MUST physically cancel all remaining open orders for that bot on the exchange.
+- This prevents orphaned Grid orders from filling "after the bot has moved on", which historically created unowned positions (e.g. XRP 6430 unit orphan).
+- Handles both synchronous REST exits and asynchronous WebSocket fills (via `_pending_cancel_after_tp` registry).
+
+### 2.10. Unified Ledger Mathematics
+- All position calculations MUST use the definitive ledger sum logic:
+    - **Entries:** `('entry', 'grid', 'adoption_add', 'adoption')`
+    - **Exits:** `('tp', 'close', 'exit', 'adoption_reduce', 'dust_close', 'sl')`
+- Any deviation creates "ledger gaps" where the UI reports a mismatch despite the bot having all necessary data in `bot_orders`.
+
+### 2.11. `safe_wipe_bot()` Is the ONLY Authorized Reset Path (V1.5.0)
+- **NEVER** call `reset_bot_after_tp(bot_id, ..., action_label='SYSTEM_WIPE')` directly.
+- ALL destructive resets go through `safe_wipe_bot(bot_id, pair, direction, reason, exit_price)` in `database.py`.
+- 3 guards enforced before any wipe:
+  - **Guard 1:** Blocked if `trades.cycle_phase == 'CARRY_PENDING'`
+  - **Guard 2:** Blocked if exchange physical qty > 0.0005
+  - **Guard 3:** Blocked if `bot_orders` ledger net qty > 0.0005
+- **⚠️ Python scoping trap:** NEVER put `from .database import safe_wipe_bot` inside a function body. It's imported at the TOP of `reconciler.py` (L12). An inline import makes Python treat `safe_wipe_bot` as a local variable for the ENTIRE function, causing `UnboundLocalError` at every earlier call site. This was the root cause of the periodic reconciliation crash (2026-04-07).
+
+### 2.12. `cycle_phase` State Machine (V1.5.0)
+- Column: `trades.cycle_phase` TEXT, DEFAULT `'ACTIVE'`
+- Transitions:
+  - `ACTIVE` → `CARRY_PENDING`: `reset_bot_after_tp()` when carry qty > 0.0001
+  - `ACTIVE` → `IDLE`: `reset_bot_after_tp()` clean zero reset
+  - `CARRY_PENDING` → `ACTIVE`: `_align_memory_to_ledger()` at startup, or `_update_trade_state_from_fill()` on live WS fill
+- A `CARRY_PENDING` bot looks like a ghost but is a real position. Do NOT ghost-detect it.
+
+### 2.13. Single Exchange Snapshot Per Startup (V1.5.0)
+- `StateReconciler.prime_startup_snapshot()` fetches ALL positions once, writes `active_positions`, stores in `self._startup_snapshot`.
+- **One fetch only.** Do NOT add any `fetch_positions()` call in `_initialize_exchanges()` — it was removed intentionally.
+- Periodic reconciler in `run_cycle()` uses `self._reconciler.reconcile_all()` (persistent instance). Do NOT instantiate `StateReconciler(self.exchanges)` inside `run_cycle`.
+
 
 ## 3. Key File Deep-Dives
 
@@ -87,11 +119,13 @@ In-memory singleton for positions and open orders. Populated by:
 
 **Critical:** Both methods normalize symbol keys via `normalize_symbol()`. Do not remove this or you'll re-introduce the split-brain phantom position bug.
 
-### `engine/reconciler.py`
-Multi-phase offline fill detector. Runs on startup (48h window) and every 10 cycles (2h window).
-- **Phase: Offline fill detection** — Scans `bot_orders` for open orders that are now filled on the exchange.
-- **Phase: Position anchor** — Re-reads exchange position after any fill and overwrites `avg_entry_price`/`total_invested`.
-- **DO NOT** add any position math that uses `total_physical_notional - sum(sister_bots)`. This causes ghost injection. Use strict CID matching only.
+### `engine/reconciler.py` (V1.5.0)
+Multi-phase offline fill detector and position consensus engine.
+- **Startup:** `prime_startup_snapshot()` → `reconstruct_offline_fills(48h)` → `_align_memory_to_ledger()` → `resolve_net_mismatch()`
+- **Periodic (every 60 cycles):** `self._reconciler.reconcile_all()` — uses SAME persistent instance as startup to preserve CARRY_PENDING awareness.
+- **Ghost detection guard:** `resolve_net_mismatch()` skips any bot with `cycle_phase == 'CARRY_PENDING'`.
+- **DO NOT** add any `from .database import safe_wipe_bot` inside function bodies — see invariant 2.11.
+- **DO NOT** add position math using `total_physical_notional - sum(sister_bots)` — use strict CID matching only.
 
 ### `engine/integrity.py`
 FLAG-ONLY module. It logs mismatches (`SIZE DISCREPANCY`, `UNMATCHED POSITION`) but **does not mutate state**. The reconciler handles corrections. If you see these warnings in the log, investigate the reconciler and ws_cache.
@@ -129,7 +163,10 @@ FLAG-ONLY module. It logs mismatches (`SIZE DISCREPANCY`, `UNMATCHED POSITION`) 
 | `GHOST_RESET` in reconciliation_logs | Bot has `total_invested > 0` but no valid CID evidence | Happens after crash/wipe — use Manual Link in UI |
 | Orders rejected `-2022` | `reduceOnly=True` used on multi-bot pair | Check `bot_executor.py` sibling count logic |
 | BotExecutor skips all grids | `entry_confirmed = 0` in trades | Reconciler needs to process the entry fill first |
-| `ADOPTION_BLOCKED` logs everywhere | Sibling bots already claimed the full position value | Expected — prevents double-counting on shared pairs |
+| `ADOPTION_BLOCKED` logs everywhere | Sibling bots already claimed full position value | Expected — prevents double-counting on shared pairs |
+| `UnboundLocalError: safe_wipe_bot referenced before assignment` | Inline `import safe_wipe_bot` inside a function body | Remove it — `safe_wipe_bot` is at file top of `reconciler.py` L12 |
+| Bot wiped immediately after TP (CARRY position lost) | `safe_wipe_bot()` guard 1 not firing | Check `trades.cycle_phase` is correctly set to `CARRY_PENDING` by `reset_bot_after_tp()` |
+| `[SNAPSHOT]` appears multiple times at startup | Duplicate `fetch_positions` call still present | Check `_initialize_exchanges()` — only `prime_startup_snapshot()` should fetch |
 
 ---
 
@@ -147,11 +184,11 @@ Get-Content engine.log -Wait -Tail 30
 ```
 
 **After restart**, the engine will:
-1. Run `check_and_fix_integrity()` (DB startup sanitizer)
-2. Run `reconstruct_offline_fills(48h)` (offline TP/Grid crediting)
-3. Scan open exchange orders and tag stray CQB orders for recovery
-4. Run `run_cycle()` once to populate snapshots
-5. Begin normal polling loop
+1. `check_and_fix_integrity()` — DB startup sanitizer
+2. `prime_startup_snapshot()` — fetches ALL exchange positions **once**, writes `active_positions` table
+3. `reconstruct_offline_fills(48h)` — credits any fills that happened while offline
+4. `_align_memory_to_ledger()` — promotes CARRY_PENDING bots to ACTIVE if fills confirmed
+5. `run_cycle()` — begins normal polling using `self._reconciler` (persistent instance)
 
 ---
 

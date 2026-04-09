@@ -1,0 +1,12 @@
+import sqlite3
+c = sqlite3.connect('crypto_bot.db')
+q = c.cursor()
+q.execute("SELECT id, step, order_type, amount, filled_amount, status, created_at FROM bot_orders WHERE bot_id=10011 AND filled_amount > 0 ORDER BY created_at DESC LIMIT 30")
+print('ID | STEP | TYPE | AMOUNT | FILLED | STATUS | CREATED')
+for r in q.fetchall(): print(r)
+q.execute("SELECT bot_id, total_invested, current_step FROM trades WHERE bot_id=10011")
+print(q.fetchone())
+q.execute("SELECT id, step, order_type, amount, filled_amount, status, created_at FROM bot_orders WHERE bot_id=10011 AND status='filled' ORDER BY created_at DESC LIMIT 5")
+print('FILLED ORDERS:')
+for r in q.fetchall(): print(r)
+c.close()

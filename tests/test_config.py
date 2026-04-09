@@ -17,9 +17,7 @@ def reload_config():
     # This assumes the test runs from the root of the project structure
     with patch('os.path.abspath', return_value=os.path.join(os.getcwd(), 'config', 'settings.py')):
         import config.settings
-        # Re-calculate root_dir, which is two levels up from settings.py's location
-        root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        return config.settings.ConfigLoader(root_dir)
+        return config.settings.Config()
 
 def test_config_loads_defaults_from_json():
     """Tests that the ConfigLoader loads default values from the JSON file."""

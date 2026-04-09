@@ -49,8 +49,8 @@ class TestExchangeIntegration(unittest.TestCase):
         # Since we mocked the instance, we can check the dict state if logic ran
         self.assertTrue('fapiPublic' in mock_exchange_instance.urls['api'], 
                        "Should have added fapiPublic to API URLs")
-        self.assertIn('testnet.binancefuture.com', mock_exchange_instance.urls['api']['fapiPublic'],
-                     "Should point to testnet URL")
+        self.assertIn('demo-fapi.binance.com', mock_exchange_instance.urls['api']['fapiPublic'],
+                     "Should point to demo-fapi URL")
 
     @patch('engine.exchange_interface.ccxt.binance')
     def test_fetch_balance_params(self, mock_ccxt_binance):
@@ -65,11 +65,16 @@ class TestExchangeIntegration(unittest.TestCase):
         
         ex = ExchangeInterface(market_type='future')
         
-        # Call fetch_balance
-        ex.fetch_balance()
-        
-        # Verify underlying call
-        mock_exchange_instance.fetch_balance.assert_called_with(params={'type': 'future'})
+        # Mock _raw_request
+        with patch.object(ex, '_raw_request') as mock_raw:
+            mock_raw.return_value = [{'asset': 'USDT', 'balance': '100.0'}]
+            
+            # Call fetch_balance
+            balance = ex.fetch_balance()
+            
+            # Verify underlying call
+            mock_raw.assert_called_with('/fapi/v2/balance')
+            self.assertEqual(balance['total']['USDT'], 100.0)
 
 if __name__ == '__main__':
     unittest.main()

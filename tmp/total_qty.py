@@ -1,0 +1,10 @@
+import sqlite3
+c = sqlite3.connect('crypto_bot.db')
+q = c.cursor()
+q.execute("SELECT bot_id, SUM(filled_amount) FROM bot_orders WHERE order_type IN ('entry', 'grid', 'adoption_add') GROUP BY bot_id")
+print('BOT_ID | TOTAL_ENTRY_QTY')
+for r in q.fetchall(): print(r)
+q.execute("SELECT bot_id, SUM(filled_amount) FROM bot_orders WHERE order_type IN ('tp', 'exit', 'close', 'adoption_reduce', 'sl') GROUP BY bot_id")
+print('BOT_ID | TOTAL_EXIT_QTY')
+for r in q.fetchall(): print(r)
+c.close()

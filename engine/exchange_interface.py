@@ -395,13 +395,17 @@ class ExchangeInterface:
                     for t in res:
                         trades.append({
                             'id': t['id'],
-                            'orderId': t['orderId'],
+                            'order': str(t['orderId']),   # CCXT-normalised key used by reconciler
+                            'orderId': t['orderId'],       # raw key, kept for backward compat
                             'symbol': t['symbol'],
                             'side': t['side'].lower(),
                             'price': float(t['price']),
                             'amount': float(t['qty']),
                             'cost': float(t['quoteQty']),
                             'commission': float(t.get('commission', 0)),
+                            # clientOrderId is NOT available on /fapi/v1/userTrades responses.
+                            # Reconciler PASS 2 must look up CID from bot_orders by order_id.
+                            'clientOrderId': '',
                             'timestamp': t['time']
                         })
                 return trades

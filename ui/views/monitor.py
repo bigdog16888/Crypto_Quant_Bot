@@ -350,8 +350,8 @@ def render_monitor_view():
     # Detect if the Reconciler / Forensic Wizard is actively in use.
     # Suppressing auto-refresh while the wizard is open prevents the page
     # from reloading mid-operation and wiping the user's in-progress state.
-    _wizard_keys = [k for k in st.session_state if k.startswith(("forensic_trades_", "adopt_force_sel_", "trade_sel_"))]
-    wizard_active = bool(_wizard_keys)
+    # We must check if the values are actually truthy, as Streamlit leaves stale keys behind.
+    wizard_active = any(bool(st.session_state[k]) for k in st.session_state if k.startswith(("forensic_trades_", "adopt_force_sel_", "trade_sel_")))
 
     # --- Data Fetching (Parallel) ---
     with st.spinner("Fetching market data..."):
@@ -594,15 +594,19 @@ def render_monitor_view():
                         else:
                             expected_for_bot = 1 if c_step >= max_steps else 2
                         
-                        # Only IN-TRADE bots (c_step > 0) can be "missing" baseline orders. Scanning bots are immune.
-                        if actual_physical == 0 and c_step > 0:
+                        # Only genuinely IN-TRADE bots can be "missing" baseline orders.
+                        # A bot with c_step > 0 but total_invested <= 0 is a zombie state (post-reset race condition)
+                        # — do NOT alarm on it, as it has no real position and no orders are expected.
+                        # Fix 4: also check total_invested > 0 to suppress false positives for zombie bots.
+                        bot_invested = float(bot_row.get('total_invested', 0) or 0)
+                        if actual_physical == 0 and c_step > 0 and bot_invested > 0:
                             if is_pos_capped:
                                 # Bot hit exchange cap — holding position, waiting for TP.
                                 # This is EXPECTED behaviour — do not alarm.
                                 bots_pos_limit.append(f"{bot_row['name']} (0/{expected_for_bot})")
                             else:
                                 bots_with_missing_orders.append(f"{bot_row['name']} (0/{expected_for_bot})")
-                        elif actual_physical < expected_for_bot and c_step > 0:
+                        elif actual_physical < expected_for_bot and c_step > 0 and bot_invested > 0:
                             if is_pos_capped:
                                 # Has TP but no grid — expected when pos cap hit
                                 bots_pos_limit.append(f"{bot_row['name']} ({actual_physical}/{expected_for_bot})")
@@ -983,9 +987,12 @@ def render_monitor_view():
                                     ee_pc = min(ee_pc, 100.0)
                                 if ee_pc > 0:
                                     ee_status = f" [EE: -{ee_pc:.1f}%]"
+                    hedge_status = ""
+                    if is_in_trade and cfg.get('UseStepHedge', False) and int(row.get('current_step', 0)) >= int(cfg.get('HedgeStartStep', 99)):
+                        hedge_status = " 🛡️ [HEDGED]"
 
                     if is_in_trade:
-                        res['Trigger'] = f"In Trade{ee_status} ({desc_trigger})"
+                        res['Trigger'] = f"In Trade{ee_status}{hedge_status} ({desc_trigger})"
                     else:
                         res['Trigger'] = desc_trigger
                     
@@ -1380,8 +1387,19 @@ def render_monitor_view():
     # --- Auto-Refresh Upgrade ---
     if auto_refresh and not wizard_active:
         from streamlit_autorefresh import st_autorefresh
+        from datetime import datetime
         # 🚀 UI PERFORMANCE BATCHING: Now that rendering is async/cached, we can safely refresh every 15s
-        st_autorefresh(interval=15000, limit=None, key="monitor_autorefresh")
+        refresh_count = st_autorefresh(interval=15000, limit=None, key="monitor_autorefresh")
+        
+        # When the auto-refresh triggers a rerun, the counter increments.
+        # We explicitly clear the cache to mirror the "Refresh Now" button's behavior.
+        if "last_autorefresh_count" not in st.session_state:
+            st.session_state.last_autorefresh_count = refresh_count
+        elif refresh_count != st.session_state.last_autorefresh_count:
+            st.session_state.last_autorefresh_count = refresh_count
+            st.cache_data.clear()
+
+        st.caption(f"⏱️ Last Updated: {datetime.now().strftime('%H:%M:%S')} (Auto-refreshes every 15s)")
     elif wizard_active:
         st.warning(
             "⏸ **Auto-Refresh Paused** — Reconciler wizard is active. "

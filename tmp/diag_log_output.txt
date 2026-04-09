@@ -1,0 +1,703 @@
+2026-03-31 14:17:14,926 - StateReconciliation - INFO - ⚖️ RECON AUDIT [ETHUSDC]: Virtual LONG $0.00 vs Physical LONG $0.00 | Virtual SHORT $0.00 vs Physical SHORT $0.00
+2026-03-31 14:17:14,926 - StateReconciliation - INFO - ⚖️ RECON AUDIT [BTCUSDC]: Virtual LONG $472.51 vs Physical LONG $337.51 | Virtual SHORT $135.24 vs Physical SHORT $0.00
+2026-03-31 14:17:14,931 - StateReconciliation - INFO - ⚖️ RECON AUDIT [XRPUSDC]: Virtual LONG $467.37 vs Physical LONG $927.12 | Virtual SHORT $0.00 vs Physical SHORT $0.00
+2026-03-31 14:17:14,932 - StateReconciliation - ERROR - 🚨 [QTY-GAP] XRPUSDC: Virtual=343.800000 vs Physical=682.000000 (Delta=338.200000 units, $459.75). Scanning for physically impossible states...
+2026-03-31 14:17:14,932 - StateReconciliation - WARNING - ⚠️ [NET-MISMATCH] XRPUSDC: Virtual=343.800000 units, Physical=682.000000 units. Gap=338.200000 ($459.75).
+2026-03-31 14:17:14,938 - StateReconciliation - INFO - ⚖️ RECON AUDIT [XAUUSDT]: Virtual LONG $0.00 vs Physical LONG $5958.33 | Virtual SHORT $0.00 vs Physical SHORT $0.00
+2026-03-31 14:17:14,938 - StateReconciliation - ERROR - 🚨 [QTY-GAP] XAUUSDT: Virtual=0.000000 vs Physical=1.304000 (Delta=1.304000 units, $5958.33). Scanning for physically impossible states...
+2026-03-31 14:17:14,939 - StateReconciliation - WARNING - ⚠️ [NET-MISMATCH] XAUUSDT: Virtual=0.000000 units, Physical=1.304000 units. Gap=1.304000 ($5958.33).
+2026-03-31 14:17:14,939 - StateReconciliation - WARNING - 🚫 [ADOPTION-BLOCKED] XAUUSDT: Physical is LONG but sole bot short gold is SHORT.
+2026-03-31 14:17:14,942 - StateReconciliation - INFO - 🔍 [B.5 CHECK] XAUUSDT: b4_ran=False, is_sole=True, error_side=LONG, match_bots=[]
+2026-03-31 14:17:14,947 - IntegrityEnforcer - WARNING - ⚠️ UNMATCHED POSITION: XAUUSDT NET PhysQty=1.3040 VirtQty=0.0000 — Possibly manual trade. NO ACTION TAKEN.
+2026-03-31 14:17:14,947 - IntegrityEnforcer - WARNING - ⚠️ SIZE DISCREPANCY: XRPUSDC NET PhysQty=682.0000 VirtQty=343.8000 (Diff: 338.2000 qty). NO ACTION TAKEN.
+2026-03-31 14:17:20,000 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:17:27,015 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:17:33,286 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:17:41,225 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:17:47,434 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:17:53,597 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:18:00,706 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:18:07,189 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:18:13,399 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:18:19,697 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:18:26,033 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:18:33,299 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:18:39,524 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:18:45,744 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:18:51,946 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:18:58,500 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:19:05,632 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:19:11,908 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:19:18,211 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:19:19,676 - WebSocketHandler - INFO - 📬 Order Update: ETHUSDC SELL NEW #271213438 | CID: CQB_10011_ENTRY_1_1774937959418
+2026-03-31 14:19:25,037 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:19:31,337 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:19:37,671 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:19:43,915 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:19:51,276 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:19:57,548 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:20:03,839 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:20:10,128 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:20:16,668 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:20:23,729 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:20:24,627 - WebSocketHandler - INFO - 📬 Order Update: ETHUSDC SELL CANCELED #271213438 | CID: CQB_10011_ENTRY_1_1774937959418
+2026-03-31 14:20:25,879 - WebSocketHandler - INFO - 📬 Order Update: ETHUSDC SELL NEW #271214191 | CID: CQB_10011_ENTRY_1_1774938025643
+2026-03-31 14:20:31,027 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:20:32,192 - StateReconciliation - INFO - 🔍 [HISTORY-ORPHAN] 2 pairs with position gaps: [('XRPUSDC', 338.2), ('XAUUSDT', 1.304)]
+2026-03-31 14:20:38,541 - WebSocketHandler - INFO - 📊 Position Update: ETHUSDC SHORT -0.01
+2026-03-31 14:20:38,542 - WebSocketHandler - INFO - 📬 Order Update: ETHUSDC SELL FILLED #271214191 | CID: CQB_10011_ENTRY_1_1774938025643
+2026-03-31 14:20:41,780 - StateReconciliation - INFO - ⚖️ RECON AUDIT [ETHUSDC]: Virtual LONG $0.00 vs Physical LONG $0.00 | Virtual SHORT $20.55 vs Physical SHORT $20.55
+2026-03-31 14:20:41,782 - StateReconciliation - INFO - ⚖️ RECON AUDIT [BTCUSDC]: Virtual LONG $472.51 vs Physical LONG $337.51 | Virtual SHORT $135.24 vs Physical SHORT $0.00
+2026-03-31 14:20:41,785 - StateReconciliation - INFO - ⚖️ RECON AUDIT [XRPUSDC]: Virtual LONG $467.37 vs Physical LONG $927.12 | Virtual SHORT $0.00 vs Physical SHORT $0.00
+2026-03-31 14:20:41,785 - StateReconciliation - ERROR - 🚨 [QTY-GAP] XRPUSDC: Virtual=343.800000 vs Physical=682.000000 (Delta=338.200000 units, $459.75). Scanning for physically impossible states...
+2026-03-31 14:20:41,785 - StateReconciliation - WARNING - ⚠️ [NET-MISMATCH] XRPUSDC: Virtual=343.800000 units, Physical=682.000000 units. Gap=338.200000 ($459.75).
+2026-03-31 14:20:41,788 - StateReconciliation - INFO - ⚖️ RECON AUDIT [XAUUSDT]: Virtual LONG $0.00 vs Physical LONG $5958.33 | Virtual SHORT $0.00 vs Physical SHORT $0.00
+2026-03-31 14:20:41,789 - StateReconciliation - ERROR - 🚨 [QTY-GAP] XAUUSDT: Virtual=0.000000 vs Physical=1.304000 (Delta=1.304000 units, $5958.33). Scanning for physically impossible states...
+2026-03-31 14:20:41,789 - StateReconciliation - WARNING - ⚠️ [NET-MISMATCH] XAUUSDT: Virtual=0.000000 units, Physical=1.304000 units. Gap=1.304000 ($5958.33).
+2026-03-31 14:20:41,790 - StateReconciliation - WARNING - 🚫 [ADOPTION-BLOCKED] XAUUSDT: Physical is LONG but sole bot short gold is SHORT.
+2026-03-31 14:20:41,792 - StateReconciliation - INFO - 🔍 [B.5 CHECK] XAUUSDT: b4_ran=False, is_sole=True, error_side=LONG, match_bots=[]
+2026-03-31 14:20:41,795 - IntegrityEnforcer - WARNING - ⚠️ UNMATCHED POSITION: XAUUSDT NET PhysQty=1.3040 VirtQty=0.0000 — Possibly manual trade. NO ACTION TAKEN.
+2026-03-31 14:20:41,795 - IntegrityEnforcer - WARNING - ⚠️ SIZE DISCREPANCY: ETHUSDC NET PhysQty=0.0000 VirtQty=-0.0100 (Diff: 0.0100 qty). NO ACTION TAKEN.
+2026-03-31 14:20:41,796 - IntegrityEnforcer - WARNING - ⚠️ SIZE DISCREPANCY: XRPUSDC NET PhysQty=682.0000 VirtQty=343.8000 (Diff: 338.2000 qty). NO ACTION TAKEN.
+2026-03-31 14:20:46,843 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:20:47,772 - BotExecutor - INFO - [PHYS-TRACE] _get_phys_pos called for ETH/USDC:USDC -> ETHUSDC dir=SHORT | ROW: (0.01, 'SHORT', 2055.42)
+2026-03-31 14:20:47,773 - BotExecutor - INFO - [PHYS-TRACE] _get_phys_pos called for ETH/USDC:USDC -> ETHUSDC dir=None | ROW: (0.01, 'SHORT', 2055.42)
+2026-03-31 14:20:48,018 - WebSocketHandler - INFO - 📬 Order Update: ETHUSDC BUY NEW #271214460 | CID: CQB_10011_TP_1_1774938047772
+2026-03-31 14:20:48,281 - WebSocketHandler - INFO - 📬 Order Update: ETHUSDC SELL NEW #271214464 | CID: CQB_10011_GRID_2_1774938048036
+2026-03-31 14:20:53,475 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:20:54,680 - WebSocketHandler - INFO - 📬 Order Update: ETHUSDC BUY CANCELED #271214460 | CID: CQB_10011_TP_1_1774938047772
+2026-03-31 14:20:54,921 - WebSocketHandler - INFO - 📬 Order Update: ETHUSDC BUY NEW #271214685 | CID: CQB_10011_TP_1_1774938054688
+2026-03-31 14:21:00,076 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:21:06,343 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:21:12,663 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:21:19,261 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:21:26,417 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:21:32,701 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:21:39,582 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:21:46,235 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:21:52,474 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:21:58,624 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:22:05,687 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:22:12,242 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:22:18,539 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:22:24,835 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:22:31,171 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:22:38,497 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:22:44,778 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:22:50,976 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:22:59,384 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:23:05,861 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:23:12,968 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:23:19,332 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:23:25,664 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:23:32,261 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:23:38,585 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:23:45,646 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:23:51,965 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:23:58,799 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:24:00,296 - StateReconciliation - INFO - 🔍 [HISTORY-ORPHAN] 2 pairs with position gaps: [('XRPUSDC', 338.2), ('XAUUSDT', 1.304)]
+2026-03-31 14:24:09,896 - StateReconciliation - INFO - ⚖️ RECON AUDIT [ETHUSDC]: Virtual LONG $0.00 vs Physical LONG $0.00 | Virtual SHORT $20.55 vs Physical SHORT $20.55
+2026-03-31 14:24:09,900 - StateReconciliation - INFO - ⚖️ RECON AUDIT [BTCUSDC]: Virtual LONG $472.51 vs Physical LONG $337.51 | Virtual SHORT $135.24 vs Physical SHORT $0.00
+2026-03-31 14:24:09,904 - StateReconciliation - INFO - ⚖️ RECON AUDIT [XRPUSDC]: Virtual LONG $467.37 vs Physical LONG $927.12 | Virtual SHORT $0.00 vs Physical SHORT $0.00
+2026-03-31 14:24:09,906 - StateReconciliation - ERROR - 🚨 [QTY-GAP] XRPUSDC: Virtual=343.800000 vs Physical=682.000000 (Delta=338.200000 units, $459.75). Scanning for physically impossible states...
+2026-03-31 14:24:09,906 - StateReconciliation - WARNING - ⚠️ [NET-MISMATCH] XRPUSDC: Virtual=343.800000 units, Physical=682.000000 units. Gap=338.200000 ($459.75).
+2026-03-31 14:24:09,913 - StateReconciliation - INFO - ⚖️ RECON AUDIT [XAUUSDT]: Virtual LONG $0.00 vs Physical LONG $5958.33 | Virtual SHORT $0.00 vs Physical SHORT $0.00
+2026-03-31 14:24:09,913 - StateReconciliation - ERROR - 🚨 [QTY-GAP] XAUUSDT: Virtual=0.000000 vs Physical=1.304000 (Delta=1.304000 units, $5958.33). Scanning for physically impossible states...
+2026-03-31 14:24:09,913 - StateReconciliation - WARNING - ⚠️ [NET-MISMATCH] XAUUSDT: Virtual=0.000000 units, Physical=1.304000 units. Gap=1.304000 ($5958.33).
+2026-03-31 14:24:09,913 - StateReconciliation - WARNING - 🚫 [ADOPTION-BLOCKED] XAUUSDT: Physical is LONG but sole bot short gold is SHORT.
+2026-03-31 14:24:09,916 - StateReconciliation - INFO - 🔍 [B.5 CHECK] XAUUSDT: b4_ran=False, is_sole=True, error_side=LONG, match_bots=[]
+2026-03-31 14:24:09,920 - IntegrityEnforcer - WARNING - ⚠️ UNMATCHED POSITION: XAUUSDT NET PhysQty=1.3040 VirtQty=0.0000 — Possibly manual trade. NO ACTION TAKEN.
+2026-03-31 14:24:09,920 - IntegrityEnforcer - WARNING - ⚠️ SIZE DISCREPANCY: XRPUSDC NET PhysQty=682.0000 VirtQty=343.8000 (Diff: 338.2000 qty). NO ACTION TAKEN.
+2026-03-31 14:24:14,989 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:24:21,925 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:24:28,553 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:24:34,791 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:24:41,049 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:24:47,322 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:24:54,650 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:25:01,405 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:25:07,714 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:25:13,866 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:25:20,469 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:25:27,522 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:25:33,777 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:25:40,098 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:25:46,744 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:25:53,055 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:25:59,982 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:26:06,320 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:26:12,918 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:26:19,170 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:26:25,397 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:26:32,571 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:26:39,092 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:26:45,458 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:26:51,741 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:26:58,033 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:27:05,277 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:27:11,586 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:27:17,919 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:27:24,256 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:27:25,829 - StateReconciliation - INFO - 🔍 [HISTORY-ORPHAN] 2 pairs with position gaps: [('XRPUSDC', 338.2), ('XAUUSDT', 1.304)]
+2026-03-31 14:27:36,000 - StateReconciliation - INFO - ⚖️ RECON AUDIT [ETHUSDC]: Virtual LONG $0.00 vs Physical LONG $0.00 | Virtual SHORT $20.55 vs Physical SHORT $20.55
+2026-03-31 14:27:36,002 - StateReconciliation - INFO - ⚖️ RECON AUDIT [BTCUSDC]: Virtual LONG $472.51 vs Physical LONG $337.51 | Virtual SHORT $135.24 vs Physical SHORT $0.00
+2026-03-31 14:27:36,006 - StateReconciliation - INFO - ⚖️ RECON AUDIT [XRPUSDC]: Virtual LONG $467.37 vs Physical LONG $927.12 | Virtual SHORT $0.00 vs Physical SHORT $0.00
+2026-03-31 14:27:36,007 - StateReconciliation - ERROR - 🚨 [QTY-GAP] XRPUSDC: Virtual=343.800000 vs Physical=682.000000 (Delta=338.200000 units, $459.75). Scanning for physically impossible states...
+2026-03-31 14:27:36,007 - StateReconciliation - WARNING - ⚠️ [NET-MISMATCH] XRPUSDC: Virtual=343.800000 units, Physical=682.000000 units. Gap=338.200000 ($459.75).
+2026-03-31 14:27:36,012 - StateReconciliation - INFO - ⚖️ RECON AUDIT [XAUUSDT]: Virtual LONG $0.00 vs Physical LONG $5958.33 | Virtual SHORT $0.00 vs Physical SHORT $0.00
+2026-03-31 14:27:36,013 - StateReconciliation - ERROR - 🚨 [QTY-GAP] XAUUSDT: Virtual=0.000000 vs Physical=1.304000 (Delta=1.304000 units, $5958.33). Scanning for physically impossible states...
+2026-03-31 14:27:36,013 - StateReconciliation - WARNING - ⚠️ [NET-MISMATCH] XAUUSDT: Virtual=0.000000 units, Physical=1.304000 units. Gap=1.304000 ($5958.33).
+2026-03-31 14:27:36,013 - StateReconciliation - WARNING - 🚫 [ADOPTION-BLOCKED] XAUUSDT: Physical is LONG but sole bot short gold is SHORT.
+2026-03-31 14:27:36,016 - StateReconciliation - INFO - 🔍 [B.5 CHECK] XAUUSDT: b4_ran=False, is_sole=True, error_side=LONG, match_bots=[]
+2026-03-31 14:27:36,019 - IntegrityEnforcer - WARNING - ⚠️ UNMATCHED POSITION: XAUUSDT NET PhysQty=1.3040 VirtQty=0.0000 — Possibly manual trade. NO ACTION TAKEN.
+2026-03-31 14:27:36,019 - IntegrityEnforcer - WARNING - ⚠️ SIZE DISCREPANCY: XRPUSDC NET PhysQty=682.0000 VirtQty=343.8000 (Diff: 338.2000 qty). NO ACTION TAKEN.
+2026-03-31 14:27:41,856 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:27:48,702 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:27:54,858 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:28:01,454 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:28:07,664 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:28:14,778 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:28:21,033 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:28:27,754 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:28:34,052 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:28:40,390 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:28:47,701 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:28:54,190 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:29:00,827 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:29:07,126 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:29:13,408 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:29:20,713 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:29:26,941 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:29:33,241 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:29:39,439 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:29:45,962 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:29:53,144 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:29:59,439 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:30:05,625 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:30:12,194 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:30:18,457 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:30:25,419 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:30:31,723 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:30:38,405 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:30:44,727 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:30:51,057 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:30:52,275 - WebSocketHandler - INFO - 📬 Order Update: BTCUSDC SELL CANCELED #320901066 | CID: CQB_10016_TP_2_1774937747326
+2026-03-31 14:30:52,577 - WebSocketHandler - INFO - 📬 Order Update: BTCUSDC SELL NEW #320911368 | CID: CQB_10016_TP_2_1774938652287
+2026-03-31 14:30:52,673 - StateReconciliation - INFO - 🔍 [HISTORY-ORPHAN] 2 pairs with position gaps: [('XRPUSDC', 338.2), ('XAUUSDT', 1.304)]
+2026-03-31 14:31:02,203 - StateReconciliation - INFO - ⚖️ RECON AUDIT [ETHUSDC]: Virtual LONG $0.00 vs Physical LONG $0.00 | Virtual SHORT $20.55 vs Physical SHORT $20.55
+2026-03-31 14:31:02,206 - StateReconciliation - INFO - ⚖️ RECON AUDIT [BTCUSDC]: Virtual LONG $472.51 vs Physical LONG $337.51 | Virtual SHORT $135.24 vs Physical SHORT $0.00
+2026-03-31 14:31:02,210 - StateReconciliation - INFO - ⚖️ RECON AUDIT [XRPUSDC]: Virtual LONG $467.37 vs Physical LONG $927.12 | Virtual SHORT $0.00 vs Physical SHORT $0.00
+2026-03-31 14:31:02,210 - StateReconciliation - ERROR - 🚨 [QTY-GAP] XRPUSDC: Virtual=343.800000 vs Physical=682.000000 (Delta=338.200000 units, $459.75). Scanning for physically impossible states...
+2026-03-31 14:31:02,210 - StateReconciliation - WARNING - ⚠️ [NET-MISMATCH] XRPUSDC: Virtual=343.800000 units, Physical=682.000000 units. Gap=338.200000 ($459.75).
+2026-03-31 14:31:02,217 - StateReconciliation - INFO - ⚖️ RECON AUDIT [XAUUSDT]: Virtual LONG $0.00 vs Physical LONG $5958.33 | Virtual SHORT $0.00 vs Physical SHORT $0.00
+2026-03-31 14:31:02,218 - StateReconciliation - ERROR - 🚨 [QTY-GAP] XAUUSDT: Virtual=0.000000 vs Physical=1.304000 (Delta=1.304000 units, $5958.33). Scanning for physically impossible states...
+2026-03-31 14:31:02,218 - StateReconciliation - WARNING - ⚠️ [NET-MISMATCH] XAUUSDT: Virtual=0.000000 units, Physical=1.304000 units. Gap=1.304000 ($5958.33).
+2026-03-31 14:31:02,219 - StateReconciliation - WARNING - 🚫 [ADOPTION-BLOCKED] XAUUSDT: Physical is LONG but sole bot short gold is SHORT.
+2026-03-31 14:31:02,221 - StateReconciliation - INFO - 🔍 [B.5 CHECK] XAUUSDT: b4_ran=False, is_sole=True, error_side=LONG, match_bots=[]
+2026-03-31 14:31:02,224 - IntegrityEnforcer - WARNING - ⚠️ UNMATCHED POSITION: XAUUSDT NET PhysQty=1.3040 VirtQty=0.0000 — Possibly manual trade. NO ACTION TAKEN.
+2026-03-31 14:31:02,225 - IntegrityEnforcer - WARNING - ⚠️ SIZE DISCREPANCY: XRPUSDC NET PhysQty=682.0000 VirtQty=343.8000 (Diff: 338.2000 qty). NO ACTION TAKEN.
+2026-03-31 14:31:07,279 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:31:13,870 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:31:20,200 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:31:27,183 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:31:33,460 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:31:39,982 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:31:46,393 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:31:52,720 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:31:59,756 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:32:06,262 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:32:12,573 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:32:14,049 - WebSocketHandler - INFO - 📬 Order Update: ETHUSDC BUY CANCELED #271214685 | CID: CQB_10011_TP_1_1774938054688
+2026-03-31 14:32:14,273 - WebSocketHandler - INFO - 📬 Order Update: ETHUSDC BUY NEW #271222244 | CID: CQB_10011_TP_1_1774938734057
+2026-03-31 14:32:19,428 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:32:25,782 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:32:32,315 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:32:38,681 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:32:45,752 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:32:52,036 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:32:58,604 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:33:04,929 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:33:11,139 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:33:18,208 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:33:24,626 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:33:34,379 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:33:40,751 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:33:47,064 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:33:54,328 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:34:00,740 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:34:07,040 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:34:13,419 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:34:19,951 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:34:21,258 - StateReconciliation - INFO - 🔍 [HISTORY-ORPHAN] 2 pairs with position gaps: [('XRPUSDC', 338.2), ('XAUUSDT', 1.304)]
+2026-03-31 14:34:31,100 - StateReconciliation - INFO - ⚖️ RECON AUDIT [ETHUSDC]: Virtual LONG $0.00 vs Physical LONG $0.00 | Virtual SHORT $20.55 vs Physical SHORT $20.55
+2026-03-31 14:34:31,103 - StateReconciliation - INFO - ⚖️ RECON AUDIT [BTCUSDC]: Virtual LONG $472.51 vs Physical LONG $337.51 | Virtual SHORT $135.24 vs Physical SHORT $0.00
+2026-03-31 14:34:31,108 - StateReconciliation - INFO - ⚖️ RECON AUDIT [XRPUSDC]: Virtual LONG $467.37 vs Physical LONG $927.12 | Virtual SHORT $0.00 vs Physical SHORT $0.00
+2026-03-31 14:34:31,108 - StateReconciliation - ERROR - 🚨 [QTY-GAP] XRPUSDC: Virtual=343.800000 vs Physical=682.000000 (Delta=338.200000 units, $459.75). Scanning for physically impossible states...
+2026-03-31 14:34:31,108 - StateReconciliation - WARNING - ⚠️ [NET-MISMATCH] XRPUSDC: Virtual=343.800000 units, Physical=682.000000 units. Gap=338.200000 ($459.75).
+2026-03-31 14:34:31,115 - StateReconciliation - INFO - ⚖️ RECON AUDIT [XAUUSDT]: Virtual LONG $0.00 vs Physical LONG $5958.33 | Virtual SHORT $0.00 vs Physical SHORT $0.00
+2026-03-31 14:34:31,115 - StateReconciliation - ERROR - 🚨 [QTY-GAP] XAUUSDT: Virtual=0.000000 vs Physical=1.304000 (Delta=1.304000 units, $5958.33). Scanning for physically impossible states...
+2026-03-31 14:34:31,115 - StateReconciliation - WARNING - ⚠️ [NET-MISMATCH] XAUUSDT: Virtual=0.000000 units, Physical=1.304000 units. Gap=1.304000 ($5958.33).
+2026-03-31 14:34:31,115 - StateReconciliation - WARNING - 🚫 [ADOPTION-BLOCKED] XAUUSDT: Physical is LONG but sole bot short gold is SHORT.
+2026-03-31 14:34:31,118 - StateReconciliation - INFO - 🔍 [B.5 CHECK] XAUUSDT: b4_ran=False, is_sole=True, error_side=LONG, match_bots=[]
+2026-03-31 14:34:31,122 - IntegrityEnforcer - WARNING - ⚠️ UNMATCHED POSITION: XAUUSDT NET PhysQty=1.3040 VirtQty=0.0000 — Possibly manual trade. NO ACTION TAKEN.
+2026-03-31 14:34:31,122 - IntegrityEnforcer - WARNING - ⚠️ SIZE DISCREPANCY: XRPUSDC NET PhysQty=682.0000 VirtQty=343.8000 (Diff: 338.2000 qty). NO ACTION TAKEN.
+2026-03-31 14:34:36,889 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:34:43,132 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:34:49,716 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:34:56,059 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:35:02,304 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:35:09,301 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:35:15,925 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:35:22,206 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:35:28,453 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:35:34,726 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:35:42,112 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:35:48,494 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:35:54,836 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:36:01,114 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:36:07,768 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:36:14,791 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:36:20,995 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:36:27,174 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:36:33,675 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:36:40,478 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:36:46,828 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:36:47,925 - WebSocketHandler - INFO - 📬 Order Update: BTCUSDC BUY CANCELED #320897036 | CID: CQB_10022_TP_1_1774937204424
+2026-03-31 14:36:48,179 - WebSocketHandler - INFO - 📬 Order Update: BTCUSDC BUY NEW #320915139 | CID: CQB_10022_TP_1_1774939007933
+2026-03-31 14:36:53,311 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:37:00,086 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:37:06,383 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:37:12,624 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:37:19,643 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:37:26,159 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:37:32,416 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:37:38,744 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:37:45,132 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:37:46,635 - StateReconciliation - INFO - 🔍 [HISTORY-ORPHAN] 2 pairs with position gaps: [('XRPUSDC', 338.2), ('XAUUSDT', 1.304)]
+2026-03-31 14:37:56,212 - StateReconciliation - INFO - ⚖️ RECON AUDIT [ETHUSDC]: Virtual LONG $0.00 vs Physical LONG $0.00 | Virtual SHORT $20.55 vs Physical SHORT $20.55
+2026-03-31 14:37:56,214 - StateReconciliation - INFO - ⚖️ RECON AUDIT [BTCUSDC]: Virtual LONG $472.51 vs Physical LONG $337.51 | Virtual SHORT $135.24 vs Physical SHORT $0.00
+2026-03-31 14:37:56,220 - StateReconciliation - INFO - ⚖️ RECON AUDIT [XRPUSDC]: Virtual LONG $467.37 vs Physical LONG $927.12 | Virtual SHORT $0.00 vs Physical SHORT $0.00
+2026-03-31 14:37:56,220 - StateReconciliation - ERROR - 🚨 [QTY-GAP] XRPUSDC: Virtual=343.800000 vs Physical=682.000000 (Delta=338.200000 units, $459.75). Scanning for physically impossible states...
+2026-03-31 14:37:56,221 - StateReconciliation - WARNING - ⚠️ [NET-MISMATCH] XRPUSDC: Virtual=343.800000 units, Physical=682.000000 units. Gap=338.200000 ($459.75).
+2026-03-31 14:37:56,227 - StateReconciliation - INFO - ⚖️ RECON AUDIT [XAUUSDT]: Virtual LONG $0.00 vs Physical LONG $5958.33 | Virtual SHORT $0.00 vs Physical SHORT $0.00
+2026-03-31 14:37:56,227 - StateReconciliation - ERROR - 🚨 [QTY-GAP] XAUUSDT: Virtual=0.000000 vs Physical=1.304000 (Delta=1.304000 units, $5958.33). Scanning for physically impossible states...
+2026-03-31 14:37:56,227 - StateReconciliation - WARNING - ⚠️ [NET-MISMATCH] XAUUSDT: Virtual=0.000000 units, Physical=1.304000 units. Gap=1.304000 ($5958.33).
+2026-03-31 14:37:56,228 - StateReconciliation - WARNING - 🚫 [ADOPTION-BLOCKED] XAUUSDT: Physical is LONG but sole bot short gold is SHORT.
+2026-03-31 14:37:56,231 - StateReconciliation - INFO - 🔍 [B.5 CHECK] XAUUSDT: b4_ran=False, is_sole=True, error_side=LONG, match_bots=[]
+2026-03-31 14:37:56,234 - IntegrityEnforcer - WARNING - ⚠️ UNMATCHED POSITION: XAUUSDT NET PhysQty=1.3040 VirtQty=0.0000 — Possibly manual trade. NO ACTION TAKEN.
+2026-03-31 14:37:56,235 - IntegrityEnforcer - WARNING - ⚠️ SIZE DISCREPANCY: XRPUSDC NET PhysQty=682.0000 VirtQty=343.8000 (Diff: 338.2000 qty). NO ACTION TAKEN.
+2026-03-31 14:38:02,070 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:38:08,446 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:38:14,975 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:38:21,549 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:38:27,786 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:38:34,853 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:38:41,143 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:38:47,714 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:38:53,996 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:39:00,284 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:39:07,435 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:39:14,046 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:39:20,377 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:39:27,011 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:39:33,286 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:39:40,594 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:39:46,893 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:39:53,120 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:39:59,409 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:40:06,247 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:40:12,408 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:40:18,648 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:40:24,889 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:40:32,296 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:40:38,552 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:40:44,891 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:40:51,323 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:40:57,938 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:47:49,208 - Preflight - WARNING -     ❌ XAUUSDT: Exchange=1.304 | DB=$0 (ORPHAN)
+2026-03-31 14:47:49,210 - Preflight - INFO -     ✅ ETHUSDC: Exchange=-0.01 | DB=$-20.55 — Aligned
+2026-03-31 14:47:49,211 - Preflight - INFO -     ✅ XRPUSDC: Exchange=682.0 | DB=$467.37 — Aligned
+2026-03-31 14:47:49,211 - Preflight - INFO -     ✅ BTCUSDC: Exchange=0.005 | DB=$337.27 — Aligned
+2026-03-31 14:47:49,469 - BotRunner - WARNING -   → CRITICAL: Exchange has 1.304 XAUUSDT but DB has $0. Orphaned position!
+2026-03-31 14:47:49,972 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:47:49,994 - StateReconciliation - INFO - 🔍 [HISTORY-ORPHAN] 1 pairs with position gaps: [('XAUUSDT', 1.304)]
+2026-03-31 14:47:54,939 - StateReconciliation - INFO - 🔍 [HISTORY-ORPHAN] 1 pairs with position gaps: [('XAUUSDT', 1.304)]
+2026-03-31 14:48:00,429 - StateReconciliation - INFO -   📍 Exchange: ETHUSDC short qty=0.010000 entryPrice=2055.420000
+2026-03-31 14:48:00,430 - StateReconciliation - INFO -   📍 Exchange: XRPUSDC long qty=682.000000 entryPrice=1.359413
+2026-03-31 14:48:00,430 - StateReconciliation - INFO -   📍 Exchange: XAUUSDT long qty=1.304000 entryPrice=4569.270000
+2026-03-31 14:48:00,430 - StateReconciliation - INFO -   📍 Exchange: BTCUSDC long qty=0.005000 entryPrice=67501.800000
+2026-03-31 14:48:00,431 - StateReconciliation - INFO -   📍 Exchange has open position: ETHUSDC short qty=0.010000
+2026-03-31 14:48:00,431 - StateReconciliation - INFO -   📍 Exchange has open position: XRPUSDC long qty=682.000000
+2026-03-31 14:48:00,431 - StateReconciliation - INFO -   📍 Exchange has open position: XAUUSDT long qty=1.304000
+2026-03-31 14:48:00,431 - StateReconciliation - INFO -   📍 Exchange has open position: BTCUSDC long qty=0.005000
+[PHYS-ADOPT] PASS1+2 ── Bot 10017 (xrp long) ──
+  Symbol=XRPUSDC Side=long phys_qty=682.000000
+2026-03-31 14:48:00,439 - StateReconciliation - INFO -   PASS 1: Verifying 11 ledger orders on exchange...
+2026-03-31 14:48:01,526 - StateReconciliation - WARNING -   fetch_my_trades(XRPUSDC) failed: binance {"code":-2015,"msg":"Invalid API-key, IP, or permissions for action, request ip: 42.77.2.81"}
+2026-03-31 14:48:01,527 - StateReconciliation - INFO -   PASS 2: 0 raw fills from exchange for XRPUSDC
+  📊 RESULT Bot 10017 (XRPUSDC long):
+2026-03-31 14:48:01,535 - StateReconciliation - WARNING -   ⚠️ [PHYS-ADOPT] real_proved=0.000000 (true=343.800000 - p3_adopt=343.800000), gap=682.000000. Running PASS 3...
+2026-03-31 14:48:01,535 - StateReconciliation - INFO -   [PASS3] Using entry price 1.359413 (source: physical entryPrice from exchange).
+2026-03-31 14:48:01,536 - StateReconciliation - INFO -   [PASS3] Step estimate: base=$10.0 mm=2.1 phys_inv=$927.12 cumul=$1628.26 → est_n=7 max_step=7 → est_step=7
+2026-03-31 14:48:01,537 - StateReconciliation - INFO -   ✅ [PASS3] Gap adoption written: gap=338.200000 ETH (phys=682.000000 − proved=343.800000)
+2026-03-31 14:48:01,548 - StateReconciliation - INFO -   ✅ [PASS3] Physical override applied for Bot 10017 (XRPUSDC long):
+[PHYS-ADOPT] PASS0 ── Bot 100000 (short sui) ──
+2026-03-31 14:48:01,557 - StateReconciliation - INFO -   ✅ [PASS0] Bot 100000 (SUIUSDC short) reset to scanning state.
+[PHYS-ADOPT] PASS1+2 ── Bot 10016 (long btc price) ──
+  Symbol=BTCUSDC Side=long phys_qty=0.005000
+2026-03-31 14:48:01,564 - StateReconciliation - INFO -   PASS 1: Verifying 5 ledger orders on exchange...
+2026-03-31 14:48:02,042 - StateReconciliation - WARNING -   fetch_my_trades(BTCUSDC) failed: binance {"code":-2015,"msg":"Invalid API-key, IP, or permissions for action, request ip: 42.77.2.81"}
+2026-03-31 14:48:02,043 - StateReconciliation - INFO -   PASS 2: 0 raw fills from exchange for BTCUSDC
+  📊 RESULT Bot 10016 (BTCUSDC long):
+2026-03-31 14:48:02,048 - StateReconciliation - WARNING -   ⚠️ [PHYS-ADOPT] real_proved=0.007000 (true=0.007000 - p3_adopt=0.000000), gap=-0.002000. Running PASS 3...
+2026-03-31 14:48:02,049 - StateReconciliation - INFO -   [PASS3] Using entry price 67501.800000 (source: physical entryPrice from exchange).
+2026-03-31 14:48:02,049 - StateReconciliation - INFO -   [PASS3] Step estimate: base=$10.0 mm=1.88 phys_inv=$337.51 cumul=$490.36 → est_n=6 max_step=2 → est_step=6
+2026-03-31 14:48:02,050 - StateReconciliation - INFO -   ✅ [PASS3] Gap≈0 (-0.002000): PASS-2 fully proved the position. No adoption written (stale adoption deleted).
+2026-03-31 14:48:02,062 - StateReconciliation - INFO -   ✅ [PASS3] Physical override applied for Bot 10016 (BTCUSDC long):
+[PHYS-ADOPT] PASS1+2 ── Bot 100002 (short eth) ──
+  Symbol=ETHUSDC Side=short phys_qty=0.010000
+2026-03-31 14:48:02,063 - StateReconciliation - INFO -   PASS 1: Verifying 4 ledger orders on exchange...
+2026-03-31 14:48:02,760 - StateReconciliation - WARNING -   fetch_my_trades(ETHUSDC) failed: binance {"code":-2015,"msg":"Invalid API-key, IP, or permissions for action, request ip: 42.77.2.81"}
+2026-03-31 14:48:02,761 - StateReconciliation - INFO -   PASS 2: 0 raw fills from exchange for ETHUSDC
+  📊 RESULT Bot 100002 (ETHUSDC short):
+2026-03-31 14:48:02,763 - StateReconciliation - WARNING -   ⚠️ [PHYS-ADOPT] real_proved=0.000000 (true=0.000000 - p3_adopt=0.000000), gap=0.010000. Running PASS 3...
+2026-03-31 14:48:02,763 - StateReconciliation - INFO -   [PASS3] Using entry price 2055.420000 (source: physical entryPrice from exchange).
+2026-03-31 14:48:02,764 - StateReconciliation - INFO -   [PASS3] Step estimate: base=$20.0 mm=1.88 phys_inv=$20.55 cumul=$20.00 → est_n=1 max_step=0 → est_step=1
+2026-03-31 14:48:02,764 - StateReconciliation - INFO -   ✅ [PASS3] Gap adoption written: gap=0.010000 ETH (phys=0.010000 − proved=0.000000)
+2026-03-31 14:48:02,765 - StateReconciliation - INFO -   ✅ [PASS3] Physical override applied for Bot 100002 (ETHUSDC short):
+[PHYS-ADOPT] PASS1+2 ── Bot 10018 (sui long) ──
+2026-03-31 14:48:02,767 - StateReconciliation - INFO -   PASS 1: Verifying 9 ledger orders on exchange...
+2026-03-31 14:48:03,702 - StateReconciliation - INFO -   PASS 2: 0 raw fills from exchange for SUIUSDC
+  📊 RESULT Bot 10018 (SUIUSDC long):
+2026-03-31 14:48:03,705 - StateReconciliation - WARNING -   ⚠️ [PHYS-ADOPT] real_proved=68.800000 (true=68.800000 - p3_adopt=0.000000), gap=-11.500000. Running PASS 3...
+2026-03-31 14:48:03,706 - StateReconciliation - INFO -   [PASS3] Using entry price 0.869600 (source: physical entryPrice from exchange).
+2026-03-31 14:48:03,706 - StateReconciliation - INFO -   [PASS3] Step estimate: base=$10.0 mm=2.3 phys_inv=$49.83 cumul=$85.90 → est_n=3 max_step=1 → est_step=3
+2026-03-31 14:48:03,707 - StateReconciliation - INFO -   ✅ [PASS3] Gap≈0 (-11.500000): PASS-2 fully proved the position. No adoption written (stale adoption deleted).
+2026-03-31 14:48:03,707 - StateReconciliation - INFO -   ✅ [PASS3] Physical override applied for Bot 10018 (SUIUSDC long):
+[PHYS-ADOPT] PASS0 ── Bot 10022 (short btc) ──
+  BTCUSDC short: Exchange=0 but DB shows invested=$135.24. Position was externally closed. Auto-resetting bot.
+2026-03-31 14:48:03,720 - StateReconciliation - INFO -   ✅ [PASS0] Bot 10022 (BTCUSDC short) reset to scanning state.
+[PHYS-ADOPT] PASS1+2 ── Bot 10008 (sol) ──
+2026-03-31 14:48:03,725 - StateReconciliation - INFO -   PASS 1: Verifying 8 ledger orders on exchange...
+2026-03-31 14:48:04,476 - StateReconciliation - INFO -   PASS 2: 0 raw fills from exchange for SOLUSDC
+  📊 RESULT Bot 10008 (SOLUSDC long):
+2026-03-31 14:48:04,479 - StateReconciliation - WARNING - [PHYS-ADOPT] ⚠️ Physical position XAUUSDT long qty=1.304000 has no matching active bot. Possible manual trade.
+2026-03-31 14:48:04,481 - BotRunner - INFO -   📊 Bot 10017 (XRPUSDC long): phys=682.0000 proved=682.0000 healed=0 adopted=0 match=True
+2026-03-31 14:48:04,481 - BotRunner - INFO -   📊 Bot 10016 (BTCUSDC long): phys=0.0050 proved=0.0050 healed=0 adopted=0 match=True
+2026-03-31 14:48:04,482 - BotRunner - INFO -   📊 Bot 100002 (ETHUSDC short): phys=0.0100 proved=0.0100 healed=0 adopted=0 match=True
+2026-03-31 14:48:04,482 - BotRunner - INFO -   📊 Bot 10022 (BTCUSDC short): phys=0.0000 proved=0.0000 healed=0 adopted=0 match=True
+2026-03-31 14:48:05,531 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:48:07,641 - BotExecutor - INFO - [PHYS-TRACE] _get_phys_pos called for ETH/USDC:USDC -> ETHUSDC dir=SHORT | ROW: None
+2026-03-31 14:48:07,849 - WebSocketHandler - INFO - 📬 Order Update: XRPUSDC SELL CANCELED #85224992 | CID: CQB_10017_TP_7_1774929676470
+2026-03-31 14:48:07,895 - WebSocketHandler - INFO - 📬 Order Update: BTCUSDC BUY CANCELED #320915139 | CID: CQB_10022_TP_1_1774939007933
+2026-03-31 14:48:07,952 - WebSocketHandler - INFO - 📬 Order Update: BTCUSDC SELL CANCELED #320911368 | CID: CQB_10016_TP_2_1774938652287
+2026-03-31 14:48:07,988 - WebSocketHandler - INFO - 📬 Order Update: ETHUSDC BUY CANCELED #271222244 | CID: CQB_10011_TP_1_1774938734057
+2026-03-31 14:48:08,092 - WebSocketHandler - INFO - 📬 Order Update: XRPUSDC SELL NEW #85285108 | CID: CQB_10017_TP_7_1774939687845
+2026-03-31 14:48:08,115 - WebSocketHandler - INFO - 📬 Order Update: BTCUSDC SELL CANCELED #320887560 | CID: CQB_10022_GRID_2_1774935409682
+2026-03-31 14:48:08,213 - WebSocketHandler - INFO - 📬 Order Update: BTCUSDC BUY CANCELED #320879138 | CID: CQB_10016_GRID_3_1774934063130
+2026-03-31 14:48:08,224 - WebSocketHandler - INFO - 📬 Order Update: ETHUSDC BUY NEW #271233777 | CID: CQB_10011_TP_1_1774939687980
+2026-03-31 14:48:08,456 - BotExecutor - INFO - [PHYS-TRACE] _get_phys_pos called for BTC/USDC:USDC -> BTCUSDC dir=LONG | ROW: None
+2026-03-31 14:48:08,553 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:48:09,051 - BotExecutor - INFO - [PHYS-TRACE] _get_phys_pos called for BTC/USDC:USDC -> BTCUSDC dir=LONG | ROW: (0.005, 'LONG', 67501.8)
+2026-03-31 14:48:09,053 - BotExecutor - INFO - [PHYS-TRACE] _get_phys_pos called for BTC/USDC:USDC -> BTCUSDC dir=None | ROW: (0.005, 'LONG', 67501.8)
+2026-03-31 14:48:09,161 - BotExecutor - INFO - [PHYS-TRACE] _get_phys_pos called for ETH/USDC:USDC -> ETHUSDC dir=SHORT | ROW: (0.01, 'SHORT', 2055.42)
+2026-03-31 14:48:09,163 - BotExecutor - INFO - [PHYS-TRACE] _get_phys_pos called for ETH/USDC:USDC -> ETHUSDC dir=None | ROW: (0.01, 'SHORT', 2055.42)
+2026-03-31 14:48:09,301 - WebSocketHandler - INFO - 📬 Order Update: BTCUSDC SELL NEW #320925458 | CID: CQB_10016_TP_6_1774939689051
+2026-03-31 14:48:09,398 - WebSocketHandler - INFO - 📬 Order Update: ETHUSDC BUY NEW #271233782 | CID: CQB_100002_TP_1_1774939689161
+2026-03-31 14:48:09,542 - WebSocketHandler - INFO - 📬 Order Update: BTCUSDC BUY NEW #320925466 | CID: CQB_10016_GRID_7_1774939689307
+2026-03-31 14:48:09,647 - WebSocketHandler - INFO - 📬 Order Update: ETHUSDC SELL NEW #271233785 | CID: CQB_100002_GRID_2_1774939689398
+2026-03-31 14:48:14,877 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:48:15,721 - WebSocketHandler - INFO - 📬 Order Update: BTCUSDC SELL CANCELED #320925458 | CID: CQB_10016_TP_6_1774939689051
+2026-03-31 14:48:15,949 - WebSocketHandler - INFO - 📬 Order Update: BTCUSDC SELL NEW #320925503 | CID: CQB_10016_TP_6_1774939695709
+2026-03-31 14:48:16,229 - WebSocketHandler - INFO - 📬 Order Update: ETHUSDC BUY CANCELED #271233782 | CID: CQB_100002_TP_1_1774939689161
+2026-03-31 14:48:16,507 - WebSocketHandler - INFO - 📬 Order Update: ETHUSDC BUY NEW #271233818 | CID: CQB_100002_TP_1_1774939696239
+2026-03-31 14:48:21,670 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:48:27,987 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:48:34,308 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:48:40,741 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:48:47,826 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:48:54,111 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:49:00,294 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:49:06,958 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:49:13,196 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:49:20,274 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:49:26,466 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:49:33,046 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:49:39,273 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:49:45,524 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:49:52,643 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:49:58,963 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:50:05,271 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:50:11,548 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:50:17,865 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:50:25,306 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:50:31,511 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:50:37,741 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:50:44,063 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:50:50,494 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:50:57,356 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:51:03,605 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:51:09,836 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:51:11,375 - StateReconciliation - INFO - 🔍 [HISTORY-ORPHAN] 2 pairs with position gaps: [('XRPUSDC', 343.8), ('XAUUSDT', 1.304)]
+2026-03-31 14:51:21,194 - StateReconciliation - INFO - ⚖️ RECON AUDIT [ETHUSDC]: Virtual LONG $0.00 vs Physical LONG $0.00 | Virtual SHORT $41.11 vs Physical SHORT $20.55
+2026-03-31 14:51:21,194 - StateReconciliation - ERROR - 🚨 [QTY-GAP] ETHUSDC: Virtual=-0.020000 vs Physical=-0.010000 (Delta=0.010000 units, $20.55). Scanning for physically impossible states...
+2026-03-31 14:51:21,194 - StateReconciliation - WARNING - ℹ️ [MULTIBOT-GHOST] ETHUSDC: Virtual Mag=$41.11 exceeds Physical Mag=$20.55. Ghost bots — structural ghost detection will handle.
+2026-03-31 14:51:21,195 - StateReconciliation - WARNING - ⚠️ [NET-MISMATCH] ETHUSDC: Virtual=-0.020000 units, Physical=-0.010000 units. Gap=0.010000 ($20.55).
+2026-03-31 14:51:21,204 - StateReconciliation - INFO - 🔑 [DNA-B4] Claimants for ETHUSDC: TP-proof=[100002, 10011] Ledger-proof=[]
+2026-03-31 14:51:21,204 - StateReconciliation - INFO - 🔍 [B.5 CHECK] ETHUSDC: b4_ran=False, is_sole=False, error_side=SHORT, match_bots=['eth', 'short eth']
+2026-03-31 14:51:21,866 - StateReconciliation - INFO - ⚖️ RECON AUDIT [BTCUSDC]: Virtual LONG $472.51 vs Physical LONG $337.51 | Virtual SHORT $135.24 vs Physical SHORT $0.00
+2026-03-31 14:51:21,872 - StateReconciliation - INFO - ⚖️ RECON AUDIT [XRPUSDC]: Virtual LONG $927.12 vs Physical LONG $927.12 | Virtual SHORT $0.00 vs Physical SHORT $0.00
+2026-03-31 14:51:21,879 - StateReconciliation - INFO - ⚖️ RECON AUDIT [XAUUSDT]: Virtual LONG $0.00 vs Physical LONG $5958.33 | Virtual SHORT $0.00 vs Physical SHORT $0.00
+2026-03-31 14:51:21,880 - StateReconciliation - ERROR - 🚨 [QTY-GAP] XAUUSDT: Virtual=0.000000 vs Physical=1.304000 (Delta=1.304000 units, $5958.33). Scanning for physically impossible states...
+2026-03-31 14:51:21,880 - StateReconciliation - WARNING - ⚠️ [NET-MISMATCH] XAUUSDT: Virtual=0.000000 units, Physical=1.304000 units. Gap=1.304000 ($5958.33).
+2026-03-31 14:51:21,881 - StateReconciliation - WARNING - 🚫 [ADOPTION-BLOCKED] XAUUSDT: Physical is LONG but sole bot short gold is SHORT.
+2026-03-31 14:51:21,883 - StateReconciliation - INFO - 🔍 [B.5 CHECK] XAUUSDT: b4_ran=False, is_sole=True, error_side=LONG, match_bots=[]
+2026-03-31 14:51:21,887 - IntegrityEnforcer - WARNING - ⚠️ UNMATCHED POSITION: XAUUSDT NET PhysQty=1.3040 VirtQty=0.0000 — Possibly manual trade. NO ACTION TAKEN.
+2026-03-31 14:51:21,888 - IntegrityEnforcer - WARNING - ⚠️ SIZE DISCREPANCY: ETHUSDC NET PhysQty=-0.0100 VirtQty=-0.0200 (Diff: 0.0100 qty). NO ACTION TAKEN.
+2026-03-31 14:51:21,888 - IntegrityEnforcer - WARNING - ⚠️ SIZE DISCREPANCY: XRPUSDC NET PhysQty=682.0000 VirtQty=338.2000 (Diff: 343.8000 qty). NO ACTION TAKEN.
+2026-03-31 14:51:26,944 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:51:28,034 - WebSocketHandler - INFO - 📬 Order Update: XRPUSDC SELL CANCELED #85285108 | CID: CQB_10017_TP_7_1774939687845
+2026-03-31 14:51:28,113 - WebSocketHandler - INFO - 📬 Order Update: BTCUSDC SELL CANCELED #320925503 | CID: CQB_10016_TP_6_1774939695709
+2026-03-31 14:51:28,129 - BotExecutor - INFO - [PHYS-TRACE] _get_phys_pos called for BTC/USDC:USDC -> BTCUSDC dir=SHORT | ROW: (0.005, 'LONG', 67501.8)
+2026-03-31 14:51:28,131 - BotExecutor - INFO - [PHYS-TRACE] _get_phys_pos called for BTC/USDC:USDC -> BTCUSDC dir=None | ROW: (0.005, 'LONG', 67501.8)
+2026-03-31 14:51:28,295 - WebSocketHandler - INFO - 📬 Order Update: XRPUSDC SELL NEW #85286371 | CID: CQB_10017_TP_7_1774939888033
+2026-03-31 14:51:28,370 - WebSocketHandler - INFO - 📬 Order Update: BTCUSDC SELL NEW #320927519 | CID: CQB_10016_TP_6_1774939888112
+2026-03-31 14:51:28,393 - WebSocketHandler - INFO - 📬 Order Update: BTCUSDC BUY NEW #320927521 | CID: CQB_10022_TP_0_1774939888122
+2026-03-31 14:51:28,638 - WebSocketHandler - INFO - 📬 Order Update: BTCUSDC SELL NEW #320927530 | CID: CQB_10022_GRID_1_1774939888382
+2026-03-31 14:51:33,790 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:51:34,831 - WebSocketHandler - INFO - 📬 Order Update: BTCUSDC BUY CANCELED #320927521 | CID: CQB_10022_TP_0_1774939888122
+2026-03-31 14:51:35,126 - WebSocketHandler - INFO - 📬 Order Update: BTCUSDC BUY NEW #320927657 | CID: CQB_10022_TP_0_1774939894831
+2026-03-31 14:51:40,278 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:51:46,914 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:51:53,160 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:51:59,402 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:52:06,438 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:52:13,411 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:52:19,741 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:52:26,032 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:52:32,315 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:52:39,509 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:52:45,788 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:52:52,180 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:52:58,561 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:53:05,041 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:53:12,190 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:53:18,458 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:53:24,824 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:53:31,293 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:53:37,538 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:53:44,527 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:53:50,858 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:53:57,361 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:54:03,648 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:54:09,965 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:54:16,768 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:54:23,363 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:54:29,694 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:54:36,044 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:54:37,318 - StateReconciliation - INFO - 🔍 [HISTORY-ORPHAN] 2 pairs with position gaps: [('XRPUSDC', 343.8), ('XAUUSDT', 1.304)]
+2026-03-31 14:54:46,906 - StateReconciliation - INFO - ⚖️ RECON AUDIT [ETHUSDC]: Virtual LONG $0.00 vs Physical LONG $0.00 | Virtual SHORT $41.11 vs Physical SHORT $20.55
+2026-03-31 14:54:46,906 - StateReconciliation - ERROR - 🚨 [QTY-GAP] ETHUSDC: Virtual=-0.020000 vs Physical=-0.010000 (Delta=0.010000 units, $20.55). Scanning for physically impossible states...
+2026-03-31 14:54:46,907 - StateReconciliation - WARNING - ℹ️ [MULTIBOT-GHOST] ETHUSDC: Virtual Mag=$41.11 exceeds Physical Mag=$20.55. Ghost bots — structural ghost detection will handle.
+2026-03-31 14:54:46,907 - StateReconciliation - WARNING - ⚠️ [NET-MISMATCH] ETHUSDC: Virtual=-0.020000 units, Physical=-0.010000 units. Gap=0.010000 ($20.55).
+2026-03-31 14:54:46,910 - StateReconciliation - INFO - 🔑 [DNA-B4] Claimants for ETHUSDC: TP-proof=[100002, 10011] Ledger-proof=[]
+2026-03-31 14:54:46,911 - StateReconciliation - INFO - 🔍 [B.5 CHECK] ETHUSDC: b4_ran=False, is_sole=False, error_side=SHORT, match_bots=['eth', 'short eth']
+2026-03-31 14:54:47,595 - StateReconciliation - INFO - ⚖️ RECON AUDIT [BTCUSDC]: Virtual LONG $472.51 vs Physical LONG $337.51 | Virtual SHORT $135.24 vs Physical SHORT $0.00
+2026-03-31 14:54:47,600 - StateReconciliation - INFO - ⚖️ RECON AUDIT [XRPUSDC]: Virtual LONG $459.75 vs Physical LONG $927.12 | Virtual SHORT $0.00 vs Physical SHORT $0.00
+2026-03-31 14:54:47,600 - StateReconciliation - ERROR - 🚨 [QTY-GAP] XRPUSDC: Virtual=338.200001 vs Physical=682.000000 (Delta=343.799999 units, $467.37). Scanning for physically impossible states...
+2026-03-31 14:54:47,601 - StateReconciliation - WARNING - ⚠️ [NET-MISMATCH] XRPUSDC: Virtual=338.200001 units, Physical=682.000000 units. Gap=343.799999 ($467.37).
+2026-03-31 14:54:47,607 - StateReconciliation - INFO - ⚖️ RECON AUDIT [XAUUSDT]: Virtual LONG $0.00 vs Physical LONG $5958.33 | Virtual SHORT $0.00 vs Physical SHORT $0.00
+2026-03-31 14:54:47,607 - StateReconciliation - ERROR - 🚨 [QTY-GAP] XAUUSDT: Virtual=0.000000 vs Physical=1.304000 (Delta=1.304000 units, $5958.33). Scanning for physically impossible states...
+2026-03-31 14:54:47,607 - StateReconciliation - WARNING - ⚠️ [NET-MISMATCH] XAUUSDT: Virtual=0.000000 units, Physical=1.304000 units. Gap=1.304000 ($5958.33).
+2026-03-31 14:54:47,607 - StateReconciliation - WARNING - 🚫 [ADOPTION-BLOCKED] XAUUSDT: Physical is LONG but sole bot short gold is SHORT.
+2026-03-31 14:54:47,611 - StateReconciliation - INFO - 🔍 [B.5 CHECK] XAUUSDT: b4_ran=False, is_sole=True, error_side=LONG, match_bots=[]
+2026-03-31 14:54:47,614 - IntegrityEnforcer - WARNING - ⚠️ UNMATCHED POSITION: XAUUSDT NET PhysQty=1.3040 VirtQty=0.0000 — Possibly manual trade. NO ACTION TAKEN.
+2026-03-31 14:54:47,614 - IntegrityEnforcer - WARNING - ⚠️ SIZE DISCREPANCY: ETHUSDC NET PhysQty=-0.0100 VirtQty=-0.0200 (Diff: 0.0100 qty). NO ACTION TAKEN.
+2026-03-31 14:54:47,615 - IntegrityEnforcer - WARNING - ⚠️ SIZE DISCREPANCY: XRPUSDC NET PhysQty=682.0000 VirtQty=338.2000 (Diff: 343.8000 qty). NO ACTION TAKEN.
+2026-03-31 14:54:53,422 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:54:59,911 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:55:06,684 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:55:13,042 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:55:19,340 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:55:25,882 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:55:32,930 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:55:39,242 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:55:45,513 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:55:52,090 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:55:58,376 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:56:05,499 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:56:11,792 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:56:18,342 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:56:24,715 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:56:31,030 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:56:38,051 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:56:44,648 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:56:50,920 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:56:57,186 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:57:03,456 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:57:10,796 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:57:17,160 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:57:23,364 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:57:29,645 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:57:36,273 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:57:43,516 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:57:49,751 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:57:56,039 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:58:02,577 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:58:03,839 - StateReconciliation - INFO - 🔍 [HISTORY-ORPHAN] 2 pairs with position gaps: [('XRPUSDC', 343.8), ('XAUUSDT', 1.304)]
+2026-03-31 14:58:13,689 - StateReconciliation - INFO - ⚖️ RECON AUDIT [ETHUSDC]: Virtual LONG $0.00 vs Physical LONG $0.00 | Virtual SHORT $41.11 vs Physical SHORT $20.55
+2026-03-31 14:58:13,689 - StateReconciliation - ERROR - 🚨 [QTY-GAP] ETHUSDC: Virtual=-0.020000 vs Physical=-0.010000 (Delta=0.010000 units, $20.55). Scanning for physically impossible states...
+2026-03-31 14:58:13,689 - StateReconciliation - WARNING - ℹ️ [MULTIBOT-GHOST] ETHUSDC: Virtual Mag=$41.11 exceeds Physical Mag=$20.55. Ghost bots — structural ghost detection will handle.
+2026-03-31 14:58:13,689 - StateReconciliation - WARNING - ⚠️ [NET-MISMATCH] ETHUSDC: Virtual=-0.020000 units, Physical=-0.010000 units. Gap=0.010000 ($20.55).
+2026-03-31 14:58:13,689 - StateReconciliation - INFO - 🔑 [DNA-B4] Claimants for ETHUSDC: TP-proof=[100002, 10011] Ledger-proof=[]
+2026-03-31 14:58:13,689 - StateReconciliation - INFO - 🔍 [B.5 CHECK] ETHUSDC: b4_ran=False, is_sole=False, error_side=SHORT, match_bots=['eth', 'short eth']
+2026-03-31 14:58:14,364 - StateReconciliation - INFO - ⚖️ RECON AUDIT [BTCUSDC]: Virtual LONG $472.51 vs Physical LONG $337.51 | Virtual SHORT $135.24 vs Physical SHORT $0.00
+2026-03-31 14:58:14,369 - StateReconciliation - INFO - ⚖️ RECON AUDIT [XRPUSDC]: Virtual LONG $459.75 vs Physical LONG $927.12 | Virtual SHORT $0.00 vs Physical SHORT $0.00
+2026-03-31 14:58:14,369 - StateReconciliation - ERROR - 🚨 [QTY-GAP] XRPUSDC: Virtual=338.200001 vs Physical=682.000000 (Delta=343.799999 units, $467.37). Scanning for physically impossible states...
+2026-03-31 14:58:14,370 - StateReconciliation - WARNING - ⚠️ [NET-MISMATCH] XRPUSDC: Virtual=338.200001 units, Physical=682.000000 units. Gap=343.799999 ($467.37).
+2026-03-31 14:58:14,377 - StateReconciliation - INFO - ⚖️ RECON AUDIT [XAUUSDT]: Virtual LONG $0.00 vs Physical LONG $5958.33 | Virtual SHORT $0.00 vs Physical SHORT $0.00
+2026-03-31 14:58:14,377 - StateReconciliation - ERROR - 🚨 [QTY-GAP] XAUUSDT: Virtual=0.000000 vs Physical=1.304000 (Delta=1.304000 units, $5958.33). Scanning for physically impossible states...
+2026-03-31 14:58:14,378 - StateReconciliation - WARNING - ⚠️ [NET-MISMATCH] XAUUSDT: Virtual=0.000000 units, Physical=1.304000 units. Gap=1.304000 ($5958.33).
+2026-03-31 14:58:14,378 - StateReconciliation - WARNING - 🚫 [ADOPTION-BLOCKED] XAUUSDT: Physical is LONG but sole bot short gold is SHORT.
+2026-03-31 14:58:14,381 - StateReconciliation - INFO - 🔍 [B.5 CHECK] XAUUSDT: b4_ran=False, is_sole=True, error_side=LONG, match_bots=[]
+2026-03-31 14:58:14,386 - IntegrityEnforcer - WARNING - ⚠️ UNMATCHED POSITION: XAUUSDT NET PhysQty=1.3040 VirtQty=0.0000 — Possibly manual trade. NO ACTION TAKEN.
+2026-03-31 14:58:14,387 - IntegrityEnforcer - WARNING - ⚠️ SIZE DISCREPANCY: ETHUSDC NET PhysQty=-0.0100 VirtQty=-0.0200 (Diff: 0.0100 qty). NO ACTION TAKEN.
+2026-03-31 14:58:14,387 - IntegrityEnforcer - WARNING - ⚠️ SIZE DISCREPANCY: XRPUSDC NET PhysQty=682.0000 VirtQty=338.2000 (Diff: 343.8000 qty). NO ACTION TAKEN.
+2026-03-31 14:58:20,170 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:58:26,448 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:58:45,424 - Preflight - WARNING -     ❌ XAUUSDT: Exchange=1.304 | DB=$0 (ORPHAN)
+2026-03-31 14:58:45,424 - Preflight - INFO -     ✅ ETHUSDC: Exchange=-0.01 | DB=$-41.11 — Aligned
+2026-03-31 14:58:45,424 - Preflight - INFO -     ✅ XRPUSDC: Exchange=682.0 | DB=$459.75 — Aligned
+2026-03-31 14:58:45,424 - Preflight - INFO -     ✅ BTCUSDC: Exchange=0.005 | DB=$472.51 — Aligned
+2026-03-31 14:58:45,686 - BotRunner - WARNING -   → CRITICAL: Exchange has 1.304 XAUUSDT but DB has $0. Orphaned position!
+2026-03-31 14:58:46,139 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:58:46,164 - StateReconciliation - INFO - 🔍 [HISTORY-ORPHAN] 1 pairs with position gaps: [('XAUUSDT', 1.304)]
+2026-03-31 14:58:51,363 - StateReconciliation - INFO - 🔍 [HISTORY-ORPHAN] 1 pairs with position gaps: [('XAUUSDT', 1.304)]
+2026-03-31 14:58:56,679 - StateReconciliation - INFO -   📍 Exchange: ETHUSDC short qty=0.010000 entryPrice=2055.420000
+2026-03-31 14:58:56,679 - StateReconciliation - INFO -   📍 Exchange: XRPUSDC long qty=682.000000 entryPrice=1.359413
+2026-03-31 14:58:56,679 - StateReconciliation - INFO -   📍 Exchange: XAUUSDT long qty=1.304000 entryPrice=4569.270000
+2026-03-31 14:58:56,679 - StateReconciliation - INFO -   📍 Exchange: BTCUSDC long qty=0.005000 entryPrice=67501.800000
+2026-03-31 14:58:56,679 - StateReconciliation - INFO -   📍 Exchange has open position: ETHUSDC short qty=0.010000
+2026-03-31 14:58:56,679 - StateReconciliation - INFO -   📍 Exchange has open position: XRPUSDC long qty=682.000000
+2026-03-31 14:58:56,679 - StateReconciliation - INFO -   📍 Exchange has open position: XAUUSDT long qty=1.304000
+2026-03-31 14:58:56,679 - StateReconciliation - INFO -   📍 Exchange has open position: BTCUSDC long qty=0.005000
+[PHYS-ADOPT] PASS0 ── Bot 10022 (short btc) ──
+  BTCUSDC short: Exchange=0 but DB shows invested=$0.00. Position was externally closed. Auto-resetting bot.
+2026-03-31 14:58:56,696 - StateReconciliation - INFO -   ✅ [PASS0] Bot 10022 (BTCUSDC short) reset to scanning state.
+[PHYS-ADOPT] PASS1+2 ── Bot 100002 (short eth) ──
+  Symbol=ETHUSDC Side=short phys_qty=0.010000
+2026-03-31 14:58:56,696 - StateReconciliation - INFO -   PASS 1: Verifying 6 ledger orders on exchange...
+2026-03-31 14:58:57,941 - StateReconciliation - WARNING -   fetch_my_trades(ETHUSDC) failed: binance {"code":-2015,"msg":"Invalid API-key, IP, or permissions for action, request ip: 42.77.2.81"}
+2026-03-31 14:58:57,942 - StateReconciliation - INFO -   PASS 2: 0 raw fills from exchange for ETHUSDC
+  📊 RESULT Bot 100002 (ETHUSDC short):
+[PHYS-ADOPT] PASS1+2 ── Bot 10008 (sol) ──
+2026-03-31 14:58:57,947 - StateReconciliation - INFO -   PASS 1: Verifying 8 ledger orders on exchange...
+2026-03-31 14:58:58,896 - StateReconciliation - INFO -   PASS 2: 0 raw fills from exchange for SOLUSDC
+  📊 RESULT Bot 10008 (SOLUSDC long):
+[PHYS-ADOPT] PASS1+2 ── Bot 10018 (sui long) ──
+2026-03-31 14:58:58,908 - StateReconciliation - INFO -   PASS 1: Verifying 8 ledger orders on exchange...
+2026-03-31 14:58:59,870 - StateReconciliation - INFO -   PASS 2: 0 raw fills from exchange for SUIUSDC
+  📊 RESULT Bot 10018 (SUIUSDC long):
+2026-03-31 14:58:59,881 - StateReconciliation - WARNING -   ⚠️ [PHYS-ADOPT] real_proved=68.800000 (true=68.800000 - p3_adopt=0.000000), gap=-11.500000. Running PASS 3...
+2026-03-31 14:58:59,881 - StateReconciliation - INFO -   [PASS3] Using entry price 0.869600 (source: physical entryPrice from exchange).
+2026-03-31 14:58:59,881 - StateReconciliation - INFO -   [PASS3] Step estimate: base=$10.0 mm=2.3 phys_inv=$49.83 cumul=$85.90 → est_n=3 max_step=1 → est_step=3
+2026-03-31 14:58:59,881 - StateReconciliation - INFO -   ✅ [PASS3] Gap≈0 (-11.500000): PASS-2 fully proved the position. No adoption written (stale adoption deleted).
+2026-03-31 14:58:59,881 - StateReconciliation - INFO -   ✅ [PASS3] Physical override applied for Bot 10018 (SUIUSDC long):
+[PHYS-ADOPT] PASS0 ── Bot 100000 (short sui) ──
+2026-03-31 14:58:59,895 - StateReconciliation - INFO -   ✅ [PASS0] Bot 100000 (SUIUSDC short) reset to scanning state.
+2026-03-31 14:58:59,895 - StateReconciliation - WARNING - [PHYS-ADOPT] ⚠️ Physical position XAUUSDT long qty=1.304000 has no matching active bot. Possible manual trade.
+[PHYS-ADOPT] PASS1+2 ── Bot 10016 (long btc price) ──
+  Symbol=BTCUSDC Side=long phys_qty=0.005000
+2026-03-31 14:58:59,906 - StateReconciliation - INFO -   PASS 1: Verifying 4 ledger orders on exchange...
+2026-03-31 14:59:00,306 - StateReconciliation - WARNING -   fetch_my_trades(BTCUSDC) failed: binance {"code":-2015,"msg":"Invalid API-key, IP, or permissions for action, request ip: 42.77.2.81"}
+2026-03-31 14:59:00,306 - StateReconciliation - INFO -   PASS 2: 0 raw fills from exchange for BTCUSDC
+  📊 RESULT Bot 10016 (BTCUSDC long):
+2026-03-31 14:59:00,314 - StateReconciliation - WARNING -   ⚠️ [PHYS-ADOPT] real_proved=0.007000 (true=0.007000 - p3_adopt=0.000000), gap=-0.002000. Running PASS 3...
+2026-03-31 14:59:00,314 - StateReconciliation - INFO -   [PASS3] Using entry price 67501.800000 (source: physical entryPrice from exchange).
+2026-03-31 14:59:00,314 - StateReconciliation - INFO -   [PASS3] Step estimate: base=$10.0 mm=1.88 phys_inv=$337.51 cumul=$490.36 → est_n=6 max_step=6 → est_step=6
+2026-03-31 14:59:00,316 - StateReconciliation - INFO -   ✅ [PASS3] Gap≈0 (-0.002000): PASS-2 fully proved the position. No adoption written (stale adoption deleted).
+2026-03-31 14:59:00,319 - StateReconciliation - INFO -   ✅ [PASS3] Physical override applied for Bot 10016 (BTCUSDC long):
+[PHYS-ADOPT] PASS1+2 ── Bot 10017 (xrp long) ──
+  Symbol=XRPUSDC Side=long phys_qty=682.000000
+2026-03-31 14:59:00,325 - StateReconciliation - INFO -   PASS 1: Verifying 11 ledger orders on exchange...
+2026-03-31 14:59:01,217 - StateReconciliation - WARNING -   fetch_my_trades(XRPUSDC) failed: binance {"code":-2015,"msg":"Invalid API-key, IP, or permissions for action, request ip: 42.77.2.81"}
+2026-03-31 14:59:01,218 - StateReconciliation - INFO -   PASS 2: 0 raw fills from exchange for XRPUSDC
+  📊 RESULT Bot 10017 (XRPUSDC long):
+2026-03-31 14:59:01,233 - StateReconciliation - WARNING -   ⚠️ [PHYS-ADOPT] real_proved=0.000000 (true=338.200000 - p3_adopt=338.200000), gap=682.000000. Running PASS 3...
+2026-03-31 14:59:01,234 - StateReconciliation - INFO -   [PASS3] Using entry price 1.359413 (source: physical entryPrice from exchange).
+2026-03-31 14:59:01,234 - StateReconciliation - INFO -   [PASS3] Step estimate: base=$10.0 mm=2.1 phys_inv=$927.12 cumul=$1628.26 → est_n=7 max_step=7 → est_step=7
+2026-03-31 14:59:01,236 - StateReconciliation - INFO -   ✅ [PASS3] Gap adoption written: gap=343.800000 ETH (phys=682.000000 − proved=338.200000)
+2026-03-31 14:59:01,236 - StateReconciliation - INFO -   ✅ [PASS3] Physical override applied for Bot 10017 (XRPUSDC long):
+2026-03-31 14:59:01,251 - BotRunner - INFO -   📊 Bot 10022 (BTCUSDC short): phys=0.0000 proved=0.0000 healed=0 adopted=0 match=True
+2026-03-31 14:59:01,251 - BotRunner - INFO -   📊 Bot 100002 (ETHUSDC short): phys=0.0100 proved=0.0000 healed=0 adopted=0 match=True
+2026-03-31 14:59:01,252 - BotRunner - INFO -   📊 Bot 10016 (BTCUSDC long): phys=0.0050 proved=0.0050 healed=0 adopted=0 match=True
+2026-03-31 14:59:01,253 - BotRunner - INFO -   📊 Bot 10017 (XRPUSDC long): phys=682.0000 proved=682.0000 healed=0 adopted=0 match=True
+2026-03-31 14:59:02,341 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:59:04,811 - WebSocketHandler - INFO - 📬 Order Update: BTCUSDC BUY CANCELED #320927657 | CID: CQB_10022_TP_0_1774939894831
+2026-03-31 14:59:05,032 - WebSocketHandler - INFO - 📬 Order Update: BTCUSDC SELL CANCELED #320927530 | CID: CQB_10022_GRID_1_1774939888382
+2026-03-31 14:59:05,493 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:59:11,813 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:59:18,576 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:59:24,920 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:59:31,197 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:59:37,763 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:59:44,820 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:59:51,139 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 14:59:57,410 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 15:00:03,920 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 15:00:10,199 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 15:00:17,328 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 15:00:23,580 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 15:00:31,147 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 15:00:37,534 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 15:00:43,853 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 15:00:50,913 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 15:00:57,465 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 15:01:03,614 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 15:01:09,895 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 15:01:16,095 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 15:01:23,446 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 15:01:29,792 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 15:01:36,238 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 15:01:42,559 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 15:01:49,140 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 15:01:56,145 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 15:02:02,391 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 15:02:08,678 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 15:02:10,238 - StateReconciliation - INFO - 🔍 [HISTORY-ORPHAN] 2 pairs with position gaps: [('XRPUSDC', 338.2), ('XAUUSDT', 1.304)]
+2026-03-31 15:02:20,603 - StateReconciliation - INFO - ⚖️ RECON AUDIT [ETHUSDC]: Virtual LONG $0.00 vs Physical LONG $0.00 | Virtual SHORT $41.11 vs Physical SHORT $20.55
+2026-03-31 15:02:20,604 - StateReconciliation - ERROR - 🚨 [QTY-GAP] ETHUSDC: Virtual=-0.020000 vs Physical=-0.010000 (Delta=0.010000 units, $20.55). Scanning for physically impossible states...
+2026-03-31 15:02:20,604 - StateReconciliation - WARNING - ℹ️ [MULTIBOT-GHOST] ETHUSDC: Virtual Mag=$41.11 exceeds Physical Mag=$20.55. Ghost bots — structural ghost detection will handle.
+2026-03-31 15:02:20,604 - StateReconciliation - WARNING - ⚠️ [NET-MISMATCH] ETHUSDC: Virtual=-0.020000 units, Physical=-0.010000 units. Gap=0.010000 ($20.55).
+2026-03-31 15:02:20,610 - StateReconciliation - INFO - 🔑 [DNA-B4] Claimants for ETHUSDC: TP-proof=[100002, 10011] Ledger-proof=[]
+2026-03-31 15:02:20,611 - StateReconciliation - INFO - 🔍 [B.5 CHECK] ETHUSDC: b4_ran=False, is_sole=False, error_side=SHORT, match_bots=['eth', 'short eth']
+2026-03-31 15:02:21,284 - StateReconciliation - INFO - ⚖️ RECON AUDIT [BTCUSDC]: Virtual LONG $472.51 vs Physical LONG $337.51 | Virtual SHORT $0.00 vs Physical SHORT $0.00
+2026-03-31 15:02:21,288 - StateReconciliation - CRITICAL - 👻 SYSTEM MISMATCH on BTCUSDC: Bot long btc price claims 0.007000 QTY, but Math Capacity is only 0.005000 QTY.
+2026-03-31 15:02:21,658 - StateReconciliation - ERROR - 🚨 [QTY-GAP] BTCUSDC: Virtual=0.007000 vs Physical=0.005000 (Delta=0.002000 units, $135.00). Scanning for physically impossible states...
+2026-03-31 15:02:21,658 - StateReconciliation - WARNING - ℹ️ [MULTIBOT-GHOST] BTCUSDC: Virtual Mag=$472.51 exceeds Physical Mag=$337.51. Ghost bots — structural ghost detection will handle.
+2026-03-31 15:02:21,660 - StateReconciliation - WARNING - ⚠️ [NET-MISMATCH] BTCUSDC: Virtual=0.007000 units, Physical=0.005000 units. Gap=0.002000 ($135.00).
+2026-03-31 15:02:21,663 - StateReconciliation - INFO - 🔑 [DNA-B4] Claimants for BTCUSDC: TP-proof=[10016] Ledger-proof=[]
+2026-03-31 15:02:21,663 - StateReconciliation - INFO - 🔍 [B.5 CHECK] BTCUSDC: b4_ran=False, is_sole=False, error_side=LONG, match_bots=['long btc price']
+2026-03-31 15:02:21,663 - StateReconciliation - INFO - 🧠 [SMART-DEDUCT] BTCUSDC: Adopting adjusted physical net (usd=337.51, qty=0.005000) to long btc price.
+2026-03-31 15:02:22,024 - StateReconciliation - INFO - ⚖️ RECON AUDIT [XRPUSDC]: Virtual LONG $467.37 vs Physical LONG $927.12 | Virtual SHORT $0.00 vs Physical SHORT $0.00
+2026-03-31 15:02:22,024 - StateReconciliation - ERROR - 🚨 [QTY-GAP] XRPUSDC: Virtual=343.800000 vs Physical=682.000000 (Delta=338.200000 units, $459.75). Scanning for physically impossible states...
+2026-03-31 15:02:22,024 - StateReconciliation - WARNING - ⚠️ [NET-MISMATCH] XRPUSDC: Virtual=343.800000 units, Physical=682.000000 units. Gap=338.200000 ($459.75).
+2026-03-31 15:02:22,730 - StateReconciliation - INFO - ⚖️ RECON AUDIT [XAUUSDT]: Virtual LONG $0.00 vs Physical LONG $5958.33 | Virtual SHORT $0.00 vs Physical SHORT $0.00
+2026-03-31 15:02:22,732 - StateReconciliation - ERROR - 🚨 [QTY-GAP] XAUUSDT: Virtual=0.000000 vs Physical=1.304000 (Delta=1.304000 units, $5958.33). Scanning for physically impossible states...
+2026-03-31 15:02:22,732 - StateReconciliation - WARNING - ⚠️ [NET-MISMATCH] XAUUSDT: Virtual=0.000000 units, Physical=1.304000 units. Gap=1.304000 ($5958.33).
+2026-03-31 15:02:22,732 - StateReconciliation - WARNING - 🚫 [ADOPTION-BLOCKED] XAUUSDT: Physical is LONG but sole bot short gold is SHORT.
+2026-03-31 15:02:22,737 - StateReconciliation - INFO - 🔍 [B.5 CHECK] XAUUSDT: b4_ran=False, is_sole=True, error_side=LONG, match_bots=[]
+2026-03-31 15:02:22,742 - IntegrityEnforcer - WARNING - ⚠️ UNMATCHED POSITION: XAUUSDT NET PhysQty=1.3040 VirtQty=0.0000 — Possibly manual trade. NO ACTION TAKEN.
+2026-03-31 15:02:22,742 - IntegrityEnforcer - WARNING - ⚠️ SIZE DISCREPANCY: ETHUSDC NET PhysQty=-0.0100 VirtQty=-0.0200 (Diff: 0.0100 qty). NO ACTION TAKEN.
+2026-03-31 15:02:22,742 - IntegrityEnforcer - WARNING - ⚠️ SIZE DISCREPANCY: XRPUSDC NET PhysQty=682.0000 VirtQty=343.8000 (Diff: 338.2000 qty). NO ACTION TAKEN.
+2026-03-31 15:02:22,743 - IntegrityEnforcer - WARNING - ⚠️ SIZE DISCREPANCY: BTCUSDC NET PhysQty=0.0050 VirtQty=0.0070 (Diff: 0.0020 qty). NO ACTION TAKEN.
+2026-03-31 15:02:28,584 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 15:02:29,572 - WebSocketHandler - INFO - 📬 Order Update: ETHUSDC BUY CANCELED #271233777 | CID: CQB_10011_TP_1_1774939687980
+2026-03-31 15:02:29,796 - WebSocketHandler - INFO - 📬 Order Update: ETHUSDC BUY NEW #271243844 | CID: CQB_10011_TP_1_1774940549572
+2026-03-31 15:02:34,956 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 15:02:41,489 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 15:02:47,800 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 15:02:54,181 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 15:03:00,621 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 15:03:07,121 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.
+2026-03-31 15:03:13,514 - engine.database - WARNING - ⚠️ [REALITY-ORPHAN] Physical LONG XAUUSDT has no owner. Saved with bot_id=0 for UI.

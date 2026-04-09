@@ -19,6 +19,22 @@ logger = logging.getLogger("WSEventHandlers")
 # Deduplication set for notifications
 _notified_fills = set()
 _notified_fills_timestamps = {}
+
+# 🚀 FUNDAMENTAL FIX: Deferred cancel registry for WS TP fills.
+# When a TP fills via WebSocket, we have no exchange object here.
+# We register (bot_id, pair) so the runner/reconciler can drain this
+# on its next tick and cancel any lingering grid/entry orders on the exchange.
+# This prevents orphaned positions (e.g. XRP step-6 grid filling post-cycle-reset).
+_pending_cancel_after_tp: set = set()  # set of (bot_id, pair) tuples
+
+def get_pending_cancel_after_tp() -> set:
+    """Return and clear the pending cancel registry (called by runner/reconciler)."""
+    global _pending_cancel_after_tp
+    if not _pending_cancel_after_tp:
+        return set()
+    snapshot = _pending_cancel_after_tp.copy()
+    _pending_cancel_after_tp.clear()
+    return snapshot
 _notified_fills_max_size = 10000
 
 # Per-order partial fill tracker: {f"{bot_id}_{order_id}": last_cumulative_filled_qty}
@@ -319,6 +335,14 @@ def _handle_order_filled(bot_id: int, order_type: str, event: Dict):
             reset_bot_after_tp(bot_id, exit_price=avg_price)
             log_trade(bot_id, 'WS_TP_FILL', symbol, avg_price, filled_qty, realized_pnl, "TP")
             add_notification('success', f"💰 TP Hit for {symbol} (PnL ${realized_pnl:.2f})", bot_id)
+            # 🚀 FUNDAMENTAL FIX: Register for deferred exchange-side cancel sweep.
+            # We cannot cancel exchange orders here (no exchange object), so we register
+            # (bot_id, symbol) in the pending cancel set. The runner/reconciler drains this
+            # registry with exchange access on the next tick, cancelling any lingering grid
+            # orders before they fill and create orphaned positions.
+            if symbol:
+                _pending_cancel_after_tp.add((bot_id, symbol))
+                logger.info(f"📋 [DEFERRED-CANCEL] Registered (bot={bot_id}, pair={symbol}) for next-tick orphan sweep.")
         except Exception as e:
             logger.error(f"Failed to process TP fill for bot {bot_id}: {e}")
             
@@ -327,6 +351,18 @@ def _handle_order_filled(bot_id: int, order_type: str, event: Dict):
         logger.info(f"📈 WS Grid Fill for Bot {bot_id}")
         try:
             _update_trade_state_from_fill(bot_id, order_type, symbol, avg_price, filled_qty, event)
+            # 🔑 PRECISION FIX: Seal the bot_orders row with the authoritative cumulative fill qty.
+            # The incremental_qty (Binance 'l' field) was used to update the ledger, but we must
+            # stamp the final 'z' (cumulative) into bot_orders.filled_amount so recompute_invested_from_orders
+            # always reads mathematically exact quantities — not accumulation approximations.
+            cumulative_fill_qty = float(event.get('filled_qty', 0) or 0) if event else 0.0
+            if cumulative_fill_qty > 0:
+                try:
+                    from engine.database import update_order_fill
+                    update_order_fill(order_id, cumulative_fill_qty, bot_id=bot_id)
+                    logger.debug(f"[PRECISION-SEAL] GRID {order_id}: bot_orders.filled_amount sealed at {cumulative_fill_qty} (cumulative z)")
+                except Exception as e_seal:
+                    logger.warning(f"[PRECISION-SEAL] Failed to seal GRID fill for order {order_id}: {e_seal}")
             add_notification('info', f"📉 Grid Fill for {symbol}", bot_id)
         except Exception as e:
             logger.error(f"Failed to process Grid fill for bot {bot_id}: {e}")
@@ -336,14 +372,22 @@ def _handle_order_filled(bot_id: int, order_type: str, event: Dict):
         logger.info(f"🚀 WS Entry Fill for Bot {bot_id}")
         try:
             _update_trade_state_from_fill(bot_id, order_type, symbol, avg_price, filled_qty, event)
-            
+            # 🔑 PRECISION FIX: Seal the bot_orders row with the authoritative cumulative fill qty.
+            # Same rationale as GRID above — the 'z' cumulative field is the exchange ground truth.
+            cumulative_fill_qty = float(event.get('filled_qty', 0) or 0) if event else 0.0
+            if cumulative_fill_qty > 0:
+                try:
+                    from engine.database import update_order_fill
+                    update_order_fill(order_id, cumulative_fill_qty, bot_id=bot_id)
+                    logger.debug(f"[PRECISION-SEAL] ENTRY {order_id}: bot_orders.filled_amount sealed at {cumulative_fill_qty} (cumulative z)")
+                except Exception as e_seal:
+                    logger.warning(f"[PRECISION-SEAL] Failed to seal ENTRY fill for order {order_id}: {e_seal}")
             # RATE LIMITING for Entry Notifications
             import time
             current_time = time.time()
             fill_key = f"ENTRY_FILL_{bot_id}_{symbol}"
             last_fill_time = _notified_fills_timestamps.get(fill_key, 0)
-            
-            if (current_time - last_fill_time) > 10.0: 
+            if (current_time - last_fill_time) > 10.0:
                 add_notification('info', f"🚀 Entry Fill for {symbol}", bot_id)
                 _notified_fills_timestamps[fill_key] = current_time
         except Exception as e:
@@ -391,6 +435,26 @@ def _update_trade_state_from_fill(bot_id: int, order_type: str, symbol: str, avg
         is_entry=is_entry
     )
     
+    # 🚀 CARRY_PENDING → ACTIVE (Live Fill Path)
+    # If this bot was carrying a position from a previous cycle (CARRY_PENDING),
+    # a live fill proves it is genuinely active. Upgrade immediately.
+    # This is the real-time equivalent of _align_memory_to_ledger at startup.
+    try:
+        from engine.database import get_connection as _gc_cp
+        _c = _gc_cp()
+        _phase = (_c.execute(
+            "SELECT cycle_phase FROM trades WHERE bot_id=?", (bot_id,)
+        ).fetchone() or [None])[0]
+        if _phase == 'CARRY_PENDING':
+            _c.execute(
+                "UPDATE trades SET cycle_phase='ACTIVE' WHERE bot_id=?", (bot_id,)
+            )
+            _c.commit()
+            logger.info(f"✅ [WS-FILL] Bot {bot_id} CARRY_PENDING → ACTIVE (live {order_type} fill proven)")
+        _c.close()
+    except Exception as _e_cp:
+        logger.debug(f"[WS-FILL] cycle_phase promotion skipped for bot {bot_id}: {_e_cp}")
+
     # 🚀 FUNDAMENTAL FIX: Write active_positions for this bot immediately after every full fill.
     # Same root-cause fix as the partial fill path: every bot with a position needs its own row.
     try:
@@ -404,6 +468,7 @@ def _update_trade_state_from_fill(bot_id: int, order_type: str, symbol: str, avg
     # Log to history
     log_type = f'WS_{order_type}_FILL'
     log_trade(bot_id, log_type, symbol, avg_price, filled_qty, added_value, order_type, new_step)
+
 
 
 def _handle_order_canceled(bot_id: int, order_type: str, event: Dict):

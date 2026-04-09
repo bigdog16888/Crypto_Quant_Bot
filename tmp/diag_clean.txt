@@ -1,0 +1,33 @@
+﻿
+=== ETH ===
+  SYSTEM Bot 10021 long eth | LONG | inv=$0.00 | avg=0.0000 | qty=0.0000 | signed=0.0000 | step=0 | phase=ACTIVE | Scanning
+  SYSTEM Bot 10011 eth | SHORT | inv=$3551.23 | avg=2076.7400 | qty=1.7100 | signed=-1.7100 | step=11 | phase=IDLE | Scanning
+  SYSTEM Bot 100002 short eth | SHORT | inv=$0.00 | avg=0.0000 | qty=0.0000 | signed=0.0000 | step=0 | phase=ACTIVE | Scanning
+  SYSTEM NET QTY: +0.0000 LONG - 1.7100 SHORT = -1.7100
+  EXCHANGE ETHUSDC SHORT | size=0.0350 @ 2076.7400 | bot_id=10011
+  EXCHANGE NET QTY: +0.0000 LONG - 0.0350 SHORT = -0.0350
+  DIFF: -1.6750
+
+=== SUI ===
+  SYSTEM Bot 10018 sui long | LONG | inv=$18.78 | avg=0.8536 | qty=22.0000 | signed=22.0000 | step=1 | phase=ACTIVE | Scanning
+  SYSTEM Bot 100000 short sui | SHORT | inv=$0.00 | avg=0.0000 | qty=0.0000 | signed=0.0000 | step=0 | phase=ACTIVE | Scanning
+  SYSTEM NET QTY: +22.0000 LONG - 0.0000 SHORT = +22.0000
+  EXCHANGE SUIUSDC LONG | size=11103.4000 @ 0.8536 | bot_id=10018
+  EXCHANGE NET QTY: +11103.4000 LONG - 0.0000 SHORT = +11103.4000
+  DIFF: -11081.4000
+
+=== SOL ===
+  SYSTEM Bot 10008 sol | LONG | inv=$11.13 | avg=79.5100 | qty=0.1400 | signed=0.1400 | step=1 | phase=ACTIVE | IN TRADE
+  SYSTEM Bot 100001 short sol | SHORT | inv=$0.00 | avg=0.0000 | qty=0.0000 | signed=0.0000 | step=0 | phase=IDLE | Scanning
+  SYSTEM NET QTY: +0.1400 LONG - 0.0000 SHORT = +0.1400
+  EXCHANGE SOLUSDC SHORT | size=0.0600 @ 79.7800 | bot_id=0
+  EXCHANGE NET QTY: +0.0000 LONG - 0.0600 SHORT = -0.0600
+  DIFF: +0.2000
+
+=== BNB ===
+  SYSTEM Bot 10007 BNB short | SHORT | inv=$5.98 | avg=598.0100 | qty=0.0100 | signed=-0.0100 | step=1 | phase=IDLE | IN TRADE
+  SYSTEM NET QTY: +0.0000 LONG - 0.0100 SHORT = -0.0100
+  EXCHANGE BNBUSDC SHORT | size=0.0300 @ 593.0367 | bot_id=10007
+  EXCHANGE NET QTY: +0.0000 LONG - 0.0300 SHORT = -0.0300
+  DIFF: +0.0200
+

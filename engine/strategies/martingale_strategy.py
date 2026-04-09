@@ -3,6 +3,7 @@ from .base import BaseStrategy
 import pandas as pd
 import engine.indicators as ta_custom
 import logging
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -25,18 +26,34 @@ class MartingaleStrategy(BaseStrategy):
         super().__init__("Martingale_Grid", params if params is not None else {})
         self.params = params or {}
         self.max_steps = int(self.params.get('max_steps', 10))
-        # 🚀 FUNDAMENTAL FIX: Pair-Agnostic Dynamic Precision
-        self.qty_precision = 3
-        self.price_precision = 2
-        self.step_size = 0.001
-        self.tick_size = 0.01
+        # 🚀 UNIVERSAL PRECISION: Never hardcode to 2. Fallback=4 decimals until exchange metadata injected.
+        self.qty_precision = 4
+        self.price_precision = 4
+        self.step_size = 0.0001
+        self.tick_size = 0.0001
 
     def set_precision_metadata(self, metadata: Dict[str, Any]):
-        """Sets the precision and step metadata dynamically."""
-        self.qty_precision = metadata.get('qty_precision', 3)
-        self.price_precision = metadata.get('price_precision', 2)
-        self.step_size = metadata.get('step_size', 0.001)
-        self.tick_size = metadata.get('tick_size', 0.01)
+        """Sets the precision and step metadata dynamically from real exchange data."""
+        self.qty_precision = metadata.get('qty_precision', 4)
+        self.price_precision = metadata.get('price_precision', 4)
+        self.step_size = metadata.get('step_size', 0.0001)
+        self.tick_size = metadata.get('tick_size', 0.0001)
+
+    def _round_price(self, price: float) -> float:
+        """Round to exchange tick_size — the ONLY correct way to prepare a price for the exchange."""
+        if not self.tick_size or self.tick_size <= 0:
+            return price
+        import math
+        precision = int(-math.log10(self.tick_size)) if self.tick_size < 1 else 0
+        return round(math.floor(price / self.tick_size) * self.tick_size, precision)
+
+    def _round_qty(self, qty: float) -> float:
+        """Round to exchange step_size for quantities."""
+        if not self.step_size or self.step_size <= 0:
+            return qty
+        import math
+        precision = int(-math.log10(self.step_size)) if self.step_size < 1 else 0
+        return round(math.floor(qty / self.step_size) * self.step_size, precision)
 
     def check_signals(self, market_data: pd.DataFrame, current_price_float: float = None,
                        multi_tf_data: dict = None) -> tuple[bool, bool]:
@@ -322,6 +339,7 @@ class MartingaleStrategy(BaseStrategy):
             if not bot_status.get('entry_confirmed', 0):
                 logger.info(f"{self.name}: Invested but entry NOT confirmed. Waiting for WS fill.")
                 return None
+                
             # Already in a trade, maintain orders (TP, Grid)
             return {'action': 'maintain_orders'}
         else:
@@ -348,16 +366,16 @@ class MartingaleStrategy(BaseStrategy):
         avg_price = float(bot_status.get('avg_entry_price', 0))
         if avg_price == 0:
             avg_price = current_price
-        direction = self.params.get('direction', 'LONG').upper()
+        # 🚀 UNIVERSAL: Always read direction from params; SHORT bots have direction='SHORT'
+        direction = (self.params.get('direction') or 'LONG').upper()
         tp_type = self.params.get('TakeProfitType', 'Percent')
 
         if tp_type == 'Percent':
-            # TakeProfitPct = user's % profit target (UI Percentage mode)
             tp_pct = float(self.params.get('TakeProfitPct', self.params.get('tp_pct', 1.5)))
             tp_pct = max(0.1, tp_pct)
             price = avg_price * (1 + tp_pct / 100) if direction == 'LONG' else avg_price * (1 - tp_pct / 100)
         else:
-            # TakeProfitBase = dollar/USD profit target (UI Fixed mode)
+            # Fixed USD profit target
             target_usd = float(self.params.get('TakeProfitBase', 10.0))
             total_invested = float(bot_status.get('total_invested', avg_price))
             est_qty = total_invested / avg_price if avg_price > 0 else 0
@@ -365,15 +383,76 @@ class MartingaleStrategy(BaseStrategy):
                 dist = target_usd / est_qty
                 price = avg_price + dist if direction == 'LONG' else avg_price - dist
             else:
-                price = avg_price  # fallback: no movement
+                price = avg_price
 
-        return round(price, self.price_precision)
+        # 🚀 UNIVERSAL PRECISION: Use exchange tick_size, NOT Python round(price, 2)
+        return self._round_price(price)
 
     def calculate_take_profit_amount(self, bot_status: Dict, current_price: float, pair: str, exchange: Any) -> float:
+        """
+        Return the TP close quantity.
+
+        SOURCE PRIORITY (highest to lowest):
+        1. Physical exchange position size — the authoritative number of contracts
+           that actually need to be closed. This prevents residuals when the virtual
+           ledger (total_invested / avg_price) drifts from reality due to fill timing,
+           partial-fill rounding, or carry-over rows.
+        2. Virtual ledger fallback — used only when the exchange fetch fails or the
+           physical position is zero (e.g. already closed by another path).
+
+        SAFETY CAP: Even in the fallback path, virtual quantity is capped to the largest
+        physical position we were able to observe. This prevents the DB-inflation bug where
+        PASS3 adoption rows inflate the virtual ledger beyond the real position size,
+        causing an oversized TP that nets against a sibling bot's real position in One-Way mode.
+        """
+        direction = (self.params.get('direction') or 'LONG').upper()
+        phys_cap = None  # Will hold latest known physical qty for safety cap
+
+        # -- PRIORITY 1: physical exchange position --
+        try:
+            if exchange is not None and pair:
+                from engine.exchange_interface import normalize_symbol
+                positions = exchange.fetch_positions()
+                norm_pair = normalize_symbol(pair).upper()
+                for pos in (positions or []):
+                    raw_sym = pos.get('symbol', '') or ''
+                    pos_side = (pos.get('side', '') or '').upper()
+                    # Match symbol and direction
+                    if normalize_symbol(raw_sym).upper() != norm_pair:
+                        continue
+                    # contracts > 0 means we have a physical position
+                    phys_qty = abs(float(pos.get('contracts', 0) or pos.get('size', 0) or 0))
+                    if phys_qty > 0:
+                        phys_cap = phys_qty  # Store for safety cap on fallback
+                        rounded = self._round_qty(phys_qty)
+                        logger.info(
+                            f"[TP-SIZE] {pair} using PHYSICAL position qty {phys_qty:.6f} "
+                            f"→ {rounded:.6f} (virtual ledger would give "
+                            f"{float(bot_status.get('total_invested',0)) / max(float(bot_status.get('avg_entry_price',1)),1e-9):.6f})"
+                        )
+                        return rounded
+        except Exception as _e:
+            logger.warning(f"[TP-SIZE] Could not fetch physical position for {pair}: {_e}. Falling back to virtual ledger.")
+
+        # -- PRIORITY 2: virtual ledger fallback --
         avg_price = float(bot_status.get('avg_entry_price', 1.0))
-        if avg_price == 0: avg_price = current_price
-        # 🚀 DYNAMIC ROUNDING
-        return round(float(bot_status.get('total_invested', 0)) / avg_price, self.qty_precision)
+        if avg_price <= 0:
+            avg_price = current_price
+        raw_qty = float(bot_status.get('total_invested', 0)) / avg_price
+
+        # 🛡️ SAFETY CAP (Bug 2 Fix)
+        # If we got a physical qty earlier but it was <= 0 (position already flat),
+        # do NOT send a massive virtual qty to the exchange — that would reduce
+        # a sibling bot's position in One-Way netting mode.
+        # Cap virtual qty to the physical observation if we have one.
+        if phys_cap is not None and raw_qty > phys_cap:
+            logger.warning(
+                f"[TP-SIZE-CAP] {pair} virtual qty {raw_qty:.6f} > physical cap {phys_cap:.6f}. "
+                f"Capping to physical to prevent cross-bot netting in One-Way mode."
+            )
+            raw_qty = phys_cap
+
+        return self._round_qty(raw_qty)
 
     def calculate_grid_order_price(self, bot_status: Dict, current_price: float, market_data: Any = None, multi_tf_data: dict = None) -> Tuple[float, str]:
         """
@@ -504,10 +583,9 @@ class MartingaleStrategy(BaseStrategy):
                     logger.warning(f"⛔ Gap Recovery still invalid for {direction}. Skipping grid placement.")
                     return 0.0, "GapRecovery-INVALID"
 
-            # 🚀 DYNAMIC ROUNDING
-            final_price = round(price, self.price_precision)
-            
-            # Smart distance display: show enough decimals so it never reads 0.00
+            # 🚀 UNIVERSAL PRECISION: Use exchange tick_size for all grid prices
+            final_price = self._round_price(price)
+
             def _fmt_dist(v): return f"{v:.6f}".rstrip('0').rstrip('.') if v < 0.01 else f"{v:.4f}" if v < 1.0 else f"{v:.2f}"
             explain_str = f"Grid: {' | '.join(explanation)} -> Dist {_fmt_dist(final_dist)}"
             return final_price, explain_str
@@ -519,7 +597,9 @@ class MartingaleStrategy(BaseStrategy):
     def calculate_grid_order_amount(self, bot_status: Dict, current_price: float, pair: str, exchange: Any) -> float:
         step = int(bot_status.get('current_step', 0))
         # Reuse lot size logic
-        return self.calculate_lot_size(step + 1, 10000, market_data=current_price)
+        # 🚀 BUG FIX: Pass 'step' exactly to ensure the exponent computes M^step. 
+        # Previously passed step + 1, skipping M^1 and jumping straight from M^0 (Entry) to M^2.
+        return self.calculate_lot_size(step, 10000, market_data=current_price)
 
     def _apply_volatility_sizing(self, base_size: float, market_data: Any) -> float:
         """

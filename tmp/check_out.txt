@@ -1,0 +1,24 @@
+﻿=== SUI long (bot 10018) bot_orders ===
+  CQB_10018_CARRY_1774255386878 | status=reset_cleared | filled=633.3 | price=0.8967919195702 | step=0 | cycle=6
+  CQB_10018_TP_2_1774578203616 | status=new | filled=0.0 | price=0.9394611719 | step=2 | cycle=37
+  CQB_10018_TP_2_1774577303104 | status=cancelled | filled=0.0 | price=0.940437429 | step=2 | cycle=37
+  CQB_10018_TP_2_1774576403976 | status=cancelled | filled=0.0 | price=0.9414136861 | step=2 | cycle=37
+  CQB_10018_TP_2_1774575500707 | status=cancelled | filled=0.0 | price=0.9423899432 | step=2 | cycle=37
+  CQB_10018_TP_2_1774574602837 | status=cancelled | filled=0.0 | price=0.9433662003000001 | step=2 | cycle=37
+  CQB_10018_TP_2_1774573700946 | status=cancelled | filled=0.0 | price=0.9443424574 | step=2 | cycle=37
+  CQB_10018_TP_2_1774572803853 | status=cancelled | filled=0.0 | price=0.9453187145 | step=2 | cycle=37
+  CQB_10018_TP_2_1774571898943 | status=cancelled | filled=0.0 | price=0.9462949716000001 | step=2 | cycle=37
+  CQB_10018_TP_2_1774571000079 | status=cancelled | filled=0.0 | price=0.9472712287 | step=2 | cycle=37
+python : Traceback (most recent call last):
+At line:1 char:1
++ python tmp\check_orders.py 2>&1 | Out-File tmp\check_out.txt -Encodin ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Traceback (most recent call last)::String) [], Rem 
+   oteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  File "C:\Users\Gionie\Documents\GitHub\Crypto_Quant_Bot\tmp\check_orders.py", line 18, in <mod
+ule>
+    t = conn.execute('SELECT basket_start_time, current_cycle FROM trades WHERE bot_id=?', (bot_
+id,)).fetchone()
+sqlite3.OperationalError: no such column: current_cycle
