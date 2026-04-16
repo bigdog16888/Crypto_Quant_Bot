@@ -155,43 +155,44 @@ class BotExecutor:
         Architecture (Correct):
         1. Each bot manages its OWN position. TP qty = bot's own virtual open qty from its ledger.
         2. Physical position is used as a sanity cap (can't close more than physically exists).
-        3. When all bots close their own shares, the physical net goes to zero naturally.
-        4. NO sibling subtraction — that was causing BTC TP cancel loops.
-        5. NO reduceOnly — causes rejections in multi-bot setups.
+        3. Single-Bot Active (Dust): conditionally applies reduceOnly=True if < $5 to mathematically bypass min notional.
+        4. Multi-Bot Active: drops reduceOnly, uses postOnly+GTX. If < $5, triggers DUST_CHASER abort.
         """
+        # Determine active sibling bots for conditional reduceOnly capability
+        try:
+            from engine.database import get_connection as _ghc
+            with _ghc() as _hc:
+                _hcur = _hc.cursor()
+                _hcur.execute(
+                    "SELECT COUNT(*) FROM bots b JOIN trades t ON b.id=t.bot_id "
+                    "WHERE b.pair=? AND t.total_invested>0 AND b.id!=?",
+                    (pair, bot_id)
+                )
+                _other_bots_count = _hcur.fetchone()[0]
+        except Exception:
+            _other_bots_count = 1  # Base assumption: multi-bot if DB fails
+
+        # Standard baseline for all bot configurations (protects Maker rebates via PostOnly)
         ccxt_params = {'postOnly': True, 'timeInForce': 'GTX'}
 
-        # 1. Get physical reality for sanity cap (direction-filtered for Hedge Mode)
-        # Pass the bot's direction so in Hedge Mode we only see OUR side's row,
-        # not a sibling bot's opposing position.
-        bot_direction = 'LONG' if side.lower() == 'sell' else 'SHORT'
-        pos_info = self._get_phys_pos(pair, direction=bot_direction)
-        phys_qty = pos_info['size'] if pos_info else 0.0
-
-        if phys_qty <= 0.0:
-            logger.info(f"INFO {name}: No physical {bot_direction} position on exchange for {pair}. TP not needed.")
-            return None, None
-
-
-        # 2. Calculate THIS bot's own virtual open qty from its ledger
-        # This is the authoritative source for how much THIS bot should close.
+        # 1. Calculate THIS bot's own virtual open qty from its ledger
         try:
             from engine.database import get_connection as _gc_tp
+            from engine.exchange_interface import normalize_symbol
+            norm_pair = normalize_symbol(pair)
             with _gc_tp() as _c_tp:
                 _cur = _c_tp.cursor()
-                # Get current cycle_id for this bot
                 _cur.execute("SELECT t.cycle_id FROM trades t WHERE t.bot_id = ?", (bot_id,))
                 cycle_row = _cur.fetchone()
-                cycle_id = cycle_row[0] if cycle_row else 1
+                cycle_id = cycle_row[0] if (cycle_row and cycle_row[0] is not None) else 1
                 
-                # Sum this bot's own filled entries minus exits for the current cycle
                 _cur.execute("""
                     SELECT 
                         COALESCE(SUM(CASE WHEN order_type IN ('entry', 'grid', 'adoption_add', 'adoption') THEN filled_amount ELSE 0 END), 0),
                         COALESCE(SUM(CASE WHEN order_type IN ('tp', 'close', 'adoption_reduce', 'dust_close', 'sl') THEN filled_amount ELSE 0 END), 0)
                     FROM bot_orders
                     WHERE bot_id = ? 
-                    AND status NOT IN ('reset_cleared', 'auto_closed')
+                    AND status NOT IN ('reset_cleared', 'auto_closed', 'failed', 'placing')
                     AND (cycle_id = ? OR cycle_id IS NULL)
                     AND filled_amount > 0
                 """, (bot_id, cycle_id))
@@ -200,21 +201,65 @@ class BotExecutor:
                 bot_exit_qty = float(ledger_row[1] or 0.0)
                 bot_virtual_open_qty = max(0.0, bot_entry_qty - bot_exit_qty)
                 
+                # 🚀 UNIVERSAL BOUND EQUATION (UBE) SAFE CAP [V1.7.0]
+                # Primary Truth: The bot's virtual_qty is strictly derived from Order-ID Proof (Case B.4).
+                # Redundant Guard: UBE prevents over-selling if the physical exchange state disagrees.
+                _cur.execute("""
+                    SELECT b.direction, (t.total_invested / t.avg_entry_price)
+                    FROM bots b JOIN trades t ON b.id = t.bot_id
+                    WHERE b.normalized_pair = ? AND t.total_invested > 0 AND b.id != ? AND t.avg_entry_price > 0
+                """, (norm_pair, bot_id))
+                neighbors = _cur.fetchall()
+                
+                bot_dir = 'LONG' if side == 'sell' else 'SHORT'
+                opposite_virtual_qty = sum(q for d, q in neighbors if d.upper() != bot_dir)
+                
+                # Fetch Physical snapshot context
+                # NOTE: row columns are [size, side, entry_price]
+                # FUNDAMENTAL FIX: Always normalize 'pair' when querying active_positions
+                _cur.execute("SELECT size, side FROM active_positions WHERE pair = ?", (norm_pair,))
+                phys_rows = _cur.fetchall()
+                
+                phys_matching = sum(float(r[0]) for r in phys_rows if str(r[1]).upper() == bot_dir)
+                phys_opposite = sum(float(r[0]) for r in phys_rows if str(r[1]).upper() != bot_dir)
+                
+                # 🚀 UBE FIX [V1.7.0]: In One-Way mode (or when active_positions is stale),
+                # this bot's direction may have NO matching row in active_positions.
+                # Previously: phys_matching=0 → max_possible_qty=0 → Safe Cap kills all TPs. WRONG.
+                # Fix: When phys_matching=0 and the bot has confirmed virtual inventory,
+                # treat the bot's own virtual qty as the physical anchor. It is already
+                # proof-verified by order fills (the only way virtual > 0 is a confirmed fill).
+                # This allows the bot to close its own position while still bounding against
+                # true over-sells when opposite bots negate the physical position.
+                if phys_matching > 0:
+                    max_possible_qty = phys_matching + opposite_virtual_qty
+                elif bot_virtual_open_qty > 0 and phys_matching == 0 and phys_opposite == 0:
+                    # No physical record for this direction AND no opposite physical either.
+                    # The position may be in active_positions under a different bot_id (multi-bot same pair)
+                    # or active_positions is briefly stale. Trust the virtual ledger as the anchor.
+                    max_possible_qty = bot_virtual_open_qty + opposite_virtual_qty
+                    logger.debug(f"🔍 {name}: UBE: No physical row for {bot_dir} {norm_pair}. Using virtual anchor ({bot_virtual_open_qty:.6f}).")
+                else:
+                    max_possible_qty = max(0.0, opposite_virtual_qty - phys_opposite)
+                
+                if bot_virtual_open_qty > (max_possible_qty + 0.0001):
+                    logger.warning(f"🛡️ {name}: Safe Cap triggered! Virtual={bot_virtual_open_qty:.6f} capped at Capacity={max_possible_qty:.6f}")
+                    bot_virtual_open_qty = max_possible_qty
+
         except Exception as e:
-            logger.warning(f"⚠️ {name}: Failed to calculate virtual ledger qty: {e}. Falling back to DB amount.")
-            bot_virtual_open_qty = amount  # fallback to DB-stored amount
+            logger.warning(f"⚠️ {name}: Failed to calculate virtual ledger qty/UBE cap: {e}. Falling back to DB amount.")
+            bot_virtual_open_qty = amount  
 
         if bot_virtual_open_qty <= 0.0:
-            logger.debug(f"{name}: Bot virtual ledger qty=0 (already fully exited?). TP not needed.")
+            logger.warning(f"⚠️ {name}: UBE resolved virtual qty to 0 — Safe Cap blocked TP. Physical={phys_matching:.6f} Opposite_virtual={opposite_virtual_qty:.6f}. If position is real, active_positions may be stale.")
             return None, None
 
-        # 3. Cap by physical reality — never close more than physically exists
+        # 2. Derive raw TP purely from the Virtual ledger (now capped)
         prec = exchange.get_symbol_precision(pair)
-        tp_qty_raw = min(bot_virtual_open_qty, phys_qty)
-        tp_qty = exchange.round_to_step(tp_qty_raw, prec['step_size'])
+        tp_qty = exchange.round_to_step(bot_virtual_open_qty, prec['step_size'])
 
         if tp_qty <= 0:
-            logger.info(f"INFO {name}: TP qty rounds to 0 after step_size. Skipping.")
+            logger.info(f"INFO {name}: Ledger virtual qty rounds to 0 after step_size. Skipping.")
             return None, None
 
         # 4. Log net-reducing direction for informational awareness
@@ -226,28 +271,20 @@ class BotExecutor:
         _min_notional = prec.get('min_notional')
         if _min_notional is None:
             _min_notional = 100.0 if (getattr(config, 'TESTNET', False) or getattr(config, 'DEMO_TRADING', False)) else 5.0
-        
+
         notional = tp_qty * (tp_price or current_price or 1.0)
         if notional < _min_notional:
-            logger.warning(f"DUST {name}: TP notional ${notional:.2f} < min ${_min_notional:.2f}. Adjusting TP price to meet min notional.")
-            # Rather than wash-trading instantly, we clamp the TP price so the order is validly placed for *some* profit.
-            # To meet the minimum notional, tp_price must be at least _min_notional / tp_qty.
-            required_price = (_min_notional * 1.002) / tp_qty  # Add tiny 0.2% buffer
+            logger.warning(f"DUST {name}: Virtual TP notional ${notional:.2f} < min ${_min_notional:.2f} (qty={tp_qty}).")
             
-            # For SHORTs, increasing the tp_price means taking less profit.
-            # But if required_price > current_price, taking profit means actually losing money!
-            if side == 'buy' and required_price >= current_price:
-                 logger.warning(f"🛑 {name}: Minimum notional clamp ({required_price:.4f}) breaches current price ({current_price:.4f}). Cannot TP profitably.")
-                 # Fallback: Place at exactly current maker boundary to escape the trapped size
-                 return 'DUST_CHASER', tp_qty
-                 
-            try:
-                prec = exchange.get_symbol_precision(pair)
-                tp_price = exchange.ceil_to_step(required_price, prec['tick_size']) if side == 'buy' else exchange.round_to_step(required_price, prec['tick_size'])
-            except:
-                tp_price = required_price
-                
-            logger.info(f"✨ {name}: Clamped TP to {tp_price:.4f} to satisfy min notional of ${_min_notional:.2f}.")
+            if _other_bots_count == 0:
+                # Sole bot fallback: Convert to a reduceOnly order which mathematically bypasses the min-notional gate.
+                ccxt_params = {'timeInForce': 'GTC', 'reduceOnly': True}
+                logger.info(f"✨ {name}: Sub-$5 limit detected. Sole-bot status confirmed. Switching to natively bypassed reduceOnly TP.")
+            else:
+                # Multi-bot setups cannot use reduceOnly, meaning Binance will strictly reject the sub-$5 limit order.
+                # Since we forbid synthetic price-nudging (Strict Proof-Only), this dust cannot be closed profitably.
+                logger.warning(f"🛑 {name}: Multi-bot configuration blocks reduceOnly. Cannot limit-close sub-${_min_notional:.2f} legitimately. Yielding to DUST_CHASER.")
+                return 'DUST_CHASER', tp_qty
 
         # 6. Spread-Cross Fix: TP at market price must be GTC taker
         try:
@@ -258,7 +295,7 @@ class BotExecutor:
         except Exception:
             pass
 
-        logger.debug(f"OK {name}: TP qty={tp_qty:.4f} (virtual={bot_virtual_open_qty:.4f}, physical={phys_qty:.4f}) notional=${notional:.2f}")
+        logger.debug(f"OK {name}: TP qty={tp_qty:.4f} (virtual={bot_virtual_open_qty:.4f}) notional=${notional:.2f}")
         return ccxt_params, tp_qty
 
 
@@ -691,7 +728,7 @@ class BotExecutor:
                                                 ), 0.0) 
                                                 FROM bot_orders 
                                                 WHERE bot_id = ? AND status NOT IN ('reset_cleared', 'auto_closed', 'canceled', 'rejected')
-                                                AND (cycle_id = (SELECT MAX(cycle_id) FROM bot_orders WHERE bot_id = ?) OR cycle_id IS NULL)
+                                                AND (cycle_id = (SELECT cycle_id FROM trades WHERE bot_id = ?) OR cycle_id IS NULL)
                                             """, (sibling_id, sibling_id))
                                             row = cursor.fetchone()
                                             q = float(row[0]) if row else 0.0
@@ -701,7 +738,7 @@ class BotExecutor:
                                             else:
                                                 sib_net_qty -= q
                                    finally:
-                                        conn.close()
+                                        pass # conn.close() disabled for singleton safety
                                             
                                    # 🚀 Compare actual quantities to ignore market price fluctuations
                                    phys_net_qty_abs = abs(size)
@@ -958,7 +995,7 @@ class BotExecutor:
                                 
                             cursor.execute("UPDATE bots SET status = 'IN TRADE' WHERE id = ?", (bot_id,))
                             conn.commit()
-                            conn.close()
+                            pass # conn.close() disabled for singleton safety
                             logger.info(f"✅ {name}: Recorded ENTRY order {order['id']} in DB.")
                             update_bot_error(bot_id, None) 
                         except Exception as db_err:
@@ -1057,7 +1094,7 @@ class BotExecutor:
                         cursor.execute("UPDATE trades SET tp_order_id = NULL WHERE bot_id = ?", (bot_id,))
                         cursor.execute("UPDATE bot_orders SET status = 'cancelled', filled_amount = ? WHERE order_id = ?", (filled, tp_order_id,))
                         conn.commit()
-                        conn.close()
+                        pass # conn.close() disabled for singleton safety
                     else:
                         logger.warning(f"⚠️ {name}: TP order {tp_order_id} not yet filled. Monitoring. (Status: {status}, Filled: {filled})")
             except Exception as e:
@@ -1070,7 +1107,7 @@ class BotExecutor:
                     cursor.execute("UPDATE trades SET tp_order_id = NULL WHERE bot_id = ?", (bot_id,))
                     cursor.execute("UPDATE bot_orders SET status = 'missing' WHERE order_id = ?", (tp_order_id,))
                     conn.commit()
-                    conn.close()
+                    pass # conn.close() disabled for singleton safety
                 else:
                     logger.error(f"❌ {name}: Error fetching TP order {tp_order_id} status: {e}")
         else:
@@ -1104,7 +1141,7 @@ class BotExecutor:
                     (int(time.time()), bot_id)
                 )
                 conn.commit()
-                conn.close()
+                pass # conn.close() disabled for singleton safety
                 return
 
             cur.execute(
@@ -1113,7 +1150,7 @@ class BotExecutor:
                 (bot_id,)
             )
             res = cur.fetchone()
-            conn.close()
+            pass # conn.close() disabled for singleton safety
             
             if not res or not res[1] or res[1] <= 0:
                 return
@@ -1760,18 +1797,21 @@ class BotExecutor:
                  phys_net = phys_long if direction == 'LONG' else phys_short
                  virtual_net = virtual_long if direction == 'LONG' else virtual_short
 
-                 if virtual_net > 0.001:
-                     if phys_net > virtual_net * 1.10:
-                         logger.warning(
-                             f"🛑 {name}: Physical {direction} {phys_net:.4f} >> virtual {direction} {virtual_net:.4f} "
-                             f"(+{(phys_net/virtual_net - 1)*100:.0f}%). "
-                             f"Offline fill unprocessed. SKIPPING grid until reconciler catches up."
-                         )
-                         return None
-                 else:
-                     if phys_net > 0.01:
-                         logger.warning(f"🛑 {name}: Physical {direction} {phys_net:.4f} but virtual {direction} ~0. SKIPPING grid.")
-                         return None
+                 logger.debug(
+                     f"[PHYS-GUARD] {name} ({direction}): phys_net={phys_net:.6f} virtual_net={virtual_net:.6f}"
+                 )
+                 # 🚀 MULTI-BOT ONE-WAY FIX: Only block when physical > virtual (unprocessed fills danger).
+                 # In One-Way hedging mode, phys_net can be 0 (longs/shorts cancel on exchange) while
+                 # virtual_net > 0 (individual bot ledger). This is NORMAL — do NOT block here.
+                 # We ONLY block grid placement when physical is LARGER than virtual by >10%,
+                 # which indicates the reconciler hasn't caught up with a stray fill.
+                 if virtual_net > 0.001 and phys_net > virtual_net * 1.10:
+                     logger.warning(
+                         f"🛑 {name}: Physical {direction} {phys_net:.4f} >> virtual {direction} {virtual_net:.4f} "
+                         f"(+{(phys_net/virtual_net - 1)*100:.0f}%). "
+                         f"Offline fill unprocessed. SKIPPING grid until reconciler catches up."
+                     )
+                     return None
              except Exception as _guard_err:
                  logger.debug(f"Physical-size guard check failed for {name}: {_guard_err}")
 
@@ -1792,7 +1832,7 @@ class BotExecutor:
                              WHERE bot_id=? AND status IN ('filled', 'closed') AND step=? AND created_at >= (? - 2592000)
                          """, (bot_id, bot_status['current_step'], bot_status.get('basket_start_time', 0)))
                          row = cursor.fetchone()
-                         conn.close()
+                         pass # conn.close() disabled for singleton safety
                          if not row or row[0] == 0:
                              logger.warning(
                                  f"🛑 {name}: Step Progression Blocked! Step {bot_status['current_step']} proof-of-fill not found in DB. "
@@ -1801,6 +1841,8 @@ class BotExecutor:
                              return None
                  except Exception as e:
                      logger.error(f"❌ Error checking step progression proof for {name}: {e}")
+                     logger.warning(f"🛑 {name}: Returning None because Exception checking step progression proof.")
+                     return None
 
 
              # 🚀 FUNDAMENTAL FIX: Re-calculate base size dynamically here
@@ -2076,7 +2118,7 @@ class BotExecutor:
                 (bot_id,)
             )
             filled_qty = cur.fetchone()[0] or 0.0
-            conn.close()
+            pass # conn.close() disabled for singleton safety
 
             # 2. Logic: Parity Sync
             # We want total_hedged (Filled + Open) to equal lock_qty (the bot's current total size)
@@ -2116,7 +2158,8 @@ class BotExecutor:
 
             # 3. Execution Config
             hedge_side = 'sell' if direction.upper() == 'LONG' else 'buy'
-            prec_data = exchange.get_precision(pair) or {}
+            # 🚀 FIX: get_precision() was renamed to get_symbol_precision() — use the correct method
+            prec_data = exchange.get_symbol_precision(pair) or {}
             price_prec = int(prec_data.get('price_precision', 2))
             qty_prec = int(prec_data.get('qty_precision', 3))
             step_size = float(prec_data.get('step_size', 0.001))
@@ -2227,7 +2270,7 @@ class BotExecutor:
             """, (bot_id, trigger_step, exchange_order_id, lock_price_r, lock_qty,
                   int(time.time()), cid, f"Hedge lock at step {trigger_step}"))
             conn.commit()
-            conn.close()
+            pass # conn.close() disabled for singleton safety
 
             # 6. Log to trade_history
             from engine.database import log_trade
@@ -2260,40 +2303,79 @@ class BotExecutor:
         # Cancel all open orders for this bot
         exchange.cancel_orders_by_bot_id(bot_id, pair)
 
-        # Close the position with a market order
+        # Close the position with a market order safely
         try:
             position_side = 'sell' if direction == 'LONG' else 'buy'
-            # In futures, a market order to opposite side closes position
-            # We must only close THIS bot's portion, not the entire exchange position!
             
             if bot_status['avg_entry_price'] > 0:
                 size_to_close = bot_status['total_invested'] / bot_status['avg_entry_price']
+                actual_size = abs(size_to_close)
+
+                # 🚀 SYSTEM DISCREPANCY GUARD (GHOST WIPE)
+                # Evaluate aggregate DB vs Aggregate Physical
+                phys_positions = exchange.fetch_positions()
+                phys_long = 0.0
+                phys_short = 0.0
+                for p in (phys_positions or []):
+                    if normalize_symbol(p.get('symbol', '')) == normalize_symbol(pair):
+                        size = float(p.get('contracts', 0) or abs(float(p.get('positionAmt', 0))))
+                        pt_side = p.get('side', '').upper()
+                        if not pt_side: 
+                            pos_amount = float(p.get('positionAmt', 0))
+                            if pos_amount < 0: pt_side = 'SHORT'
+                            elif pos_amount > 0: pt_side = 'LONG'
+                        if pt_side == 'SHORT': phys_short += size
+                        elif pt_side == 'LONG': phys_long += size
+                phys_net_qty = phys_long - phys_short
                 
-                # Fetch current position to ensure we don't over-close if exchange has less
-                positions = exchange.fetch_positions()
-                current_position = next((p for p in positions if normalize_symbol(p.get('symbol')) == normalize_symbol(pair)), None)
-                exchange_size = float(current_position.get('contracts', 0) or current_position.get('size', 0) or 0) if current_position else 0.0
+                from engine.database import get_connection as _st_conn
+                sib_net_qty = 0.0
+                with _st_conn() as _c:
+                    _cur = _c.cursor()
+                    _cur.execute(
+                        "SELECT direction, total_invested, avg_entry_price FROM trades "
+                        "JOIN bots ON trades.bot_id = bots.id WHERE bots.pair = ? AND trades.total_invested > 0", 
+                        (pair,)
+                    )
+                    for sib_dir, s_inv, s_avg in _cur.fetchall():
+                        if float(s_avg) > 0:
+                            s_qty = float(s_inv) / float(s_avg)
+                            if str(sib_dir).upper() == 'LONG': sib_net_qty += s_qty
+                            else: sib_net_qty -= s_qty
+
+                divergence_qty = abs(sib_net_qty - phys_net_qty)
+                divergence_usd = divergence_qty * current_price
                 
-                # Cap the close size to what is actually available on the exchange for this side
-                actual_size = min(abs(size_to_close), abs(exchange_size))
-                
+                if divergence_usd > 10.0:
+                    logger.critical(f"🛑 {name}: SL/Market Close Blocked! System net vs physical diverges by ${divergence_usd:.2f}. Bypassing API to strictly wipe Ghost DB.")
+                    from engine.database import safe_wipe_bot
+                    safe_wipe_bot(bot_id, pair, direction, reason="SL_GHOST_WIPE: divergence > $10", exit_price=current_price)
+                    return
+
                 if actual_size > 0:
                     logger.warning(f"Placing market order to close {actual_size} {pair} {position_side} for bot {name} SL")
-                    order = exchange.create_order(pair, 'market', position_side, actual_size)
+                    order = None
+                    try:
+                        order = exchange.create_order(pair, 'market', position_side, actual_size)
+                    except Exception as e_order:
+                        logger.error(f"❌ {name}: Failed to place SL Market Order ({e_order}). Purging local Ghost state.")
+                        from engine.database import safe_wipe_bot
+                        safe_wipe_bot(bot_id, pair, direction, reason=f"SL_API_REJECT_GHOST", exit_price=current_price)
+                        return
+
                     if order:
+                        from engine.database import reset_bot_after_tp
                         log_trade(bot_id, 'STOP_LOSS_EXIT', pair, current_price, actual_size, current_price * actual_size, f'SL_MARKET_{bot_id}', bot_status['current_step'], "SL Market Exit", (current_price - bot_status['avg_entry_price']) * actual_size)
                         reset_bot_after_tp(bot_id, current_price, direction=direction, action_label='STOP_LOSS_EXIT')
                         logger.info(f"✅ {name}: Market order placed to close SL for {pair} (ID: {order['id']})")
-                    else:
-                        logger.error(f"❌ {name}: Failed to place market order for SL exit for {pair}")
                 else:
-                    logger.info(f"ℹ️ {name}: No active position found on exchange for {pair} to close. Running wipe guard before DB reset.")
-                    # 🗡️ ARCHITECTURAL: Gate through safe_wipe_bot() — blocks CARRY_PENDING or if ledger still shows net units
-                    safe_wipe_bot(bot_id, pair, direction, reason="SL_EXIT_NO_POSITION: exchange has 0 units to close", exit_price=current_price)
+                    logger.info(f"ℹ️ {name}: No virtual size to close. Running wipe guard before DB reset.")
+                    from engine.database import safe_wipe_bot
+                    safe_wipe_bot(bot_id, pair, direction, reason="SL_EXIT_NO_VIRTUAL_POSITION", exit_price=current_price)
             else:
                 logger.info(f"ℹ️ {name}: Bot has 0 avg_entry_price. Running wipe guard before DB reset.")
-                # 🗡️ ARCHITECTURAL: Gate through safe_wipe_bot() — blocks CARRY_PENDING or if ledger still shows net units
-                safe_wipe_bot(bot_id, pair, direction, reason="SL_EXIT_ZERO_PRICE: avg_entry_price is 0, no market order needed", exit_price=current_price)
+                from engine.database import safe_wipe_bot
+                safe_wipe_bot(bot_id, pair, direction, reason="SL_EXIT_ZERO_PRICE", exit_price=current_price)
 
         except Exception as e:
             logger.error(f"❌ {name}: Error executing SL for {pair}: {e}")

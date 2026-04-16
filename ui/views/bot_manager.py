@@ -93,11 +93,13 @@ def render_bot_manager_view():
 
     for bot in bots:
 
-        # Current get_all_bots returns: b.id, b.name, b.pair, b.is_active, b.strategy_type, t.total_invested, t.current_step, last_error, last_error_time
+        # Current get_all_bots returns: b.id, b.name, b.pair, b.is_active, b.strategy_type, t.total_invested, t.current_step, last_error, last_error_time, b.status
         # Robust unpacking to handle stale module versions
         b_id, name, pair, is_active, strat_type, total_invested, step = bot[:7]
         last_error = bot[7] if len(bot) > 7 else None
         last_error_time = bot[8] if len(bot) > 8 else None
+        db_status = bot[9] if len(bot) > 9 else None
+        is_cleaning = db_status in ['pending_sl', 'stop_loss_triggered']
         
         # FIX: Handle potential None values from LEFT JOIN if trade record missing
         total_invested = float(total_invested) if total_invested is not None else 0.0
@@ -223,7 +225,11 @@ def render_bot_manager_view():
                 except:
                     pass
             
-            if error_reason:
+            if is_cleaning:
+                status_text = 'MARKET SL (FLUSHING)'
+                pulse_color = "#f39c12"  # Orange
+                state_label = "CLEANING"
+            elif error_reason:
                 status_text = 'ERROR'
                 pulse_color = "#cf222e"  # Red
                 state_label = "ERROR"
@@ -281,10 +287,25 @@ def render_bot_manager_view():
                 toggle_bot_active(b_id, not bool(is_active))
                 st.success(f"✅ Bot {name} status updated!")
                 st.rerun()
-            
-            # Position Management Section (only show if in trade)
-            if total_invested > 0:
-                with st.expander(f"🎛️ Position Controls for {name}", expanded=False):
+
+        # Actions
+        with row_cols[7]:
+            col1, col2 = st.columns(2)
+            if col1.button("✏️ Edit", key=f"edit_{b_id}", help=f"Edit {name} settings"):
+                render_edit_form(b_id)
+
+            if col2.button("🗑️ Delete", key=f"del_{b_id}", help=f"Delete {name}"):
+                if delete_bot(b_id):
+                    st.success(f"✅ Deleted {name} successfully!")
+                    st.rerun()
+        
+        # Position Management Section (Full Width, below row columns)
+        if total_invested > 0 or is_cleaning:
+            with st.expander(f"🎛️ Position Controls for {name}", expanded=False):
+                if is_cleaning:
+                    st.warning("⏳ **Market SL Flush in Progress...**")
+                    st.markdown("1️⃣ The system is securely clearing all pending exchange orders on Binance.\n2️⃣ Attempting physical `MARKET CLOSE`.\n3️⃣ Releasing local database memory locking.\n\n*Please wait... The Background Engine handles this automatically.*")
+                else:
                     # Get position summary
                     pos_summary = get_position_summary(b_id)
                     
@@ -292,13 +313,11 @@ def render_bot_manager_view():
                     pnl = pos_summary.get('unrealized_pnl', 0)
                     pnl_pct = pos_summary.get('pnl_pct', 0)
                     pnl_color = "green" if pnl >= 0 else "red"
-                    st.markdown(f"""
-                    **Current PnL:** <span style="color:{pnl_color}">${pnl:,.2f} ({pnl_pct:+.2f}%)</span>
-                    """, unsafe_allow_html=True)
+                    st.markdown(f"**Current PnL:** <span style='color:{pnl_color}'>${pnl:,.2f} ({pnl_pct:+.2f}%)</span>", unsafe_allow_html=True)
                     
                     # Close buttons
                     st.markdown("**🛑 Close Position**")
-                    close_cols = st.columns([1, 1, 1])
+                    close_cols = st.columns([1, 1, 1, 1])
                     
                     # Full close button
                     if close_cols[0].button("🔴 Close All", key=f"close_all_{b_id}", help="Close 100% of position"):
@@ -338,6 +357,22 @@ def render_bot_manager_view():
                         else:
                             st.error(f"❌ Panic Failed: {result.get('error')}")
                     
+                    # Engine SL/Ghost Wipe
+                    st.markdown("---")
+                    st.markdown("**👻 Ghost Wipe / Engine Stop**")
+                    if st.button("🛑 Force Engine SL (Safe Wipe)", key=f"engine_sl_{b_id}", help="Instructs the background engine to safely stop this bot. Resolves 'Ghost' mismatches safely."):
+                        try:
+                            from engine.database import get_connection
+                            conn = get_connection()
+                            curr = conn.cursor()
+                            curr.execute("UPDATE bots SET status = 'stop_loss_triggered' WHERE id = ?", (b_id,))
+                            conn.commit()
+                            conn.close()
+                            st.success(f"✅ Bot flagged. The Engine will intercept and safely resolve this shortly.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"❌ Failed to flag bot: {e}")
+
                     # Stop settings
                     st.markdown("---")
                     st.markdown("**⚙️ Auto-Close Settings**")
@@ -389,17 +424,6 @@ def render_bot_manager_view():
                             if set_manual_close_pct(b_id, new_manual_pct):
                                 st.success("✅ Manual close % updated")
                                 st.rerun()
-
-        # Actions
-        with row_cols[7]:
-            col1, col2 = st.columns(2)
-            if col1.button("✏️ Edit", key=f"edit_{b_id}", help=f"Edit {name} settings"):
-                render_edit_form(b_id)
-
-            if col2.button("🗑️ Delete", key=f"del_{b_id}", help=f"Delete {name}"):
-                if delete_bot(b_id):
-                    st.success(f"✅ Deleted {name} successfully!")
-                    st.rerun()
         
         st.divider()
 

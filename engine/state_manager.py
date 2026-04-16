@@ -277,7 +277,7 @@ class StateManager:
             )
             
         finally:
-            conn.close()
+            pass # conn.close() disabled for singleton safety
     
     def check_health(self, force: bool = False) -> HealthReport:
         """
@@ -362,7 +362,7 @@ class StateManager:
             return report
             
         finally:
-            conn.close()
+            pass # conn.close() disabled for singleton safety
     
     def sync_bot_state(self, bot_id: int) -> bool:
         """
@@ -532,7 +532,7 @@ class StateManager:
             conn.rollback()
             return False
         finally:
-            conn.close()
+            pass # conn.close() disabled for singleton safety
     
     def reconcile_all(self) -> Dict[str, Any]:
         """
@@ -547,7 +547,7 @@ class StateManager:
             cursor.execute("SELECT id FROM bots WHERE is_active = 1")
             active_bots = [row[0] for row in cursor.fetchall()]
         finally:
-            conn.close()
+            pass # conn.close() disabled for singleton safety
         
         results = {
             'synced': [],

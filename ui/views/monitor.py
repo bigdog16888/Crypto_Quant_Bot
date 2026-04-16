@@ -78,8 +78,24 @@ def fetch_balance_cached(market_type):
 
 
 def render_monitor_view():
-    st.header("📊 Live Market Monitor")
-    st.caption(f"Last Updated: {time.strftime('%H:%M:%S')} (Local)")
+    col1, col2 = st.columns([4, 1])
+    with col1:
+        st.header("📊 Live Market Monitor")
+        st.caption(f"Last Updated: {time.strftime('%H:%M:%S')} (Local)")
+    with col2:
+        if st.button("🔄 Pre-Flight Sync"):
+            try:
+                from engine.exchange_interface import ExchangeInterface
+                from engine.database import update_active_positions_snapshot
+                with st.spinner("Syncing exchange..."):
+                    ex = ExchangeInterface()
+                    pos = ex.fetch_positions()
+                    update_active_positions_snapshot(pos)
+                st.toast("✅ Active positions synchronized")
+                time.sleep(0.5)
+                st.rerun()
+            except Exception as e:
+                st.error(f"Sync failed: {e}")
 
     # --- Notifications (Phase 9.3) ---
     try:
@@ -450,11 +466,7 @@ def render_monitor_view():
             from engine.exchange_interface import normalize_symbol
             _norm = normalize_symbol
 
-            # 1. Fetch Virtual Positions (grouped by normalized pair)
-            # 🚀 AUTHORITATIVE FIX: Use trades.total_invested/avg_entry_price as the virtual qty source.
-            # The previous approach summed bot_orders, which excluded 'reset_cleared' fills —
-            # real fills where a bot reset its TP cycle without closing the physical position.
-            # The trades table is always updated correctly across resets, so it is the true ledger.
+            # 1. Fetch Virtual Positions (grouped by normalized pair + side)
             query_virtual = """
                 SELECT b.pair, b.direction,
                        t.total_invested, t.avg_entry_price
@@ -467,64 +479,51 @@ def render_monitor_view():
             
             if not df_virt.empty:
                 for _, row in df_virt.iterrows():
-                    # Derive qty from total_invested / avg_entry_price — always authoritative across resets.
                     invested = float(row['total_invested'] or 0)
                     avg_price = float(row['avg_entry_price'] or 0)
                     if invested <= 0 or avg_price <= 0:
                         continue
                     qty_abs = invested / avg_price
-                        
                     pair_key = _norm(row['pair'])
+                    side_key = str(row['direction']).upper()  # LONG or SHORT
+                    composite_key = (pair_key, side_key)
                     if pair_key not in pair_prices:
                         pair_prices[pair_key] = avg_price
-                    
-                    signed_qty = qty_abs if row['direction'] == 'LONG' else -qty_abs
-                    
-                    virtual_qty_by_pair[pair_key] = virtual_qty_by_pair.get(pair_key, 0.0) + signed_qty
+                    # 🚀 HEDGE-MODE: Group by (pair, side) so LONG and SHORT bots are tracked independently.
+                    virtual_qty_by_pair[composite_key] = virtual_qty_by_pair.get(composite_key, 0.0) + qty_abs
             
-            # 2. Physical Positions (grouped by normalized pair)
-            
+            # 2. Physical Positions (grouped by normalized pair + side)
             if not df_physical.empty:
                 for _, row in df_physical.iterrows():
                     if pd.notna(row['size']) and pd.notna(row['entry_price']):
-                        qty = float(row['size'])
+                        qty = abs(float(row['size']))
                         price = float(row['entry_price'])
-                        val = abs(qty) * price
-                        
                         side = str(row['side']).upper().strip()
+                        side_key = 'LONG' if side in ('BUY', 'LONG') else 'SHORT'
                         pair_key = _norm(row['pair'])
-                        if pair_key not in pair_prices: pair_prices[pair_key] = price
-                        
-                        signed_usd = val if side in ['BUY', 'LONG'] else -val
-                        signed_qty = abs(qty) if side in ['BUY', 'LONG'] else -abs(qty)
-                        
-                        physical_net_usd += signed_usd
-                        physical_qty_by_pair[pair_key] = physical_qty_by_pair.get(pair_key, 0.0) + signed_qty
+                        composite_key = (pair_key, side_key)
+                        if pair_key not in pair_prices:
+                            pair_prices[pair_key] = price
+                        physical_qty_by_pair[composite_key] = physical_qty_by_pair.get(composite_key, 0.0) + qty
             
-            # 3. Per-pair Net Quantity comparison (Strict 1:1 match, $1.00 USD value tolerance for dust)
-            all_pairs = set(list(virtual_qty_by_pair.keys()) + list(physical_qty_by_pair.keys()))
-            virtual_net_usd = 0.0 # Recalculate precisely with normalized physical ref_prices
+            # 3. Per-pair, per-SIDE comparison (Hedge-Mode: LONG vs LONG, SHORT vs SHORT)
+            all_keys = set(list(virtual_qty_by_pair.keys()) + list(physical_qty_by_pair.keys()))
+            virtual_net_usd = 0.0
             physical_net_usd = 0.0
             
-            for p in all_pairs:
-                v_net_qty = virtual_qty_by_pair.get(p, 0.0)
-                ph_net_qty = physical_qty_by_pair.get(p, 0.0)
-                
-                # Check Size Mismatch
-                diff_qty = abs(v_net_qty - ph_net_qty)
+            for (p, side_key) in all_keys:
+                v_qty  = virtual_qty_by_pair.get((p, side_key), 0.0)
+                ph_qty = physical_qty_by_pair.get((p, side_key), 0.0)
+                diff_qty = abs(v_qty - ph_qty)
                 ref_price = pair_prices.get(p, 1.0)
                 diff_usd = diff_qty * ref_price
-                
-                # Apply identical USD accumulation
-                virtual_net_usd += v_net_qty * ref_price
-                physical_net_usd += ph_net_qty * ref_price
-                
-                if diff_usd > 1.0: # True mismatch greater than $1 of precision dust
-                    direction_str = "NET"
-                    # Format as USD for human readability but based strictly on qty mismatch
-                    v_usd_display = abs(v_net_qty) * ref_price * (1 if v_net_qty >= 0 else -1)
-                    ph_usd_display = abs(ph_net_qty) * ref_price * (1 if ph_net_qty >= 0 else -1)
-                    mismatched_pairs.append((f"{p} {direction_str}", v_usd_display, ph_usd_display, diff_usd, v_net_qty, ph_net_qty, diff_qty, ref_price))
+                sign = 1 if side_key == 'LONG' else -1
+                virtual_net_usd  += v_qty  * ref_price * sign
+                physical_net_usd += ph_qty * ref_price * sign
+                if diff_usd > 1.0:
+                    v_usd_display  = v_qty  * ref_price * sign
+                    ph_usd_display = ph_qty * ref_price * sign
+                    mismatched_pairs.append((f"{p} {side_key}", v_usd_display, ph_usd_display, diff_usd, v_qty * sign, ph_qty * sign, diff_qty, ref_price))
             
             diff_net = abs(virtual_net_usd - physical_net_usd)
             # (Mismatch and Order Health are displayed in the MASTER STATUS INDICATOR section below)
@@ -721,23 +720,117 @@ def render_monitor_view():
                     if order_health_msg:
                         st.write(f"**Order Health**: {order_health_msg}")
 
+                # --- ORPHAN PHYSICAL POSITIONS — Direct Market Close ────────
+                # These are exchange positions that the system has no bot record for.
+                # bot_id=0 in active_positions = unowned orphan.
+                # Shown here so they can be closed without needing Bot Manager Force SL
+                # (which only works when the bot is IN TRADE, not Scanning).
+                try:
+                    from engine.database import get_connection as _orphan_conn
+                    _oc = _orphan_conn()
+                    _orphan_rows = _oc.execute(
+                        "SELECT pair, side, size, entry_price FROM active_positions WHERE bot_id=0 ORDER BY pair, side"
+                    ).fetchall()
+                    _oc.close()
+                except Exception:
+                    _orphan_rows = []
+
+                if _orphan_rows:
+                    st.divider()
+                    st.markdown("### 🚨 Unowned Physical Positions (Orphans)")
+                    st.caption(
+                        "These positions exist on the exchange but have no owning bot in the system. "
+                        "They cannot be closed via Bot Manager (no bot = no Force SL). "
+                        "Use **Market Close** below to flatten each one directly."
+                    )
+                    for _or in _orphan_rows:
+                        _o_pair, _o_side, _o_size, _o_entry = _or[0], _or[1], float(_or[2] or 0), float(_or[3] or 0)
+                        _o_notional = _o_size * _o_entry
+                        _o_col1, _o_col2, _o_col3 = st.columns([3, 2, 1])
+                        with _o_col1:
+                            st.markdown(f"**{_o_pair}** `{_o_side}`  |  qty: `{_o_size:.4f}`  |  ~${_o_notional:,.2f}  |  entry: `{_o_entry:.4f}`")
+                        with _o_col2:
+                            st.caption("No owning bot — manual close required")
+                        with _o_col3:
+                            _close_key = f"orphan_close_{_o_pair}_{_o_side}"
+                            if st.button("🛑 Market Close", key=_close_key, type="primary"):
+                                try:
+                                    _ex_orp = get_exchange_instance('future')
+                                    _close_direction = 'sell' if _o_side.upper() == 'LONG' else 'buy'
+                                    # ONE-WAY MODE: account is ONE-WAY, NOT HEDGE MODE.
+                                    # NEVER send positionSide — that param is for hedge mode only and causes 400.
+                                    # side (sell/buy) + reduceOnly=True is the correct one-way close.
+                                    _ex_orp.create_order(
+                                        symbol=_o_pair,
+                                        type='market',
+                                        side=_close_direction,
+                                        amount=_o_size,
+                                        params={'reduceOnly': True}
+                                    )
+
+                                    st.success(f"✅ Market close sent: {_close_direction.upper()} {_o_size} {_o_pair}")
+                                    time.sleep(1)
+                                    st.rerun()
+                                except Exception as _oe:
+                                    st.error(f"Close failed: {_oe}")
+
                 # --- MANUAL LINK RECOVERY TOOL (Always available if mismatch exists) ---
                 if has_mismatch:
                     st.divider()
                     st.markdown("### 🧙‍♂️ Manual Link Recovery Tool")
                     st.caption("Accurately restore bot links for manual trades or disconnected assets. These discrepancies are REAL measurements comparing the Database Virtual Contracts vs Binance's Physical Contracts.")
                     
-                    # 1. Detect Rogue Positions via Reconciler (Explicitly)
-                    reconciler = StateReconciler(exchanges={'future': get_exchange_instance('future'), 'spot': get_exchange_instance('spot')})
-                    bot_states = reconciler.get_bot_states()
-                    success, all_positions = reconciler.fetch_all_exchange_positions()
-                    all_pairs = list(set([b.pair for b in bot_states]))
-                    # Filter only pairs with mismatches to save time (stripping the " NET" suffix)
-                    m_pairs = [mp[0].split(' ')[0] for mp in mismatched_pairs]
-                    all_orders_recon = reconciler.fetch_all_exchange_orders(m_pairs)
+                    # 1. Detect Rogue Positions from cached DB results (DO NOT call reconciler from UI)
+                    # The reconciler runs in the background engine. Calling it here causes:
+                    #  - Concurrent DB writes with the engine (phantom adoption generation)
+                    #  - Binance API rate-limit spikes (every page refresh = full exchange scan)
+                    #  - 'Could not calculate order health' exceptions on DB lock
+                    # Instead, read the last cached reconciliation results from the log.
+
+                    try:
+                        from engine.database import get_connection as _gconn2
+                        _rc = _gconn2()
+                        _recon_rows = _rc.execute("""
+                            SELECT pair, action, details, created_at 
+                            FROM reconciliation_log 
+                            WHERE created_at > ? AND action IN ('UNAUTHORIZED_LOSS', 'MANUAL_INTERVENTION')
+                            ORDER BY created_at DESC LIMIT 10
+                        """, (int(__import__('time').time()) - 3600,)).fetchall()
+                        _rc.close()
+                    except Exception:
+                        _recon_rows = []
                     
-                    recon_results = reconciler.resolve_net_mismatch(bot_states, all_positions, all_orders_recon, force_adoption=False)
-                    rogue_results = [r for r in recon_results if r.action_taken in (ReconciliationAction.ROGUE_POSITION, ReconciliationAction.REQUIRE_MANUAL) or r.requires_manual_intervention]
+                    # Build rogue_results from DB cache only
+                    rogue_results = []
+                    for _rrow in _recon_rows:
+                        class _R:
+                            def __init__(self, pair, details):
+                                self.pair = pair
+                                self.details = details
+                                self.action_taken = ReconciliationAction.MANUAL_INTERVENTION_REQUIRED
+                                self.requires_manual_intervention = True
+                        rogue_results.append(_R(_rrow[0], _rrow[2]))
+                    
+                    # Fetch physical positions for the manual close tool (read-only, just positions — not reconcile)
+                    try:
+                        _ex_rogue = get_exchange_instance('future')
+                        _raw_positions = _ex_rogue.fetch_positions()
+                        all_positions = {}
+                        for p in (_raw_positions or []):
+                            if p.get('contracts', 0):
+                                _sym = p.get('symbol','')
+                                if _sym not in all_positions:
+                                    all_positions[_sym] = []
+                                class _P:
+                                    pass
+                                _pp = _P()
+                                _pp.symbol = _sym
+                                _pp.side = 'LONG' if float(p.get('contracts',0)) > 0 else 'SHORT'
+                                _pp.size = abs(float(p.get('contracts',0)))
+                                _pp.entry_price = float(p.get('entryPrice', 0) or 0)
+                                all_positions[_sym].append(_pp)
+                    except Exception:
+                        all_positions = {}
 
                     # Pre-calculate active bots available for adoption
                     # Derive candidates from df_pos which has 12+ columns

@@ -418,14 +418,14 @@ with st.sidebar:
             # Start engine logic...
             runner_path = os.path.join(ROOT_DIR, "engine", "runner.py")
             
-            # Start runner and redirect output to a specific log file for debugging
-            LOG_FILE_PATH = os.path.join(ROOT_DIR, "engine_runner_debug.log")
-            with open(LOG_FILE_PATH, "a") as log_f:
-                process = subprocess.Popen([sys.executable, runner_path], 
-                                           stdout=log_f, 
-                                           stderr=log_f, 
-                                           creationflags=subprocess.CREATE_NEW_CONSOLE if sys.platform == "win32" else 0,
-                                           close_fds=True)
+            # Redirect stdout/stderr to DEVNULL. runner.py natively uses its own RotatingFileHandler.
+            # Passing a file handle here locks the file on Windows and causes RotatingFileHandler to crash.
+            process = subprocess.Popen([sys.executable, runner_path], 
+                                       stdout=subprocess.DEVNULL, 
+                                       stderr=subprocess.DEVNULL, 
+                                       creationflags=subprocess.CREATE_NEW_CONSOLE if sys.platform == "win32" else 0,
+                                       close_fds=True)
+
             
             with open(PID_FILE, "w") as f:
                 f.write(str(process.pid))

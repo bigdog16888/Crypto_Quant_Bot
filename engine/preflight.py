@@ -130,7 +130,7 @@ def _check_position_match(exchanges: Dict[str, ExchangeInterface]):
             WHERE b.is_active = 1 AND COALESCE(t.total_invested, 0) > 0
         """)
         db_positions = cursor.fetchall()
-        conn.close()
+        pass # conn.close() disabled for singleton safety
 
         # Build DB net map: { normalized_symbol: net_usd }
         db_net_map = {}
@@ -199,7 +199,7 @@ def _check_order_integrity(exchanges: Dict[str, ExchangeInterface]):
             WHERE b.is_active = 1 AND t.total_invested > 0
         """)
         in_trade_bots = cursor.fetchall()
-        conn.close()
+        pass # conn.close() disabled for singleton safety
 
         if not in_trade_bots:
             logger.info("    ℹ️ No bots in trade — skipping order check")
@@ -268,7 +268,7 @@ def _check_step_consistency():
             WHERE b.is_active = 1 AND t.total_invested > 0
         """)
         rows = cursor.fetchall()
-        conn.close()
+        pass # conn.close() disabled for singleton safety
 
         for bot_id, name, step, invested, base_size in rows:
             # Sanity checks

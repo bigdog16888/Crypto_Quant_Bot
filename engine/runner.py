@@ -1,4 +1,4 @@
-﻿import time
+import time
 import logging
 import json
 import sys
@@ -268,6 +268,7 @@ class BotRunner:
             # 📸 PHASE 2: prime_startup_snapshot() fetches positions ONCE atomically.
             # This replaces the separate fetch_positions loop that used to fire here
             # AND the duplicate fetch inside reconstruct_offline_fills below.
+            from engine.reconciler import StateReconciler
             reconciler = StateReconciler(self.exchanges)
             try:
                 logger.info("📸 [STARTUP] Priming single exchange snapshot (Phase 2 architecture)...")
@@ -656,7 +657,7 @@ class BotRunner:
             logger.error(f"Error fetching bots: {e}")
             return []
         finally: 
-            conn.close()
+            pass # conn.close() disabled for singleton safety
 
 
 
@@ -667,7 +668,7 @@ class BotRunner:
             cursor = conn.cursor()
             cursor.execute("SELECT COUNT(*) FROM trades WHERE total_invested > 0")
             count = cursor.fetchone()[0]
-            conn.close()
+            pass # conn.close() disabled for singleton safety
             return count
         except Exception as e:
             logger.error(f"Failed to get expected positions count: {e}")
@@ -1028,6 +1029,87 @@ class BotRunner:
             return False  # Main loop will handle the file cleanup and liquidation
 
         # 3. Process Bots
+        # ================================================================
+        # 🛑 FORCE ENGINE SL INTERCEPT
+        # Before processing any bot, check if the UI flagged it with
+        # status='stop_loss_triggered'. If so: cancel all its open orders,
+        # fire a reduce-only market close, and reset it to idle.
+        # This makes the "Force Engine SL" button in Bot Manager actually work.
+        # ================================================================
+        _sl_conn = get_connection()
+        _sl_cur = _sl_conn.cursor()
+        _sl_cur.execute("SELECT id, name, pair, direction FROM bots WHERE status='stop_loss_triggered' AND is_active=1")
+        sl_flagged_bots = _sl_cur.fetchall()
+        pass # _sl_conn.close() disabled for singleton safety
+
+        for sl_bid, sl_name, sl_pair, sl_dir in sl_flagged_bots:
+            logger.critical(f"🛑 [FORCE-SL] Bot {sl_name} (ID {sl_bid}) flagged for forced stop. Executing safe close.")
+            try:
+                from engine.database import safe_wipe_bot
+                ex_sl = list(self.exchanges.values())[0] if self.exchanges else None
+                if ex_sl:
+                    # Cancel all open CQB_ orders for this bot first
+                    try:
+                        open_ords = ex_sl.fetch_open_orders(sl_pair)
+                        for o in (open_ords or []):
+                            cid = o.get('clientOrderId', '')
+                            if cid.startswith(f'CQB_{sl_bid}_'):
+                                ex_sl.cancel_order(o['id'], sl_pair)
+                                logger.info(f"  ✅ [FORCE-SL] Cancelled order {cid}")
+                    except Exception as _co_err:
+                        logger.warning(f"  ⚠️ [FORCE-SL] Could not cancel orders for {sl_name}: {_co_err}")
+                    # Fire market reduce-only close natively matching a TP sequence
+                    try:
+                        exit_side = 'buy' if sl_dir.upper() == 'SHORT' else 'sell'
+                        _sl_conn2 = get_connection()
+                        qty_row = _sl_conn2.execute(
+                            "SELECT total_invested, avg_entry_price FROM trades WHERE bot_id=?", (sl_bid,)
+                        ).fetchone()
+                        _sl_conn2.close()
+                        
+                        api_success = False
+                        if qty_row and qty_row[0] and qty_row[1] and float(qty_row[1]) > 0:
+                            close_qty = float(qty_row[0]) / float(qty_row[1])
+                            
+                            # 🚀 ROOT CAUSE FIX: Use the native exact tracking ID so WS handles the math.
+                            client_order_id = f"CQB_{sl_bid}_TP_MARKETSL{int(time.time())}"
+                            
+                            ex_sl.create_order(sl_pair, 'market', exit_side, close_qty,
+                                               params={'reduceOnly': True, 'clientOrderId': client_order_id})
+                            logger.info(f"  ✅ [FORCE-SL] Market close placed via ID {client_order_id}: {exit_side} {close_qty:.6f} {sl_pair}")
+                            api_success = True
+                            
+                    except Exception as _mc_err:
+                        logger.warning(f"  ⚠️ [FORCE-SL] Market close rejected by exchange!: {_mc_err}")
+                
+                # 🚀 ROOT CAUSE FIX: NEVER wipe the bot manually bypassing proof. 
+                # If API passed, we set status to pending_sl so the WS catches the fill and executes normal TP shutdown.
+                # Record audit but don't freeze the bot permanently
+                _r_conn = get_connection()
+                if api_success:
+                    _r_conn.execute("UPDATE bots SET status='pending_sl' WHERE id=?", (sl_bid,))
+                    logger.info(f"  ⏳ [FORCE-SL] Bot {sl_name} pending WS confirmation to formally close.")
+                else:
+                    # API failed (e.g. 0 qty locally, rejected order, etc). 
+                    # Do NOT blindly wipe the bot, as this creates Ghost positions if the DB is desynced.
+                    logger.warning(f"  ⚠️ [FORCE-SL] Market close API failed or bypassed for {sl_name}. Reverting to normal state without forcing wiping.")
+                    # If the bot has a ledger position, it remains IN TRADE. If flat, it scans.
+                    qty_row = _r_conn.execute("SELECT total_invested FROM trades WHERE bot_id=?", (sl_bid,)).fetchone()
+                    if qty_row and qty_row[0] and float(qty_row[0]) > 0:
+                        _r_conn.execute("UPDATE bots SET status='IN TRADE' WHERE id=?", (sl_bid,))
+                    else:
+                        _r_conn.execute("UPDATE bots SET status='Scanning' WHERE id=?", (sl_bid,))
+                
+                _r_conn.commit()
+                pass # _r_conn.close() disabled for singleton safety
+
+            except Exception as _sl_err:
+                logger.error(f"❌ [FORCE-SL] Failed to process forced SL for {sl_name}: {_sl_err}")
+
+        # Remove SL-flagged bots from this cycle's run list so they don't also get processed normally
+        sl_flagged_ids = {b[0] for b in sl_flagged_bots}
+        bots = [b for b in bots if b[0] not in sl_flagged_ids]
+
         # Update workers size
         max_workers = min(len(bots) + 2, 20)
         
@@ -1035,9 +1117,6 @@ class BotRunner:
             self._bot_executor = BotExecutor(self)
         bot_executor = self._bot_executor
 
-        # logger.info(f"🚀 BotRunner started. Cycle time: {POLL_INTERVAL_SECONDS}s")
-        # logger.info(f"📂 DATABASE PATH: {config.PATHS['DB_FILE']}")
-        # logger.info(f"📂 PID FILE: {config.PATHS['PID_FILE']}")
         logger.debug(f"DEBUG: Starting cycle with {len(bots)} bots")
         if not bots:
             logger.warning("No active bots found to process in this cycle.")

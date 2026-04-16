@@ -286,7 +286,7 @@ class ExchangeInterface:
                         positions.append({
                             'symbol': unified_symbol,
                             'contracts': float(pos['positionAmt']),
-                            'side': 'long' if float(pos['positionAmt']) > 0 else 'short',
+                            'side': str(pos.get('positionSide', 'BOTH')).lower(), # Normalized: long, short, both
                             'unrealizedPnl': float(pos['unrealizedProfit']),
                             'entryPrice': float(pos['entryPrice'])
                         })
@@ -413,6 +413,9 @@ class ExchangeInterface:
             # Mainnet fallback
             return self.exchange.fetch_my_trades(symbol, since=since, limit=limit)
         except Exception as e:
+            if "2015" in str(e):
+                self.logger.error(f"🛡️ GEOFENCED/RESTRICTED: API permission denied for {symbol} trades. Forensic proof will be skipped.")
+                raise PermissionError(f"API Permission denied for {symbol}")
             self.logger.error(f"Trades Fetch Error for {symbol}: {e}")
             return []
 

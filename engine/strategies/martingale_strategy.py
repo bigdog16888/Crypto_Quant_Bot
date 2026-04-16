@@ -390,68 +390,17 @@ class MartingaleStrategy(BaseStrategy):
 
     def calculate_take_profit_amount(self, bot_status: Dict, current_price: float, pair: str, exchange: Any) -> float:
         """
-        Return the TP close quantity.
-
-        SOURCE PRIORITY (highest to lowest):
-        1. Physical exchange position size — the authoritative number of contracts
-           that actually need to be closed. This prevents residuals when the virtual
-           ledger (total_invested / avg_price) drifts from reality due to fill timing,
-           partial-fill rounding, or carry-over rows.
-        2. Virtual ledger fallback — used only when the exchange fetch fails or the
-           physical position is zero (e.g. already closed by another path).
-
-        SAFETY CAP: Even in the fallback path, virtual quantity is capped to the largest
-        physical position we were able to observe. This prevents the DB-inflation bug where
-        PASS3 adoption rows inflate the virtual ledger beyond the real position size,
-        causing an oversized TP that nets against a sibling bot's real position in One-Way mode.
+        Calculates the quantity (amount) for the Take Profit order.
+        Strictly relies on the mathematically perfect Virtual Ledger.
+        In Binance One-Way Mode, multiple bots across opposing directions mathematically Net out
+        on the exchange orderbook. Using the aggregate physical position size would erroneously
+        clip identical Long and Short bots down to 0, trapping their Take Profits.
         """
-        direction = (self.params.get('direction') or 'LONG').upper()
-        phys_cap = None  # Will hold latest known physical qty for safety cap
-
-        # -- PRIORITY 1: physical exchange position --
-        try:
-            if exchange is not None and pair:
-                from engine.exchange_interface import normalize_symbol
-                positions = exchange.fetch_positions()
-                norm_pair = normalize_symbol(pair).upper()
-                for pos in (positions or []):
-                    raw_sym = pos.get('symbol', '') or ''
-                    pos_side = (pos.get('side', '') or '').upper()
-                    # Match symbol and direction
-                    if normalize_symbol(raw_sym).upper() != norm_pair:
-                        continue
-                    # contracts > 0 means we have a physical position
-                    phys_qty = abs(float(pos.get('contracts', 0) or pos.get('size', 0) or 0))
-                    if phys_qty > 0:
-                        phys_cap = phys_qty  # Store for safety cap on fallback
-                        rounded = self._round_qty(phys_qty)
-                        logger.info(
-                            f"[TP-SIZE] {pair} using PHYSICAL position qty {phys_qty:.6f} "
-                            f"→ {rounded:.6f} (virtual ledger would give "
-                            f"{float(bot_status.get('total_invested',0)) / max(float(bot_status.get('avg_entry_price',1)),1e-9):.6f})"
-                        )
-                        return rounded
-        except Exception as _e:
-            logger.warning(f"[TP-SIZE] Could not fetch physical position for {pair}: {_e}. Falling back to virtual ledger.")
-
-        # -- PRIORITY 2: virtual ledger fallback --
         avg_price = float(bot_status.get('avg_entry_price', 1.0))
         if avg_price <= 0:
             avg_price = current_price
+            
         raw_qty = float(bot_status.get('total_invested', 0)) / avg_price
-
-        # 🛡️ SAFETY CAP (Bug 2 Fix)
-        # If we got a physical qty earlier but it was <= 0 (position already flat),
-        # do NOT send a massive virtual qty to the exchange — that would reduce
-        # a sibling bot's position in One-Way netting mode.
-        # Cap virtual qty to the physical observation if we have one.
-        if phys_cap is not None and raw_qty > phys_cap:
-            logger.warning(
-                f"[TP-SIZE-CAP] {pair} virtual qty {raw_qty:.6f} > physical cap {phys_cap:.6f}. "
-                f"Capping to physical to prevent cross-bot netting in One-Way mode."
-            )
-            raw_qty = phys_cap
-
         return self._round_qty(raw_qty)
 
     def calculate_grid_order_price(self, bot_status: Dict, current_price: float, market_data: Any = None, multi_tf_data: dict = None) -> Tuple[float, str]:
