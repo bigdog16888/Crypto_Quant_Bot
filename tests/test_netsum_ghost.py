@@ -192,12 +192,12 @@ class TestNetSumGhostDetection(unittest.TestCase):
     ):
         """
         Scenario:
-        - Bot A: LONG 0.01 (ghost — no matching physical LONG)
-        - Bot B: SHORT 0.01 (valid — matching physical SHORT)
-        - Physical: SHORT 0.01
+        - Bot A: LONG 0.1 (ghost — no matching physical LONG)
+        - Bot B: SHORT 0.1 (valid — matching physical SHORT)
+        - Physical: SHORT 0.1
         Expected: Bot A is reset (ghost, no matching LONG exists).
         """
-        QTY = 0.01
+        QTY = 0.1   # $10 notional — avoids the sub-$5 Dust Chaser path
         PRICE = 100.0
         db = _make_db([(101, QTY), (102, QTY)])
         mock_conn.return_value = db

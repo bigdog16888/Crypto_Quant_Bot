@@ -889,12 +889,9 @@ def render_edit_form(bot_id):
             config_dict['UseVolSizing'] = st.checkbox("Volatility Position Sizing", value=config_dict.get('UseVolSizing', False), help="Adjusts lot size based on ATR (High Vol = Smaller Size).")
 
         st.markdown("#### Advanced Exit & Hedge Settings")
-        col_ee1, col_ee2, col_ee3, col_ee4, col_ee5 = st.columns(5)
+        col_ee1, col_ee3, col_ee4, col_ee5 = st.columns(4)
         with col_ee1:
             use_ee = st.checkbox("Use Early Exit", value=config_dict.get('UseEarlyExit', False), help="Moves TP target closer to Break Even over time to exit stale trades safely.")
-        with col_ee2:
-            ee_start_hours = st.number_input("Start After (Hours)", value=float(config_dict.get('EEStartHours', 2.0)), min_value=0.0, step=0.5,
-                help="Hours after entry before decay begins.")
         with col_ee3:
             decay_interval = st.number_input("Decay Every (Mins)", value=float(config_dict.get('DecayIntervalMins', 15.0)), help="How often (in minutes) the profit target is reduced.")
         with col_ee4:
@@ -914,7 +911,6 @@ def render_edit_form(bot_id):
 
         # EE
         config_dict['UseEarlyExit'] = use_ee
-        config_dict['EEStartHours'] = ee_start_hours
         config_dict['DecayIntervalMins'] = decay_interval
         config_dict['DecayPercentPerInterval'] = decay_pct
         config_dict['EEAllowLoss'] = ee_allow_loss
@@ -994,7 +990,6 @@ def render_edit_form(bot_id):
                 'TakeProfitBase': float(config_dict.get('TakeProfitBase', 10.0)),
                 'TakeProfitPct': float(config_dict.get('TakeProfitPct', 1.0)),
                 'UseEarlyExit': bool(config_dict.get('UseEarlyExit', False)),
-                'EEStartHours': float(config_dict.get('EEStartHours', 2.0)),
                 'DecayIntervalMins': float(config_dict.get('DecayIntervalMins', 15.0)),
                 'DecayPercentPerInterval': float(config_dict.get('DecayPercentPerInterval', 30.0)),
                 'EEAllowLoss': bool(config_dict.get('EEAllowLoss', False)),

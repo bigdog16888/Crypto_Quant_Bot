@@ -1,9 +1,17 @@
 # Crypto Quant Bot — AI Agent Codebase Guide
-**Version: 1.8.1 | Last Updated: 2026-04-16**
+**Version: 1.8.5 | Last Updated: 2026-04-17**
 
 > **READ THIS FIRST** before touching any code. This is the single authoritative guide.
 > It supersedes `UNIFIED_BOT_DOCUMENTATION.md` and all older session notes.
 > Every invariant here was added because someone violated it and the system broke.
+
+---
+
+## 🏗️ High-Level Engine Architecture
+The Crypto Quant Bot relies on a **Proof-Only Reconciliation Architecture**. 
+1. **Virtual Ledger (`crypto_bot.db`):** The system tracks exactly what each bot intends to hold through cryptographic proof (clientOrderIds like `CQB_###`).
+2. **Physical Imprint (Binance):** The system connects to Binance via CCXT & Raw FAPI to verify actual holdings.
+3. **The `StateReconciler`:** Compares the DB math against the physical imprint. If any impossible discrepancy occurs (e.g. Virtual > Physical), the system will NEVER invent numbers or guess (as it did historically across heuristical patching). It will default to the **Market Flatten Protocol**, physically wiping the exchange position safely to $0 and neutralizing the bot ledger to Step 0 to guarantee mathematical safety. No orphaned dust will survive.
 
 ---
 
@@ -176,6 +184,11 @@ Transitions:
   orders. Their `cycle_id` is ground truth. Moving them corrupts the cycle they belong to.
 - The correct proof of ownership is the CQB ID, not a numeric cycle comparison.
 
+### Version 1.8.3 (API Stabilization & Sync Flow Documentation)
+- **Demo FAPI Price Bug & Artificial TP Loss**: Identified and documented the edge case where the Binance Demo FAPI suppresses the `avgPrice` field on completed limit orders. Combined with illiquidity wick events, this forced `actual_exit` to fall back to the live `current_price` at that exact millisecond. If the price dropped, this recorded an artificial loss (e.g. SUI logging a -0.19 PNL on a TP hit). The recent FAPI parse fix in `exchange_interface.py` prevents this future corruption.
+- **WebSocket Position Streaming Delay**: Documented standard startup synchronization behavior. When starting the WebSocket monitor, initial exchange balances will momentarily read `0.0` until the first `position_update` event streams from the exchange.
+- **Standard Operating Procedure**: The documented startup flow is now explicitly defined as `Pre-Sync (REST pull to establish baseline)` -> `Start Monitor (WebSocket stream to maintain live delta)`.
+
 ### 3.9. Ledger Mathematics — Canonical Form
 All position calculations MUST use:
 - **Entries** (add to position): `order_type IN ('entry', 'grid', 'adoption_add', 'adoption')`
@@ -194,10 +207,27 @@ CARRY fallback that reads stale `trades.avg_entry_price` values.
 Wrap all TP reset logic with `if total_invested > 0:`. Without this, the REST polling loop can
 race against the WS fill handler and fire twice, producing phantom `$0.00 TP_HIT` journal entries.
 
-### 3.12. Early Exit (EE) Decay Baseline
-The EE formula decays the Take-Profit parameter incrementally across time towards the Average Entry. `basket_start_time` manages this timing sequence. It MUST be natively updated to `int(time.time())` in `accumulate_trade_fill` asynchronously upon ANY limit order hitting the ledger (both Entries AND Grid level averages). Doing this correctly scales profitability targets rather than abruptly crashing freshly loaded grid margins into Break-Even status because of old entry cycle footprints.
+### 3.12. Early Exit (EE) Decay — Architecture (Correct)
 
-### 3.12. Carry-Over Ghost Mass Protection
+EE decay is a **step function**, NOT continuous per-cycle drift.
+
+All production bots use `DecayIntervalMins` + `DecayPercentPerInterval` (configured in the bot UI).
+The formula in `manager.calculate_early_exit_decay` (line 46) uses:
+```python
+intervals_passed = math.floor(duration_mins / interval_mins)  # INTEGER floor
+ee_pc += intervals_passed * decay_per_interval
+```
+`math.floor` makes this a staircase: the TP value is **identical** between interval boundaries
+and **steps down** only when a complete interval has elapsed (e.g., every 15 minutes).
+
+The `EEHoursPC` (linear per-hour) mode is NOT used by any current bot — it would cause continuous
+per-cycle drift. Do not enable it without understanding the SYNC-DRIFT implication (see §5 table).
+
+`basket_start_time` MUST be updated to `int(time.time())` in `accumulate_trade_fill` on every
+limit fill (both entries AND grid averages). Without this, the decay anchors to the original
+cycle open time, crashing fresh grids toward break-even prematurely.
+
+### 3.13. Carry-Over Ghost Mass Protection
 Administrative exits (`SYSTEM_WIPE`, `MANUAL_CLOSE`, `STOP_LOSS_EXIT`) must NEVER trigger carry-over.
 `reset_bot_after_tp` uses `action_label` to detect admin exits and skip carry propagation.
 
@@ -246,6 +276,10 @@ Administrative exits (`SYSTEM_WIPE`, `MANUAL_CLOSE`, `STOP_LOSS_EXIT`) must NEVE
 | Bot resets immediately after CARRY TP | `safe_wipe_bot()` guard 1 not firing | Check `trades.cycle_phase` is set to `CARRY_PENDING` by `reset_bot_after_tp` |
 | Orphaned physical position with no system entry | Position opened manually or by a reset-then-deleted bot | Use Force SL from Bot Manager UI to cleanly close the position |
 | XRP/SUI/ETH SHORT with system=0 | Bots have zero `bot_orders` fills — position was never opened by the bot system | Must use Force SL via Bot Manager to close; cannot be adopted without CQB proof |
+| "MISSING GRIDS" alert persists despite grid on exchange | `get_bot_order_ids()` only queried `status='open'`; Binance FAPI returns `status='new'` for acknowledged orders → `local_grid_ids=[]` → engine re-places grid indefinitely | Fixed in v1.8.2: query includes `'new'` and `'placing'` statuses |
+| `trades.tp_order_id` stuck as `PLACING_CQB_...` forever | Pre-commit pattern writes placeholder to `trades` but `update_bot_order_exchange_id` only updated `bot_orders`, leaving the stalemate evictor querying a non-existent exchange ID | Fixed in v1.8.2: `update_bot_order_exchange_id` now back-fills `trades` table; `get_bot_order_ids` strips `PLACING_` and self-heals from `bot_orders` |
+| `[SYNC-DRIFT]` fires every cycle replacing a valid TP | Drift-check re-computed `db_tp` via `_compute_effective_tp(avg_entry_price)` each cycle. If `avg_entry_price` shifted (grid fill), the re-computed base TP differed from the placed TP → false drift even when no EE interval elapsed | Fixed in v1.8.4: drift-check reads `bot_orders.price` (what was physically placed on Binance) and compares it to the live exchange TP. EE interval change is detected separately via `new_ee_tp != placed_tp`. Tolerance reduced from 2% (patch) to 0.1% (tick-size rounding only) |
+| `python-dotenv could not parse` on startup (lines 17-51) | A test exercised the UI "Apply Settings" path with a mocked `st.text_input()` that returned a `MagicMock` object. `set_key()` wrote `MagicMock repr` verbatim to `.env`. The `<` character in the repr is illegal in dotenv format | Fixed in v1.8.4: `ui/app.py` validates inputs before writing (len≥10, printable ASCII, no `<`). `.env` now has stub `BINANCE_API_KEY=` so `set_key()` updates in-place, never appends |
 
 ---
 
@@ -271,7 +305,100 @@ After restart, watch for:
 
 ## 7. Version History (Change Log)
 
-### v1.7.0 — 2026-04-14
+### v1.8.4 — 2026-04-17
+**Root causes: (1) SYNC-DRIFT check re-computed TP from formula instead of reading placed price. (2) `.env` corrupted by test writing MagicMock objects via `set_key()`.**
+
+**bot_executor.py** (fundamental fix):
+- `maintain_orders` SYNC-DRIFT block: Removed the pattern of re-running `_compute_effective_tp`
+  to get `db_tp` and comparing it against the exchange's live TP price.
+  **Root cause**: `_compute_effective_tp` re-calls `calculate_take_profit_price(avg_entry_price)`,
+  which produces a fresh float every cycle. When a grid fill shifts `avg_entry_price` between
+  cycles, the re-computed base TP differs from the physically placed TP — even if no EE interval
+  has elapsed. This falsely triggered `[SYNC-DRIFT]` and the 2% tolerance was a patch hiding it.
+  **Correct design**: For the drift check, read `bot_orders.price` (the price actually submitted
+  to Binance) as the reference. Compare that against `exchange_tp` (what Binance holds live).
+  EE interval change is detected separately: if `_compute_effective_tp` returns a value that
+  differs from `placed_tp`, a new interval stepped — then and only then replace the TP.
+  Tolerance restored to **0.1%** (covers tick-size rounding only, not formula re-computation).
+- Log format: `[SYNC-DRIFT]` now reports which of three conditions triggered the replace:
+  `EE-stepped`, `price-drift`, or `qty-drift`, with exact percentages.
+
+**ui/app.py**:
+- `Apply Settings` button: Added validation before `set_key()` — value must be str, len≥10,
+  printable ASCII, no `<` character (rejects MagicMock repr). If invalid, shows error and
+  does NOT touch `.env`. Prevents test artefacts from corrupting the file.
+
+**.env**:
+- Cleaned all 24 garbage lines (MagicMock repr written by unconstrained `set_key()` in test).
+- Added stub `BINANCE_API_KEY=` and `BINANCE_API_SECRET=` placeholders so `set_key()` updates
+  in-place on future writes, never appends duplicate keys.
+- Added `RULE-ENV` block to CODEBASE_GUIDE (§8).
+
+**CODEBASE_GUIDE.md**:
+- §3.12: Corrected EE decay architecture — documented as step function (not continuous drift).
+  Clarified `math.floor` behaviour and why `EEHoursPC` is not used.
+- §5: Added `[SYNC-DRIFT]` and `python-dotenv` failure patterns with root causes.
+
+### v1.8.3 — 2026-04-17
+**Root causes: (1) `StateReconciler` constructor treated `exchanges={}` as falsy, firing real connections in tests. (2) `error_side` used raw net signs instead of `net_error`, wrong bot wiped. (3) `recompute_invested_from_orders` returned 3-tuple on early exit path. (4) `_fe` UnboundLocalError in race-condition guard.**
+
+**reconciler.py**:
+- Constructor: Changed `if exchanges:` to `if exchanges is not None:` — empty dict `{}` is falsy,
+  causing real `ExchangeInterface` connections in tests that pass `exchanges={}`.
+- `resolve_net_mismatch`: `error_side` replaced with `net_error = virt_net - phys_net` formula.
+  Previous logic used raw sign of `virt_net` and `phys_net` independently — failed in hedged
+  multi-bot scenarios (LONG ghost + SHORT valid → detected wrong side as ghost).
+- Race-condition guard: Moved inside `except` block so `_fe` is always in scope when referenced.
+  Previously `_fe` was declared after the try/except it was used in, causing `UnboundLocalError`.
+
+**database.py**:
+- `recompute_invested_from_orders`: Early-return path returned 3-tuple; callers expect 4-tuple.
+  Changed to `return 0.0, 0.0, 0.0, 0.0`.
+
+### v1.8.2 — 2026-04-16
+**Root causes: (1) `get_bot_order_ids` missed grid orders with Binance's `'new'` status. (2) `trades.tp_order_id` permanently stuck with `PLACING_` placeholder.**
+
+**database.py**:
+- `get_bot_order_ids`: Grid order query now includes `status IN ('open','new','placing')`. Binance FAPI
+  acknowledges limit orders with `status='new'` before confirming them as `status='open'`. Querying only
+  `'open'` caused `local_grid_ids=[]` → engine saw no grid in DB + none on exchange → tried to place a
+  duplicate grid forever, while the reconciler couldn't fix it because it thought no grid was tracked.
+- `get_bot_order_ids`: Added `PLACING_` prefix detection on `trades.tp_order_id`. Pre-commit pattern
+  writes `'PLACING_{clientOrderId}'` to `trades` before the exchange call. `update_bot_order_exchange_id`
+  only stamped `bot_orders` with the real ID — leaving `trades.tp_order_id` permanently as placeholder.
+  The stalemate evictor then called `fetch_order('PLACING_...', pair)` → order-not-found → evicted the
+  valid TP, causing unnecessary re-placement. Fix: detect the prefix, look up the real ID from
+  `bot_orders`, back-fill `trades`, and return the correct ID.
+- `update_bot_order_exchange_id`: Now back-fills `trades.tp_order_id` or `trades.entry_order_id` when
+  stamping a real exchange ID onto a `placing` row if `trades` still has the stale placeholder.
+- **Accounting Math Fix (`recompute_invested_from_orders`)**: Previously, LEDGER-SYNC subtracted `(sold_qty * exit_price)` from the `total_cost` basis when aggregating position metrics. If the exit price (like a partial TP) was different from entry, this algebraically corrupted the remaining Average Entry Price, sometimes making it negative. This caused the Reconciler to see a mismatch between active_positions and trades, triggering a phantom `adoption_reduce`, which further pushed the ledger negative and trapped the bot in an endless DB-reset loop. The SQL query was fundamentally rewritten to strictly separate `bought_cost` and `bought_qty` from `sold_qty`. `avg_entry_price` is now derived *only* from entries (`bought_cost / bought_qty`), and `total_cost = remaining_qty * avg_entry_price`.
+- **EE Decay Reset on Limit Fill (`accumulate_trade_fill`)**: Restored logic where `basket_start_time` is accurately reset to `time.time()` via the accumulator every time a dynamic grid order fills. This ensures Early Exit (EE) calculations correctly track decay strictly out from the most recent grid fill (cost basis shift) rather than anchoring back to the initial bot cycle opening tick.
+
+**bot_executor.py**:
+- Grid stalemate evictor (`maintain_orders`): When `fetch_order` confirms a grid is `filled`, the fill
+  is now processed **inline** via `accumulate_trade_fill` + `update_order_status('filled')`. Previously,
+  the code said "Offline sync will handle this" and returned without clearing `local_grid_ids`. Since
+  `reconstruct_offline_fills` is not called frequently enough in the periodic reconciler, the bot looped
+  indefinitely in "Blocked by Local DB Lock" state — ledger never updated, mismatch alert never cleared.
+  To revert: restore the `elif status_str in ['filled','closed']` branch to log-only + return.
+- Inline fill price fallback: Binance Demo FAPI returns `average=0` for filled orders. Added fallback:
+  first looks up `bot_orders.price` for the order ID, then falls back to `current_price`. Zero-price
+  fills are now rejected with a guard (`if actual_fill_qty <= 0 or actual_fill_price <= 0`) instead
+  of silently writing `$0` into the ledger and corrupting `avg_entry_price`.
+- Inline fill step extraction: Demo FAPI may omit `clientOrderId` in filled order responses. Added
+  DB fallback: if `clientOrderId` is missing or doesn't contain `_GRID_`, queries `bot_orders` for
+  the stored `client_order_id` by exchange `order_id` to extract the martingale step number.
+
+**exchange_interface.py** ← **Root Cause**:
+- `fetch_order` Demo FAPI path returned only `{id, status, filled, amount}` — silently dropping
+  `avgPrice` and `price` from the raw Binance response. This meant every caller of `fetch_order`
+  in Demo mode received `order['average'] = None` → fallback to `0` → zero-price fill.
+- Fix: the response dict now includes `average` (from `avgPrice`, falling back to `price` if 0),
+  `price`, and `clientOrderId`. For limit grid orders on Demo FAPI, `avgPrice` is always `"0"`;
+  the `price` field (the limit price) is the correct fill price and is now used as the fallback.
+  The `clientOrderId` inclusion eliminates the extra DB lookup for step extraction.
+
+### v1.8.1 — 2026-04-16
 **Root cause: `active_positions` was a split-brain table with stale virtual data.**
 
 **database.py**:
@@ -314,11 +441,71 @@ After restart, watch for:
 
 ## 8. Testing Checklist
 
-Before restarting after any code change:
-- [ ] `python -c "import py_compile; py_compile.compile('engine/reconciler.py', doraise=True); py_compile.compile('engine/database.py', doraise=True)"` — syntax clean
-- [ ] `active_positions` row count matches Binance open positions count after startup
-- [ ] No `[PHYS-ADOPT] Fatal` in engine.log (was crashing due to f_side NameError)
-- [ ] SUI SHORT shows correct qty (168.2, not 84.1) in `active_positions`
-- [ ] IDLE bots (10016 BTC, 10018 SUI) self-reset to Scanning after `_align_memory_to_ledger`
+Run before every restart:
+```powershell
+python -m pytest tests/ -x -q --tb=short
+# Expected: 64 passed, 6 skipped, 0 failed
+```
+
+Then verify in logs:
+- [ ] No `[PHYS-ADOPT] Fatal` in engine.log
+- [ ] `active_positions` row count matches Binance open positions count
+- [ ] SUI SHORT shows correct qty in `active_positions`
+- [ ] IDLE bots self-reset to Scanning after `_align_memory_to_ledger`
 - [ ] No `SIZE DISCREPANCY` after 5+ cycles
-- [ ] BNB short `[RECOMPUTE-CARRY]` shows -0.04 BNB (from bot_orders), not -0.05 (from trades fallback)
+- [ ] `[SYNC-DRIFT]` only fires when EE interval steps OR exchange holds wrong price — NOT every cycle
+- [ ] `[SYNC-DRIFT]` log shows reason: `EE-stepped`, `price-drift`, or `qty-drift`
+- [ ] No `python-dotenv could not parse` warnings in logs
+
+---
+
+## ⛔ RULE-ENV — The `.env` File Is Read-Only Except in Two Cases
+
+```
+THE .env FILE MUST NEVER BE WRITTEN BY ANY CODE EXCEPT ui/app.py's "Apply Settings" button.
+IT MUST NEVER BE WRITTEN BY TESTS, SCRIPTS, OR DURING DEVELOPMENT.
+```
+
+### The only two authorised edits to `.env`
+
+| When | What to change | How |
+|------|---------------|-----|
+| Rotating testnet credentials | Replace `BINANCE_TESTNET_API_KEY` and `BINANCE_TESTNET_API_SECRET` | Edit manually in a text editor |
+| Going live (future) | Add `BINANCE_API_KEY` and `BINANCE_API_SECRET` below the testnet keys | Edit manually in a text editor |
+
+### What must NEVER touch `.env`
+
+- **Tests** — all tests must mock `set_key` and `load_dotenv`. Never let pytest run code that calls `set_key()` against a real file path.
+- **Scripts / debug tools** — no script in `engine/` or `tests/` may open and write `.env`.
+- **The reconciler or engine** — they read `config.*` (loaded at startup). They never write back.
+
+### Why this rule exists
+
+A test that mocked `st.text_input()` but did NOT mock `set_key()` wrote 24 lines of `MagicMock` garbage to `.env`, causing `python-dotenv could not parse` warnings on every startup. The engine itself was unaffected (it reads `BINANCE_TESTNET_API_KEY`, not `BINANCE_API_KEY`), but the parse warnings are noisy and mask real issues.
+
+### Defensive guard in `ui/app.py`
+
+`ui/app.py` now validates values before writing:
+- Must be a plain string (no `<` angle brackets — MagicMock repr starts with `<`)
+- Must be ≥ 10 characters
+- Must be printable ASCII only
+
+If validation fails, the UI shows "❌ Invalid key format" and **nothing is written to disk**.
+
+### Current `.env` canonical form
+
+```
+BINANCE_TESTNET_API_KEY=<your_key>
+BINANCE_TESTNET_API_SECRET=<your_secret>
+# BINANCE_API_KEY=       ← leave commented until mainnet
+# BINANCE_API_SECRET=    ← leave commented until mainnet
+TESTNET=True
+DEMO_TRADING=True
+DRY_RUN=False
+LOG_LEVEL=INFO
+ALLOWED_SYMBOLS=BTC/USDT,ETH/USDT,BNB/USDT,BTC/USDC
+MAX_ORDER_USD=20000
+GLOBAL_STOP_LOSS_PCT=70.0
+```
+
+If `.env` ever gains extra garbage lines (e.g. after a test run), restore this exact structure manually.

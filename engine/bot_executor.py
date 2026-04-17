@@ -822,6 +822,13 @@ class BotExecutor:
         # Get strategy from cache - FIXED: Use bot_config instead of bot_status for params
         strategy = self._get_strategy_instance(bot_id, bot_config)
 
+        # 🚀 CARRY_PENDING GUARD
+        # Do NOT place new entry orders if we are waiting for a dust/carry position
+        # to be adopted by the background Reconciler process.
+        if bot_status.get('cycle_phase') == 'CARRY_PENDING':
+             logger.info(f"⏳ [CARRY-PENDING] {name}: Awaiting carry adoption from Reconciler. Suspending ENTRY order placement.")
+             return None
+
         # 🚀 MISSING ENTRY LOGIC RESTORED 🚀
         # If we are NOT in a trade (total_invested == 0) and NO entry order exists, PLACE IT.
         # If an entry order already exists, handle CHASE logic or wait
@@ -1336,7 +1343,15 @@ class BotExecutor:
         # 🚀 STRICT SEQUENCING & STATE ENFORCEMENT
         existing_entry_orders = [o for o in bot_open_orders if '_ENTRY_' in o.get('clientOrderId', '')]
 
-        # CASE 1: IN TRADE -> NO ENTRY ORDERS ALLOWED
+        # CASE 1: CARRY_PENDING GUARD -> SUSPEND MAINTENANCE
+        # A bot in CARRY_PENDING state has TP'd but left a remainder dust position.
+        # It is waiting for the background Reconciler to adopt the remainder into the ledger.
+        # Do NOT treat it as "SCANNING" (which would purge orders) and do NOT place TP/Grid.
+        if bot_status.get('cycle_phase') == 'CARRY_PENDING':
+             logger.info(f"⏳ [CARRY-PENDING] {name}: Ledger awaiting background carry adoption. Suspending maintenance.")
+             return None
+
+        # CASE 2: IN TRADE -> NO ENTRY ORDERS ALLOWED
         if bot_status['total_invested'] > 0 and existing_entry_orders:
              logger.warning(f"🧹 {name}: Found {len(existing_entry_orders)} dangling ENTRY orders while IN TRADE. Cancelling to enforce state.")
              for o in existing_entry_orders:
@@ -1701,44 +1716,85 @@ class BotExecutor:
                             else:
                                 logger.error(f"❌ {name}: Error maintaining TP: {e}")
 
-
         # 2b. EE/SYNC DRIFT CHECK: existing TP at wrong price or qty
         elif existing_tp_order and bot_status.get('total_invested', 0) > 0:
-            db_tp  = self._compute_effective_tp(bot_id, name, bot_status, bot_config, strategy)
-            db_qty = strategy.calculate_take_profit_amount(bot_status, current_price, pair, exchange)
-            
-            # 🚀 ALIGNMENT FIX: Run the theoretical target through the exchange validator
-            # This ensures if the exchange auto-scaled the amount upward (e.g. for Min Notional on Demo),
-            # we compare the exchange's scaled amount against our own validated scaled amount, preventing loops.
-            valid, val_qty, val_tp, _ = exchange.validate_order(pair, 'sell' if direction == 'LONG' else 'buy', db_qty, db_tp, is_closing=True)
-            if valid:
-                db_qty = val_qty
-                db_tp = val_tp
-                
+
+            # ── STEP 1: Run EE decay to detect if a NEW interval has fired.
+            # _compute_effective_tp only returns a *different* value from raw_db_tp
+            # when math.floor(duration_mins / interval_mins) has incremented.
+            # If the interval hasn't changed it returns exactly raw_db_tp.
+            new_ee_tp = self._compute_effective_tp(bot_id, name, bot_status, bot_config, strategy)
+
+            # ── STEP 2: DRIFT CHECK — compare what Binance actually holds
+            # against what we PHYSICALLY PLACED (bot_orders.price), NOT a
+            # freshly re-computed value.  Using a re-computed value was the
+            # root cause of false SYNC-DRIFT fires: avg_entry_price can shift
+            # between cycles (grid fills), making the re-computed base TP
+            # differ from the placed TP even when no EE interval has elapsed.
             exchange_tp  = float(existing_tp_order.get('price') or existing_tp_order.get('stopPrice') or 0)
             exchange_qty = self._get_order_amount(existing_tp_order)
 
-            # DB-TP ZERO GUARD: recalculate if target_tp_price was wiped (post-repair/reset)
-            if db_tp == 0 and bot_status.get('avg_entry_price', 0) > 0:
-                db_tp = strategy.calculate_take_profit_price(bot_status, bot_status.get('avg_entry_price', 0))
-                logger.info(f"[TP-RECOVER] {name}: db_tp was 0, recalculated to {db_tp:.4f} from avg_entry.")
+            # Read the price we PLACED from bot_orders (the authoritative record).
+            placed_tp = 0.0
+            try:
+                from engine.database import get_connection as _gc_tp_check
+                with _gc_tp_check() as _c_chk:
+                    _tp_row = _c_chk.execute(
+                        "SELECT price FROM bot_orders WHERE bot_id=? AND order_type='tp'"
+                        " AND status IN ('open','new','placed') ORDER BY created_at DESC LIMIT 1",
+                        (bot_id,)
+                    ).fetchone()
+                    if _tp_row and _tp_row[0]:
+                        placed_tp = float(_tp_row[0])
+            except Exception as _e_tp_chk:
+                logger.debug(f"[SYNC-DRIFT] {name}: Could not read placed_tp from bot_orders: {_e_tp_chk}")
 
-            if db_tp > 0 and exchange_tp > 0:
-                # Diff matching
-                # Drift bounds (0.05% for price to tolerate tiny rounding, 1% for qty)
-                drift_tp  = abs(db_tp - exchange_tp) / max(db_tp, 0.01)
-                drift_qty = abs(db_qty - exchange_qty) / max(db_qty, 0.0001)
+            # Fall back to DB target_tp_price if bot_orders row is missing (e.g. legacy bot).
+            if placed_tp <= 0:
+                placed_tp = float(bot_status.get('target_tp_price', 0))
 
-                tp_tolerance = 0.0005  # 0.05%
-                # 🚀 ROUNDING FIX: Increase qty tolerance to 5% to account for lot-size reduction 
-                # on small position sizes (e.g. 0.071 -> 0.070 is a 1.4% drift)
-                qty_tolerance = 0.05   # 5%
+            # DB-TP ZERO GUARD: recalculate only if we genuinely have no reference
+            if placed_tp == 0 and bot_status.get('avg_entry_price', 0) > 0:
+                placed_tp = strategy.calculate_take_profit_price(bot_status, bot_status.get('avg_entry_price', 0))
+                logger.info(f"[TP-RECOVER] {name}: placed_tp was 0, recalculated to {placed_tp:.4f} from avg_entry.")
 
-                if drift_tp > tp_tolerance or drift_qty > qty_tolerance:
-                    logger.info(f"[SYNC-DRIFT] {name}: TP drifted price {drift_tp*100:.4f}% (DB:{db_tp:.4f} vs EX:{exchange_tp:.4f}) qty {drift_qty*100:.2f}% (DB:{db_qty:.4f} vs EX:{exchange_qty:.4f}). Replacing.")
+            # ── STEP 3: Decide whether to replace the TP on exchange.
+            # Case A: EE fired a new interval → must replace with new_ee_tp.
+            # Case B: Genuine price mismatch (e.g. position size changed, TP
+            #         was cancelled/refilled and re-placed at wrong price).
+            #
+            # Tolerance: 0.1% — only covers exchange rounding noise (tick_size).
+            # We do NOT need wider tolerance because we compare placed vs live,
+            # not recomputed vs live.
+            db_qty = strategy.calculate_take_profit_amount(bot_status, current_price, pair, exchange)
+            valid, db_qty, _, _ = exchange.validate_order(pair, 'sell' if direction == 'LONG' else 'buy', db_qty, placed_tp, is_closing=True)
+
+            ee_interval_fired = (new_ee_tp != placed_tp and new_ee_tp > 0 and placed_tp > 0)
+            if exchange_tp > 0 and placed_tp > 0:
+                drift_tp  = abs(placed_tp - exchange_tp) / max(placed_tp, 0.01)
+                drift_qty = abs(db_qty   - exchange_qty) / max(db_qty, 0.0001)
+
+                tp_tolerance  = 0.001   # 0.1% — rounding noise only (not a patch)
+                qty_tolerance = 0.05    # 5% for lot-size step rounding on small positions
+
+                price_drifted = drift_tp > tp_tolerance
+                qty_drifted   = drift_qty > qty_tolerance
+
+                if ee_interval_fired or price_drifted or qty_drifted:
+                    replace_reason = []
+                    if ee_interval_fired:
+                        replace_reason.append(f"EE-stepped {placed_tp:.4f}→{new_ee_tp:.4f}")
+                    if price_drifted:
+                        replace_reason.append(f"price-drift {drift_tp*100:.4f}% (placed:{placed_tp:.4f} live:{exchange_tp:.4f})")
+                    if qty_drifted:
+                        replace_reason.append(f"qty-drift {drift_qty*100:.2f}% (want:{db_qty:.4f} live:{exchange_qty:.4f})")
+                    logger.info(f"[SYNC-DRIFT] {name}: Replacing TP — {'; '.join(replace_reason)}")
+
+                    # Use the EE-updated price if a new interval fired, else the placed price
+                    target_tp = new_ee_tp if ee_interval_fired else placed_tp
                     tp_order = self._sync_replace_tp(
                         bot_id, name, pair, direction, bot_status, exchange,
-                        db_tp, db_qty, existing_tp_order
+                        target_tp, db_qty, existing_tp_order
                     )
 
 
@@ -1878,25 +1934,72 @@ class BotExecutor:
                       latest_grid_id = local_grid_ids[-1]
                       order_status = exchange.fetch_order(latest_grid_id, pair)
                       status_str = order_status.get('status') if order_status else 'unknown'
-                      filled_qty = order_status.get('filled', 0.0) if order_status else 0.0
-                      
-                      if status_str in ['canceled', 'cancelled', 'expired', 'rejected']:
-                          logger.info(f"🚫 {name}: Stored GRID ID {latest_grid_id} is CANCELLED on exchange. Evicting from DB state. Preserving {filled_qty} fill.")
+
+                      if status_str in ['filled', 'closed']:
+                           actual_fill_qty = float(order_status.get('filled', 0) or 0)
+                           actual_fill_price = float(order_status.get('average') or order_status.get('price') or 0)
+                           # 🔧 Demo FAPI returns average=0 for filled orders — fall back to stored grid price
+                           if actual_fill_price <= 0:
+                               try:
+                                   from engine.database import get_connection as _gcnn
+                                   _fb_conn = _gcnn()
+                                   _fb_row = _fb_conn.execute(
+                                       "SELECT price FROM bot_orders WHERE order_id=? AND bot_id=?",
+                                       (str(latest_grid_id), bot_id)
+                                   ).fetchone()
+                                   actual_fill_price = float(_fb_row[0]) if _fb_row and _fb_row[0] else float(current_price)
+                               except Exception: actual_fill_price = float(current_price)
+                           logger.info(f"✅ {name}: Stored GRID ID {latest_grid_id} is FILLED @ {actual_fill_price} (Qty: {actual_fill_qty}). Processing INLINE.")
+                           # 🚀 CRITICAL FIX: Process the fill inline — do NOT delegate to offline sync.
+                           # The periodic reconciler does not call reconstruct_offline_fills frequently enough;
+                           # delegating caused an infinite "Blocked by Local DB Lock" loop.
+                           if actual_fill_qty <= 0 or actual_fill_price <= 0:
+                               logger.error(f"❌ {name}: Cannot process inline fill — zero qty={actual_fill_qty} or price={actual_fill_price}. Evicting grid to unblock.")
+                           else:
+                               try:
+                                   from engine.database import accumulate_trade_fill as _atf, update_order_status as _uos, get_connection as _gcnn
+                                   _client_id = order_status.get('clientOrderId', '') or ''
+                                   _new_step = None
+                                   try:
+                                       if '_GRID_' in _client_id:
+                                           _new_step = int(_client_id.split('_GRID_')[1].split('_')[0])
+                                       else:
+                                           # Demo FAPI may omit clientOrderId — look it up from bot_orders
+                                           _gc = _gcnn()
+                                           _cid_row = _gc.execute(
+                                               "SELECT client_order_id FROM bot_orders WHERE order_id=? AND bot_id=?",
+                                               (str(latest_grid_id), bot_id)
+                                           ).fetchone()
+                                           if _cid_row and _cid_row[0] and '_GRID_' in _cid_row[0]:
+                                               _new_step = int(_cid_row[0].split('_GRID_')[1].split('_')[0])
+                                   except Exception: pass
+                                   _atf(
+                                       bot_id=bot_id,
+                                       added_invested=actual_fill_qty * actual_fill_price,
+                                       added_qty=actual_fill_qty,
+                                       avg_price=actual_fill_price,
+                                       new_step=_new_step,
+                                       tp_price=None,
+                                       is_entry=False,
+                                   )
+                                   _uos(latest_grid_id, 'filled', bot_id=bot_id, filled_qty=actual_fill_qty)
+                                   logger.info(f"✅ [INLINE-GRID-FILL] {name}: Ledger updated — added {actual_fill_qty} @ {actual_fill_price}, step→{_new_step}. Lock cleared.")
+                               except Exception as _fill_err:
+                                   logger.error(f"❌ {name}: Failed to process inline grid fill for {latest_grid_id}: {_fill_err}")
+                           local_grid_ids = []  # Clear lock so the next step's grid can be placed
+                      elif status_str in ['canceled', 'cancelled', 'expired', 'rejected']:
+                          logger.info(f"🚫 {name}: Stored GRID ID {latest_grid_id} is CANCELLED on exchange. Evicting from DB state.")
                           from engine.database import update_order_status as _uos
-                          _uos(latest_grid_id, 'cancelled', bot_id=bot_id, filled_qty=filled_qty)
-                          local_grid_ids = [] # Clear locals to unblock
-                      elif status_str in ['filled', 'closed']:
-                          logger.info(f"✅ {name}: Stored GRID ID {latest_grid_id} is FILLED. Offline sync will handle this.")
-                          # It's filled, let the offline sync processor handle it. Wait.
+                          _uos(latest_grid_id, 'cancelled', bot_id=bot_id)
+                          local_grid_ids = []  # Clear locals to unblock
                       else:
                           logger.warning(f"⏳ {name}: Stored Grid {latest_grid_id} status is {status_str}, but missing from open_orders! Forcing CANCEL and Eviction.")
                           try:
                               exchange.cancel_order(latest_grid_id, pair)
                           except: pass
                           from engine.database import update_order_status as _uos
-                          _uos(latest_grid_id, 'cancelled', bot_id=bot_id, filled_qty=filled_qty)
                           _uos(latest_grid_id, 'cancelled', bot_id=bot_id)
-                          local_grid_ids = [] # Clear to allow grid logic below to immediately fire
+                          local_grid_ids = []  # Clear to allow grid logic below to immediately fire
                   except Exception as _evict_err:
                       err_str = str(_evict_err).lower()
                       if "not found" in err_str or "-2013" in err_str:
@@ -1906,10 +2009,10 @@ class BotExecutor:
                           local_grid_ids = []
                       else:
                           logger.error(f"❌ {name}: Failed to evict stalemate GRID ID: {_evict_err}")
-                          # Free the local hold regardless, let the engine rebuild it.
                           from engine.database import update_order_status as _uos
                           _uos(local_grid_ids[-1], 'cancelled', bot_id=bot_id)
                           local_grid_ids = []
+
 
              if len(local_grid_ids) > 0:
                   grid_price = 0

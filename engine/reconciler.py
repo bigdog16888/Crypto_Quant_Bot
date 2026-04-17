@@ -110,7 +110,7 @@ class StateReconciler:
     """
     
     def __init__(self, exchanges: Optional[Dict[str, ExchangeInterface]] = None):
-        if exchanges:
+        if exchanges is not None:
             self.exchanges = exchanges
         else:
             if getattr(config, 'FUTURES_ONLY_MODE', False):
@@ -1594,11 +1594,12 @@ class StateReconciler:
                 # B.4 ALSO CLEARS PHANTOMS: any bot claiming a position with ZERO
                 # evidence from both proofs is reset to 0 (it's a ghost).
                 # ================================================================
-                if abs(phys_net) > abs(virt_net):
-                    error_side = 'LONG' if phys_net > 0 else 'SHORT'
-                else:
-                    error_side = 'LONG' if virt_net > 0 else 'SHORT'
-                    
+                # error_side = the side where virtual exposure EXCEEDS physical.
+                # net_error = virt_net - phys_net:
+                #   > 0 → system over-reports LONG (ghost LONG bot)  → heal via LONG wipe
+                #   < 0 → system over-reports SHORT (ghost SHORT bot) → heal via SHORT wipe
+                error_side = 'LONG' if net_error > 0 else 'SHORT'
+
                 # Pre-calculate physical capacity for the error direction
                 opposite_tracked_qty_for_b4 = sum(b.total_invested / b.avg_entry_price for b in bots if b.in_trade and b.avg_entry_price > 0 and b.direction.upper() != error_side)
                 if error_side == 'LONG':
@@ -1807,7 +1808,13 @@ class StateReconciler:
 
                     # 2. EVALUATE RECOVERED STATE: Check if reconstruction solved the gap.
                     suspects = [b for b in bots if b.in_trade and b.direction.upper() == error_side]
-                    phys_qty_abs = abs(adjusted_phys_qty)
+                    
+                    # 🚀 CORE FIX: Only draw absolute capacity if the physical mass is actually in the error_side direction!
+                    if error_side == 'LONG':
+                        phys_qty_abs = abs(max(0.0, adjusted_phys_qty))
+                    else:
+                        phys_qty_abs = abs(min(0.0, adjusted_phys_qty))
+                        
                     bot_claimed_abs = sum((b.total_invested / b.avg_entry_price) for b in suspects if b.avg_entry_price > 0)
                     gap_qty_signed = phys_qty_abs - bot_claimed_abs
 
@@ -1851,57 +1858,63 @@ class StateReconciler:
                     # 4. 🚀 AGGRESSIVE MARKET FLATTEN PROTOCOL [V2.0]
                     # If forensic proof failed, we no longer block healing.
                     # We execute a direct Market Close to restore FACT-ONLY PARITY.
-                    logger.warning(f"🗡️ [MARKET-FLATTEN] {pair_normalized}: Forensic proof failed for {gap_qty_signed:.6f} units. Flattening to zero.")
+                    logger.warning(f"🗡️ [MARKET-FLATTEN] {pair_normalized}: Forensic proof failed. Flattening to zero parity.")
                     
                     flatten_executed = False
                     if ex_heal:
-                        flatten_side = 'sell' if error_side == 'LONG' else 'buy'
-                        try:
-                            # Execute MARKET close on the gap amount
-                            ex_heal.create_order(
-                                symbol=pair_normalized, type='market', side=flatten_side, amount=abs(gap_qty_signed),
-                                params={'reduceOnly': True}
-                            )
-                            logger.info(f"✅ [MARKET-FLATTEN] Physical {flatten_side.upper()} order executed for {abs(gap_qty_signed):.6f} {pair_normalized}.")
+                        if phys_qty_abs < QTY_EPSILON:
+                            # The exchange has NO physical footprint for this error side.
+                            # The gap is purely virtual. No exchange order is needed.
+                            logger.info(f"✅ [MARKET-FLATTEN] {pair_normalized}: Physical footprint is 0.0. Skipping exchange order.")
                             flatten_executed = True
-                        except Exception as _fe:
-                            logger.error(f"❌ [MARKET-FLATTEN] Physical execution failed for {pair_normalized}: {_fe}")
-                            # 🚀 RACE-CONDITION GUARD [V1.7.2]:
-                            # -2022 ReduceOnly rejected has two causes in one-way mode:
-                            # (a) Position flipped direction since snapshot → gap naturally resolved.
-                            # (b) Bot's own TP limit order already covers the full position,
-                            #     so adding another reduceOnly SELL exceeds the position size.
-                            # In both cases, the gap is self-healing — don't block with REQUIRE_MANUAL.
-                            if ex_heal and ('-2022' in str(_fe) or 'reduceonly' in str(_fe).lower() or 'reduce_only' in str(_fe).lower()):
-                                try:
-                                    fresh_positions = ex_heal.fetch_positions() or []
-                                    fresh_orders   = ex_heal.fetch_open_orders(pair_normalized) or []
-                                    fresh_signed_qty = sum(
-                                        float(p.get('contracts', 0))
-                                        for p in fresh_positions
-                                        if normalize_symbol(p.get('symbol', '')) == pair_normalized
-                                    )
-                                    # How much existing reduce capacity is already pending?
-                                    reduce_side = 'sell' if gap_qty_signed > 0 else 'buy'
-                                    pending_reduce_qty = sum(
-                                        float(o.get('amount', o.get('origQty', 0)))
-                                        for o in fresh_orders
-                                        if str(o.get('side', '')).lower() == reduce_side
-                                        and o.get('reduceOnly', True)  # assume TP orders reduce
-                                    )
-                                    # Gap is healed if: (a) position now near virtual parity
-                                    #                  (b) pending TP already covers position
-                                    fresh_gap = abs(fresh_signed_qty - virtual_net_qty)
-                                    position_covered_by_tp = pending_reduce_qty >= abs(fresh_signed_qty) - 0.0001
-                                    if fresh_gap < 0.001 or position_covered_by_tp:
-                                        logger.info(
-                                            f"⚡ [RACE-HEAL] {pair_normalized}: Gap self-healed. "
-                                            f"Fresh pos={fresh_signed_qty:.6f}, pending_reduce={pending_reduce_qty:.6f}, "
-                                            f"fresh_gap={fresh_gap:.6f}. Skipping REQUIRE_MANUAL."
+                        else:
+                            flatten_side = 'sell' if error_side == 'LONG' else 'buy'
+                            try:
+                                # Execute MARKET close on the TRUE physical capacity available for this side
+                                ex_heal.create_order(
+                                    symbol=pair_normalized, type='market', side=flatten_side, amount=phys_qty_abs,
+                                    params={'reduceOnly': True}
+                                )
+                                logger.info(f"✅ [MARKET-FLATTEN] Physical {flatten_side.upper()} order executed for {phys_qty_abs:.6f} {pair_normalized}.")
+                                flatten_executed = True
+                            except Exception as _fe:
+                                logger.error(f"❌ [MARKET-FLATTEN] Physical execution failed for {pair_normalized}: {_fe}")
+                                # 🚀 RACE-CONDITION GUARD [V1.7.2]:
+                                # -2022 ReduceOnly rejected has two causes in one-way mode:
+                                # (a) Position flipped direction since snapshot → gap naturally resolved.
+                                # (b) Bot's own TP limit order already covers the full position,
+                                #     so adding another reduceOnly SELL exceeds the position size.
+                                # In both cases, the gap is self-healing — don't block with REQUIRE_MANUAL.
+                                if '-2022' in str(_fe) or 'reduceonly' in str(_fe).lower() or 'reduce_only' in str(_fe).lower():
+                                    try:
+                                        fresh_positions = ex_heal.fetch_positions() or []
+                                        fresh_orders   = ex_heal.fetch_open_orders(pair_normalized) or []
+                                        fresh_signed_qty = sum(
+                                            float(p.get('contracts', 0))
+                                            for p in fresh_positions
+                                            if normalize_symbol(p.get('symbol', '')) == pair_normalized
                                         )
-                                        flatten_executed = True  # Position managed by bot's TP
-                                except Exception as _rfe:
-                                    logger.warning(f"⚠️ [RACE-HEAL] Re-fetch failed: {_rfe}")
+                                        # How much existing reduce capacity is already pending?
+                                        reduce_side = 'sell' if gap_qty_signed > 0 else 'buy'
+                                        pending_reduce_qty = sum(
+                                            float(o.get('amount', o.get('origQty', 0)))
+                                            for o in fresh_orders
+                                            if str(o.get('side', '')).lower() == reduce_side
+                                            and o.get('reduceOnly', True)  # assume TP orders reduce
+                                        )
+                                        # Gap is healed if: (a) position now near target parity (0)
+                                        #                  (b) pending TP already covers position
+                                        fresh_gap = abs(fresh_signed_qty)
+                                        position_covered_by_tp = pending_reduce_qty >= abs(fresh_signed_qty) - 0.0001
+                                        if fresh_gap < 0.001 or position_covered_by_tp:
+                                            logger.info(
+                                                f"⚡ [RACE-HEAL] {pair_normalized}: Gap self-healed. "
+                                                f"Fresh pos={fresh_signed_qty:.6f}, pending_reduce={pending_reduce_qty:.6f}. Skipping REQUIRE_MANUAL."
+                                            )
+                                            flatten_executed = True  # Position managed by bot's TP
+                                    except Exception as _rfe:
+                                        logger.warning(f"⚠️ [RACE-HEAL] Re-fetch failed: {_rfe}")
+
 
                     if flatten_executed or not ex_heal:
                         # Success or Offline: Zero out all local ledger tracks for this direction
@@ -1910,17 +1923,25 @@ class StateReconciler:
                             self._execute_accounting_adjustment(b, 0.0, 0.0, "Ultimate Flatten Protocol: Zero-Parity Reset")
                             safe_wipe_bot(
                                 b.bot_id, b.pair, b.direction,
-                                reason=f"MARKET_FLATTEN: Gap of {gap_qty_signed:.6f} closed physically",
+                                reason=f"MARKET_FLATTEN: Ultimate Zero-Parity Protocol invoked.",
                                 exit_price=0.0,
                                 force=True
                             )
+                            # 🚀 Per-bot result so callers can identify which bots were cleared
+                            results.append(ReconciliationResult(
+                                bot_id=b.bot_id, bot_name=b.name, pair=pair_normalized,
+                                action_taken=ReconciliationAction.SYSTEM_FIX_ZOMBIE,
+                                details=f"Ultimate Flatten: Bot {b.name} virtual state wiped. Physical gap={phys_qty_abs:.6f}.",
+                                requires_manual_intervention=False
+                            ))
                         
                         results.append(ReconciliationResult(
                             bot_id=0, bot_name="NET-GAP", pair=pair_normalized,
                             action_taken=ReconciliationAction.SYSTEM_FIX_ORPHAN,
-                            details=f"Ultimate Flatten: Closed {abs(gap_qty_signed):.6f} physical gap and wiped virtual memory.",
+                            details=f"Ultimate Flatten: Parity achieved. Wiped virtual memory and {phys_qty_abs:.6f} physical gap.",
                             requires_manual_intervention=False
                         ))
+
                     else:
                         # Only block if API call still failed after re-check
                         results.append(ReconciliationResult(

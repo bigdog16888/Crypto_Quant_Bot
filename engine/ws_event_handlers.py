@@ -189,7 +189,9 @@ def _handle_order_partial_fill(bot_id: int, order_type: str, event: Dict):
     events for the same order don't double-count.
     """
     order_id = event.get('order_id')
-    avg_price = float(event.get('avg_price', 0) or 0)
+    raw_avg_price = float(event.get('avg_price', 0) or 0)
+    raw_limit_price = float(event.get('price', 0) or 0)
+    avg_price = raw_avg_price if raw_avg_price > 0 else raw_limit_price
     cumulative_filled = float(event.get('filled_qty', 0) or 0)  # total filled so far
     symbol = event.get('symbol')
 
@@ -281,7 +283,9 @@ def _handle_order_filled(bot_id: int, order_type: str, event: Dict):
     )
     
     order_id = event.get('order_id')
-    avg_price = event.get('avg_price', 0)
+    raw_avg_price = float(event.get('avg_price', 0) or 0)
+    raw_price = float(event.get('price', 0) or 0)
+    avg_price = raw_avg_price if raw_avg_price > 0 else raw_price
     
     # 🚀 FUNDAMENTAL FIX: Use incremental_qty to avoid double-counting if there were partial fills
     filled_qty = event.get('incremental_qty', event.get('filled_qty', 0))

@@ -21,11 +21,7 @@ def calculate_early_exit_decay(
     if not settings.get('UseEarlyExit', False):
         return initial_tp
         
-    # Standard Strategy Params
-    start_hours = settings.get('EEStartHours', 0.0)
-    hours_pc = settings.get('EEHoursPC', 0.0) # Percent per hour
-    
-    # Accelerated Params (Custom)
+    # Accelerated Params (Step Decay)
     interval_mins = settings.get('DecayIntervalMins', 60.0)
     decay_per_interval = settings.get('DecayPercentPerInterval', 0.0) / 100.0
     
@@ -36,22 +32,13 @@ def calculate_early_exit_decay(
     
     ee_pc = 0.0
     
-    # 1. Standard Time-based decay
-    if duration_hours > start_hours:
 
-        ee_pc += (duration_hours - start_hours) * (hours_pc / 100.0)
-        
     # 2. Accelerated Interval-based decay (User Style: 30% per 15 mins)
     if decay_per_interval > 0:
         intervals_passed = math.floor(duration_mins / interval_mins)
         ee_pc += intervals_passed * decay_per_interval
         
-    # 3. Level-based decay
-    start_level = settings.get('EEStartLevel', 5)
-    level_pc = settings.get('EELevelPC', 0.0) / 100.0
-    if total_orders >= start_level:
-        ee_pc += (total_orders - start_level + 1) * level_pc
-        
+
     # Calculate Decay Factor (1.0 = No Decay, 0.0 = Full Decay to BE)
     decay_factor = 1.0 - ee_pc
     

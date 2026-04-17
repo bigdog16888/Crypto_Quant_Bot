@@ -527,17 +527,14 @@ def render_bot_creator_view():
             st.subheader("Accelerated Early Exit (Smart Decay)")
             st.caption("Gradually moves the TP toward break-even over time to exit stale trades.")
             bot_config['UseEarlyExit'] = st.checkbox("Enable Early Exit", value=True)
-            col_ee1, col_ee2, col_ee3, col_ee4 = st.columns(4)
+            col_ee1, col_ee2, col_ee3 = st.columns(3)
             with col_ee1:
-                bot_config['EEStartHours'] = st.number_input("Start After (Hours)", value=2.0, min_value=0.0, step=0.5,
-                    help="How many hours after entry before decay begins. 0 = start immediately.")
-            with col_ee2:
                 bot_config['DecayIntervalMins'] = st.number_input("Decay Every (Mins)", value=15.0, min_value=1.0,
                     help="How often the TP is reduced.")
-            with col_ee3:
+            with col_ee2:
                 bot_config['DecayPercentPerInterval'] = st.number_input("Reduction (%) per Interval", value=30.0, min_value=1.0,
                     help="How much of the remaining profit gap is cut each interval.")
-            with col_ee4:
+            with col_ee3:
                 bot_config['EEAllowLoss'] = st.checkbox("Allow Loss Exit", value=False,
                     help="If checked, TP can decay past break-even (exit at a small loss to free capital).")
 

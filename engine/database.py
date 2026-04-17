@@ -665,7 +665,8 @@ def get_bot_status(bot_id):
                b.direction, b.is_active,
                COALESCE(t.entry_confirmed, 0) as entry_confirmed,
                COALESCE(t.cycle_id, 1) as cycle_id,
-               COALESCE(b.pos_limit_hit, 0) as pos_limit_hit
+               COALESCE(b.pos_limit_hit, 0) as pos_limit_hit,
+               COALESCE(t.cycle_phase, 'ACTIVE') as cycle_phase
         FROM bots b 
         LEFT JOIN trades t ON b.id = t.bot_id 
         WHERE b.id = ?
@@ -690,6 +691,7 @@ def get_bot_status(bot_id):
         'entry_confirmed': row[12],
         'cycle_id': row[13],
         'pos_limit_hit': bool(row[14]),
+        'cycle_phase': row[15],
     }
 
     # --- SAFETY GUARD: Log suspicious entry prices but do NOT wipe state ---
@@ -758,6 +760,11 @@ def update_martingale_step(bot_id, step, total_invested, avg_price, tp_price):
         exists = cursor.fetchone()
         
         if exists:
+            # Look up bot direction for position_side
+            cursor.execute("SELECT direction FROM bots WHERE id = ?", (bot_id,))
+            bot_dir_row = cursor.fetchone()
+            position_side = str(bot_dir_row[0]).upper() if bot_dir_row else 'LONG'
+            
             # UPDATE existing record
             cursor.execute("""
                 UPDATE trades
@@ -768,15 +775,21 @@ def update_martingale_step(bot_id, step, total_invested, avg_price, tp_price):
                     entry_confirmed = 1,
                     position_side = ?
                 WHERE bot_id = ? AND (current_step <= ? OR ? = 0)
-            """, (step, total_invested, avg_price, tp_price, str(kwargs.get('position_side', 'LONG')).upper(), bot_id, step, step))
+            """, (step, total_invested, avg_price, tp_price, position_side, bot_id, step, step))
             logger.debug(f"✅ Updated trade state for bot {bot_id}: step={step}, invested={total_invested}, avg_price={avg_price}")
         else:
+            # Look up bot direction for position_side
+            cursor.execute("SELECT direction FROM bots WHERE id = ?", (bot_id,))
+            bot_dir_row = cursor.fetchone()
+            position_side = str(bot_dir_row[0]).upper() if bot_dir_row else 'LONG'
+            
             # INSERT new record
             cursor.execute("""
                 INSERT INTO trades (bot_id, current_step, total_invested, avg_entry_price, target_tp_price, entry_confirmed, basket_start_time, position_side)
                 VALUES (?, ?, ?, ?, ?, 1, ?, ?)
-            """, (bot_id, step, total_invested, avg_price, tp_price, int(time.time()), str(kwargs.get('position_side', 'LONG')).upper()))
+            """, (bot_id, step, total_invested, avg_price, tp_price, int(time.time()), position_side))
             logger.info(f"✅ Created trade record for bot {bot_id}: step={step}, invested={total_invested}, avg_price={avg_price}")
+
         
         cursor.execute("UPDATE bots SET status = 'IN TRADE' WHERE id = ?", (bot_id,))
         conn.commit()
@@ -1233,25 +1246,71 @@ def get_bot_order_ids(bot_id):
     cursor.execute('SELECT entry_order_id, tp_order_id FROM trades WHERE bot_id = ?', (bot_id,))
     res = cursor.fetchone()
     if res:
-        orders['entry_order_id'], orders['tp_order_id'] = res
+        raw_entry, raw_tp = res
+        orders['entry_order_id'] = raw_entry
+        # 🚀 BUG FIX: Strip PLACING_ prefix from trades.tp_order_id.
+        # The pre-commit pattern writes 'PLACING_{clientOrderId}' to trades before the exchange call.
+        # update_bot_order_exchange_id only updates bot_orders, not trades, so trades can be
+        # permanently stuck with the placeholder. Strip it here so the stalemate evictor
+        # doesn't try to fetch 'PLACING_CQB_...' as an exchange order ID.
+        if raw_tp and str(raw_tp).startswith('PLACING_'):
+            # Try to find the real exchange ID in bot_orders for this bot's tp type
+            cursor.execute(
+                "SELECT order_id FROM bot_orders WHERE bot_id=? AND order_type='tp'"
+                " AND status IN ('open','new','placed') AND order_id NOT LIKE 'PLACING_%'"
+                " ORDER BY created_at DESC LIMIT 1",
+                (bot_id,)
+            )
+            real_tp_row = cursor.fetchone()
+            if real_tp_row and real_tp_row[0]:
+                orders['tp_order_id'] = real_tp_row[0]
+                # Back-fill trades so we don't hit this path again
+                try:
+                    conn.execute(
+                        "UPDATE trades SET tp_order_id=? WHERE bot_id=? AND tp_order_id=?",
+                        (real_tp_row[0], bot_id, raw_tp)
+                    )
+                    conn.commit()
+                except Exception:
+                    pass
+            else:
+                orders['tp_order_id'] = None  # Will trigger fresh TP placement
+        else:
+            orders['tp_order_id'] = raw_tp
     
     # BELT-AND-SUSPENDERS: If trades table has NULL, check bot_orders as fallback.
-    # This covers the window between save_bot_order() inserting into bot_orders
-    # and the trades table being updated (shouldn't happen now, but defensive).
     if not orders['entry_order_id']:
-        cursor.execute("SELECT order_id FROM bot_orders WHERE bot_id = ? AND order_type = 'entry' AND status = 'open' ORDER BY created_at DESC LIMIT 1", (bot_id,))
+        cursor.execute(
+            "SELECT order_id FROM bot_orders WHERE bot_id = ? AND order_type = 'entry'"
+            " AND status IN ('open','new','placing') ORDER BY created_at DESC LIMIT 1",
+            (bot_id,)
+        )
         entry_row = cursor.fetchone()
         if entry_row and entry_row[0]:
             orders['entry_order_id'] = entry_row[0]
     
     if not orders['tp_order_id']:
-        cursor.execute("SELECT order_id FROM bot_orders WHERE bot_id = ? AND order_type = 'tp' AND status = 'open' ORDER BY created_at DESC LIMIT 1", (bot_id,))
+        cursor.execute(
+            "SELECT order_id FROM bot_orders WHERE bot_id = ? AND order_type = 'tp'"
+            " AND status IN ('open','new','placing') AND order_id NOT LIKE 'PLACING_%'"
+            " ORDER BY created_at DESC LIMIT 1",
+            (bot_id,)
+        )
         tp_row = cursor.fetchone()
         if tp_row and tp_row[0]:
             orders['tp_order_id'] = tp_row[0]
     
-    # Grid orders from bot_orders (filter to grid type only)
-    cursor.execute("SELECT order_id FROM bot_orders WHERE bot_id = ? AND order_type = 'grid' AND status = 'open'", (bot_id,))
+    # Grid orders from bot_orders.
+    # 🚀 BUG FIX: Include 'new' and 'placing' statuses.
+    # Binance FAPI returns status='new' for acknowledged (not-yet-filled) limit orders.
+    # 'placing' is the pre-commit placeholder written before the exchange call.
+    # Both represent "this grid is tracked and on the exchange" — treating only 'open'
+    # causes local_grid_ids to be [], making the engine think no grid exists and try to place one.
+    cursor.execute(
+        "SELECT order_id FROM bot_orders WHERE bot_id = ? AND order_type = 'grid'"
+        " AND status IN ('open','new','placing') AND order_id NOT LIKE 'PLACING_%'",
+        (bot_id,)
+    )
     orders['grid_orders'] = [{'order_id': r[0]} for r in cursor.fetchall() if r[0]]
     return orders
 
@@ -1911,7 +1970,8 @@ def accumulate_trade_fill(bot_id: int, added_invested: float, added_qty: float, 
                         END,
                         target_tp_price = ?,
                         basket_start_time = ?,
-                        entry_confirmed = 1
+                        entry_confirmed = 1,
+                        cycle_phase = 'ACTIVE'
                     WHERE bot_id = ?
                 """, (
                     added_invested,
@@ -1943,7 +2003,8 @@ def accumulate_trade_fill(bot_id: int, added_invested: float, added_qty: float, 
                             ELSE current_step
                         END,
                         basket_start_time = ?,
-                        entry_confirmed = 1
+                        entry_confirmed = 1,
+                        cycle_phase = 'ACTIVE'
                     WHERE bot_id = ?
                 """, (
                     added_invested,
@@ -2184,7 +2245,7 @@ def recompute_invested_from_orders(bot_id: int) -> tuple:
             "SELECT COALESCE(cycle_id, 1), COALESCE(position_side, 'LONG') FROM trades WHERE bot_id = ?", (bot_id,)
         ).fetchone()
         if not row:
-            return 0.0, 0.0, 0
+            return 0.0, 0.0, 0.0, 0
         cycle_id, bot_side = row
 
         # ... (Healing block omitted for brevity)
@@ -2194,19 +2255,14 @@ def recompute_invested_from_orders(bot_id: int) -> tuple:
         cursor.execute("""
             SELECT
                 COALESCE(SUM(
-                    CASE 
-                        WHEN bo.order_type IN ('entry', 'grid', 'adoption_add', 'adoption') THEN (bo.filled_amount * bo.price)
-                        WHEN bo.order_type IN ('adoption_reduce', 'tp', 'close', 'dust_close', 'sl') THEN -(bo.filled_amount * bo.price)
-                        ELSE 0.0
-                    END
-                ), 0.0) AS total_cost,
+                    CASE WHEN bo.order_type IN ('entry', 'grid', 'adoption_add', 'adoption') THEN (bo.filled_amount * bo.price) ELSE 0.0 END
+                ), 0.0) AS bought_cost,
                 COALESCE(SUM(
-                    CASE 
-                        WHEN bo.order_type IN ('entry', 'grid', 'adoption_add', 'adoption') THEN bo.filled_amount
-                        WHEN bo.order_type IN ('adoption_reduce', 'tp', 'close', 'dust_close', 'sl') THEN -bo.filled_amount
-                        ELSE 0.0
-                    END
-                ), 0.0) AS total_qty,
+                    CASE WHEN bo.order_type IN ('entry', 'grid', 'adoption_add', 'adoption') THEN bo.filled_amount ELSE 0.0 END
+                ), 0.0) AS bought_qty,
+                COALESCE(SUM(
+                    CASE WHEN bo.order_type IN ('adoption_reduce', 'tp', 'close', 'dust_close', 'sl') THEN bo.filled_amount ELSE 0.0 END
+                ), 0.0) AS sold_qty,
                 COALESCE(MAX(bo.step), 0) AS max_step
             FROM bot_orders bo
             WHERE bo.bot_id  = ?
@@ -2221,12 +2277,16 @@ def recompute_invested_from_orders(bot_id: int) -> tuple:
         """, (bot_id, cycle_id, bot_side))
 
         r = cursor.fetchone()
-        total_cost = float(r[0] or 0.0)
-        total_qty  = float(r[1] or 0.0)
-        max_step   = int(r[2] or 0)
+        bought_cost = float(r[0] or 0.0)
+        bought_qty  = float(r[1] or 0.0)
+        sold_qty    = float(r[2] or 0.0)
+        max_step    = int(r[3] or 0)
 
-        if total_qty > 1e-8 or total_cost < -1e-8:
-            avg_price = total_cost / total_qty if abs(total_qty) > 1e-8 else 0.0
+        total_qty = bought_qty - sold_qty
+
+        if total_qty > 1e-8:
+            avg_price = bought_cost / bought_qty if bought_qty > 1e-8 else 0.0
+            total_cost = total_qty * avg_price
             if max_step == 0:
                 max_step = 1
 
@@ -2747,6 +2807,11 @@ def update_bot_order_exchange_id(db_row_id, exchange_order_id, status='open'):
     🚀 PRE-COMMIT PATTERN: After placing an order on the exchange, call this to stamp the real
     exchange order_id onto the 'placing' row that was pre-committed before the exchange call.
     If exchange_order_id is None (order placement failed), marks the row as 'failed'.
+
+    🚀 BUG FIX: Also back-fills trades.tp_order_id / trades.entry_order_id when stamping a real
+    exchange ID. Previously the pre-commit pattern wrote 'PLACING_{clientOrderId}' to trades
+    (via save_bot_order), and this function only updated bot_orders — leaving trades permanently
+    stuck with the placeholder string, causing the stalemate evictor to query an invalid ID.
     """
     if db_row_id is None:
         return False
@@ -2757,6 +2822,25 @@ def update_bot_order_exchange_id(db_row_id, exchange_order_id, status='open'):
                 "UPDATE bot_orders SET order_id=?, status=?, updated_at=? WHERE id=?",
                 (exchange_order_id, status, int(time.time()), db_row_id)
             )
+            # 🚀 BACK-FILL TRADES: Resolve order_type and bot_id from this row, then update trades.
+            row = conn.execute(
+                "SELECT bot_id, order_type FROM bot_orders WHERE id=?", (db_row_id,)
+            ).fetchone()
+            if row:
+                bot_id_for_row, order_type_for_row = row
+                if order_type_for_row == 'tp':
+                    # Only update if trades still has the old PLACING_ value (or was not set yet)
+                    conn.execute(
+                        "UPDATE trades SET tp_order_id=? WHERE bot_id=?"
+                        " AND (tp_order_id IS NULL OR tp_order_id LIKE 'PLACING_%')",
+                        (exchange_order_id, bot_id_for_row)
+                    )
+                elif order_type_for_row == 'entry':
+                    conn.execute(
+                        "UPDATE trades SET entry_order_id=? WHERE bot_id=?"
+                        " AND (entry_order_id IS NULL OR entry_order_id LIKE 'PLACING_%')",
+                        (exchange_order_id, bot_id_for_row)
+                    )
         else:
             conn.execute(
                 "UPDATE bot_orders SET status='failed', updated_at=? WHERE id=?",

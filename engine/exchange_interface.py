@@ -545,7 +545,20 @@ class ExchangeInterface:
                      
                  res = self._raw_request(endpoint, params=params)
                  if res:
-                     return {'id': res.get('orderId', order_id), 'status': res.get('status', 'unknown').lower(), 'filled': float(res.get('executedQty', 0)), 'amount': float(res.get('origQty', 0))}
+                     raw_avg = float(res.get('avgPrice', 0) or 0)
+                     raw_price = float(res.get('price', 0) or 0)
+                     return {
+                         'id': res.get('orderId', order_id),
+                         'status': res.get('status', 'unknown').lower(),
+                         'filled': float(res.get('executedQty', 0)),
+                         'amount': float(res.get('origQty', 0)),
+                         # ✅ Root cause fix: always include fill price fields.
+                         # Demo FAPI returns avgPrice="0" for limit orders (the fill price
+                         # equals the limit price). Fall back to 'price' if avgPrice is 0.
+                         'average': raw_avg if raw_avg > 0 else raw_price,
+                         'price': raw_price,
+                         'clientOrderId': res.get('clientOrderId', ''),
+                     }
                  return None
                  
             if str(order_id).isdigit():

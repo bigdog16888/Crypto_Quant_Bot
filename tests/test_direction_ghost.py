@@ -237,7 +237,10 @@ class TestPhantomEntryDetection(unittest.TestCase):
             conn.close()
 
         finally:
-            os.unlink(db_path)
+            try:
+                os.unlink(db_path)
+            except OSError:
+                pass  # Windows may hold a file lock; assertions already passed
 
 
 if __name__ == '__main__':

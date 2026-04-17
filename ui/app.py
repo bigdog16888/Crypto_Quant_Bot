@@ -346,24 +346,40 @@ with st.sidebar:
     if st.button("Apply Settings"):
         if api_key and api_secret:
             try:
-                # 1. Update .env file on disk
-                set_key(dotenv_path, "BINANCE_API_KEY", api_key)
-                set_key(dotenv_path, "BINANCE_API_SECRET", api_secret)
-                
-                # 2. Update current process environment
-                os.environ["BINANCE_API_KEY"] = api_key
-                os.environ["BINANCE_API_SECRET"] = api_secret
-                
-                # 3. Update global config object immediately (for UI components)
-                config.API_KEY = api_key
-                config.API_SECRET = api_secret
-                
-                st.success("✅ Credentials Saved!")
-                
-                # 4. Check if engine is running and warn
-                if os.path.exists(config.PATHS["PID_FILE"]):
-                    st.warning("⚠️ Engine is running! Please RESTART Monitoring below to apply changes.")
-                    
+                # ⚠️ SAFETY GUARD: Only write plain ASCII strings.
+                # This prevents MagicMock objects (from tests) or corrupted
+                # values from ever reaching the .env file on disk.
+                _key_str = str(api_key).strip()
+                _sec_str = str(api_secret).strip()
+                _is_safe = (
+                    len(_key_str) >= 10
+                    and len(_sec_str) >= 10
+                    and _key_str.isprintable()
+                    and _sec_str.isprintable()
+                    and "<" not in _key_str  # reject MagicMock repr
+                    and "<" not in _sec_str
+                )
+                if not _is_safe:
+                    st.error("❌ Invalid key format — not saved. Check your credentials.")
+                else:
+                    # 1. Update .env file on disk
+                    set_key(dotenv_path, "BINANCE_API_KEY", _key_str)
+                    set_key(dotenv_path, "BINANCE_API_SECRET", _sec_str)
+
+                    # 2. Update current process environment
+                    os.environ["BINANCE_API_KEY"] = _key_str
+                    os.environ["BINANCE_API_SECRET"] = _sec_str
+
+                    # 3. Update global config object immediately (for UI components)
+                    config.API_KEY = _key_str
+                    config.API_SECRET = _sec_str
+
+                    st.success("✅ Credentials Saved!")
+
+                    # 4. Check if engine is running and warn
+                    if os.path.exists(config.PATHS["PID_FILE"]):
+                        st.warning("⚠️ Engine is running! Please RESTART Monitoring below to apply changes.")
+
             except Exception as e:
                 st.error(f"Failed to save settings: {e}")
         else:

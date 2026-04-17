@@ -1,14 +1,13 @@
-# 🤖 Crypto Quant Bot (v1.6.6)
+# 🤖 Crypto Quant Bot (v1.8.5)
 
 A professional-grade, multi-bot algorithmic trading system designed for **Binance Futures (USDT/USDC)**. It features a robust **Virtual Position Manager** that allows multiple bots to trade the same pair independently (e.g., Hedging Long/Short) without conflict.
 
 ## 🌟 Key Features
 
 *   **Virtual Position System:** Each bot tracks its own position logic (`trades` table) while the engine reconciles with the exchange.
-*   **Hybrid Raw Mode:** Bypasses CCXT limitations on Binance Demo/Testnet by using raw signed requests for critical private data.
-*   **Restricted Adoption Fallback (v1.6.6):** Automatically unblocks deadlocked bots on geofenced/Demo accounts by synthesizing proof of possession when API history is restricted (Binance -2015).
-*   **Proof-Only Reconciliation:** Eliminates heuristic mathematical guessing. The engine only adjusts the ledger based on cryptographic order-ID proof or verified physical possession.
-*   **Atomic State Integrity:** Consolidates snapshots into `BEGIN IMMEDIATE` transaction blocks, preventing database locks and race-condition crashes.
+*   **Fully Autonomous Reconciliation (v1.8.5):** Achieved strict zero-drift ledger stability. The engine relies on cryptographic proof-of-fill (Exchange Order ID mapping) and will dynamically scrub geometric precision anomalies (Dust Chaser).
+*   **Proof-Only Mathematics:** Eliminates heuristic database guessing. The dynamic Market Flatten fallback protocol ensures any impossible physical/virtual state desync is safely zeroed entirely without corrupting internal ledgers.
+*   **Atomic State Integrity:** Consolidates snapshots into `BEGIN IMMEDIATE` transaction blocks, preventing database locks and race-condition crashes between REST polls and WebSockets streams.
 *   **SocketLock Singleton:** OS-enforced process protection (TCP port 19888) to prevent duplicate runners.
 *   **Real-Time UI:** Streamlit dashboard with ghosting-loop fixes, **Auto-Refresh**, Live Charts, Parallel Data Fetching, and Portfolio Heatmaps.
 *   **One-Way & Hedge Mode Support:** Fully compatible with Binance's One-Way and Hedge modes.
