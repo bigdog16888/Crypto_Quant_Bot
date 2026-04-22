@@ -20,7 +20,7 @@ from .exchange_interface import ExchangeInterface
 logger = logging.getLogger("BotManagement")
 
 
-def close_position(bot_id: int, close_pct: float = 100.0, reason: str = "Manual Close", exchange_interface=None) -> Dict[str, Any]:
+def close_position(bot_id: int, close_pct: float = 100.0, reason: str = "Manual Close", exchange_interface=None, order_type='limit') -> Dict[str, Any]:
     """
     Close a bot's position (partial or full) on the exchange.
     
@@ -29,6 +29,7 @@ def close_position(bot_id: int, close_pct: float = 100.0, reason: str = "Manual 
         close_pct: Percentage of position to close (100 = full close)
         reason: Reason for close
         exchange_interface: Optional ExchangeInterface instance to reuse
+        order_type: 'limit' (Post-Only) or 'market' (Panic)
     
     Returns:
         dict with success status and details
@@ -40,7 +41,7 @@ def close_position(bot_id: int, close_pct: float = 100.0, reason: str = "Manual 
     
     name, pair, direction = params[0], params[1], params[2]
     config_json = params[7]
-    config_dict = config_json if isinstance(config_json, dict) else {}
+    config_dict = json.loads(config_json) if isinstance(config_json, str) else (config_json or {})
     market_type = config_dict.get('market_type', 'future')
     
     # Get current trade state
@@ -63,23 +64,17 @@ def close_position(bot_id: int, close_pct: float = 100.0, reason: str = "Manual 
     close_amount = total_invested * (close_pct / 100.0)
     
     # For futures: calculate quantity
-    # For spot: calculate asset amount
     if market_type == 'future':
-        # Futures: amount is in contracts, need to calculate from USD value
-        close_qty = close_amount / current_price  # Simplified
+        close_qty = close_amount / current_price
     else:
-        # Spot: amount is the asset
+        # Spot: close the asset
         base_asset = pair.split('/')[0]
         balance = exchange.fetch_balance()
         if not balance or not isinstance(balance, dict):
             return {'success': False, 'error': 'Could not fetch balance'}
-        base_info = balance.get(base_asset)
-        if not isinstance(base_info, dict):
-            base_info = {}
-        current_holdings = base_info.get('total', 0)
-        if not isinstance(current_holdings, (int, float)):
-            current_holdings = 0
-        close_qty = float(current_holdings) * (close_pct / 100.0)
+        base_info = balance.get(base_asset, {})
+        current_holdings = float(base_info.get('total', 0))
+        close_qty = current_holdings * (close_pct / 100.0)
     
     if close_qty <= 0:
         return {'success': False, 'error': 'Invalid close quantity'}
@@ -87,24 +82,30 @@ def close_position(bot_id: int, close_pct: float = 100.0, reason: str = "Manual 
     # Determine close side (opposite of position direction)
     close_side = 'sell' if direction == 'LONG' else 'buy'
     
-    # Execute MARKET order to close
+    # Execute order to close
     try:
-        logger.info(f"🔴 Closing {close_pct:.0f}% of {name}'s position: {close_qty:.6f} {pair} @ MARKET")
+        mode_label = "LIMIT (Post-Only)" if order_type == 'limit' else "MARKET (Panic)"
+        logger.info(f"🔴 {mode_label} Closing {close_pct:.0f}% of {name}'s position: {close_qty:.6f} {pair}")
+        
+        # Professional Order Routing
         close_order = exchange.create_order(
-            pair, 
-            'market', 
-            close_side, 
-            close_qty
+            symbol=pair, 
+            type=order_type, 
+            side=close_side, 
+            amount=close_qty,
+            price=current_price if order_type == 'limit' else None,
+            params={'reduceOnly': True},
+            post_only=(order_type == 'limit')
         )
         
         if not close_order or close_order.get('status') == 'rejected':
             return {'success': False, 'error': f'Close order rejected: {close_order}'}
         
-        # Get fill price
-        fill_price = float(close_order.get('price', current_price))
-        filled_qty = float(close_order.get('filled', close_qty))
+        # Get fill price (market order might not have immediate price in response, use current as fallback)
+        fill_price = float(close_order.get('price', current_price) or current_price)
+        filled_qty = float(close_order.get('filled', close_qty) or close_qty)
         
-        logger.info(f"✅ Close order filled: {filled_qty} @ {fill_price}")
+        logger.info(f"✅ Close order placed/filled: {filled_qty} @ {fill_price}")
         
     except Exception as e:
         logger.error(f"❌ Failed to execute close order for {name}: {e}")

@@ -134,6 +134,17 @@ class BotRunner:
         except Exception as e:
             logger.error(f"Startup integrity check failed: {e}")
 
+        # --- v2.0 SCHEMA MIGRATION ---
+        # Idempotent: safe to run on every startup.
+        # Adds cumulative_filled, position_side, cycle_id columns to bot_orders if missing.
+        try:
+            from engine.migrations.migration_001_v2_schema import run as _run_migration
+            _m_result = _run_migration()
+            if _m_result.get('applied'):
+                logger.info(f"✅ [MIGRATION] Applied schema changes: {_m_result['applied']}")
+        except Exception as _m_err:
+            logger.warning(f"⚠️ [MIGRATION] v2.0 schema migration skipped (non-fatal): {_m_err}")
+
         self.strategies = {} # Cache strategy instances: {bot_id: strategy_instance}
         
         # Safety / Circuit Breaker State
@@ -407,6 +418,21 @@ class BotRunner:
             except Exception as _smal_err:
                 logger.warning(f"⚠️ [STARTUP] Memory-to-ledger alignment failed (non-fatal): {_smal_err}")
 
+            # v2.0: Seal all active bot states from the authoritative ledger (bot_orders).
+            # This is the canonical startup gate — trades table is written exactly once,
+            # from confirmed fills, before any orders are placed or cancelled.
+            try:
+                from engine.ledger import seal_all_active_bots
+                corrected = seal_all_active_bots()
+                if corrected:
+                    logger.info(f"✅ [STARTUP-SEAL] {corrected} bot(s) had trades row corrected by seal_all_active_bots().")
+                else:
+                    logger.info("✅ [STARTUP-SEAL] All bot trades rows are consistent with ledger fills.")
+            except Exception as _seal_err:
+                logger.warning(f"⚠️ [STARTUP-SEAL] seal_all_active_bots failed (non-fatal): {_seal_err}")
+
+
+
             # 🔬 BIDIRECTIONAL PROOF RECONCILIATION — run at every startup.
             # Verifies all ledger orders against exchange (PASS 1) and scans exchange
             # fills for DNA-matched orders not yet in bot_orders (PASS 2).
@@ -647,7 +673,8 @@ class BotRunner:
                        COALESCE(t.total_invested, 0), 
                        COALESCE(t.current_step, 0), 
                        b.rsi_limit, b.is_active,
-                       b.base_size, b.martingale_multiplier
+                       b.base_size, b.martingale_multiplier,
+                       b.status
                 FROM bots b
                 LEFT JOIN trades t ON b.id = t.bot_id
             ''')
@@ -886,9 +913,9 @@ class BotRunner:
                             relevant_bots = [b for b in bots if normalize_symbol(b[2]) == normalize_symbol(pos_symbol)]
                             same_dir_bots = [b for b in relevant_bots if b[3].upper() == pos_side_real]
                             
-                            # Check if any bot claims this position
-                            claimed = any(float(b[6] or 0) > 1.0 for b in same_dir_bots)
-                            if not claimed and full_exch_notional > 10.0:
+                            # Check if any bot claims this position (Threshold lowered to $0.01 for cent-level accuracy)
+                            claimed = any(float(b[6] or 0) > 0.01 for b in same_dir_bots)
+                            if not claimed and full_exch_notional > 0.01:
                                 logger.info(f"📋 [MONITOR] Unclaimed {pos_side_real} position on {pos_symbol}: ${full_exch_notional:.2f} @ {entry_price}. Reconciler will handle.")
                         
                         # Flag bots that think they're invested but exchange disagrees
@@ -1109,6 +1136,45 @@ class BotRunner:
         # Remove SL-flagged bots from this cycle's run list so they don't also get processed normally
         sl_flagged_ids = {b[0] for b in sl_flagged_bots}
         bots = [b for b in bots if b[0] not in sl_flagged_ids]
+
+        # ================================================================
+        # 🔁 v2.0 TP CASCADE DRAIN
+        # WS handler cannot cancel exchange orders (no exchange obj).
+        # It registers (bot_id, pair, exit_price) in ledger.
+        # We drain it here with exchange access for the full atomic workflow.
+        # ================================================================
+        try:
+            from engine.ledger import drain_tp_cascade, handle_tp_completion
+            pending_tp_cascades = drain_tp_cascade()
+            if pending_tp_cascades:
+                logger.info(f"[TP-DRAIN] Processing {len(pending_tp_cascades)} pending TP cascades...")
+                for (tp_bot_id, tp_pair, tp_price) in pending_tp_cascades:
+                    try:
+                        # Find the exchange for this pair
+                        tp_ex = list(self.exchanges.values())[0] if self.exchanges else None
+                        if tp_ex:
+                            success = handle_tp_completion(
+                                bot_id=tp_bot_id,
+                                exit_price=tp_price,
+                                pair=tp_pair,
+                                exchange=tp_ex
+                            )
+                            if success:
+                                logger.info(f"✅ [TP-DRAIN] Bot {tp_bot_id} {tp_pair} cascade complete.")
+                                # Remove from this cycle's bot list (already reset)
+                                bots = [b for b in bots if b[0] != tp_bot_id]
+                            else:
+                                logger.error(f"❌ [TP-DRAIN] Bot {tp_bot_id} cascade FAILED — will retry next drain.")
+                        else:
+                            logger.warning(f"[TP-DRAIN] No exchange available for bot {tp_bot_id}. Re-queuing.")
+                            from engine.ledger import register_tp_cascade
+                            register_tp_cascade(tp_bot_id, tp_pair, tp_price)
+                    except Exception as _tp_cascade_err:
+                        logger.error(f"[TP-DRAIN] Exception for bot {tp_bot_id}: {_tp_cascade_err}")
+        except Exception as _drain_err:
+            logger.warning(f"[TP-DRAIN] Drain loop failed (non-fatal): {_drain_err}")
+
+
 
         # Update workers size
         max_workers = min(len(bots) + 2, 20)

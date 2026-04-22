@@ -25,13 +25,16 @@ class ExchangeInterface:
     _exchange_info_loaded = False
     _exchange_info_lock = threading.Lock()
     _hybrid_mode_logged = False
+    _position_mode_hedge = None # None=Unknown, True=Hedge, False=One-Way
+    _position_mode_lock = threading.Lock()
 
 
     def __init__(self, market_type='future'):
         self.logger = logging.getLogger(f"ExchangeInterface.{market_type}")
-        self.market_type = normalize_market_type(market_type)  # Canonical gate: 'futures'→'future'
+        self.market_type = normalize_market_type(market_type)
         self.exchange = self._create_exchange_instance()
         self._ensure_markets()
+        self._detect_position_mode()
 
     @classmethod
     def _get_anon_exchange(cls):
@@ -135,6 +138,14 @@ class ExchangeInterface:
             except Exception as e:
                 logger.error(f"⚠️ Could not load exchangeInfo precision cache: {e}")
 
+    def _detect_position_mode(self):
+        """
+        Detects if the account is in Hedge Mode (dualSidePosition: True) or One-Way Mode (False).
+        FIXED: System is strictly designed for ONE-WAY MODE to support multi-bot netting.
+        """
+        ExchangeInterface._position_mode_hedge = False
+        self.logger.info(f"🛡️ [MODE-DETECT] System forced to ONE-WAY MODE as required.")
+
     def _raw_request(self, endpoint: str, method: str = 'GET', params: dict = None) -> Any:
         """
         Executes a raw signed request to the Binance Demo FAPI.
@@ -216,7 +227,14 @@ class ExchangeInterface:
         try:
             # FIXED: Use shared anon instance
             anon = self._get_anon_exchange()
-            return anon.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+            data = anon.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+            
+            # 🔍 DIAGNOSTIC: BNB/XRP Tracking
+            if symbol.startswith('BNB') or symbol.startswith('XRP'):
+                qty = len(data) if data else 0
+                self.logger.info(f"🔍 [OHLCV-TRACE] {symbol} ({timeframe}): Fetched {qty} candles.")
+            
+            return data
         except Exception as e:
             err_msg = str(e)
             # If it's a JSON decoding error (truncated response), log it as a warning instead of error to reduce alarm
@@ -283,10 +301,23 @@ class ExchangeInterface:
                             else:
                                 unified_symbol = entry['symbol']
                         
+                        # 🚀 ONE-WAY MODE NORMALIZATION:
+                        # In One-Way mode, Binance reports positionSide as 'BOTH'.
+                        # The engine requires 'LONG' or 'SHORT' for proof verification.
+                        raw_side = str(pos.get('positionSide', 'BOTH')).upper()
+                        pos_amt = float(pos.get('positionAmt', 0))
+                        
+                        if raw_side == 'BOTH':
+                            normalized_side = 'LONG' if pos_amt > 0 else 'SHORT'
+                        else:
+                            normalized_side = raw_side.upper()
+
                         positions.append({
                             'symbol': unified_symbol,
-                            'contracts': float(pos['positionAmt']),
-                            'side': str(pos.get('positionSide', 'BOTH')).lower(), # Normalized: long, short, both
+                            'contracts': pos_amt,
+                            'qty': abs(pos_amt),      # Raw unsigned magnitude
+                            'net_qty': pos_amt,       # Signed magnitude for netting math
+                            'side': normalized_side.lower(), # Normalized: long, short
                             'unrealizedPnl': float(pos['unrealizedProfit']),
                             'entryPrice': float(pos['entryPrice'])
                         })
@@ -457,27 +488,27 @@ class ExchangeInterface:
 
     @staticmethod
     def round_to_step(value: float, step: float) -> float:
-        """Rounds a value DOWN to the nearest exchange step size (e.g., 0.05). Use for normal quantities."""
+        """Rounds a value DOWN to the nearest exchange step size using Decimal for precision."""
         if not step or step <= 0: return value
-        import math
-        if step < 1:
-            precision = int(-math.log10(step))
-        else:
-            precision = 0
-        return round(math.floor(value / step) * step, precision)
+        from decimal import Decimal, ROUND_FLOOR
+        # Convert inputs to strings first to avoid importing existing float noise
+        d_val = Decimal(str(value))
+        d_step = Decimal(str(step))
+        # Quantize performs the floor division in decimal space
+        rounded = (d_val / d_step).quantize(Decimal('1'), rounding=ROUND_FLOOR) * d_step
+        return float(rounded)
 
     @staticmethod
     def ceil_to_step(value: float, step: float) -> float:
-        """Rounds a value UP to the nearest exchange step size. Use when scaling UP to meet minimum notional."""
+        """Rounds a value UP to the nearest exchange step size using Decimal for precision."""
         if not step or step <= 0: return value
-        import math
-        if step < 1:
-            precision = int(-math.log10(step))
-        else:
-            precision = 0
-        return round(math.ceil(value / step) * step, precision)
+        from decimal import Decimal, ROUND_CEILING
+        d_val = Decimal(str(value))
+        d_step = Decimal(str(step))
+        rounded = (d_val / d_step).quantize(Decimal('1'), rounding=ROUND_CEILING) * d_step
+        return float(rounded)
 
-    def create_order(self, symbol, type, side, amount, price=None, params=None) -> dict:
+    def create_order(self, symbol, type, side, amount, price=None, params=None, post_only=False) -> dict:
         try:
             # Use raw signature logic for order placement on Demo
             if config.TESTNET or config.DEMO_TRADING:
@@ -497,6 +528,18 @@ class ExchangeInterface:
                     'type': type.upper(),
                     'quantity': qty_str,
                 }
+
+                # Professional Maker-Only Support
+                if post_only and type.upper() == 'LIMIT':
+                    # ccxt uses timeInForce: 'GTX' for 'Good Till Crossing' (Post-Only on Binance)
+                    raw_params['timeInForce'] = 'GTX'
+
+                # 🚀 ARCHITECTURAL FIX: Strictly enforce One-Way Mode.
+                # Binance rejects orders with positionSide if the account is in One-Way mode.
+                if 'positionSide' in raw_params:
+                    del raw_params['positionSide']
+                if 'position_side' in raw_params:
+                    del raw_params['position_side']
                 
                 if price:
                     price_rounded = self.round_to_step(price, prec['tick_size'])
@@ -510,12 +553,13 @@ class ExchangeInterface:
                     if 'clientOrderId' in params:
                         raw_params['newClientOrderId'] = params['clientOrderId']
                     for k, v in params.items():
-                        if k not in ['clientOrderId', 'reduceOnly']:
+                        if k not in ['clientOrderId', 'reduceOnly', 'positionSide', 'position_side']:
                             raw_params[k] = v
                     if 'reduceOnly' in params:
                         raw_params['reduceOnly'] = 'true' if params['reduceOnly'] else 'false'
 
                 res = self._raw_request(endpoint, method='POST', params=raw_params)
+
                 if res:
                     # Return CCXT-like structure
                     return {
@@ -528,7 +572,11 @@ class ExchangeInterface:
                     raise Exception("Raw order placement returned empty response")
             
             # Fallback for Mainnet
-            return self.exchange.create_order(symbol, type, side, amount, price, params or {})
+            if params is None: params = {}
+            if post_only and type.lower() == 'limit':
+                params['timeInForce'] = 'GTX'
+                
+            return self.exchange.create_order(symbol, type, side, amount, price, params)
         except Exception as e:
             self.logger.error(f"Order Placement Failed: {e}")
             raise APIError(str(e))

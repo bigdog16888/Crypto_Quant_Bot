@@ -316,31 +316,31 @@ def render_bot_manager_view():
                     st.markdown(f"**Current PnL:** <span style='color:{pnl_color}'>${pnl:,.2f} ({pnl_pct:+.2f}%)</span>", unsafe_allow_html=True)
                     
                     # Close buttons
-                    st.markdown("**🛑 Close Position**")
-                    close_cols = st.columns([1, 1, 1, 1])
+                    st.markdown("**🛑 Professional Position Exit**")
+                    close_cols = st.columns([2, 1, 1])
                     
-                    # Full close button
-                    if close_cols[0].button("🔴 Close All", key=f"close_all_{b_id}", help="Close 100% of position"):
-                        result = close_position(b_id, close_pct=100.0, reason="Manual close from UI")
+                    # Standard Limit/Post-Only Close
+                    if close_cols[0].button("🟢 Close Position (Limit/Post-Only)", key=f"close_all_{b_id}", help="Close 100% of position using Post-Only Limit orders (Professional/Maker)."):
+                        result = close_position(b_id, close_pct=100.0, reason="Manual close (Limit) from UI", order_type='limit')
                         if result['success']:
-                            st.success(f"✅ Closed position for {name}. PnL: ${result.get('pnl', 0):.2f}")
+                            st.success(f"✅ Limit close order placed for {name}.")
+                            st.rerun()
+                        else:
+                            st.error(f"❌ Limit Close Failed: {result.get('error')}")
+                    
+                    # Partial close buttons (Still using limit for consistency)
+                    if close_cols[1].button("🟡 50%", key=f"close_50_{b_id}", help="Close 50% via Limit"):
+                        result = close_position(b_id, close_pct=50.0, reason="Partial 50% (Limit)", order_type='limit')
+                        if result['success']:
+                            st.success(f"✅ 50% Limit order placed.")
                             st.rerun()
                         else:
                             st.error(f"❌ Failed: {result.get('error')}")
                     
-                    # Partial close buttons
-                    if close_cols[1].button("🟡 50%", key=f"close_50_{b_id}", help="Close 50% of position"):
-                        result = partial_close(b_id, pct=50, reason="Partial close 50%")
+                    if close_cols[2].button("⚪ 25%", key=f"close_25_{b_id}", help="Close 25% via Limit"):
+                        result = close_position(b_id, close_pct=25.0, reason="Partial 25% (Limit)", order_type='limit')
                         if result['success']:
-                            st.success(f"✅ Closed 50% of {name}. PnL: ${result.get('pnl', 0):.2f}")
-                            st.rerun()
-                        else:
-                            st.error(f"❌ Failed: {result.get('error')}")
-                    
-                    if close_cols[2].button("🟢 25%", key=f"close_25_{b_id}", help="Close 25% of position"):
-                        result = partial_close(b_id, pct=25, reason="Partial close 25%")
-                        if result['success']:
-                            st.success(f"✅ Closed 25% of {name}. PnL: ${result.get('pnl', 0):.2f}")
+                            st.success(f"✅ 25% Limit order placed.")
                             st.rerun()
                         else:
                             st.error(f"❌ Failed: {result.get('error')}")
@@ -349,18 +349,18 @@ def render_bot_manager_view():
                     st.markdown("---")
                     st.markdown("**🚨 Emergency Panic Close**")
                     panic_confirm = st.checkbox(f"⚠️ Confirm instant MARKET close for 100% of {name}'s position.", key=f"confirm_panic_{b_id}")
-                    if st.button("🚨 PANIC CLOSE & FLATTEN", key=f"panic_all_{b_id}", type="primary", disabled=not panic_confirm, help="Instantly market-sells entire position and resets bot state."):
-                        result = close_position(b_id, close_pct=100.0, reason="PANIC FLAT from UI")
+                    if st.button("🔥 Kill Bot Position (Market)", key=f"panic_all_{b_id}", type="primary", disabled=not panic_confirm, help="Instantly market-sells entire position. Capped by bot ledger size. Use for emergency exits."):
+                        result = close_position(b_id, close_pct=100.0, reason="PANIC KILL from UI", order_type='market')
                         if result['success']:
-                            st.success(f"✅ PANIC CLOSED {name}. PnL: ${result.get('pnl', 0):.2f}")
+                            st.success(f"✅ KILLED {name} (Market). PnL: ${result.get('pnl', 0):.2f}")
                             st.rerun()
                         else:
-                            st.error(f"❌ Panic Failed: {result.get('error')}")
+                            st.error(f"❌ Kill Failed: {result.get('error')}")
                     
                     # Engine SL/Ghost Wipe
                     st.markdown("---")
-                    st.markdown("**👻 Ghost Wipe / Engine Stop**")
-                    if st.button("🛑 Force Engine SL (Safe Wipe)", key=f"engine_sl_{b_id}", help="Instructs the background engine to safely stop this bot. Resolves 'Ghost' mismatches safely."):
+                    st.markdown("**🧬 Ledger Management**")
+                    if st.button("🛑 Engine Ledger Reset (No Trade)", key=f"engine_sl_{b_id}", help="Instructs the background engine to safely stop this bot. Does NOT send exchange orders. Use to clear 'Ghost' mismatch errors if you already closed the position manually on Binance."):
                         try:
                             from engine.database import get_connection
                             conn = get_connection()
@@ -368,10 +368,10 @@ def render_bot_manager_view():
                             curr.execute("UPDATE bots SET status = 'stop_loss_triggered' WHERE id = ?", (b_id,))
                             conn.commit()
                             conn.close()
-                            st.success(f"✅ Bot flagged. The Engine will intercept and safely resolve this shortly.")
+                            st.success(f"✅ Ledger reset requested. Engine will clear state momentarily.")
                             st.rerun()
                         except Exception as e:
-                            st.error(f"❌ Failed to flag bot: {e}")
+                            st.error(f"❌ Reset Failed: {e}")
 
                     # Stop settings
                     st.markdown("---")
@@ -889,11 +889,13 @@ def render_edit_form(bot_id):
             config_dict['UseVolSizing'] = st.checkbox("Volatility Position Sizing", value=config_dict.get('UseVolSizing', False), help="Adjusts lot size based on ATR (High Vol = Smaller Size).")
 
         st.markdown("#### Advanced Exit & Hedge Settings")
-        col_ee1, col_ee3, col_ee4, col_ee5 = st.columns(4)
+        col_ee1, col_ee2, col_ee3, col_ee4, col_ee5 = st.columns(5)
         with col_ee1:
             use_ee = st.checkbox("Use Early Exit", value=config_dict.get('UseEarlyExit', False), help="Moves TP target closer to Break Even over time to exit stale trades safely.")
+        with col_ee2:
+            grace_mins = st.number_input("Grace (Mins)", value=float(config_dict.get('EEGracePeriodMins', 0.0)), help="Minutes to wait before decay starts.")
         with col_ee3:
-            decay_interval = st.number_input("Decay Every (Mins)", value=float(config_dict.get('DecayIntervalMins', 15.0)), help="How often (in minutes) the profit target is reduced.")
+            decay_interval = st.number_input("Decay every(Mins)", value=float(config_dict.get('DecayIntervalMins', 15.0)), help="How often (in minutes) the profit target is reduced.")
         with col_ee4:
             decay_pct = st.number_input("TP Reduction (%)", value=float(config_dict.get('DecayPercentPerInterval', 30.0)), help="What percentage of the current profit target to cut per interval.")
         with col_ee5:
@@ -911,6 +913,7 @@ def render_edit_form(bot_id):
 
         # EE
         config_dict['UseEarlyExit'] = use_ee
+        config_dict['EEGracePeriodMins'] = grace_mins
         config_dict['DecayIntervalMins'] = decay_interval
         config_dict['DecayPercentPerInterval'] = decay_pct
         config_dict['EEAllowLoss'] = ee_allow_loss

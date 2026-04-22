@@ -9,7 +9,11 @@ import os
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from engine.exchange_interface import ExchangeInterface
-from engine.database import get_connection, get_bots_by_order_id, get_unread_notifications, mark_notifications_read, import_position_from_exchange
+from engine.database import (
+    get_connection, get_bots_by_order_id, get_unread_notifications, 
+    mark_notifications_read, import_position_from_exchange,
+    add_manual_whitelist, clear_manual_whitelists_for_pair, get_manual_whitelists
+)
 from engine.reconciler import StateReconciler, ReconciliationAction
 from config.settings import config as global_config
 
@@ -422,7 +426,7 @@ def render_monitor_view():
             
             # Fetch Bot Strategies (df_pos)
             query_all = """
-                SELECT b.id, b.name, b.pair, b.direction, b.strategy_type, b.config, t.current_step, t.total_invested, t.avg_entry_price, t.target_tp_price, b.is_active, b.status, t.basket_start_time
+                SELECT b.id, b.name, b.pair, b.direction, b.strategy_type, b.config, t.current_step, t.total_invested, t.avg_entry_price, t.target_tp_price, b.is_active, b.status, b.error, t.basket_start_time
                 FROM bots b
                 LEFT JOIN trades t ON b.id = t.bot_id
                 WHERE b.is_active = 1
@@ -506,24 +510,45 @@ def render_monitor_view():
                             pair_prices[pair_key] = price
                         physical_qty_by_pair[composite_key] = physical_qty_by_pair.get(composite_key, 0.0) + qty
             
-            # 3. Per-pair, per-SIDE comparison (Hedge-Mode: LONG vs LONG, SHORT vs SHORT)
-            all_keys = set(list(virtual_qty_by_pair.keys()) + list(physical_qty_by_pair.keys()))
+            # 3. Symbol-Level NET comparison (One-Way Mode Awareness)
+            all_keys = set(virtual_qty_by_pair.keys()) | set(physical_qty_by_pair.keys())
+            distinct_symbols = set([k[0] for k in all_keys])
             virtual_net_usd = 0.0
             physical_net_usd = 0.0
             
-            for (p, side_key) in all_keys:
-                v_qty  = virtual_qty_by_pair.get((p, side_key), 0.0)
-                ph_qty = physical_qty_by_pair.get((p, side_key), 0.0)
-                diff_qty = abs(v_qty - ph_qty)
+            for p in distinct_symbols:
+                # Calculate NET sums for this symbol
+                v_net_qty = virtual_qty_by_pair.get((p, 'LONG'), 0.0) - virtual_qty_by_pair.get((p, 'SHORT'), 0.0)
+                ph_net_qty = physical_qty_by_pair.get((p, 'LONG'), 0.0) - physical_qty_by_pair.get((p, 'SHORT'), 0.0)
+                
+                # 🛡️ ARCHITECT'S SHIELD: Apply manual whitelists to ignore personal trades
+                whitelists = get_manual_whitelists(p)
+                for w in whitelists:
+                    w_qty = float(w['qty'])
+                    ph_net_qty -= w_qty if w['side'] == 'LONG' else -w_qty
+                
                 ref_price = pair_prices.get(p, 1.0)
-                diff_usd = diff_qty * ref_price
-                sign = 1 if side_key == 'LONG' else -1
-                virtual_net_usd  += v_qty  * ref_price * sign
-                physical_net_usd += ph_qty * ref_price * sign
-                if diff_usd > 1.0:
-                    v_usd_display  = v_qty  * ref_price * sign
-                    ph_usd_display = ph_qty * ref_price * sign
-                    mismatched_pairs.append((f"{p} {side_key}", v_usd_display, ph_usd_display, diff_usd, v_qty * sign, ph_qty * sign, diff_qty, ref_price))
+                net_qty_diff = abs(v_net_qty - ph_net_qty)
+                net_usd_diff = net_qty_diff * ref_price
+                
+                # Global metrics update
+                virtual_net_usd += v_net_qty * ref_price
+                physical_net_usd += ph_net_qty * ref_price
+
+                # DISCREPANCY DETECTION
+                # 🚀 PROFESSOR'S PRECISION: Low as possible — $0.01 tolerance (CENT LEVEL)
+                if net_usd_diff > 0.01:
+                    # Report the mismatch for the whole symbol (Net basis)
+                    v_usd_net = v_net_qty * ref_price
+                    ph_usd_net = ph_net_qty * ref_price
+                    # 🚀 V2.1: Keep signed difference for accurate whitelisting
+                    signed_qty_diff = ph_net_qty - v_net_qty 
+                    mismatched_pairs.append((f"{p} NET", v_usd_net, ph_usd_net, net_usd_diff, v_net_qty, ph_net_qty, signed_qty_diff, ref_price))
+                else:
+                    # SYNCED AT NET LEVEL: 
+                    # We might still check if sides are 'fighting' (e.g. system has LONG+SHORT but exchange has NET)
+                    # but since they net out perfectly, we consider it Healthy.
+                    pass
             
             diff_net = abs(virtual_net_usd - physical_net_usd)
             # (Mismatch and Order Health are displayed in the MASTER STATUS INDICATOR section below)
@@ -632,7 +657,19 @@ def render_monitor_view():
                 order_health_msg = f"⚠️ MISSING CRITICAL ORDERS: {', '.join(bots_with_missing_orders)} have 0 open limit orders!"
                 order_status_color = "red"
             elif bots_with_partial_orders:
-                order_health_msg = f"⚠️ MISSING GRIDS (Max Pos Limit?): {', '.join(bots_with_partial_orders)} missing expected grid ladders."
+                # 🚀 DIAGNOSTIC UPGRADE: Pull specific error from bot state if missing grids
+                error_reasons = []
+                for b_str in bots_with_partial_orders:
+                    # 🚀 ROBUST PARSING: Use rpartition to safely extract multi-word names from "Name (qty)"
+                    b_name = b_str.rpartition(' (')[0] if ' (' in b_str else b_str
+                    # Find first matching bot row safely
+                    b_row = active_bots[active_bots['name'] == b_name].iloc[0] if not active_bots[active_bots['name'] == b_name].empty else None
+                    if b_row is not None and b_row.get('error'):
+                        error_reasons.append(f"{b_name}: {b_row['error']}")
+                    else:
+                        error_reasons.append(b_str)
+                
+                order_health_msg = f"⚠️ MISSING GRIDS (Check ATR/Params): {', '.join(error_reasons)}"
                 order_status_color = "orange"
                 # Downgrade visually to yellow for bots experiencing partial grid errors
                 for pd_idx, bot_row in df_pos.iterrows():
@@ -708,12 +745,74 @@ def render_monitor_view():
                             if _pair_pos_capped:
                                 # Truthful label — the exchange capped the position at this size
                                 st.info(f"   🚫 **{mp_pair}**: System ${mp_virt:,.2f} vs Exchange ${mp_phys:,.2f} (Diff: ${mp_diff:,.2f}){qty_str} — *POS LIMIT: Exchange capped. Holding position until TP.*")
-                            elif mp_dqty is not None and mp_dqty > 0.001:
-                                # Real quantity gap — show qty mismatch prominently
+                            elif mp_diff > 0.01:
+                                # 🚨 CENT-LEVEL ALERT: Anything over $0.01 mismatch gets a Warning
                                 st.warning(f"   ⚠️ **{mp_pair}**: System ${mp_virt:,.2f} vs Exchange ${mp_phys:,.2f} (Diff: ${mp_diff:,.2f}){qty_str}")
                             else:
-                                # USD difference only (price basis / mark-to-market) — no real qty gap
+                                # USD difference is negligible (< $0.01) — show bullet for perfect sync
                                 st.write(f"   • **{mp_pair}**: System ${mp_virt:,.2f} vs Exchange ${mp_phys:,.2f} (Diff: ${mp_diff:,.2f}){qty_str} *(price basis only)*")
+
+                            # 🚀 ACTION BUTTONS 🔬
+                            if abs(mp_dqty or 0) > 0.0001:
+                                _act_col1, _act_col2, _act_col3, _act_col4 = st.columns([1,1,1,1])
+                                with _act_col1:
+                                    if st.button("🕵️ Forensic Adopt", key=f"forensic_{mp_pair}", help="Deep 7-day scan for CQB_ order ID proofs"):
+                                        with st.spinner("Scanning 7-day history..."):
+                                            sr = StateReconciler()
+                                            res = sr.perform_forensic_reconstruction(_pair_root)
+                                            if sum(res.values()) > 0:
+                                                st.success(f"Forensic Success! Found {sum(res.values())} missing fills.")
+                                                time.sleep(1)
+                                                st.rerun()
+                                            else:
+                                                st.warning("No missing proof-based fills found.")
+
+                                with _act_col2:
+                                    _side = 'LONG' if mp_dqty > 0 else 'SHORT'
+                                    if st.button("📝 Mark as Manual", key=f"manual_{mp_pair}", help=f"Whitelist {abs(mp_dqty):.4f} {_side} as personal trade"):
+                                        add_manual_whitelist(_pair_root, _side, abs(mp_dqty))
+                                        st.success(f"Whitelisted {abs(mp_dqty):.4f} {_side} for {_pair_root}")
+                                        time.sleep(1)
+                                        st.rerun()
+
+                                with _act_col3:
+                                    if st.button("💥 Market Close", key=f"mkt_close_{mp_pair}", help="FULL NEUTRALIZE: Flattens physical inventory AND wipes virtual ledger for this pair"):
+                                        try:
+                                            ex_mkt = get_exchange_instance('future')
+                                            
+                                            # 1. 🎯 FLATTEN PHYSICAL (Bring exchange to exactly 0)
+                                            if abs(mp_pqty) > 0.0001:
+                                                _flat_side = 'sell' if mp_pqty > 0 else 'buy'
+                                                ex_mkt.create_order(
+                                                    symbol=_pair_root, 
+                                                    type='market', 
+                                                    side=_flat_side, 
+                                                    amount=abs(mp_pqty), 
+                                                    params={'reduceOnly': True}
+                                                )
+                                                st.info(f"Physical Flatten sent: {_flat_side.upper()} {abs(mp_pqty):.4f} {_pair_root}")
+
+                                            # 2. 🧹 WIPE VIRTUAL (Force-SL all bots on this pair to 0)
+                                            from engine.database import get_connection as _gconn_mkt
+                                            _conn_mkt = _gconn_mkt()
+                                            _c_mkt = _conn_mkt.cursor()
+                                            _c_mkt.execute("SELECT id FROM bots WHERE pair LIKE ?", (f"{_pair_root}%",))
+                                            _involved_bots = [r[0] for r in _c_mkt.fetchall()]
+                                            
+                                            for _bid in _involved_bots:
+                                                _c_mkt.execute("UPDATE bot_orders SET status='auto_closed' WHERE bot_id=? AND status NOT IN ('filled', 'canceled', 'auto_closed', 'reset_cleared')", (_bid,))
+                                                _c_mkt.execute("UPDATE trades SET total_invested=0, current_step=0, cycle_phase='IDLE' WHERE bot_id=?", (_bid,))
+                                                _c_mkt.execute("UPDATE bots SET status='Scanning' WHERE id=?", (_bid,))
+                                            
+                                            _conn_mkt.commit()
+                                            st.success(f"✅ Neutralized {_pair_root}: Physical closed & {len(_involved_bots)} bots reset to Scanning.")
+                                            time.sleep(1)
+                                            st.rerun()
+                                        except Exception as _mkt_e:
+                                            st.error(f"Neutralize failed: {_mkt_e}")
+                                            
+                                with _act_col4:
+                                    st.caption("Deterministic Control")
                     else:
                         st.write(f"**Position State**: Perfect Quantity Match")
                         
@@ -753,7 +852,7 @@ def render_monitor_view():
                             st.caption("No owning bot — manual close required")
                         with _o_col3:
                             _close_key = f"orphan_close_{_o_pair}_{_o_side}"
-                            if st.button("🛑 Market Close", key=_close_key, type="primary"):
+                            if st.button("🛑 Flatten Orphan (Market)", key=_close_key, type="primary"):
                                 try:
                                     _ex_orp = get_exchange_instance('future')
                                     _close_direction = 'sell' if _o_side.upper() == 'LONG' else 'buy'
@@ -967,277 +1066,271 @@ def render_monitor_view():
 
         st.divider()
 
-        # --- Physical Positions (Exchange Reality) ---
-        st.subheader("🏥 Exchange Reality (Physical)")
-        if not df_physical.empty:
-            st.dataframe(df_physical, width="stretch")
-            # Calculate Physical Net on the fly if needed, but we already have physical_net_usd from above
-        else:
-            st.info("Exchange wallet is empty (No physical positions).")
-            if virtual_gross_usd > 100:
-                st.caption("ℹ️ Note: If active bots exist, this means Longs and Shorts are perfectly hedged (Net ~0).")
+        # -------------------------------------------------------------------------
+        # ⚡ FRAGMENT: Exchange Reality + Bot Strategies
+        # Decorated with @st.fragment so this section refreshes independently
+        # without triggering a full-page rerun. The sidebar, charts tab, and
+        # history tab stay completely static while this block auto-updates.
+        # -------------------------------------------------------------------------
+        @st.fragment(run_every=15 if auto_refresh and not wizard_active else None)
+        def _bot_positions_fragment(df_physical, df_pos, virtual_gross_usd):
+            # --- Physical Positions (Exchange Reality) ---
+            st.subheader("🏥 Exchange Reality (Physical)")
+            if not df_physical.empty:
+                st.dataframe(df_physical, width="stretch")
+            else:
+                st.info("Exchange wallet is empty (No physical positions).")
+                if virtual_gross_usd > 100:
+                    st.caption("ℹ️ Note: If active bots exist, this means Longs and Shorts are perfectly hedged (Net ~0).")
 
-        st.divider()
-
-        # --- Virtual Positions (Bot Strategies) ---
-        st.subheader("🤖 Bot Strategies (Virtual Positions)")
-        if not df_pos.empty:
-            # UX Improvements: Rename Status to friendly labels
-            df_pos['status'] = df_pos['status'].replace('Scanning', '🟢 SCANNING')
-            df_pos['status'] = df_pos['status'].replace('Waiting for Signal', '🟢 SCANNING')  # legacy
-            df_pos['status'] = df_pos['status'].replace('IN TRADE', '🔴 IN TRADE')
-            df_pos['status'] = df_pos['status'].replace('ENTRY PENDING', '🟡 WAITING FOR FILL')
-            df_pos['status'] = df_pos['status'].replace('Stopped', '⚪ STOPPED')
-            df_pos['status'] = df_pos['status'].replace('STOPPED', '⚪ STOPPED')
-            
-            # Extract Trigger Info & Active Orders
-            def extract_info(row):
-                res = {
-                    'Trigger': 'N/A', 
-                    'Orders': '0',
-                    'TP_Price': 0.0,
-                    'Grid_Price': 0.0,
-                    'Grid_Amount': 0.0
-                }
-                try:
-                    cfg = json.loads(row.get('config', '{}') or '{}')
-                    triggers = []
-
-                    # 1. Price Trigger
-                    m_p = int(cfg.get('mode_price', 0) or 0)
-                    try:
-                        t_p = float(cfg.get('price_threshold', 0) or 0)
-                    except ValueError:
-                        t_p = 0.0
-                    if m_p == 1: triggers.append(f"Price > ${t_p:,.2f}")
-                    elif m_p == 2: triggers.append(f"Price < ${t_p:,.2f}")
-
-                    # 2. Indicator Triggers
-                    if cfg.get('mode_rsi'):
-                        r_m = int(cfg['mode_rsi'] or 0)
-                        try: r_l = float(cfg.get('rsi_level', 0) or 0)
-                        except ValueError: r_l = 0.0
-                        triggers.append(f"RSI({'<' if r_m==1 else '>'}{r_l})")
-                    if cfg.get('mode_cci'):
-                        c_m = int(cfg['mode_cci'] or 0)
-                        try: c_l = float(cfg.get('cci_level', 0) or 0)
-                        except ValueError: c_l = 0.0
-                        triggers.append(f"CCI({'<' if c_m==2 else '>'}{c_l})")
-                    if cfg.get('mode_boll'):
-                        b_m = cfg['mode_boll']
-                        triggers.append("BOLL(Outside)")
-                    if cfg.get('mode_stoch'):
-                        s_m = int(cfg['mode_stoch'] or 0)
-                        triggers.append(f"Stoch({'Oversold' if s_m==1 else 'Overbought'})")
-                    
-                    # 3. Patterns and others
-                    for i in range(1, 5):
-                        if cfg.get(f'pat_{i}_mode'):
-                            p_m = int(cfg[f'pat_{i}_mode'] or 0)
-                            p_c = int(cfg.get(f'pat_{i}_count', 1) or 1)
-                            p_s = cfg.get(f'pat_{i}_source', 'Price')
-                            triggers.append(f"{p_s}Pat({p_c}x {'Up' if p_m==1 else 'Dn'})")
-
-                    desc_trigger = " + ".join(triggers) if triggers else "N/A"
-
-                    ee_status = ""
-                    # 🚀 STATUS INDEPENDENCE: Don't rely on string matching '🔴 IN TRADE' 
-                    # as pandas apply order might not have finalized the column yet.
-                    is_in_trade = False
-                    try:
-                        inv = float(row.get('total_invested', 0) or 0)
-                        if inv > 0: is_in_trade = True
-                    except: pass
-
-                    if is_in_trade and cfg.get('UseEarlyExit', False) and row.get('basket_start_time', 0) > 0:
-                        import time as _t
-                        from datetime import datetime as _dt
-                        try:
-                            from engine.manager import calculate_early_exit_decay as _eed
-                            avg_p = float(row.get('avg_entry_price', 0) or 0)
-                            tp_p  = float(row.get('target_tp_price', 0) or 0)
-                            if avg_p > 0 and tp_p > 0:
-                                start_dt = _dt.fromtimestamp(row.get('basket_start_time', 0))
-                                now_dt   = _dt.fromtimestamp(_t.time())
-                                step_n   = int(row.get('current_step', 0)) + 1
-                                decayed_tp = _eed(start_dt, now_dt, step_n, tp_p, avg_p, cfg)
-                                # Derive the % decay relative to the original spread
-                                direction_up = row.get('direction', 'LONG').upper() == 'LONG'
-                                orig_spread = abs(tp_p - avg_p)
-                                decayed_spread = abs(decayed_tp - avg_p)
-                                if orig_spread > 0:
-                                    ee_pc = (1 - decayed_spread / orig_spread) * 100
-                                    ee_pc = max(0.0, min(ee_pc, 100.0) if not cfg.get('EEAllowLoss', False) else ee_pc)
-                                    ee_status = f" [EE: -{ee_pc:.1f}% → TP {decayed_tp:,.4f}]"
-                        except Exception:
-                            # Fallback: simple interval-based display only
-                            duration_mins = (_t.time() - row.get('basket_start_time', _t.time())) / 60.0
-                            interval_mins = float(cfg.get('DecayIntervalMins', 60.0))
-                            decay_per_interval = float(cfg.get('DecayPercentPerInterval', 0.0))
-                            if decay_per_interval > 0 and interval_mins > 0:
-                                ee_pc = (duration_mins / interval_mins) * decay_per_interval
-                                if not cfg.get('EEAllowLoss', False):
-                                    ee_pc = min(ee_pc, 100.0)
-                                if ee_pc > 0:
-                                    ee_status = f" [EE: -{ee_pc:.1f}%]"
-                    hedge_status = ""
-                    if is_in_trade and cfg.get('UseStepHedge', False) and int(row.get('current_step', 0)) >= int(cfg.get('HedgeStartStep', 99)):
-                        hedge_status = " 🛡️ [HEDGED]"
-
-                    if is_in_trade:
-                        res['Trigger'] = f"In Trade{ee_status}{hedge_status} ({desc_trigger})"
-                    else:
-                        res['Trigger'] = desc_trigger
-                    
-                    # 2. Active Orders
-                    try:
-                        bot_id = int(row['id'])
-                    except (ValueError, TypeError):
-                        bot_id = row['id']
-                        
-                    # Filter market_orders (deduplicated)
-                    my_orders = [o for o in market_orders if str(o.get('clientOrderId') or '').startswith(f"CQB_{bot_id}_")]
-
-                    if my_orders:
-                        detailed = []
-                        is_hedged = False
-                        for o in my_orders:
-                            cid = o.get('clientOrderId', '')
-                            price_val = float(o.get('price', 0.0) or 0.0)
-                            if 'TP' in cid: 
-                                detailed.append('TP')
-                                res['TP_Price'] = price_val
-                            elif 'GRID' in cid: 
-                                detailed.append('GRID')
-                                res['Grid_Price'] = price_val
-                                res['Grid_Amount'] = float(o.get('origQty', o.get('amount', 0.0)) or 0.0)
-                            elif 'HEDGE' in cid:
-                                detailed.append('HEDGE')
-                                is_hedged = True
-                            elif 'ENTRY' in cid: detailed.append('ENTRY')
-                            else: detailed.append('LIMIT')
-                        
-                        count_str = f"{len(my_orders)} " + (f"({', '.join(detailed)})" if detailed else "")
-                        res['Orders'] = count_str
-                        if is_hedged:
-                             res['Trigger'] = f"🛡️ HEDGED | {res['Trigger']}"
-                    else:
-                        res['Orders'] = "0"
-                            
-                except Exception as e: 
-                    res['Trigger'] = f"⚠️ ERR: {type(e).__name__} - {str(e)}"
-                    print(f"UI Extract Error: {e}")
-                return res
-
-            info_df = df_pos.apply(extract_info, axis=1, result_type='expand')
-            df_pos['Trigger Condition'] = info_df['Trigger']
-            df_pos['Active Orders'] = info_df['Orders']
-            def format_tp_price(x):
-                if x <= 0: return "-"
-                if x < 1.0:    return f"${x:.4f}"   # sub-dollar assets like SUI, DOGE
-                if x < 10.0:   return f"${x:.3f}"   # low-dollar assets
-                return f"${x:,.2f}"                 # normal assets
-            df_pos['Active TP'] = info_df['TP_Price'].apply(format_tp_price)
-            df_pos['Next Grid'] = info_df.apply(
-                lambda row: f"{row['Grid_Amount']} @ {format_tp_price(row['Grid_Price'])}" if row.get('Grid_Price', 0) > 0 else "-",
-                axis=1
-            )
-            
-            # --- PERFORMANCE MATRIX (Enterprise Batch View) ---
-            # Calculate dense metrics for 20+ bots
-            st.markdown("### ⚡ Batch Performance Matrix")
-            try:
-                matrix_df = df_pos.copy()
-                
-                # 1. PnL Estimate Column
-                def est_profit(row):
-                    if row['total_invested'] > 0 and row['avg_entry_price'] > 0 and row['target_tp_price'] > 0:
-                        ee_full_decay = False
-                        if 'Trigger Condition' in row and isinstance(row['Trigger Condition'], str):
-                            if '-100.0%]' in row['Trigger Condition'] or '-100%]' in row['Trigger Condition']:
-                                ee_full_decay = True
-                        if ee_full_decay:
-                            return "$0.00 (Break-Even)"
-                        
-                        qty = row['total_invested'] / row['avg_entry_price']
-                        if row['direction'] == 'LONG':
-                            profit = (row['target_tp_price'] - row['avg_entry_price']) * qty
-                        else:
-                            profit = (row['avg_entry_price'] - row['target_tp_price']) * qty
-                        try:
-                            # ROI% = profit / notional invested (position size, not margin)
-                            roi_pct = (profit / row['total_invested']) * 100
-                            # ROE% = profit / margin (notional / leverage) — matches Binance UI
-                            try:
-                                cfg_raw = json.loads(row.get('config', '{}') or '{}')
-                                lev = float(cfg_raw.get('leverage', 1) or 1)
-                            except Exception:
-                                lev = 1.0
-                            roe_pct = roi_pct * lev
-                            sign = "+" if profit >= 0 else ""
-                            warn = " ⚠️ (Inverted TP)" if profit < 0 else ""
-                            if lev > 1:
-                                return f"${profit:,.2f} ({sign}{roi_pct:.2f}% | ROE {sign}{roe_pct:.1f}%){warn}"
-                            else:
-                                return f"${profit:,.2f} ({sign}{roi_pct:.2f}%){warn}"
-                        except Exception:
-                            return f"${profit:,.2f}"
-                    return "-"
-                
-                matrix_df['Expected Profit'] = matrix_df.apply(est_profit, axis=1)
-                
-                # 2. Time in Trade Column
-                current_time = time.time()
-                def time_in_trade(row):
-                    if row['total_invested'] > 0 and row['basket_start_time'] > 0:
-                        sec = current_time - row['basket_start_time']
-                        m, s = divmod(sec, 60)
-                        h, m = divmod(m, 60)
-                        return f"{int(h)}h {int(m)}m"
-                    return "-"
-                
-                matrix_df['Time in Trade'] = matrix_df.apply(time_in_trade, axis=1)
-                
-                # 3. Format columns
-                cols_matrix = ['name', 'pair', 'direction', 'current_step', 'total_invested', 'Active TP', 'Next Grid', 'Expected Profit', 'Time in Trade', 'status']
-                matrix_df = matrix_df[[c for c in cols_matrix if c in matrix_df.columns]]
-                
-                matrix_df['total_invested'] = matrix_df['total_invested'].apply(lambda x: f"${x:,.2f}" if x > 0 else "-")
-                # Expected Profit already formatted above
-                
-                st.dataframe(matrix_df, width="stretch")
-            except Exception as e:
-                st.warning(f"Failed to render Batch Matrix: {e}")
-                
             st.divider()
-            
+
+            # --- Virtual Positions (Bot Strategies) ---
+            st.subheader("🤖 Bot Strategies (Virtual Positions)")
             if not df_pos.empty:
+                # UX Improvements: Rename Status to friendly labels
+                _status_map = {
+                    'Scanning': '🟢 SCANNING',
+                    'Waiting for Signal': '🟢 SCANNING',
+                    'IN TRADE': '🔴 IN TRADE',
+                    'ENTRY PENDING': '🟡 WAITING FOR FILL',
+                    'Stopped': '⚪ STOPPED',
+                    'STOPPED': '⚪ STOPPED',
+                }
+                df_pos['status'] = df_pos['status'].replace(_status_map)
+
+                # Extract Trigger Info & Active Orders
+                def extract_info(row):
+                    res = {
+                        'Trigger': 'N/A',
+                        'Orders': '0',
+                        'TP_Price': 0.0,
+                        'Grid_Price': 0.0,
+                        'Grid_Amount': 0.0
+                    }
+                    try:
+                        cfg = json.loads(row.get('config', '{}') or '{}')
+                        triggers = []
+
+                        # 1. Price Trigger
+                        m_p = int(cfg.get('mode_price', 0) or 0)
+                        try:
+                            t_p = float(cfg.get('price_threshold', 0) or 0)
+                        except ValueError:
+                            t_p = 0.0
+                        if m_p == 1: triggers.append(f"Price > ${t_p:,.2f}")
+                        elif m_p == 2: triggers.append(f"Price < ${t_p:,.2f}")
+
+                        # 2. Indicator Triggers
+                        if cfg.get('mode_rsi'):
+                            r_m = int(cfg['mode_rsi'] or 0)
+                            try: r_l = float(cfg.get('rsi_level', 0) or 0)
+                            except ValueError: r_l = 0.0
+                            triggers.append(f"RSI({'<' if r_m==1 else '>'}{r_l})")
+                        if cfg.get('mode_cci'):
+                            c_m = int(cfg['mode_cci'] or 0)
+                            try: c_l = float(cfg.get('cci_level', 0) or 0)
+                            except ValueError: c_l = 0.0
+                            triggers.append(f"CCI({'<' if c_m==2 else '>'}{c_l})")
+                        if cfg.get('mode_boll'):
+                            triggers.append("BOLL(Outside)")
+                        if cfg.get('mode_stoch'):
+                            s_m = int(cfg['mode_stoch'] or 0)
+                            triggers.append(f"Stoch({'Oversold' if s_m==1 else 'Overbought'})")
+
+                        # 3. Patterns
+                        for i in range(1, 5):
+                            if cfg.get(f'pat_{i}_mode'):
+                                p_m = int(cfg[f'pat_{i}_mode'] or 0)
+                                p_c = int(cfg.get(f'pat_{i}_count', 1) or 1)
+                                p_s = cfg.get(f'pat_{i}_source', 'Price')
+                                triggers.append(f"{p_s}Pat({p_c}x {'Up' if p_m==1 else 'Dn'})")
+
+                        desc_trigger = " + ".join(triggers) if triggers else "N/A"
+
+                        ee_status = ""
+                        is_in_trade = False
+                        try:
+                            inv = float(row.get('total_invested', 0) or 0)
+                            if inv > 0: is_in_trade = True
+                        except: pass
+
+                        if is_in_trade and cfg.get('UseEarlyExit', False) and row.get('basket_start_time', 0) > 0:
+                            import time as _t
+                            from datetime import datetime as _dt
+                            try:
+                                from engine.manager import calculate_early_exit_decay as _eed
+                                avg_p = float(row.get('avg_entry_price', 0) or 0)
+                                tp_p  = float(row.get('target_tp_price', 0) or 0)
+                                if avg_p > 0 and tp_p > 0:
+                                    start_dt = _dt.fromtimestamp(row.get('basket_start_time', 0))
+                                    now_dt   = _dt.fromtimestamp(_t.time())
+                                    step_n   = int(row.get('current_step', 0)) + 1
+                                    decayed_tp = _eed(start_dt, now_dt, step_n, tp_p, avg_p, cfg)
+                                    orig_spread = abs(tp_p - avg_p)
+                                    decayed_spread = abs(decayed_tp - avg_p)
+                                    if orig_spread > 0:
+                                        ee_pc = (1 - decayed_spread / orig_spread) * 100
+                                        ee_pc = max(0.0, min(ee_pc, 100.0) if not cfg.get('EEAllowLoss', False) else ee_pc)
+                                        ee_status = f" [EE: -{ee_pc:.1f}% → TP {decayed_tp:,.4f}]"
+                            except Exception:
+                                duration_mins = (_t.time() - row.get('basket_start_time', _t.time())) / 60.0
+                                grace_mins = float(cfg.get('EEGracePeriodMins', 0.0))
+                                adjusted_mins = max(0.0, duration_mins - grace_mins)
+                                
+                                interval_mins = float(cfg.get('DecayIntervalMins', 60.0))
+                                decay_per_interval = float(cfg.get('DecayPercentPerInterval', 0.0))
+                                
+                                if decay_per_interval > 0 and interval_mins > 0 and adjusted_mins > 0:
+                                    import math as _m
+                                    intervals_passed = _m.floor(adjusted_mins / interval_mins)
+                                    ee_pc = intervals_passed * decay_per_interval
+                                    if not cfg.get('EEAllowLoss', False):
+                                        ee_pc = min(ee_pc, 100.0)
+                                    if ee_pc > 0:
+                                        ee_status = f" [EE: -{ee_pc:.1f}%]"
+
+                        hedge_status = ""
+                        if is_in_trade and cfg.get('UseStepHedge', False) and int(row.get('current_step', 0)) >= int(cfg.get('HedgeStartStep', 99)):
+                            hedge_status = " 🛡️ [HEDGED]"
+
+                        if is_in_trade:
+                            res['Trigger'] = f"In Trade{ee_status}{hedge_status} ({desc_trigger})"
+                        else:
+                            res['Trigger'] = desc_trigger
+
+                        # 2. Active Orders
+                        try:
+                            bot_id = int(row['id'])
+                        except (ValueError, TypeError):
+                            bot_id = row['id']
+
+                        my_orders = [o for o in market_orders if str(o.get('clientOrderId') or '').startswith(f"CQB_{bot_id}_")]
+
+                        if my_orders:
+                            detailed = []
+                            is_hedged = False
+                            for o in my_orders:
+                                cid = o.get('clientOrderId', '')
+                                price_val = float(o.get('price', 0.0) or 0.0)
+                                if 'TP' in cid:
+                                    detailed.append('TP')
+                                    res['TP_Price'] = price_val
+                                elif 'GRID' in cid:
+                                    detailed.append('GRID')
+                                    res['Grid_Price'] = price_val
+                                    res['Grid_Amount'] = float(o.get('origQty', o.get('amount', 0.0)) or 0.0)
+                                elif 'HEDGE' in cid:
+                                    detailed.append('HEDGE')
+                                    is_hedged = True
+                                elif 'ENTRY' in cid: detailed.append('ENTRY')
+                                else: detailed.append('LIMIT')
+                            count_str = f"{len(my_orders)} " + (f"({', '.join(detailed)})" if detailed else "")
+                            res['Orders'] = count_str
+                            if is_hedged:
+                                res['Trigger'] = f"🛡️ HEDGED | {res['Trigger']}"
+                        else:
+                            res['Orders'] = "0"
+
+                    except Exception as e:
+                        res['Trigger'] = f"⚠️ ERR: {type(e).__name__} - {str(e)}"
+                        print(f"UI Extract Error: {e}")
+                    return res
+
+                info_df = df_pos.apply(extract_info, axis=1, result_type='expand')
+                df_pos['Trigger Condition'] = info_df['Trigger']
+                df_pos['Active Orders'] = info_df['Orders']
+
+                def format_tp_price(x):
+                    if x <= 0: return "-"
+                    if x < 1.0:  return f"${x:.4f}"
+                    if x < 10.0: return f"${x:.3f}"
+                    return f"${x:,.2f}"
+
+                df_pos['Active TP'] = info_df['TP_Price'].apply(format_tp_price)
+                df_pos['Next Grid'] = info_df.apply(
+                    lambda row: f"{row['Grid_Amount']} @ {format_tp_price(row['Grid_Price'])}" if row.get('Grid_Price', 0) > 0 else "-",
+                    axis=1
+                )
+
+                # --- PERFORMANCE MATRIX (Enterprise Batch View) ---
+                st.markdown("### ⚡ Batch Performance Matrix")
+                try:
+                    matrix_df = df_pos.copy()
+
+                    def est_profit(row):
+                        if row['total_invested'] > 0 and row['avg_entry_price'] > 0 and row['target_tp_price'] > 0:
+                            ee_full_decay = False
+                            if 'Trigger Condition' in row and isinstance(row['Trigger Condition'], str):
+                                if '-100.0%]' in row['Trigger Condition'] or '-100%]' in row['Trigger Condition']:
+                                    ee_full_decay = True
+                            if ee_full_decay:
+                                return "$0.00 (Break-Even)"
+                            qty = row['total_invested'] / row['avg_entry_price']
+                            if row['direction'] == 'LONG':
+                                profit = (row['target_tp_price'] - row['avg_entry_price']) * qty
+                            else:
+                                profit = (row['avg_entry_price'] - row['target_tp_price']) * qty
+                            try:
+                                roi_pct = (profit / row['total_invested']) * 100
+                                try:
+                                    cfg_raw = json.loads(row.get('config', '{}') or '{}')
+                                    lev = float(cfg_raw.get('leverage', 1) or 1)
+                                except Exception:
+                                    lev = 1.0
+                                roe_pct = roi_pct * lev
+                                sign = "+" if profit >= 0 else ""
+                                warn = " ⚠️ (Inverted TP)" if profit < 0 else ""
+                                if lev > 1:
+                                    return f"${profit:,.2f} ({sign}{roi_pct:.2f}% | ROE {sign}{roe_pct:.1f}%){warn}"
+                                else:
+                                    return f"${profit:,.2f} ({sign}{roi_pct:.2f}%){warn}"
+                            except Exception:
+                                return f"${profit:,.2f}"
+                        return "-"
+
+                    matrix_df['Expected Profit'] = matrix_df.apply(est_profit, axis=1)
+
+                    current_time = time.time()
+                    def time_in_trade(row):
+                        if row['total_invested'] > 0 and row['basket_start_time'] > 0:
+                            sec = current_time - row['basket_start_time']
+                            m, s = divmod(sec, 60)
+                            h, m = divmod(m, 60)
+                            return f"{int(h)}h {int(m)}m"
+                        return "-"
+
+                    matrix_df['Time in Trade'] = matrix_df.apply(time_in_trade, axis=1)
+
+                    cols_matrix = ['name', 'pair', 'direction', 'current_step', 'total_invested', 'Active TP', 'Next Grid', 'Expected Profit', 'Time in Trade', 'status']
+                    matrix_df = matrix_df[[c for c in cols_matrix if c in matrix_df.columns]]
+                    matrix_df['total_invested'] = matrix_df['total_invested'].apply(lambda x: f"${x:,.2f}" if x > 0 else "-")
+                    st.dataframe(matrix_df, width="stretch")
+                except Exception as e:
+                    st.warning(f"Failed to render Batch Matrix: {e}")
+
+                st.divider()
+
+                # Entry Trigger Proximity
                 scanning_bots = df_pos[df_pos['status'].str.contains('SCANNING', na=False)]
                 if not scanning_bots.empty:
                     st.markdown("#### 🎯 Entry Trigger Proximity (Scanning Bots)")
                     st.caption("Shows how close each scanning bot is to its entry signal thresholds.")
-                    
                     for _, sbot in scanning_bots.iterrows():
                         try:
-                            # Fetch config directly from DB — it's not in df_pos
                             conn_trig = get_connection()
                             _row = conn_trig.execute("SELECT config FROM bots WHERE id=?", (sbot['id'],)).fetchone()
                             conn_trig.close()
                             conf = json.loads(_row[0]) if _row else {}
                             pair_s = sbot['pair']
                             mkt_type = conf.get('market_type', 'future')
-                            
-                            # Fetch quick OHLCV using the cached fetcher (no exchange_interface needed)
                             _ohlcv = fetch_ohlcv_cached(mkt_type, pair_s, '15m')
                             if not _ohlcv or len(_ohlcv) < 20:
                                 continue
-                                
                             _df = pd.DataFrame(_ohlcv, columns=['ts','open','high','low','close','vol'])
                             _close = _df['close']
-                            
                             indicators = []
-                            
-                            # RSI
+
                             mode_rsi = int(conf.get('mode_rsi', 0))
                             if mode_rsi > 0:
                                 rsi_lvl = float(conf.get('rsi_level', 30))
@@ -1248,8 +1341,7 @@ def render_monitor_view():
                                 triggered = (live_rsi <= rsi_lvl) if mode_rsi == 1 else (live_rsi >= rsi_lvl)
                                 badge = "✅ Triggered" if triggered else ("🔥 Near" if pct_away <= 10 else ("👀 In Sight" if pct_away <= 30 else "🌑 Not Ready"))
                                 indicators.append(f"RSI: {live_rsi:.1f} (target {cond} {rsi_lvl:.0f}) — {badge}")
-                            
-                            # CCI
+
                             mode_cci = int(conf.get('mode_cci', 0))
                             if mode_cci > 0:
                                 cci_lvl = float(conf.get('cci_level', 100))
@@ -1261,7 +1353,6 @@ def render_monitor_view():
                                 badge = "✅ Triggered" if triggered else ("🔥 Near" if pct_away <= 10 else ("👀 In Sight" if pct_away <= 30 else "🌑 Not Ready"))
                                 indicators.append(f"CCI: {live_cci:.1f} (target {cond} {cci_lvl:.0f}) — {badge}")
 
-                            # Stochastic
                             mode_stoch = int(conf.get('mode_stoch', 0))
                             if mode_stoch > 0:
                                 from engine.indicators import stochastic
@@ -1273,7 +1364,6 @@ def render_monitor_view():
                                 badge = "✅ Triggered" if triggered else ("🔥 Near" if pct_away <= 20 else ("👀 In Sight" if pct_away <= 60 else "🌑 Not Ready"))
                                 indicators.append(f"Stoch %K: {live_k:.1f} (target {cond}) — {badge}")
 
-                            # Price Threshold
                             mode_price = int(conf.get('mode_price', 0))
                             if mode_price > 0:
                                 p_thresh = float(conf.get('price_threshold', 0))
@@ -1284,8 +1374,7 @@ def render_monitor_view():
                                     pct_away = abs(curr_p - p_thresh) / p_thresh * 100
                                     badge = "✅ Triggered" if triggered else ("🔥 Near" if pct_away <= 2 else ("👀 In Sight" if pct_away <= 10 else "🌑 Not Ready"))
                                     indicators.append(f"Price: {curr_p:.4f} (target {cond} {p_thresh:.4f}) — {badge}")
-                            
-                            # Bollinger Bands
+
                             mode_boll = int(conf.get('mode_boll', 0))
                             if mode_boll > 0:
                                 from engine.indicators import bollinger_bands
@@ -1295,56 +1384,44 @@ def render_monitor_view():
                                 curr_p = float(_close.iloc[-1])
                                 b_up = float(upper.iloc[-1])
                                 b_dn = float(lower.iloc[-1])
-
-                                if mode_boll == 1:  # Outside Lower — price below lower band
+                                if mode_boll == 1:
                                     triggered = curr_p < b_dn
                                     dist = abs(curr_p - b_dn) / curr_p * 100
                                     badge = "✅ Triggered" if triggered else ("🔥 Near" if dist <= 1 else ("👀 In Sight" if dist <= 3 else "🌑 Not Ready"))
                                     indicators.append(f"BOLL: Outside Lower (Dist: {dist:.2f}%) — {badge}")
-                                elif mode_boll == 2:  # Outside Upper — price above upper band
+                                elif mode_boll == 2:
                                     triggered = curr_p > b_up
                                     dist = abs(curr_p - b_up) / curr_p * 100
                                     badge = "✅ Triggered" if triggered else ("🔥 Near" if dist <= 1 else ("👀 In Sight" if dist <= 3 else "🌑 Not Ready"))
                                     indicators.append(f"BOLL: Outside Upper (Dist: {dist:.2f}%) — {badge}")
-                                    
-                            # ATR Percent/Expansion
-                            mode_atrp = int(conf.get('mode_atrp', 0))
-                            if mode_atrp > 0:
+
+                            if int(conf.get('mode_atrp', 0)) > 0:
                                 indicators.append(f"ATR % Active (Target > {conf.get('atrp_level', 0)}%)")
-                            mode_atre = int(conf.get('mode_atre', 0))
-                            if mode_atre > 0:
+                            if int(conf.get('mode_atre', 0)) > 0:
                                 indicators.append(f"ATR Exp Active (Mult {conf.get('atre_mult', 0)})")
-                            
-                            # Patterns
-                            patterns = []
-                            if int(conf.get('pat_1_mode', 0)) > 0: patterns.append("Pat 1")
-                            if int(conf.get('pat_2_mode', 0)) > 0: patterns.append("Pat 2")
-                            if int(conf.get('pat_3_mode', 0)) > 0: patterns.append("Pat 3")
-                            if int(conf.get('pat_4_mode', 0)) > 0: patterns.append("Pat 4")
+
+                            patterns = [f"Pat {i}" for i in range(1, 5) if int(conf.get(f'pat_{i}_mode', 0)) > 0]
                             if patterns:
                                 indicators.append(f"Patterns: {', '.join(patterns)} Active")
-                            
+
                             with st.expander(f"📡 {sbot['name']} ({pair_s}) — {'No active triggers configured' if not indicators else f'{len(indicators)} trigger(s)'}", expanded=False):
                                 if indicators:
                                     for ind in indicators:
                                         st.write(f"  • {ind}")
                                 else:
                                     st.caption("No entry triggers (RSI/CCI/Stoch/Price) are enabled for this bot.")
-                                    
                         except Exception as e_trig:
                             st.caption(f"  ⚠️ Could not load triggers for {sbot.get('name','?')}: {e_trig}")
 
-            st.markdown("### ⚙️ Detailed Bot State (Debug View)")
-            
-            # Reorder columns for readability
-            cols = ['name', 'pair', 'direction', 'status', 'Active Orders', 'Trigger Condition', 'current_step', 'total_invested', 'avg_entry_price']
-            # Filter strictly for columns that exist
-            existing_cols = [c for c in cols if c in df_pos.columns]
-            
-            st.dataframe(df_pos[existing_cols], width="stretch")
-        else:
-            st.info("No active bots.")
+                st.markdown("### ⚙️ Detailed Bot State (Debug View)")
+                cols = ['name', 'pair', 'direction', 'status', 'Active Orders', 'Trigger Condition', 'current_step', 'total_invested', 'avg_entry_price']
+                existing_cols = [c for c in cols if c in df_pos.columns]
+                st.dataframe(df_pos[existing_cols], width="stretch")
+            else:
+                st.info("No active bots.")
 
+        # Invoke the fragment (passes current data snapshot into the isolated block)
+        _bot_positions_fragment(df_physical, df_pos, virtual_gross_usd)
 
     with tab_charts:
         st.subheader(f"📈 Live Market Chart: {symbol} ({timeframe})")
@@ -1360,7 +1437,7 @@ def render_monitor_view():
                                 close=df_ohlcv['close'],
                                 name='Price')])
                 
-                # If a bot is focused and in trade, add entry lines
+                # 🚀 UPGRADE 2: Visual Intelligence Overlays
                 if selected_bot_id:
                     # Fetch current bot status for lines
                     cur_bot = df_pos[df_pos['id'] == selected_bot_id]
@@ -1368,12 +1445,36 @@ def render_monitor_view():
                         be = float(cur_bot.iloc[0]['avg_entry_price'] or 0)
                         tp = float(cur_bot.iloc[0]['target_tp_price'] or 0)
                         
+                        # 1. Average Entry (Yellow Solid)
                         if be > 0:
-                            fig.add_hline(y=be, line_dash="dash", line_color="blue", 
-                                          annotation_text=f"Avg Entry: {be:,.2f}")
+                            fig.add_hline(y=be, line_dash="solid", line_color="#FFD700", 
+                                          annotation_text=f"ENTRY: {be:,.4f}", 
+                                          annotation_position="top left")
+                        
+                        # 2. Take Profit (Green Solid)
                         if tp > 0:
-                            fig.add_hline(y=tp, line_dash="dash", line_color="green", 
-                                          annotation_text=f"Take Profit: {tp:,.2f}")
+                            fig.add_hline(y=tp, line_dash="solid", line_color="#00FF00", 
+                                          annotation_text=f"TP: {tp:,.4f}", 
+                                          annotation_position="bottom right")
+
+                    # 3. Active Grid/Safety Orders (Orange Dashed)
+                    # Filter exchange orders for THIS bot specifically
+                    prefix = f"CQB_{selected_bot_id}_"
+                    bot_orders = [o for o in market_orders if str(o.get('clientOrderId', '')).startswith(prefix)]
+                    
+                    grid_orders = [o for o in bot_orders if 'GRID' in str(o.get('clientOrderId', ''))]
+                    # Sort by proximity to current price
+                    last_price = float(df_ohlcv['close'].iloc[-1])
+                    grid_orders.sort(key=lambda x: abs(float(x.get('price', 0)) - last_price))
+                    
+                    # Limit to next 10 for readability as requested
+                    for i, order in enumerate(grid_orders[:10]):
+                        g_price = float(order.get('price', 0))
+                        if g_price > 0:
+                            fig.add_hline(y=g_price, line_dash="dash", line_color="#FFA500", 
+                                          annotation_text=f"GRID {i+1}", 
+                                          annotation_position="bottom left",
+                                          opacity=0.6)
 
                 fig.update_layout(
                     height=500,
@@ -1477,27 +1578,26 @@ def render_monitor_view():
         except Exception as e:
             st.error(f"Error loading trade history: {e}")
 
-    # --- Auto-Refresh Upgrade ---
+    # --- Auto-Refresh (Legacy full-page fallback) ---
+    # NOTE: The main bot metrics section is now a @st.fragment that self-refreshes
+    # every 15 seconds. The legacy st_autorefresh below is kept for the header
+    # metrics at the top of the page (equity, balance, PnL) which are NOT
+    # wrapped in a fragment and require a full-page rerun to update.
     if auto_refresh and not wizard_active:
-        from streamlit_autorefresh import st_autorefresh
+        import streamlit_autorefresh
         from datetime import datetime
-        # 🚀 UI PERFORMANCE BATCHING: Now that rendering is async/cached, we can safely refresh every 15s
-        refresh_count = st_autorefresh(interval=15000, limit=None, key="monitor_autorefresh")
-        
-        # When the auto-refresh triggers a rerun, the counter increments.
-        # We explicitly clear the cache to mirror the "Refresh Now" button's behavior.
+        refresh_count = streamlit_autorefresh.st_autorefresh(interval=30000, limit=None, key="monitor_autorefresh")
         if "last_autorefresh_count" not in st.session_state:
             st.session_state.last_autorefresh_count = refresh_count
         elif refresh_count != st.session_state.last_autorefresh_count:
             st.session_state.last_autorefresh_count = refresh_count
             st.cache_data.clear()
-
-        st.caption(f"⏱️ Last Updated: {datetime.now().strftime('%H:%M:%S')} (Auto-refreshes every 15s)")
+        st.caption(f"⏱️ Header updated: {datetime.now().strftime('%H:%M:%S')} | Bot grid auto-refreshes every 15s via fragment.")
     elif wizard_active:
         st.warning(
-            "⏸ **Auto-Refresh Paused** — Reconciler wizard is active. "
+            "⏸ **Auto-Refresh Paused** \u2014 Reconciler wizard is active. "
             "Refreshing now would wipe your in-progress recovery work. "
             "Complete or dismiss the wizard to resume automatic updates."
         )
     else:
-        st.caption("ℹ️ Tip: Auto-Refresh is OFF. Toggle it in the sidebar for real-time updates.")
+        st.caption("ℹ️ Tip: Auto-Refresh is OFF. Toggle it above for real-time updates.")

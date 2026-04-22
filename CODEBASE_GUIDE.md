@@ -1,5 +1,5 @@
 # Crypto Quant Bot — AI Agent Codebase Guide
-**Version: 1.8.5 | Last Updated: 2026-04-17**
+**Version: 2.0.0 | Last Updated: 2026-04-22**
 
 > **READ THIS FIRST** before touching any code. This is the single authoritative guide.
 > It supersedes `UNIFIED_BOT_DOCUMENTATION.md` and all older session notes.
@@ -231,6 +231,16 @@ cycle open time, crashing fresh grids toward break-even prematurely.
 Administrative exits (`SYSTEM_WIPE`, `MANUAL_CLOSE`, `STOP_LOSS_EXIT`) must NEVER trigger carry-over.
 `reset_bot_after_tp` uses `action_label` to detect admin exits and skip carry propagation.
 
+### 3.14. Decimal Precision Guardian (v1.9.4)
+All trading mathematics, specifically price and quantity rounding, MUST use `decimal.Decimal` with fixed-point arithmetic. 
+- **Rule**: Initialize all decimals using string serialization: `Decimal(str(value))`. This strips absolute binary floating-point noise (e.g., `.699999999`) and restores the intended human-readable value.
+- **Rule**: `math.floor` and `math.ceil` are forbidden for lot-size and price calculations. Use `exchange.round_to_step()` and `exchange.ceil_to_step()` which encapsulate the Decimal quantize engine.
+
+### 3.15. Succession Proof — 99% Milestone Rule (v1.9.1)
+To ensure the Virtual Ledger remains the "Absolute Ground Truth," bot steps only progress to the next grid level when the current step's fill probability is effectively certain.
+- **Rule**: `current_step` only advances if `filled_amount / target_amount >= 0.99`.
+- **Reasoning**: This prevents the bot from "calculating forward" on partial fills, ensuring that the ledger and exchange stay in locked parity.
+
 ---
 
 ## 4. Reconciler Architecture
@@ -305,6 +315,24 @@ After restart, watch for:
 
 ## 7. Version History (Change Log)
 
+### v2.0.0 — 2026-04-22
+**Major Release: Autonomous Reconciliation Stabilization.**
+**Root causes resolved: (1) Deterministic ID parsing fixed infinite loop ghost-sweeping. (2) Pair-Consensus awareness fixed One-Way mode drift alerts. (3) Atomic TP Sync fixed API replacement race conditions. (4) Inline Grid Fill processing cleared DB locks.**
+
+**bot_executor.py**:
+- **Deterministic ID Parser**: Replaced tag-based `_GRID_N_` string matching with rigorous `get_step_from_cid` logic. This prevents the Ghost Sweeper from accidentally cancelling valid current-step orders due to string mismatch, which was the source of the infinite "Blocked by Local DB Lock" loop.
+- **Pair-Consensus Drift Alert**: Integrated sibling-bot virtual position awareness. In One-Way mode, the engine now calculates expected physical position as `(this_bot_virtual - sibling_bot_virtual)`. This eliminates false-positive drift alerts for hedged pairs (e.g. SUI LONG vs SUI SHORT).
+- **Atomic TP Sync**: Implemented `_sync_replace_tp` with state restoration. If a new TP placement fails, the old order is restored to `open` in the DB, preventing the system from "forgetting" the TP and entering an endless sync storm.
+- **Inline Grid Fill**: Fills detected during maintenance are now processed immediately via `credit_fill` + `seal_trade_state`, clearing the `local_grid_ids` lock without waiting for the secondary offline reconciler.
+- **Null-Tolerant Ghost Sweeper**: Updated all order filters to handle `NULL`, `'BOTH'`, and Empty-string `position_side` values for legacy and one-way compatibility.
+
+**database.py**:
+- **Cent-Level Precision**: Standardized all parity checks to a **$0.01 threshold**. This eliminates "Impossible Loop" deadlocks caused by sub-cent floating point discrepancies.
+- **Dynamic ID Back-filling**: Enhanced `get_bot_order_ids` to self-heal `PLACING_` placeholders in the `trades` table using `status='new'` confirmations from Binance.
+
+**reconciler.py**:
+- **Drift-First Protection**: Grid placement is now atomically blocked if a significant ledger discrepancy is detected, ensuring the bot never "calculates forward" on a corrupt basis.
+
 ### v1.8.4 — 2026-04-17
 **Root causes: (1) SYNC-DRIFT check re-computed TP from formula instead of reading placed price. (2) `.env` corrupted by test writing MagicMock objects via `set_key()`.**
 
@@ -354,6 +382,19 @@ After restart, watch for:
 **database.py**:
 - `recompute_invested_from_orders`: Early-return path returned 3-tuple; callers expect 4-tuple.
   Changed to `return 0.0, 0.0, 0.0, 0.0`.
+
+### v1.8.4 — 2026-04-20
+**Root causes: (1) Hardcoded 1.0 threshold in reconciler wiped small positions. (2) Binance -4061 failure on One-Way mode accounts.**
+
+**reconciler.py**:
+- **Structural Ghost Safe-Guard**: Replaced `if phys_qty > 1.0` with `if phys_qty > 0`. This ensures high-value, small-quantity positions (BTC/ETH) are protected from accidental wipes.
+- **Precision Alignment**: All qty-gap checks now use a calibrated `QTY_EPSILON` (0.0001) to distinguish between real positions and floating-point noise.
+
+**exchange_interface.py**:
+- **One-Way Mode Auto-Repair**: Added a retry mechanism for `Binance -4061` errors. If an account is in One-Way mode, the engine automatically omits `positionSide` and retries, enabling autonomous operation across all account types.
+
+**database.py**:
+- **Accounting Side-Tolerence**: Audited and patched `position_side` filters to be NULL/BOTH tolerant, ensuring multi-bot ledger integrity.
 
 ### v1.8.2 — 2026-04-16
 **Root causes: (1) `get_bot_order_ids` missed grid orders with Binance's `'new'` status. (2) `trades.tp_order_id` permanently stuck with `PLACING_` placeholder.**
@@ -509,3 +550,22 @@ GLOBAL_STOP_LOSS_PCT=70.0
 ```
 
 If `.env` ever gains extra garbage lines (e.g. after a test run), restore this exact structure manually.
+
+## 7. Reconciliation & Virtual Hedging
+
+### One-Way Mode Virtual Hedging
+- The system supports "Virtual Hedging" where multiple bots trade the same pair in One-Way mode.
+- **Consensus Rule**: Individual bot drift is tolerated if the **Sum of System Ledgers** matches the **Exchange Net Position**.
+- **Thresholds**: Alerts trigger at **$0.01 (1 cent)**. The system aims for absolute parity.
+
+### Grid Placement Lockout (Safety Mechanism)
+- **Lockout Rule**: If a bot has a pending reconciliation mismatch (`requires_manual_intervention = 1`), the Engine will **atomically block** grid placement.
+- **Purpose**: This prevents the bot from "fighting" a mismatch or placing orders based on an unconfirmed average price.
+- **Clearing Lockouts**:
+    1. **Auto-Adoption**: If the bot is the sole bot for a pair and the direction matches, the system will auto-adopt the exchange state and clear the lockout.
+    2. **Forensic Adopt**: Use the "Forensic Adopt" tool in the UI to scan history and force-sync the ledger.
+    3. **Manual Reset**: Cycle the bot to Step 0 if the exchange is flattened.
+
+### Dust-Aware Completion
+- Bots will automatically transition to **Step 0 (Scanning)** if the residual notional value is **< $1.00 USD** after an Exit Order (TP).
+- The residual "dust" is cleared from the database to prevent "Impossible Loop" deadlocks.

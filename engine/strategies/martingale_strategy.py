@@ -40,20 +40,24 @@ class MartingaleStrategy(BaseStrategy):
         self.tick_size = metadata.get('tick_size', 0.0001)
 
     def _round_price(self, price: float) -> float:
-        """Round to exchange tick_size — the ONLY correct way to prepare a price for the exchange."""
+        """Round to exchange tick_size using Decimal precision."""
         if not self.tick_size or self.tick_size <= 0:
             return price
-        import math
-        precision = int(-math.log10(self.tick_size)) if self.tick_size < 1 else 0
-        return round(math.floor(price / self.tick_size) * self.tick_size, precision)
+        from decimal import Decimal, ROUND_FLOOR
+        d_val = Decimal(format(price, '.15g'))
+        d_step = Decimal(format(self.tick_size, '.15g'))
+        rounded = (d_val / d_step).quantize(Decimal('1'), rounding=ROUND_FLOOR) * d_step
+        return float(rounded)
 
     def _round_qty(self, qty: float) -> float:
-        """Round to exchange step_size for quantities."""
+        """Round to exchange step_size for quantities using Decimal precision."""
         if not self.step_size or self.step_size <= 0:
             return qty
-        import math
-        precision = int(-math.log10(self.step_size)) if self.step_size < 1 else 0
-        return round(math.floor(qty / self.step_size) * self.step_size, precision)
+        from decimal import Decimal, ROUND_FLOOR
+        d_val = Decimal(format(qty, '.15g'))
+        d_step = Decimal(format(self.step_size, '.15g'))
+        rounded = (d_val / d_step).quantize(Decimal('1'), rounding=ROUND_FLOOR) * d_step
+        return float(rounded)
 
     def check_signals(self, market_data: pd.DataFrame, current_price_float: float = None,
                        multi_tf_data: dict = None) -> tuple[bool, bool]:
@@ -392,9 +396,6 @@ class MartingaleStrategy(BaseStrategy):
         """
         Calculates the quantity (amount) for the Take Profit order.
         Strictly relies on the mathematically perfect Virtual Ledger.
-        In Binance One-Way Mode, multiple bots across opposing directions mathematically Net out
-        on the exchange orderbook. Using the aggregate physical position size would erroneously
-        clip identical Long and Short bots down to 0, trapping their Take Profits.
         """
         avg_price = float(bot_status.get('avg_entry_price', 1.0))
         if avg_price <= 0:
@@ -409,9 +410,7 @@ class MartingaleStrategy(BaseStrategy):
         Returns: (price, explanation_string)
         """
         try:
-            # 🚀 HARMONIZED KEYS: Support both UI 'StepPct' and engine 'grid_dist_pct'
             dist_pct = float(self.params.get('grid_dist_pct', self.params.get('StepPct', 1.0)))
-            # 🛡️ SAFETY FLOOR: Prevent 0.0 or negative distance which causes 'Same Price' ordering
             dist_pct = max(0.1, dist_pct)
             
             direction = self.params.get('direction', 'LONG').upper()
@@ -422,19 +421,11 @@ class MartingaleStrategy(BaseStrategy):
             
             explanation = []
             
-            # 1. Calculate Base Distance
             if use_atr:
                  try:
                      atr_period = int(self.params.get('ATRPeriods', 14))
                      atr_factor = float(self.params.get('ATRGridFactor', 1.0))
-
-                     # 🚀 FUNDAMENTAL FIX: Use the CONFIGURED ATR timeframe, not just the 1-min feed.
-                     # The bot config has 'ATR_Timeframe' (e.g. '15m', '1h'). If multi_tf_data is provided,
-                     # select the correct candle series. Otherwise fall back to the 1-min market_data.
-                     # Note: support 'ATR_Timeframe' (UI key), 'ATRTimeframe', and 'atr_tf' as fallbacks.
-                     atr_tf = (self.params.get('ATR_Timeframe')
-                               or self.params.get('ATRTimeframe')
-                               or self.params.get('atr_tf', ''))
+                     atr_tf = (self.params.get('ATR_Timeframe') or self.params.get('ATRTimeframe') or self.params.get('atr_tf', ''))
                      atr_df = None
                      if multi_tf_data and atr_tf and atr_tf in multi_tf_data:
                          candidate = multi_tf_data[atr_tf]
@@ -443,101 +434,46 @@ class MartingaleStrategy(BaseStrategy):
                      if atr_df is None and hasattr(market_data, 'empty') and not market_data.empty:
                          atr_df = market_data
 
-                     # Smart display: use enough decimal places to show a non-zero value
                      def _fmt(v): return f"{v:.6f}".rstrip('0').rstrip('.') if v < 0.01 else f"{v:.4f}" if v < 1.0 else f"{v:.2f}"
 
                      if atr_df is not None and len(atr_df) >= atr_period:
-                         atr_val = iATR(atr_df['high'], atr_df['low'], atr_df['close'], atr_period)
-                         # Safety floor: if ATR is too small (< 0.01% of price), fall back to price-relative distance
-                         min_atr_floor = current_price * 0.0001  # 0.01% of price
-                         if atr_val <= 0 or atr_val < min_atr_floor:
-                             # Fallback to percentage-relative distance (safe for any asset)
-                             pct_fallback = current_price * (dist_pct / 100.0)
-                             logger.warning(f"ATR({atr_period},{atr_tf or '1m'})={_fmt(atr_val)} below floor ({_fmt(min_atr_floor)}), using {dist_pct}% = {_fmt(pct_fallback)} instead.")
-                             grid_dist = pct_fallback
-                             explanation.append(f"ATR({atr_period},{atr_tf or '1m'})={_fmt(atr_val)} [FLOOR->{dist_pct}%={_fmt(pct_fallback)}]")
-                         else:
-                             grid_dist = atr_val * atr_factor
-                             explanation.append(f"ATR({atr_period},{atr_tf or '1m'})={_fmt(atr_val)} * {atr_factor}")
+                          atr_val = iATR(atr_df['high'], atr_df['low'], atr_df['close'], atr_period)
+                          # 🚀 STRICT STRATEGY: No fallbacks.
+                          if atr_val > 0:
+                              grid_dist = atr_val * atr_factor
+                              explanation.append(f"ATR({atr_period},{atr_tf or '1m'})={_fmt(atr_val)} * {atr_factor}")
+                          else:
+                              logger.warning(f"ATR is 0 for {atr_tf or '1m'}. Aborting.")
+                              return 0.0, "ERROR_ATR_ZERO"
                      else:
-                         # Not enough candle data yet — fall back to % distance
-                         pct_fallback = current_price * (dist_pct / 100.0)
-                         logger.warning(f"ATR: insufficient {atr_tf or '1m'} data, using {dist_pct}% = {_fmt(pct_fallback)}.")
-                         grid_dist = pct_fallback
-                         explanation.append(f"ATR no-data [FALLBACK {dist_pct}%]")
+                          logger.warning(f"ATR: insufficient {atr_tf or '1m'} data. Aborting.")
+                          return 0.0, "ERROR_INSUFFICIENT_DATA"
                  except Exception as e:
-                     logger.error(f"ATR Calc failed: {e}")
-                     grid_dist = current_price * (dist_pct / 100.0)  # Safe fallback for any asset
-                     explanation.append(f"ATR Fail (Fallback {dist_pct}%)")
+                      logger.error(f"ATR Calc failed: {e}")
+                      return 0.0, f"ERROR_ATR_EXCEPTION"
             else:
-                 # Standard Percentage or Fixed Pips?
-                 # Old logic used 'grid_dist_pct' (Percentage).
-                 # UI Projection used 'base_grid' (Pips/Raw).
-                 # We need to support BOTH or standardize.
-                 # Let's standardize on PERCENTAGE for default, but if 'UseATRGrid' is OFF, check if 'base_grid' is preferred?
-                 # Param `grid_dist_pct` suggests % based.
-                 # Let's check `calculate_next_grid_price` (UI algo). It prefers `base_grid` (which implies price delta, not %).
-                 # BUT default settings usually use %.
-                 # Let's stick to PERCENTAGE if ATR is OFF, to avoid breaking existing users who rely on %?
-                 # Wait, `calculate_next_grid_price` uses `base_grid` as fallback.
-                 # I will preserve `grid_dist_pct` as the primary non-ATR logic for now, to be safe.
-                 
                  grid_dist = current_price * (dist_pct/100.0)
                  explanation.append(f"Fixed {dist_pct}%")
 
-            # 2. Calculate NEXT-STEP distance only (not cumulative)
-            # Each grid order is placed 1 step-distance from the avg_entry, not a sum of all steps.
-            # Cumulative approach caused the grid price to overshoot the market, triggering the GAP RECOVERY
-            # loop which then re-placed at the same invalid offset every cycle.
             grid_mult = float(self.params.get('GridMultiplier', 1.0))
-            # Apply multiplier for the NEXT step only (step is already the current step count)
-            next_step_dist = grid_dist * (grid_mult ** step)
-            final_dist = next_step_dist
+            final_dist = grid_dist * (grid_mult ** step)
             if grid_mult != 1.0:
                 explanation.append(f"Step {step} dist (mult={grid_mult}^{step})")
 
-            # 3. Calculate Price from reference (avg_entry is most stable, falls back to current_price)
             ref_price = avg_entry if avg_entry > 0 else current_price
-            
-            # Calculate next grid order price: 1 step beyond the current avg entry
-            if direction == 'LONG':
-                price = ref_price - final_dist
-            else:
-                price = ref_price + final_dist
+            price = ref_price - final_dist if direction == 'LONG' else ref_price + final_dist
 
-            # 🚀 GAP RECOVERY: If calculated grid crossed market (e.g. after a fast move),
-            # use 1 step-distance from current_price instead (still a valid, BETTER price for the bot).
-            is_invalid = False
-            if direction == 'LONG' and price > current_price:
-                 is_invalid = True  # Buy Order ABOVE Market → use recovery
-            elif direction == 'SHORT' and price < current_price:
-                 is_invalid = True  # Sell Order BELOW Market → use recovery
-            
+            # Gap Recovery
+            is_invalid = (direction == 'LONG' and price > current_price) or (direction == 'SHORT' and price < current_price)
             if is_invalid:
-                def _p(v): return f"{v:.6f}".rstrip('0').rstrip('.') if v < 1.0 else f"{v:.4f}" if v < 10.0 else f"{v:,.2f}"
-                # Recovery: use a SINGLE-step offset from the current market price
-                # This produces a valid limit order that is 1 ATR-step beyond current price
-                if direction == 'LONG':
-                    price = current_price - final_dist
-                else:
-                    price = current_price + final_dist
-                logger.info(f"📐 Gap Recovery: Grid {_p(ref_price - final_dist if direction == 'LONG' else ref_price + final_dist)} crossed Market {_p(current_price)}. Recovery → {_p(price)}.")
+                price = current_price - final_dist if direction == 'LONG' else current_price + final_dist
                 explanation.append("GapRecovery")
                 
-                # Final safety: if recovery price still invalid (e.g. extreme volatility), skip
-                if direction == 'LONG' and price > current_price:
-                    logger.warning(f"⛔ Gap Recovery still invalid for {direction}. Skipping grid placement.")
-                    return 0.0, "GapRecovery-INVALID"
-                elif direction == 'SHORT' and price < current_price:
-                    logger.warning(f"⛔ Gap Recovery still invalid for {direction}. Skipping grid placement.")
+                if (direction == 'LONG' and price > current_price) or (direction == 'SHORT' and price < current_price):
                     return 0.0, "GapRecovery-INVALID"
 
-            # 🚀 UNIVERSAL PRECISION: Use exchange tick_size for all grid prices
             final_price = self._round_price(price)
-
-            def _fmt_dist(v): return f"{v:.6f}".rstrip('0').rstrip('.') if v < 0.01 else f"{v:.4f}" if v < 1.0 else f"{v:.2f}"
-            explain_str = f"Grid: {' | '.join(explanation)} -> Dist {_fmt_dist(final_dist)}"
-            return final_price, explain_str
+            return final_price, f"Grid: {' | '.join(explanation)} -> Dist {final_dist:.6f}"
 
         except Exception as e:
             logger.error(f"Error calculating grid price: {e}")
@@ -545,203 +481,117 @@ class MartingaleStrategy(BaseStrategy):
 
     def calculate_grid_order_amount(self, bot_status: Dict, current_price: float, pair: str, exchange: Any) -> float:
         step = int(bot_status.get('current_step', 0))
-        # Reuse lot size logic
-        # 🚀 BUG FIX: Pass 'step' exactly to ensure the exponent computes M^step. 
-        # Previously passed step + 1, skipping M^1 and jumping straight from M^0 (Entry) to M^2.
         return self.calculate_lot_size(step, 10000, market_data=current_price)
 
     def _apply_volatility_sizing(self, base_size: float, market_data: Any) -> float:
-        """
-        Adjusts the position size based on relative volatility.
-        Ratio = ATR(100) / ATR(14). 
-        - High Vol (ATR > AVG) -> Smaller Size
-        - Low Vol (ATR < AVG) -> Larger Size
-        """
         if not self.params.get('UseVolSizing', False):
             return base_size
-            
         if not isinstance(market_data, pd.DataFrame) or market_data.empty:
             return base_size
-            
         try:
             atr_period = int(self.params.get('ATRPeriods', 14))
-            # Baseline (SMA 100) vs Short-term (SMA 14)
             baseline_atr = iATR(market_data['high'], market_data['low'], market_data['close'], 100)
             current_atr = iATR(market_data['high'], market_data['low'], market_data['close'], atr_period)
-            
             if baseline_atr > 0 and current_atr > 0:
                 vol_mult = baseline_atr / current_atr
-                # Safety Clamp: don't let size swing more than 5x or less than 0.2x
                 vol_mult = max(0.2, min(vol_mult, 5.0))
-                
-                adjusted_size = base_size * vol_mult
-                logger.info(f"📊 Vol Sizing: Base ${base_size:.2f} * {vol_mult:.2f}x (ATR100/ATR{atr_period}) -> ${adjusted_size:.2f}")
-                return adjusted_size
-        except Exception as e:
-            logger.error(f"Volatility sizing calculation failed: {e}")
-            
+                return base_size * vol_mult
+        except:
+            pass
         return base_size
 
     def calculate_lot_size(self, current_step: int, balance: float, market_data=None) -> float:
         base_size_usd = float(self.params.get('base_size', 150.0))
-        
-        # Apply Volatility Sizing if enabled (only affects the base calculation)
         if market_data is not None:
              base_size_usd = self._apply_volatility_sizing(base_size_usd, market_data)
-             
         multiplier = float(self.params.get('martingale_multiplier', 2.0))
         size_usd = base_size_usd * (multiplier ** current_step)
-        
         calc_price = 0.0
         if market_data is not None:
             if isinstance(market_data, pd.DataFrame) and not market_data.empty:
                 calc_price = float(market_data['close'].iloc[-1])
             elif isinstance(market_data, (int, float)):
                 calc_price = float(market_data)
-            
         if calc_price <= 0: calc_price = 68000.0 # Fallback
-        
-        # 🚀 DYNAMIC ROUNDING
-        return round(size_usd / calc_price, self.qty_precision)
+        return self._round_qty(size_usd / calc_price)
 
-    def calculate_next_grid_price(self, direction: str, current_price: float, avg_entry: float, step: int, market_data: Any, **kwargs) -> float:
-        """Helper for UI to predict next grid order price."""
-        dist_pct = float(self.params.get('grid_dist_pct', self.params.get('StepPct', 1.0)))
+    def calculate_next_grid_price(self, direction: str, current_price: float, avg_entry: float, step: int, market_data: Any, **kwargs) -> Optional[float]:
+        dist_pct = float(self.params.get('grid_dist_pct', self.params.get('StepPct', 0)))
         base_grid = float(self.params.get('base_grid', 100.0))
         use_atr = self.params.get('UseATRGrid', False)
-        
-        # Calculate distance
-        if use_atr and hasattr(market_data, 'empty') and not market_data.empty:
-             try:
-                 atr_period = int(self.params.get('ATRPeriods', 14))
-                 atr_val = iATR(market_data['high'], market_data['low'], market_data['close'], atr_period)
-                 grid_dist = atr_val * float(self.params.get('ATRGridFactor', 1.0))
-             except:
-                 grid_dist = base_grid # Fallback
+        grid_dist = 0
+        if use_atr:
+            if hasattr(market_data, 'empty') and not market_data.empty:
+                try:
+                    atr_period = int(self.params.get('ATRPeriods', 14))
+                    atr_val = iATR(market_data['high'], market_data['low'], market_data['close'], atr_period)
+                    grid_dist = atr_val * float(self.params.get('ATRGridFactor', 1.0))
+                except:
+                    return None
+            else:
+                return None
+        elif dist_pct > 0:
+            ref_price = avg_entry if avg_entry > 0 else current_price
+            grid_dist = ref_price * (dist_pct / 100.0)
+        elif base_grid > 0:
+            grid_dist = base_grid
         else:
-             # If not ATR, use percentage of entry if StepPct is set, otherwise base_grid
-             if self.params.get('StepPct') is not None or self.params.get('grid_dist_pct') is not None:
-                 ref_price = avg_entry if avg_entry > 0 else current_price
-                 grid_dist = ref_price * (dist_pct / 100.0)
-             else:
-                 grid_dist = base_grid # Default fixed grid
+            return None
                  
-        # Dynamic Multiplier logic if enabled
         grid_mult = float(self.params.get('GridMultiplier', 1.0))
         if step > 0 and grid_mult > 1.0:
             grid_dist = grid_dist * (grid_mult ** step)
              
-        # Direction Logic
         last_grid_price = kwargs.get('last_grid_price', 0)
-        # Using last_grid_price provides absolute origin anchoring instead of drifting avg_entry
         ref_price = last_grid_price if last_grid_price > 0 else (avg_entry if avg_entry > 0 else current_price)
-        
-        if direction.upper() == 'LONG':
-             price = ref_price - grid_dist
-        else:
-             price = ref_price + grid_dist
-             
+        price = ref_price - grid_dist if direction.upper() == 'LONG' else ref_price + grid_dist
+        if price <= 0: return None
         return round(price, self.price_precision)
 
     def calculate_projections(self, base_price: float, current_atr: float = 0.0) -> List[Dict[str, Any]]:
-        """
-        Generates a projection of trade steps (Grid Orders) based on current parameters.
-        Used by the UI to visualize risk and potential order placements.
-        """
         try:
             projections = []
-            
-            # Parameters
             base_size = float(self.params.get('base_size', 10.0))
             mm_mult = float(self.params.get('martingale_multiplier', 2.0))
             max_steps = int(self.params.get('max_steps', 10))
             direction = self.params.get('direction', 'LONG').upper()
-            
-            # Grid Spacing
             use_atr = self.params.get('UseATRGrid', False)
-            base_grid = float(self.params.get('base_grid', 100.0)) # Pips/Price
+            base_grid = float(self.params.get('base_grid', 100.0))
             grid_mult = float(self.params.get('GridMultiplier', 1.0))
-
-            # Initial State
             current_price_level = base_price
             total_invested = 0.0
             total_qty = 0.0
             avg_price = 0.0
-            
-            # Hedge Config
             use_hedge = self.params.get('UseHedge', False)
             hedge_start_step = int(self.params.get('HedgeStartStep', 5))
             
             for step in range(max_steps + 1):
-                # 1. Calculate Order Size for this step
-                # Step 0 is Base Order
-                step_mult = mm_mult ** step
-                order_size = base_size * step_mult
-                
-                # 2. Calculate Price Level for this step
+                order_size = base_size * (mm_mult ** step)
                 if step == 0:
                     price = base_price
                 else:
-                    # Calculate distance for this specific step
-                    # Distance = Base * (GridMult ^ (step-1))
-                    # Note: Simplified logic matching standard Martingale
-                    if use_atr and current_atr > 0:
-                        dist = current_atr * float(self.params.get('ATRGridFactor', 1.0))
-                    else:
-                        dist = base_grid
-                        
-                    # Apply expansion
+                    dist = current_atr * float(self.params.get('ATRGridFactor', 1.0)) if (use_atr and current_atr > 0) else base_grid
                     dist = dist * (grid_mult ** (step - 1))
-                    
-                    if direction == 'LONG':
-                        current_price_level -= dist
-                    else:
-                        current_price_level += dist
-                    
+                    current_price_level = current_price_level - dist if direction == 'LONG' else current_price_level + dist
                     price = current_price_level
                 
-                # Rounding
-                price = round(price, self.price_precision)
+                price = self._round_price(price)
                 qty = order_size / price if price > 0 else 0
-                
-                # Update Accumulators
                 total_invested += order_size
                 total_qty += qty
                 if total_qty > 0:
                     avg_price = total_invested / total_qty
                 
-                # 3. Calculate Take Profit
-                # For UI projection, use simple TP logic
                 tp_pct = float(self.params.get('tp_pct', 1.0))
                 tp_dist = avg_price * (tp_pct / 100.0)
+                tp_price = self._round_price(avg_price + tp_dist if direction == 'LONG' else avg_price - tp_dist)
                 
-                if direction == 'LONG':
-                    tp_price = avg_price + tp_dist
-                else:
-                    tp_price = avg_price - tp_dist
-                    
-                tp_price = round(tp_price, self.price_precision)
-                
-                # 4. Hedge Logic
-                is_hedge = False
-                hedge_size = 0.0
-                if use_hedge and step == hedge_start_step:
-                    is_hedge = True
-                    hedge_size = total_invested # 1:1 Hedge usually
-                
+                is_hedge = use_hedge and step == hedge_start_step
                 projections.append({
-                    'step': step,
-                    'price': price,
-                    'order_size_usdc': round(order_size, 2),
-                    'total_invested': round(total_invested, 2),
-                    'avg_price': round(avg_price, self.price_precision),
-                    'tp_price': tp_price,
-                    'is_hedge': is_hedge,
-                    'hedge_size_usdc': round(hedge_size, 2)
+                    'step': step, 'price': price, 'order_size_usdc': round(order_size, 2),
+                    'total_invested': round(total_invested, 2), 'avg_price': self._round_price(avg_price),
+                    'tp_price': tp_price, 'is_hedge': is_hedge, 'hedge_size_usdc': round(total_invested, 2) if is_hedge else 0.0
                 })
-                
             return projections
-            
-        except Exception as e:
-            logger.error(f"Error calculating projections: {e}")
+        except:
             return []

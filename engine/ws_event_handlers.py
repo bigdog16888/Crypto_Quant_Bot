@@ -1,45 +1,142 @@
 """
-WebSocket Event Handlers (Phase 7)
+WebSocket Event Handlers (v2.0)
 
 Processes real-time events from Binance WebSocket stream:
 - Order updates (fill, cancel, new)
 - Position updates
 - Balance updates
 
-Updates database state based on these events.
+v2.0 Architecture:
+  ALL fills are recorded exclusively via ledger.credit_fill() → bot_orders.
+  trades table is updated via ledger.seal_trade_state() (idempotent, enqueued).
+  TP fills register in ledger._tp_cascade_registry.
+  Runner.run_cycle() drains the TP registry and calls handle_tp_completion().
+  No accumulate_trade_fill() calls. No upsert_active_position_for_bot() calls.
 """
 
 import logging
-from typing import Dict
+import queue
+import threading
+import time
+from typing import Dict, Callable
 
 from engine.ws_cache import get_ws_cache
 
 logger = logging.getLogger("WSEventHandlers")
 
+# ---------------------------------------------------------------------------
+# ⚡ ASYNC DB WRITE QUEUE
+# ---------------------------------------------------------------------------
+# All SQLite mutations from the WS path go through this queue/thread so the
+# CCXT listener is never paused by disk I/O.
+# ---------------------------------------------------------------------------
+_db_write_queue: queue.Queue = queue.Queue(maxsize=2000)
+_db_worker_thread: threading.Thread | None = None
+_db_worker_stop = threading.Event()
+
+
+def _db_worker_loop():
+    """Background thread: drain the write queue and execute each task."""
+    while not _db_worker_stop.is_set():
+        try:
+            fn, args, kwargs = _db_write_queue.get(timeout=0.5)
+            try:
+                fn(*args, **kwargs)
+            except Exception as e:
+                logger.error(f"[DB-WORKER] Task failed: {fn.__name__} — {e}")
+            finally:
+                _db_write_queue.task_done()
+        except queue.Empty:
+            continue
+
+
+def _enqueue_db_write(fn: Callable, *args, **kwargs):
+    """Submit a database write task to the background worker queue."""
+    try:
+        _db_write_queue.put_nowait((fn, args, kwargs))
+    except queue.Full:
+        logger.warning(f"[DB-WORKER] Queue full — executing {fn.__name__} synchronously")
+        fn(*args, **kwargs)  # Fallback: execute inline rather than drop data
+
+
+def start_db_worker():
+    """Start the background DB worker thread (idempotent — safe to call multiple times)."""
+    global _db_worker_thread
+    if _db_worker_thread is None or not _db_worker_thread.is_alive():
+        _db_worker_stop.clear()
+        _db_worker_thread = threading.Thread(
+            target=_db_worker_loop, name="WSDBWorker", daemon=True
+        )
+        _db_worker_thread.start()
+        logger.info("[DB-WORKER] Async SQLite write worker started.")
+
+
+def stop_db_worker(timeout: float = 5.0):
+    """Gracefully flush the queue and stop the worker."""
+    _db_worker_stop.set()
+    try:
+        _db_write_queue.join()  # Wait for all tasks to complete
+    except Exception:
+        pass
+    if _db_worker_thread:
+        _db_worker_thread.join(timeout=timeout)
+    logger.info("[DB-WORKER] Async SQLite write worker stopped.")
+
+
+# ---------------------------------------------------------------------------
+# ⚡ TERMINAL ORDER CACHE
+# ---------------------------------------------------------------------------
+# Orders in terminal states (filled / cancelled) are immutable.  Caching
+# their IDs prevents the reconciler from re-fetching them over the wire.
+# ---------------------------------------------------------------------------
+_terminal_order_ids: set = set()          # exchange order IDs confirmed terminal
+_terminal_order_ids_lock = threading.Lock()
+
+
+def mark_terminal_order(order_id) -> None:
+    """Record an order ID as terminal so it is never re-fetched from the exchange."""
+    with _terminal_order_ids_lock:
+        _terminal_order_ids.add(str(order_id))
+
+
+def is_terminal_order(order_id) -> bool:
+    """Return True if the order ID is already confirmed terminal (cached)."""
+    with _terminal_order_ids_lock:
+        return str(order_id) in _terminal_order_ids
+
+
+def get_terminal_order_cache_size() -> int:
+    with _terminal_order_ids_lock:
+        return len(_terminal_order_ids)
+
+
+# Auto-start the worker when this module is imported
+start_db_worker()
+
+# ---------------------------------------------------------------------------
 # Deduplication set for notifications
 _notified_fills = set()
 _notified_fills_timestamps = {}
 
-# 🚀 FUNDAMENTAL FIX: Deferred cancel registry for WS TP fills.
-# When a TP fills via WebSocket, we have no exchange object here.
-# We register (bot_id, pair) so the runner/reconciler can drain this
-# on its next tick and cancel any lingering grid/entry orders on the exchange.
-# This prevents orphaned positions (e.g. XRP step-6 grid filling post-cycle-reset).
-_pending_cancel_after_tp: set = set()  # set of (bot_id, pair) tuples
+# ---------------------------------------------------------------------------
+# Partial fill accumulator
+# Tracks the cumulative filled qty seen so far per (bot_id, order_id) key.
+# When a FILLED event arrives, we compute incremental_qty = filled - prev_tracked.
+# Cleared on FILLED or CANCELLED (terminal events).
+_partial_fill_tracker: dict = {}  # key: f"{bot_id}_{order_id}" → float cumulative_qty
 
+# v2.0: TP cascade registry is now managed in engine.ledger
+# get_pending_cancel_after_tp is kept for backward compatibility but now
+# delegates to the ledger registry.
 def get_pending_cancel_after_tp() -> set:
-    """Return and clear the pending cancel registry (called by runner/reconciler)."""
-    global _pending_cancel_after_tp
-    if not _pending_cancel_after_tp:
+    """Return and clear the TP cascade registry (now managed by engine.ledger)."""
+    try:
+        from engine.ledger import drain_tp_cascade
+        return drain_tp_cascade()
+    except ImportError:
         return set()
-    snapshot = _pending_cancel_after_tp.copy()
-    _pending_cancel_after_tp.clear()
-    return snapshot
-_notified_fills_max_size = 10000
 
-# Per-order partial fill tracker: {f"{bot_id}_{order_id}": last_cumulative_filled_qty}
-# Computes the INCREMENTAL fill on each PARTIALLY_FILLED event to avoid double-counting.
-_partial_fill_tracker: Dict[str, float] = {}
+_notified_fills_max_size = 10000
 
 
 def handle_order_update(event: Dict):
@@ -180,315 +277,200 @@ def _cleanup_notified_fills():
 
 def _handle_order_partial_fill(bot_id: int, order_type: str, event: Dict):
     """
-    Handle PARTIALLY_FILLED events for ENTRY, GRID, and TP orders.
+    v2.0: Handle PARTIALLY_FILLED events via ledger.credit_fill() exclusively.
 
-    ENTRY/GRID: Accumulate the incremental filled portion into total_invested.
-    TP: Log and update the bot_order record so the system knows true remaining qty.
+    credit_fill() uses MAX() protection — multiple partial events for the same
+    order are idempotent. Only the highest cumulative_qty ever gets written,
+    so double-processing is impossible.
 
-    Uses _partial_fill_tracker to compute incremental fills, so multiple partial
-    events for the same order don't double-count.
+    After crediting the fill, seal_trade_state() is enqueued to recompute
+    the trades table from the updated bot_orders ledger.
     """
-    order_id = event.get('order_id')
+    order_id = str(event.get('order_id', ''))
+    client_id = str(event.get('client_order_id', event.get('clientOrderId', '')))
     raw_avg_price = float(event.get('avg_price', 0) or 0)
     raw_limit_price = float(event.get('price', 0) or 0)
     avg_price = raw_avg_price if raw_avg_price > 0 else raw_limit_price
-    cumulative_filled = float(event.get('filled_qty', 0) or 0)  # total filled so far
-    symbol = event.get('symbol')
+    cumulative_filled = float(event.get('filled_qty', 0) or 0)
+    symbol = event.get('symbol', '')
 
     if avg_price <= 0 or cumulative_filled <= 0:
         return
 
-    tracker_key = f"{bot_id}_{order_id}"
-    
-    if tracker_key not in _partial_fill_tracker:
-        try:
-            from engine.database import get_connection
-            conn = get_connection()
-            # client_order_id might not always be in event dict, protect with get
-            client_id = str(event.get('client_order_id', event.get('clientOrderId', '')))
-            db_filled = conn.execute("SELECT filled_amount FROM bot_orders WHERE order_id = ? OR client_order_id = ?", (str(order_id), client_id)).fetchone()
-            if db_filled and db_filled[0] is not None:
-                _partial_fill_tracker[tracker_key] = float(db_filled[0])
-        except Exception as e_pf:
-            logger.debug(f"[PF-SYNC] Failed to sync tracker for {tracker_key}: {e_pf}")
-            
-    prev_filled = _partial_fill_tracker.get(tracker_key, 0.0)
-    incremental_qty = cumulative_filled - prev_filled
+    logger.info(
+        f"⚡ WS PARTIAL FILL: Bot {bot_id} {order_type} "
+        f"cumulative={cumulative_filled:.6f} @ {avg_price:.6f} (order={order_id})"
+    )
 
-    if incremental_qty <= 1e-9:
-        # No new fill since last event — ignore
-        return
+    # --- v2.0 path: credit_fill → seal_trade_state ---
+    try:
+        from engine.ledger import credit_fill, seal_trade_state
 
-    _partial_fill_tracker[tracker_key] = cumulative_filled
-    logger.info(f"⚡ WS PARTIAL FILL: Bot {bot_id} {order_type} +{incremental_qty:.6f} @ {avg_price} (total so far: {cumulative_filled:.6f})")
+        # Use client_order_id as lookup key (works even if exchange order_id not yet stamped)
+        lookup_id = order_id if order_id else client_id
+        credited = credit_fill(
+            bot_id=bot_id,
+            order_id=lookup_id,
+            cumulative_qty=cumulative_filled,
+            avg_price=avg_price,
+            order_type=order_type.lower(),
+            is_cumulative=True
+        )
 
-    if order_type in ('ENTRY', 'GRID'):
-        # 🚀 FUNDAMENTAL FIX: Extract exact step from Client Order ID immediately.
-        # This prevents 'Step Lag' where the bot has partial money but the DB thinks it's still at Step N-1.
-        partial_step = None
-        if event:
-             parts = str(event.get('client_order_id', '')).split('_')
-             if len(parts) > 3 and parts[3].isdigit():
-                 partial_step = int(parts[3])
+        if credited:
+            # Track cumulative so FILLED handler computes correct incremental_qty
+            tracker_key = f"{bot_id}_{order_id}"
+            _partial_fill_tracker[tracker_key] = cumulative_filled
+            # Enqueue idempotent state recompute (non-blocking)
+            _enqueue_db_write(seal_trade_state, bot_id)
+            logger.debug(f"[PARTIAL] Bot {bot_id}: credit_fill + seal_trade_state enqueued (cumulative={cumulative_filled:.6f}).")
 
-        # Accumulate the incremental portion into trade state
-        try:
-            from engine.database import accumulate_trade_fill, log_trade, update_order_fill, upsert_active_position_for_bot
-            accumulate_trade_fill(
-                bot_id=bot_id,
-                added_invested=avg_price * incremental_qty,
-                added_qty=incremental_qty,
-                avg_price=avg_price,
-                new_step=partial_step,   # 🚀 ROOT CAUSE FIX: Proactively advance step even for partial fills
-                tp_price=None,            # Maintain existing TP price calculation logic
-                is_entry=(order_type == 'ENTRY')
-            )
-            log_trade(bot_id, f'WS_{order_type}_PARTIAL', symbol, avg_price, incremental_qty,
-                      avg_price * incremental_qty, order_type, step=partial_step)
-            # 🚀 FUNDAMENTAL FIX: Write active_positions for this bot immediately after every partial fill.
-            # Previously only REALITY-AUTO-MAP wrote active_positions — leaving all other same-direction
-            # bots on the same pair without a row, causing permanent mismatch alerts.
-            try:
-                from engine.database import get_connection as _gc
-                _conn = _gc()
-                _bot_dir = (_conn.execute('SELECT direction FROM bots WHERE id=?', (bot_id,)).fetchone() or ['LONG'])[0]
-                upsert_active_position_for_bot(bot_id, symbol, _bot_dir, avg_price)
-            except Exception as e_ap:
-                logger.warning(f"[ACTIVE-POS] partial fill upsert failed for bot {bot_id}: {e_ap}")
-            # 🚀 PERSIST partial progress for UI
-            update_order_fill(order_id, cumulative_filled, bot_id=bot_id)
-        except Exception as e:
-            logger.error(f"Failed to accumulate partial fill for bot {bot_id}: {e}")
+    except Exception as e:
+        logger.error(f"[PARTIAL] Failed to credit partial fill for bot {bot_id}: {e}")
 
-    elif order_type == 'TP':
-        # TP partial fill: the position is being reduced. Log it for audit.
-        # The bot doesn't reset until the full TP fills. We just track it.
-        try:
-            from engine.database import log_trade, update_order_fill
-            log_trade(bot_id, 'WS_TP_PARTIAL', symbol, avg_price, incremental_qty,
-                      0.0, 'TP_PARTIAL')
-            logger.info(f"📋 WS TP Partial: Bot {bot_id} sold {incremental_qty:.6f} @ {avg_price}. Waiting for full fill.")
-            # 🚀 PERSIST partial progress for UI
-            update_order_fill(order_id, cumulative_filled, bot_id=bot_id)
-        except Exception as e:
-            logger.error(f"Failed to log TP partial for bot {bot_id}: {e}")
 
 
 def _handle_order_filled(bot_id: int, order_type: str, event: Dict):
-    """Process a filled order - update trade state."""
+    """
+    Process a fully-filled order update.
+
+    v2.0 Architecture:
+      - credit_fill + seal_trade_state ALWAYS run (idempotent, safe to call twice)
+      - Dedup gate only prevents duplicate NOTIFICATIONS, not state updates
+      - This ensures WS replay / double-emit never loses a fill
+    """
     from engine.database import (
-        update_martingale_step, reset_bot_after_tp, 
-        get_bot_order_ids, log_trade,
-        add_notification
+        get_bot_order_ids, log_trade, add_notification
     )
-    
+
     order_id = event.get('order_id')
     raw_avg_price = float(event.get('avg_price', 0) or 0)
     raw_price = float(event.get('price', 0) or 0)
     avg_price = raw_avg_price if raw_avg_price > 0 else raw_price
-    
-    # 🚀 FUNDAMENTAL FIX: Use incremental_qty to avoid double-counting if there were partial fills
-    filled_qty = event.get('incremental_qty', event.get('filled_qty', 0))
-    
-    realized_pnl = event.get('realized_pnl', 0)
+
+    # Always use total cumulative fill for credit_fill (it uses MAX protection)
+    cumulative_fill_qty = float(event.get('filled_qty', 0) or 0)
+    realized_pnl = float(event.get('realized_pnl', 0) or 0)
     symbol = event.get('symbol')
-    
-    logger.info(f"🎯 WS FILL: Bot {bot_id} {order_type} filled @ {avg_price} (Qty: {filled_qty:.6f}, PnL: ${realized_pnl:.2f})")
-    logger.info(f"🔍 [DIAG-NOTIFICATION] About to add notification for {order_type} fill")
-    
-    # DEDUPLICATION: Check if we already notified for this order
+    client_id = str(event.get('client_order_id', event.get('clientOrderId', '')))
+
+    logger.info(
+        f"[WS-FILL] Bot {bot_id} {order_type} FILLED @ {avg_price:.6f} "
+        f"qty={cumulative_fill_qty:.6f} order={order_id}"
+    )
+
+    # Mark order terminal immediately so reconciler doesn't re-fetch it
+    mark_terminal_order(order_id)
+
+    # ── STATE UPDATE (always runs — credit_fill is idempotent) ─────────────
+    if order_type in ('TP',):
+        # v2.0: TP hit — credit fill then register cascade for runner
+        try:
+            from engine.ledger import register_tp_cascade, credit_fill
+            lookup_id = str(order_id) if order_id else client_id
+            credit_fill(
+                bot_id=bot_id,
+                order_id=lookup_id,
+                cumulative_qty=cumulative_fill_qty,
+                avg_price=avg_price,
+                order_type='tp',
+                is_cumulative=True
+            )
+            if symbol:
+                register_tp_cascade(bot_id, symbol, avg_price)
+                logger.info(f"[TP-CASCADE] Bot {bot_id} {symbol} @ {avg_price:.6f} queued.")
+        except Exception as e:
+            logger.error(f"[WS-FILL] TP credit failed for bot {bot_id}: {e}")
+
+    elif order_type in ('GRID', 'ENTRY'):
+        # v2.0: credit_fill → seal_trade_state
+        try:
+            from engine.ledger import credit_fill, seal_trade_state
+            lookup_id = str(order_id) if order_id else client_id
+            credited = credit_fill(
+                bot_id=bot_id,
+                order_id=lookup_id,
+                cumulative_qty=cumulative_fill_qty,
+                avg_price=avg_price,
+                order_type=order_type.lower(),
+                is_cumulative=True
+            )
+            if credited:
+                _enqueue_db_write(seal_trade_state, bot_id)
+                logger.info(f"[WS-FILL] Bot {bot_id} {order_type}: credit_fill OK → seal enqueued.")
+            else:
+                # credit_fill returned False: most likely a race — save_bot_order hasn't
+                # created the DB row yet. Schedule a deferred retry via the write queue.
+                def _deferred_credit(bid, oid, cid, qty, px, otype):
+                    from engine.ledger import credit_fill as _cf, seal_trade_state as _sts
+                    import time as _t
+                    _t.sleep(0.5)  # Wait for save_bot_order to commit
+                    ok = _cf(bid, oid, qty, px, otype, is_cumulative=True)
+                    if not ok:
+                        ok = _cf(bid, cid, qty, px, otype, is_cumulative=True)
+                    if ok:
+                        _sts(bid)
+                        logger.info(f"[WS-FILL-RETRY] Bot {bid} {otype}: deferred credit OK.")
+                    else:
+                        logger.warning(
+                            f"[WS-FILL-RETRY] Bot {bid} {otype}: order {oid}/{cid} "
+                            f"still not in bot_orders after retry. Fill may be lost."
+                        )
+                _enqueue_db_write(_deferred_credit, bot_id, str(order_id), client_id,
+                                  cumulative_fill_qty, avg_price, order_type.lower())
+                logger.warning(
+                    f"[WS-FILL] Bot {bot_id} {order_type}: credit_fill returned False "
+                    f"(race condition). Deferred retry enqueued for order {order_id}."
+                )
+        except Exception as e:
+            logger.error(f"[WS-FILL] ENTRY/GRID credit failed for bot {bot_id}: {e}")
+
+    # Queue DB status update (non-blocking)
+    try:
+        from engine.database import update_order_status
+        _enqueue_db_write(update_order_status, order_id, 'filled', bot_id, cumulative_fill_qty)
+    except Exception as e:
+        logger.debug(f"[WS-FILL] order status update queued failed: {e}")
+
+    # ── NOTIFICATION (dedup-gated — prevents spam but never blocks state) ──
     notification_key = f"{bot_id}_{order_id}_{order_type}"
     if notification_key in _notified_fills:
-        logger.debug(f"⏭️ Skipping duplicate notification for {notification_key}")
+        logger.debug(f"[WS-FILL] Skipping duplicate notification for {notification_key}")
         return
     _notified_fills.add(notification_key)
-    _cleanup_notified_fills()  # Periodic cleanup
-    
-    # 🛡️ FIX: Mark order as 'filled' (NOT cancelled) so reconciler & integrity
-    # checks can distinguish a completed fill from an orphan or cancelled order.
-    # 🚀 NEW: Pass the final true cumulative fill quantity to avoid math inflation.
-    # 🔑 CRITICAL FIX: If Binance 'z' field was 0 at event time (common for ACCOUNT_UPDATE flow),
-    # fall back to the bot_orders.amount column as filled_amount so the virtual ledger is never 0.
+    _cleanup_notified_fills()
+
     try:
-        from engine.database import update_order_status, get_connection
-        cumulative_fill = float(event.get('filled_qty', 0) or 0)
-        update_order_status(order_id, 'filled', bot_id=bot_id, filled_qty=cumulative_fill)
-        
-        # Safety net: if filled_qty was 0 from WS event, use the order's own amount as the fill quantity
-        # Must cast order_id to str() to match SQLite TEXT column correctly just like update_order_status does
-        if cumulative_fill <= 0:
-            conn_fix = get_connection()
-            client_oid = event.get('client_order_id')
-            
-            # Using both order_id and client_order_id ensures we match it even if order_id is late to sync
-            conn_fix.execute(
-                "UPDATE bot_orders SET filled_amount = amount WHERE (order_id = ? OR client_order_id = ?) AND bot_id = ? AND filled_amount = 0 AND amount > 0",
-                (str(order_id), str(client_oid), bot_id)
-            )
-            conn_fix.commit()
-            logger.debug(f"[FILL-SAFETY] Used order.amount as filled_amount for order {order_id} (WS filled_qty was 0)")
-        
-        logger.debug(f"Marked order {order_id} as filled in DB (Final Qty: {cumulative_fill}).")
-    except Exception as e:
-        logger.debug(f"Could not mark order {order_id} as filled in DB: {e}")
-
-    if order_type == 'TP':
-        # Take Profit hit - reset bot
-        logger.info(f"✅ WS TP Hit for Bot {bot_id}! Resetting trade...")
-        try:
-            reset_bot_after_tp(bot_id, exit_price=avg_price)
-            log_trade(bot_id, 'WS_TP_FILL', symbol, avg_price, filled_qty, realized_pnl, "TP")
-            add_notification('success', f"💰 TP Hit for {symbol} (PnL ${realized_pnl:.2f})", bot_id)
-            # 🚀 FUNDAMENTAL FIX: Register for deferred exchange-side cancel sweep.
-            # We cannot cancel exchange orders here (no exchange object), so we register
-            # (bot_id, symbol) in the pending cancel set. The runner/reconciler drains this
-            # registry with exchange access on the next tick, cancelling any lingering grid
-            # orders before they fill and create orphaned positions.
-            if symbol:
-                _pending_cancel_after_tp.add((bot_id, symbol))
-                logger.info(f"📋 [DEFERRED-CANCEL] Registered (bot={bot_id}, pair={symbol}) for next-tick orphan sweep.")
-        except Exception as e:
-            logger.error(f"Failed to process TP fill for bot {bot_id}: {e}")
-            
-    elif order_type == 'GRID':
-        # Grid order filled - increment step
-        logger.info(f"📈 WS Grid Fill for Bot {bot_id}")
-        try:
-            _update_trade_state_from_fill(bot_id, order_type, symbol, avg_price, filled_qty, event)
-            # 🔑 PRECISION FIX: Seal the bot_orders row with the authoritative cumulative fill qty.
-            # The incremental_qty (Binance 'l' field) was used to update the ledger, but we must
-            # stamp the final 'z' (cumulative) into bot_orders.filled_amount so recompute_invested_from_orders
-            # always reads mathematically exact quantities — not accumulation approximations.
-            cumulative_fill_qty = float(event.get('filled_qty', 0) or 0) if event else 0.0
-            if cumulative_fill_qty > 0:
-                try:
-                    from engine.database import update_order_fill
-                    update_order_fill(order_id, cumulative_fill_qty, bot_id=bot_id)
-                    logger.debug(f"[PRECISION-SEAL] GRID {order_id}: bot_orders.filled_amount sealed at {cumulative_fill_qty} (cumulative z)")
-                except Exception as e_seal:
-                    logger.warning(f"[PRECISION-SEAL] Failed to seal GRID fill for order {order_id}: {e_seal}")
-            add_notification('info', f"📉 Grid Fill for {symbol}", bot_id)
-        except Exception as e:
-            logger.error(f"Failed to process Grid fill for bot {bot_id}: {e}")
-            
-    elif order_type == 'ENTRY':
-        # Entry order filled - start or expand trade
-        logger.info(f"🚀 WS Entry Fill for Bot {bot_id}")
-        try:
-            _update_trade_state_from_fill(bot_id, order_type, symbol, avg_price, filled_qty, event)
-            # 🔑 PRECISION FIX: Seal the bot_orders row with the authoritative cumulative fill qty.
-            # Same rationale as GRID above — the 'z' cumulative field is the exchange ground truth.
-            cumulative_fill_qty = float(event.get('filled_qty', 0) or 0) if event else 0.0
-            if cumulative_fill_qty > 0:
-                try:
-                    from engine.database import update_order_fill
-                    update_order_fill(order_id, cumulative_fill_qty, bot_id=bot_id)
-                    logger.debug(f"[PRECISION-SEAL] ENTRY {order_id}: bot_orders.filled_amount sealed at {cumulative_fill_qty} (cumulative z)")
-                except Exception as e_seal:
-                    logger.warning(f"[PRECISION-SEAL] Failed to seal ENTRY fill for order {order_id}: {e_seal}")
-            # RATE LIMITING for Entry Notifications
-            import time
-            current_time = time.time()
-            fill_key = f"ENTRY_FILL_{bot_id}_{symbol}"
-            last_fill_time = _notified_fills_timestamps.get(fill_key, 0)
-            if (current_time - last_fill_time) > 10.0:
-                add_notification('info', f"🚀 Entry Fill for {symbol}", bot_id)
-                _notified_fills_timestamps[fill_key] = current_time
-        except Exception as e:
-            logger.error(f"Failed to process Entry fill for bot {bot_id}: {e}")
-
-
-
-def _update_trade_state_from_fill(bot_id: int, order_type: str, symbol: str, avg_price: float, filled_qty: float, event: Dict = None):
-    """Unified helper to update trade state from a fill event (Entry or Grid) using atomic DB accumulation."""
-    from engine.database import accumulate_trade_fill, log_trade, get_bot_status
-    
-    # 🚀 FUNDAMENTAL FIX: Extract exact step from Client Order ID directly
-    new_step = None
-    if event:
-        client_id = event.get('client_order_id', '')
-        parts = client_id.split('_')
-        # format: CQB_{bot_id}_{type}_{step}_{uuid}
-        if len(parts) > 3 and parts[3].isdigit():
-            new_step = int(parts[3])
-
-    if new_step is None:
-        trade_data = get_bot_status(bot_id)
-        current_step = trade_data.get('current_step', 0) if trade_data else 0
-        new_step = current_step
-        if order_type == 'GRID':
-            new_step = current_step + 1
+        if order_type == 'TP':
+            log_trade(bot_id, 'WS_TP_FILL', symbol, avg_price, cumulative_fill_qty, realized_pnl, 'TP')
+            add_notification('success', f"TP Hit {symbol} (PnL ${realized_pnl:.2f})", bot_id)
         elif order_type == 'ENTRY':
-            new_step = 1
-
-    added_value = avg_price * filled_qty
-    
-    # Conservative TP: 1.5% above new average (Runner will refine this based on bot settings)
-    tp_price = avg_price * 1.015 # Fallback
-    
-    is_entry = (order_type == 'ENTRY')
-
-    # Execute Atomic Update
-    accumulate_trade_fill(
-        bot_id=bot_id,
-        added_invested=added_value,
-        added_qty=filled_qty,
-        avg_price=avg_price,
-        new_step=new_step,
-        tp_price=tp_price,
-        is_entry=is_entry
-    )
-    
-    # 🚀 CARRY_PENDING → ACTIVE (Live Fill Path)
-    # If this bot was carrying a position from a previous cycle (CARRY_PENDING),
-    # a live fill proves it is genuinely active. Upgrade immediately.
-    # This is the real-time equivalent of _align_memory_to_ledger at startup.
-    try:
-        from engine.database import get_connection as _gc_cp
-        _c = _gc_cp()
-        _phase = (_c.execute(
-            "SELECT cycle_phase FROM trades WHERE bot_id=?", (bot_id,)
-        ).fetchone() or [None])[0]
-        if _phase == 'CARRY_PENDING':
-            _c.execute(
-                "UPDATE trades SET cycle_phase='ACTIVE' WHERE bot_id=?", (bot_id,)
-            )
-            _c.commit()
-            logger.info(f"✅ [WS-FILL] Bot {bot_id} CARRY_PENDING → ACTIVE (live {order_type} fill proven)")
-        _c.close()
-    except Exception as _e_cp:
-        logger.debug(f"[WS-FILL] cycle_phase promotion skipped for bot {bot_id}: {_e_cp}")
-
-    # 🚀 FUNDAMENTAL FIX: Write active_positions for this bot immediately after every full fill.
-    # Same root-cause fix as the partial fill path: every bot with a position needs its own row.
-    try:
-        from engine.database import upsert_active_position_for_bot as _uap, get_connection as _gc
-        _conn = _gc()
-        _bot_dir = (_conn.execute('SELECT direction FROM bots WHERE id=?', (bot_id,)).fetchone() or ['LONG'])[0]
-        _uap(bot_id, symbol, _bot_dir, avg_price)
-    except Exception as e_ap:
-        logger.warning(f"[ACTIVE-POS] full fill upsert failed for bot {bot_id}: {e_ap}")
-    
-    # Log to history
-    log_type = f'WS_{order_type}_FILL'
-    log_trade(bot_id, log_type, symbol, avg_price, filled_qty, added_value, order_type, new_step)
+            log_trade(bot_id, 'WS_ENTRY_FILL', symbol, avg_price, cumulative_fill_qty, 0, 'ENTRY')
+            add_notification('info', f"Entry Filled {symbol} qty={cumulative_fill_qty:.4f} @ {avg_price:.4f}", bot_id)
+        elif order_type == 'GRID':
+            log_trade(bot_id, 'WS_GRID_FILL', symbol, avg_price, cumulative_fill_qty, 0, 'GRID')
+    except Exception as e:
+        logger.debug(f"[WS-FILL] Notification/log failed (non-fatal): {e}")
 
 
 
 def _handle_order_canceled(bot_id: int, order_type: str, event: Dict):
     """Process a canceled order - update DB, ensuring any partial fill is recorded."""
     from engine.database import update_order_status
-    
+
     order_id = event.get('order_id')
     cumulative_fill = float(event.get('filled_qty', 0) or 0)
-    
+
     logger.info(f"❌ WS Cancel: Bot {bot_id} {order_type} order {order_id} canceled (Partial Fill: {cumulative_fill})")
-    
+
+    # Mark terminal so reconciler skips re-fetching this cancelled order
+    mark_terminal_order(order_id)
+
     try:
-        # 🚀 FUNDAMENTAL FIX: capture partial fills before cancellation in bot_orders history
-        update_order_status(order_id, 'cancelled', bot_id=bot_id, filled_qty=cumulative_fill)
+        # Capture partial fills before cancellation — queued so listener stays non-blocking
+        _enqueue_db_write(update_order_status, order_id, 'cancelled', bot_id, cumulative_fill)
     except Exception as e:
-        logger.debug(f"Could not close canceled order {order_id} in DB: {e}")
+        logger.debug(f"Could not queue cancel for order {order_id} in DB: {e}")
 
 
 def _handle_order_new(bot_id: int, order_type: str, event: Dict):

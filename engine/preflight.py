@@ -124,46 +124,136 @@ def _check_position_match(exchanges: Dict[str, ExchangeInterface]):
         conn = sqlite3.connect(DB_PATH, timeout=10)
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT b.pair, b.direction, COALESCE(t.total_invested, 0), COALESCE(t.avg_entry_price, 0)
+            SELECT b.pair, b.direction, 
+                   SUM(CASE WHEN bo.order_type IN ('entry','grid','adoption','adoption_entry') THEN bo.filled_amount
+                            WHEN bo.order_type IN ('tp','close','adoption_reduce') THEN -bo.filled_amount
+                            ELSE 0 END) as net_qty
             FROM bots b
-            LEFT JOIN trades t ON b.id = t.bot_id
-            WHERE b.is_active = 1 AND COALESCE(t.total_invested, 0) > 0
+            LEFT JOIN bot_orders bo ON b.id = bo.bot_id 
+                  AND bo.status NOT IN ('auto_closed', 'reset_cleared', 'placing')
+                  AND bo.filled_amount > 0
+            WHERE b.is_active = 1
+            GROUP BY b.id
         """)
         db_positions = cursor.fetchall()
         pass # conn.close() disabled for singleton safety
 
-        # Build DB net map: { normalized_symbol: net_usd }
-        db_net_map = {}
-        for pair, direction, invested, entry_price in db_positions:
+        # Build DB qty map: { normalized_symbol: net_qty }
+        db_net_qty_map = {}
+        for pair, direction, raw_qty in db_positions:
             sym = normalize_symbol(pair)
-            signed = float(invested) if direction.upper() == 'LONG' else -float(invested)
-            db_net_map[sym] = db_net_map.get(sym, 0) + signed
+            qty_val = float(raw_qty) if raw_qty else 0.0
+            if qty_val > 0:
+                signed_qty = qty_val if direction.upper() == 'LONG' else -qty_val
+                db_net_qty_map[sym] = db_net_qty_map.get(sym, 0) + signed_qty
 
-        # Compare
-        all_symbols = set(list(exchange_map.keys()) + list(db_net_map.keys()))
+        # 🚀 CONSENSUS COMPARISON ($0.01 Standard)
+        PRECISION_USD = 0.01
+        
+        # Fetch exchange positions and build consolidated qty map
+        exchange_reported_qty_map = {}
+        mark_price_map = {}
+        for p in all_positions:
+            sym = normalize_symbol(p['symbol'])
+            # Extract properly signed magnitude (One-way mode 'contracts' is often unsigned natively)
+            raw_qty = float(p.get('contracts', 0) or 0)
+            side = p.get('side', 'long').lower()
+            if side == 'short':
+                raw_qty = -abs(raw_qty)
+            else:
+                raw_qty = abs(raw_qty)
+            
+            if raw_qty == 0: continue
+            exchange_reported_qty_map[sym] = exchange_reported_qty_map.get(sym, 0) + raw_qty
+            
+            notional = abs(float(p.get('notional', 0) or p.get('notionalValue', 0) or 0))
+            if notional > 0 and abs(raw_qty) > 0:
+                mark_price_map[sym] = notional / abs(raw_qty)
+            elif float(p.get('markPrice', 0)) > 0:
+                mark_price_map[sym] = float(p.get('markPrice'))
+            elif float(p.get('entryPrice', 0)) > 0:
+                mark_price_map[sym] = float(p.get('entryPrice'))
+            else:
+                mark_price_map[sym] = 1.0
+
+        # Compare Quantities using uniform Mark Price translation
+        all_symbols = set(list(exchange_reported_qty_map.keys()) + list(db_net_qty_map.keys()))
         
         for sym in all_symbols:
-            exch_qty = exchange_map.get(sym, 0)
-            db_usd = db_net_map.get(sym, 0)
+            exch_qty = exchange_reported_qty_map.get(sym, 0.0)
+            db_qty = db_net_qty_map.get(sym, 0.0)
+            
+            mark_price = mark_price_map.get(sym, 1.0)
+            delta_qty = abs(db_qty - exch_qty)
+            delta_usd = delta_qty * mark_price
+            
+            exch_usd = exch_qty * mark_price
+            db_usd = db_qty * mark_price
+            
+            # Check 1: Perfect Alignment or Consensus ($0.01 threshold)
+            if delta_usd < PRECISION_USD:
+                logger.info(f"    ✅ {sym}: Net Parity (Exchange=${exch_usd:.2f} | DB=${db_usd:.2f})")
+                continue
 
-            # If exchange has position but DB has nothing → CRITICAL
+            # Check 2: Directional Healing (Fact-Based)
+            # Find all active bots for this pair
+            cursor.execute("""
+                SELECT b.id, b.name, b.direction, b.pair
+                FROM bots b
+                WHERE b.is_active = 1
+            """)
+            all_active = cursor.fetchall()
+            pair_bots = [b for b in all_active if normalize_symbol(b[3]) == sym]
+            
+            # Fetch current trade state for these bots
+            # all_active returns (id, name, direction, pair)
+            ids = [f"({b[0]})" for b in pair_bots]
+            if not ids: continue
+            
+            cursor.execute(f"SELECT bot_id, current_step, total_invested FROM trades WHERE bot_id IN ({','.join([str(b[0]) for b in pair_bots])})")
+            trade_map = {row[0]: row for row in cursor.fetchall()}
+            
+            # Determine which side is responsible for the mismatch
+            is_sole_pair_bot = len(pair_bots) == 1
+            diff_qty = exch_qty - db_qty
+            diff_usd = diff_qty * mark_price
+            target_direction = 'LONG' if diff_qty > 0 else 'SHORT'
+            
+            actual_target_bot = None
+            if is_sole_pair_bot:
+                # Rule 1: Sole bot for pair, it owns the error
+                actual_target_bot = pair_bots[0]
+            else:
+                # Rule 2: Multi-bot pair, use directional attribution
+                target_bots = [b for b in pair_bots if b[2].upper() == target_direction]
+                if len(target_bots) >= 1:
+                    # Select the lowest ID bot deterministically among candidates
+                    actual_target_bot = sorted(target_bots, key=lambda x: x[0])[0]
+            
+            if actual_target_bot:
+                bot_id, bot_name, direction, _ = actual_target_bot
+                trade_row = trade_map.get(bot_id, (bot_id, 0, 0.0))
+                current_step = trade_row[1]
+
+                # ────────────────────────────────────────────────────────────────
+                # REMOVED: v2.0 ADOPTION logic here was aggressively double-counting.
+                # Offline fills are the explicit domain of StateReconciler Pass 3.
+                # Preflight should NEVER write phantom adoptions.
+                # ────────────────────────────────────────────────────────────────
+                continue
+
+
+
+            # Check 3: If not healed, report as issue
             if exch_qty != 0 and db_usd == 0:
                 issues.append(f"CRITICAL: Exchange has {exch_qty} {sym} but DB has $0. Orphaned position!")
                 logger.warning(f"    ❌ {sym}: Exchange={exch_qty} | DB=$0 (ORPHAN)")
-            
-            # If DB has position but exchange has nothing → Warning (ghost)
             elif db_usd != 0 and exch_qty == 0:
                 issues.append(f"WARNING: DB has ${db_usd:.2f} {sym} but Exchange has 0. Possible ghost.")
                 logger.warning(f"    ⚠️ {sym}: DB=${db_usd:.2f} | Exchange=0 (GHOST?)")
-            
-            # Both have positions — check direction alignment
-            elif exch_qty != 0 and db_usd != 0:
-                # Sign check: both should agree on direction
-                if (exch_qty > 0 and db_usd < 0) or (exch_qty < 0 and db_usd > 0):
-                    issues.append(f"WARNING: Direction mismatch for {sym}: Exchange={'LONG' if exch_qty > 0 else 'SHORT'} vs DB={'LONG' if db_usd > 0 else 'SHORT'}")
-                    logger.warning(f"    ⚠️ {sym}: Direction mismatch")
-                else:
-                    logger.info(f"    ✅ {sym}: Exchange={exch_qty} | DB=${db_usd:.2f} — Aligned")
+            else:
+                issues.append(f"WARNING: Sync Mismatch for {sym}: Exchange=${exch_usd:.2f} vs DB=${db_usd:.2f} (Diff: ${delta_usd:.2f})")
+                logger.warning(f"    ⚠️ {sym}: Sync Mismatch (${delta_usd:.2f})")
 
         if not issues:
             logger.info("    ✅ All positions aligned")

@@ -1,13 +1,17 @@
-# 🤖 Crypto Quant Bot (v1.8.5)
+# 🤖 Crypto Quant Bot (v2.0.0)
 
 A professional-grade, multi-bot algorithmic trading system designed for **Binance Futures (USDT/USDC)**. It features a robust **Virtual Position Manager** that allows multiple bots to trade the same pair independently (e.g., Hedging Long/Short) without conflict.
 
 ## 🌟 Key Features
 
 *   **Virtual Position System:** Each bot tracks its own position logic (`trades` table) while the engine reconciles with the exchange.
-*   **Fully Autonomous Reconciliation (v1.8.5):** Achieved strict zero-drift ledger stability. The engine relies on cryptographic proof-of-fill (Exchange Order ID mapping) and will dynamically scrub geometric precision anomalies (Dust Chaser).
-*   **Proof-Only Mathematics:** Eliminates heuristic database guessing. The dynamic Market Flatten fallback protocol ensures any impossible physical/virtual state desync is safely zeroed entirely without corrupting internal ledgers.
-*   **Atomic State Integrity:** Consolidates snapshots into `BEGIN IMMEDIATE` transaction blocks, preventing database locks and race-condition crashes between REST polls and WebSockets streams.
+*   **Fully Autonomous Reconciliation (v2.0.0):** Achieved strict zero-drift ledger stability. The engine relies on cryptographic proof-of-fill (Deterministic ID mapping) and handles complex One-Way mode netting.
+*   **Ghost-Proof Order Management:** Advanced string-parsing logic for `clientOrderId` eliminates infinite cancel/recreate loops and stale order "ghosting."
+*   **Drift-Aware Consensus:** Pair-consensus logic accounts for sibling virtual positions on the same pair, preventing false-positive drift alerts in One-Way accounts.
+*   **Atomic State Integrity:** Consolidates snapshots into `BEGIN IMMEDIATE` transaction blocks with fail-safe recovery for TP and Grid placements.
+*   **High-Precision Arithmetic:** All calculations use cent-level ($0.01) precision guards, eliminating floating-point noise across all assets.
+*   **Async DB Write Queue:** WebSocket fill events are dispatched to a non-blocking background SQLite worker, keeping the CCXT listener lag-free.
+*   **Fragment UI Refresh:** Bot grid panel uses `@st.fragment` for isolated 15-second updates — zero full-page flickering.
 *   **SocketLock Singleton:** OS-enforced process protection (TCP port 19888) to prevent duplicate runners.
 *   **Real-Time UI:** Streamlit dashboard with ghosting-loop fixes, **Auto-Refresh**, Live Charts, Parallel Data Fetching, and Portfolio Heatmaps.
 *   **One-Way & Hedge Mode Support:** Fully compatible with Binance's One-Way and Hedge modes.
@@ -79,7 +83,7 @@ streamlit run ui/app.py
 
 ## 🔧 Architecture & Troubleshooting
 
-See `UNIFIED_BOT_DOCUMENTATION.md` for a deep dive into the system architecture, mathematical rules, and detailed debugging steps.
+See **[CODEBASE_GUIDE.md](file:///c:/Users/Gionie/Documents/GitHub/Crypto_Quant_Bot/CODEBASE_GUIDE.md)** for a deep dive into the system architecture, Pair-Consensus mathematical rules, and detailed debugging steps.
 
 ### Common Fixes
 *   **System Slow?** Enable "Auto-Refresh" in the UI only when needed. The Dashboard now uses **parallel fetching** for speed.

@@ -463,6 +463,19 @@ def init_db():
             )
         """)
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_recon_logs_bot ON reconciliation_logs(bot_id)')
+        
+        # 🛡️ ARCHITECT'S SHIELD: Manual Whitelisting
+        # Stores user-declared manual trades that the bot should ignore.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS manual_whitelists (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pair TEXT NOT NULL,
+                side TEXT NOT NULL,
+                qty REAL NOT NULL,
+                created_at INTEGER DEFAULT (strftime('%s', 'now'))
+            )
+        """)
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_whitelist_pair ON manual_whitelists(pair)')
 
         # FUNDAMENTAL FIX: Clear stale active positions on startup
         # This prevents the UI from showing "Green" (Synced) against old data before the first poll cycle
@@ -873,15 +886,17 @@ def _reset_bot_after_tp_internal(cursor, bot_id, exit_price, direction=None, act
 
 
     cursor.execute("""
-        SELECT COALESCE(SUM(CASE WHEN order_type IN ('entry', 'grid', 'adoption_add', 'adoption') THEN filled_amount ELSE 0 END), 0) -
-               COALESCE(SUM(CASE WHEN order_type IN ('tp', 'close', 'adoption_reduce', 'dust_close', 'sl') THEN filled_amount ELSE 0 END), 0)
+        SELECT ROUND(COALESCE(SUM(CASE WHEN order_type IN ('entry', 'grid', 'adoption_add', 'adoption') THEN filled_amount ELSE 0 END), 0) -
+               COALESCE(SUM(CASE WHEN order_type IN ('tp', 'close', 'adoption_reduce', 'dust_close', 'sl') THEN filled_amount ELSE 0 END), 0), 8)
         FROM bot_orders WHERE bot_id = ? AND filled_amount > 0 AND (cycle_id = ? OR cycle_id IS NULL)
         AND status NOT IN ('reset_cleared', 'auto_closed')
     """, (bot_id, old_cycle))
-    old_net_qty = max(0.0, float(cursor.fetchone()[0] or 0.0))
+    raw_net = cursor.fetchone()[0] or 0.0
+    # Snap sub-epsilon dust to zero to prevent ghost carry-over
+    old_net_qty = max(0.0, float(raw_net) if abs(float(raw_net)) > 1e-8 else 0.0)
 
     cursor.execute("UPDATE bot_orders SET status = 'auto_closed', updated_at = ? WHERE bot_id = ? AND status = 'open'", (int(time.time()), bot_id))
-    cursor.execute("UPDATE bot_orders SET status = 'reset_cleared', updated_at = ? WHERE bot_id = ? AND status IN ('filled', 'closed', 'missing', 'cancelled', 'canceled') AND order_type != 'hedge'", (int(time.time()), bot_id))
+    cursor.execute("UPDATE bot_orders SET status = 'reset_cleared', updated_at = ? WHERE bot_id = ? AND status NOT IN ('open', 'new', 'auto_closed', 'reset_cleared') AND order_type != 'hedge'", (int(time.time()), bot_id))
 
     # 🚀 ROOT CAUSE FIX B: Clamp carry-over qty against exchange physical reality.
     # Previously, old_net_qty was pure arithmetic from bot_orders (entry fills - TP fills).
@@ -915,8 +930,14 @@ def _reset_bot_after_tp_internal(cursor, bot_id, exit_price, direction=None, act
             old_net_qty = 0.0
 
     excluded_carry_labels = ['RESET_VANISHED_POSITION', 'RESET_STRUCTURAL_GHOST', 'RESET_PHANTOM_ENTRY', 'SYSTEM_WIPE', 'MANUAL_CLOSE', 'STOP_LOSS_EXIT']
-
-    if abs(old_net_qty) > 0.0001 and action_label not in excluded_carry_labels:
+    
+    # 🛡️ DUST-AWARE COMPLETION (ROOT CAUSE FIX):
+    # Only carry over residiual quantity if it represents significant monetary value (>$1.00).
+    # This prevents the "Impossible Loop" where tiny rounding errors block 
+    # the bot from returning to 'Scanning' mode.
+    residue_notional = abs(old_net_qty) * (exit_price if exit_price > 0 else 1.0)
+    
+    if abs(old_net_qty) > 0.0001 and residue_notional > 1.0 and action_label not in excluded_carry_labels:
         logger.info(f"🌉 [CARRY-OVER] Bot {bot_id}: Carrying over {old_net_qty:.4f} {pair} units into Cycle {new_cycle}.")
         carry_otype = 'entry'
         carry_cid = f"CQB_{bot_id}_CARRY_{int(time.time() * 1000)}"
@@ -933,7 +954,7 @@ def _reset_bot_after_tp_internal(cursor, bot_id, exit_price, direction=None, act
         ))
         cursor.execute("UPDATE bot_orders SET status = 'filled' WHERE client_order_id = ?", (carry_cid,))
 
-    new_cycle_phase = 'CARRY_PENDING' if (abs(old_net_qty) > 0.0001 and action_label not in excluded_carry_labels) else 'IDLE'
+    new_cycle_phase = 'CARRY_PENDING' if (abs(old_net_qty) > 0.0001 and residue_notional > 1.0 and action_label not in excluded_carry_labels) else 'IDLE'
     cursor.execute(
         "UPDATE trades SET current_step = 0, total_invested = 0, avg_entry_price = 0, "
         "target_tp_price = 0, last_exit_price = ?, last_exit_time = ?, basket_start_time = ?, "
@@ -1009,7 +1030,8 @@ def safe_wipe_bot(
 
     Returns True if the wipe was executed, False if it was blocked.
     """
-    MIN_PHYSICAL_THRESHOLD = 0.0005   # Treat anything below this as dust / 0
+    # Treatment of positions < $1.00 as "Dust" to allow state transitions
+    MIN_NOTIONAL_THRESHOLD = 1.0  # Dollars
 
     conn = get_connection()
     cursor = conn.cursor()
@@ -1066,12 +1088,19 @@ def safe_wipe_bot(
 
     phys_qty = max(cached_phys_qty, snapshot_phys_qty)
 
-    if phys_qty > MIN_PHYSICAL_THRESHOLD:
+    # We now check NOTIONAL value instead of just quantity.
+    cursor.execute("SELECT avg_entry_price FROM trades WHERE bot_id=?", (bot_id,))
+    price_row = cursor.fetchone()
+    current_price = float(price_row[0]) if price_row and price_row[0] else 0.0
+    
+    # If we have no price, we use 1.0 as multiplier (conservative)
+    notional_value = phys_qty * (current_price if current_price > 0 else 1.0)
+
+    if notional_value > MIN_NOTIONAL_THRESHOLD:
         logger.warning(
             f"🛡️ [SAFE-WIPE BLOCKED] Bot {bot_id} ({clean_pair} {side_check}): "
-            f"Exchange shows {phys_qty:.6f} physical units (cached={cached_phys_qty:.6f}, "
-            f"snapshot={snapshot_phys_qty:.6f}). Wipe BLOCKED — real money is on exchange. "
-            f"Reason attempted: {reason}"
+            f"Exchange shows {phys_qty:.6f} units (~${notional_value:.2f}). "
+            f"Wipe BLOCKED — significant money is on exchange. Reason: {reason}"
         )
         return False
 
@@ -1088,17 +1117,15 @@ def safe_wipe_bot(
     """, (bot_id,)).fetchone()
     ledger_net_qty = max(0.0, float(ledger_row[0] or 0))
 
-    if ledger_net_qty > MIN_PHYSICAL_THRESHOLD:
+    # check notional for ledger too
+    ledger_notional = ledger_net_qty * (current_price if current_price > 0 else 1.0)
+    if ledger_notional > MIN_NOTIONAL_THRESHOLD:
         if bypass_ledger_guard:
-            logger.warning(
-                f"⚠️ [SAFE-WIPE BYPASS] Bot {bot_id}: Ledger shows {ledger_net_qty:.6f} net units, "
-                f"BUT bypass_ledger_guard is True. Overriding ledger due to Ghost Detection!"
-            )
+            logger.warning(f"⚠️ [SAFE-WIPE BYPASS] Bot {bot_id}: Ledger shows ${ledger_notional:.2f} residue, but bypass is ACTIVE.")
         else:
             logger.warning(
-                f"🛡️ [SAFE-WIPE BLOCKED] Bot {bot_id}: Ledger shows {ledger_net_qty:.6f} net units "
-                f"across all cycles. Position mathematically exists even if physical cache is stale. "
-                f"Wipe BLOCKED. Reason attempted: {reason}"
+                f"🛡️ [SAFE-WIPE BLOCKED] Bot {bot_id}: Ledger shows {ledger_net_qty:.6f} net units (~${ledger_notional:.2f}). "
+                f"Wipe BLOCKED. Reason: {reason}"
             )
             return False
 
@@ -1696,7 +1723,14 @@ def fail_order(db_id, reason):
     try:
         conn.execute("BEGIN IMMEDIATE")
         cursor = conn.cursor()
-        cursor.execute("UPDATE bot_orders SET status = 'failed', notes = ?, updated_at = ? WHERE id = ?", (reason, int(time.time()), db_id))
+        # 🚀 INTEGRITY GUARD: Never overwrite a physical fill with a 'failed' network status.
+        cursor.execute("""
+            UPDATE bot_orders 
+            SET status = 'failed', notes = ?, updated_at = ? 
+            WHERE id = ? 
+              AND status NOT IN ('filled', 'partially_filled', 'open')
+              AND COALESCE(filled_amount, 0) = 0
+        """, (reason, int(time.time()), db_id))
         conn.commit()
         return True
     except:
@@ -2163,56 +2197,52 @@ def get_active_bot_id_by_symbol_direction(symbol: str, direction: str) -> Option
 
 def _calculate_formula_step(bot_id: int, total_cost: float, fallback_step: int, cursor, cycle_id: int) -> int:
     """
-    Validates and corrects the max_step using THE LEDGER SUCCESSION PROOF.
-    Instead of guessing via log math, we trust the explicit 'step' column in filled bot_orders.
-    Catches stale rows or CARRY positions that represent multiple martingale steps.
+    Validates and corrects the current_step using the ABSOLUTE LEDGER SUCCESSION PROOF:
+    Truth Hierarchy:
+    1. PROOF (Ledger): Count highest verified 'filled' step in bot_orders for this cycle.
+    2. SANITY (Fallback): If no ledger fills exist, Step is 0. 
+    
+    Mathematical derivation is strictly for cross-referencing in logs/UI and MUST NOT 
+    automatically move the bot's current_step, as that leads to 'Step Inflation' (fixing drift).
     """
     try:
         import math as _math
         import logging
         logger = logging.getLogger(__name__)
 
-        # 🚀 SUCCESSION PROOF: Look for the highest non-zero step actually recorded in orders.
-        # This is 100% accurate for bots that follow the ladder.
-        ledger_step = cursor.execute(
-            "SELECT MAX(step) FROM bot_orders WHERE bot_id=? AND status='filled' AND step > 0 AND cycle_id=?", (bot_id, cycle_id)
-        ).fetchone()
+        # 🚀 1. ABSOLUTE SUCCESSION PROOF: Highest milestone reached with ≥ 99% fill ratio.
+        # We query all orders for this bot/cycle with fills.
+        orders = cursor.execute(
+            """SELECT step, amount, filled_amount FROM bot_orders 
+               WHERE bot_id=? AND cycle_id=? 
+               AND filled_amount > 0 
+               AND status IN ('filled', 'closed', 'canceled', 'cancelled', 'partially_filled')
+               ORDER BY step DESC""", 
+            (bot_id, cycle_id)
+        ).fetchall()
         
-        if ledger_step and ledger_step[0]:
-            actual_step = int(ledger_step[0])
-            if actual_step > fallback_step:
-                logger.info(f"📐 [STEP-DNA] Bot {bot_id}: Ledger proof says Step {actual_step} (was {fallback_step}).")
-                return actual_step
-            elif actual_step < fallback_step:
-                # This handles TPs or shrinks where the ledger proves we are at a lower step
-                logger.info(f"📐 [STEP-DNA] Bot {bot_id}: Ledger proof confirms Step {actual_step} (downgrade from {fallback_step}).")
-                return actual_step
-            else:
-                return actual_step
+        # Determine the highest 'Mastered' step. 
+        # A step is only mastered if it reached near-total completion (99%).
+        # This absorbs exchange dust while preventing 'Step Skipping' on tiny fills.
+        ledger_step = 0
+        for o_step, o_amount, o_filled in orders:
+            if o_step is None: continue
+            
+            target = float(o_amount or 0)
+            filled = float(o_filled or 0)
+            
+            if target > 0 and (filled / target) >= 0.99:
+                ledger_step = int(o_step)
+                break # Found highest completed step
+            elif target == 0 and filled > 0:
+                # Edge case: adoptions/carries with 0 target but positive fill
+                ledger_step = max(ledger_step, int(o_step))
 
-        # FALLBACK: Geometric series formula (only for orphan adoption rows missing step info)
-        cfg = cursor.execute(
-            "SELECT base_size, martingale_multiplier FROM bots WHERE id=?", (bot_id,)
-        ).fetchone()
-        if cfg:
-            _base = float(cfg[0] or 0.0)
-            _mult = float(cfg[1] or 2.0)
-            _mult = _mult if _mult > 0 else 2.0
-            if _base > 0:
-                if abs(_mult - 1.0) < 1e-6:
-                    _formula_step = max(1, round(total_cost / _base))
-                else:
-                    _ratio = total_cost * (_mult - 1.0) / _base + 1.0
-                    if _ratio > 0:
-                        _formula_step = max(1, min(20, round(_math.log(_ratio) / _math.log(_mult))))
-                    else:
-                        _formula_step = fallback_step
-                
-                if _formula_step != fallback_step:
-                    logger.info(
-                        f"📐 [STEP-XREF] Bot {bot_id}: Cross-ref math says Step {_formula_step} (invested=${total_cost:.2f})."
-                    )
-                    return _formula_step
+        # 🚀 2. THE IDENTITY GUARD
+        if ledger_step != fallback_step:
+            logger.info(f"📐 [SUCCESSION-PROOF] Bot {bot_id}: Milestone Ledger confirms Step {ledger_step} (Previously {fallback_step}).")
+        
+        return ledger_step
     except Exception as e:
         logger.error(f"Error in _calculate_formula_step (bot {bot_id}): {e}")
     return fallback_step
@@ -2252,37 +2282,66 @@ def recompute_invested_from_orders(bot_id: int) -> tuple:
 
         # 🚀 HEDGE-MODE FIX: Filter fills by the bot's position_side.
         # This prevents a LONG bot from adopting SHORT fills (and vice versa).
+        # Find the wipe wall: the highest row ID of any reset_cleared/auto_closed marker
+        # in this cycle. Rows at id <= wall_id were definitively archived at that point
+        # and must stay dead, even if they have filled_amount > 0 (historical ghosts).
+        # Rows with id > wall_id genuinely belong to the current active cycle.
+        # This is more reliable than basket_start_time (which is continuously updated
+        # as new orders are placed and can postdate legitimate fills within this cycle).
+        wipe_wall_row = cursor.execute("""
+            SELECT COALESCE(MAX(id), 0)
+            FROM bot_orders
+            WHERE bot_id = ? AND cycle_id = ?
+              AND status IN ('reset_cleared', 'auto_closed')
+        """, (bot_id, cycle_id)).fetchone()
+        wipe_wall_id = int(wipe_wall_row[0]) if wipe_wall_row else 0
+
         cursor.execute("""
             SELECT
-                COALESCE(SUM(
+                ROUND(COALESCE(SUM(
                     CASE WHEN bo.order_type IN ('entry', 'grid', 'adoption_add', 'adoption') THEN (bo.filled_amount * bo.price) ELSE 0.0 END
-                ), 0.0) AS bought_cost,
-                COALESCE(SUM(
+                ), 0.0), 8) AS bought_cost,
+                ROUND(COALESCE(SUM(
                     CASE WHEN bo.order_type IN ('entry', 'grid', 'adoption_add', 'adoption') THEN bo.filled_amount ELSE 0.0 END
-                ), 0.0) AS bought_qty,
-                COALESCE(SUM(
+                ), 0.0), 8) AS bought_qty,
+                ROUND(COALESCE(SUM(
                     CASE WHEN bo.order_type IN ('adoption_reduce', 'tp', 'close', 'dust_close', 'sl') THEN bo.filled_amount ELSE 0.0 END
-                ), 0.0) AS sold_qty,
+                ), 0.0), 8) AS sold_qty,
                 COALESCE(MAX(bo.step), 0) AS max_step
             FROM bot_orders bo
             WHERE bo.bot_id  = ?
               AND bo.cycle_id = ?
-              AND (bo.position_side = ? OR bo.position_side IS NULL
-                   OR bo.position_side = 'BOTH'
-                   OR bo.position_side = '')
+              AND (bo.position_side = ? OR bo.position_side IS NULL OR bo.position_side = 'BOTH' OR bo.position_side = '')  -- 🚀 FUNDAMENTAL FIX: NULL-tolerant Side filter (v2.1)
               AND bo.filled_amount > 0
               AND bo.price > 0
               AND bo.client_order_id LIKE 'CQB_%'
-              AND bo.status NOT IN ('placing', 'failed', 'auto_closed', 'reset_cleared')
-        """, (bot_id, cycle_id, bot_side))
+              -- 🚀 WIPE-WALL INTEGRITY GUARD:
+              -- Hard exclude all structurally archived rows (they are history).
+              AND bo.status NOT IN ('auto_closed', 'reset_cleared')
+              -- Exclude rows at or behind the wipe wall — they belong to a previous
+              -- sub-cycle that was explicitly closed. 0 means no wall (fresh cycle).
+              AND (? = 0 OR bo.id > ?)
+              -- For 'failed' rows: only include if they have genuine fills AND sit
+              -- above the wipe wall (i.e., they are true REST-timeout races on
+              -- WebSocket-confirmed fills, not ancient pre-wipe ghosts).
+              AND (
+                  bo.status NOT IN ('placing', 'failed')
+                  OR (bo.status = 'failed' AND bo.filled_amount > 0)
+              )
+        """, (bot_id, cycle_id, bot_side, wipe_wall_id, wipe_wall_id))
 
         r = cursor.fetchone()
         bought_cost = float(r[0] or 0.0)
         bought_qty  = float(r[1] or 0.0)
         sold_qty    = float(r[2] or 0.0)
         max_step    = int(r[3] or 0)
+        # Snap sub-epsilon fractions to zero — prevents invisible IEEE 754 dust
+        # from triggering spurious CARRY-OVER rows on the next cycle.
+        if abs(float(r[0] or 0.0)) <= 1e-8:
+            return 0.0, 0.0, 0.0, 0
 
-        total_qty = bought_qty - sold_qty
+        net_qty_raw = float(r[1] or 0.0) - float(r[2] or 0.0)
+        total_qty = round(net_qty_raw, 8)  # Normalized net position quantity
 
         if total_qty > 1e-8:
             avg_price = bought_cost / bought_qty if bought_qty > 1e-8 else 0.0
@@ -2434,9 +2493,28 @@ def sync_trades_from_orders(bot_id: int) -> bool:
 
         delta_qty = abs(recomputed_qty - cached_qty)
 
+        # 🚀 THE ABSOLUTE GROUND TRUTH [V1.8.6]
+        # Recomputed fills are authoritative. If the ledger is empty, the bot is IDLE.
+        # We do NOT allow 'Math Proof' to override an empty ledger here because that 
+        # is how 'Step Inflation' happens (by trusting legacy total_invested).
+        
+        if recomputed_qty <= QTY_EPSILON:
+            # Ledger is empty. Ensure trades row is cleared.
+            if cached_invested > 0 or cached_step > 0:
+                logger.warning(f"🧹 [DNA-WIPE] Bot {bot_id}: No ledger fills found. Resetting phantom state (was ${cached_invested:.2f}, Step {cached_step}).")
+                cursor.execute("""
+                    UPDATE trades 
+                    SET total_invested = 0, avg_entry_price = 0, current_step = 0, 
+                        entry_confirmed = 0, basket_start_time = 0
+                    WHERE bot_id = ?
+                """, (bot_id,))
+                conn.commit()
+                return True
+            return False
+
         if delta_qty <= QTY_EPSILON and recomputed_step == cached_step:
-            conn.commit() # 🚀 FIX: release implicit SELECT (SHARED) lock before returning
-            return False  # Already in sync — no write needed
+            conn.commit()
+            return False
 
         # 🚀 CYCLE-CONTAMINATION GUARD [V1.7.3]:
         # If recomputed_cost is NEGATIVE, it means historical entries and exits
@@ -2459,20 +2537,32 @@ def sync_trades_from_orders(bot_id: int) -> bool:
             f"Cached={cached_qty:.8f} vs Confirmed={recomputed_qty:.8f} (Δ={delta_qty:.8f}). "
             f"Correcting trades row from order fills."
         )
-        cursor.execute("""
+
+        # 🚀 EE TIMER RESET [V1.9.0]
+        # If the quantity is increasing significantly (a safety order/grid hit), 
+        # we reset the basket_start_time to 'now'. This restarts the Early Exit 
+        # countdown for the new, averaged position.
+        new_basket_time_sql = ""
+        params = [round(recomputed_cost, 8), round(recomputed_avg, 8), recomputed_step, recomputed_cost]
+        
+        # Reset if step increases or qty increases by more than 1% (avoid noise resets)
+        if recomputed_step > cached_step or recomputed_qty > (cached_qty * 1.01):
+            logger.info(f"⏳ [EE-RESET] Bot {bot_id}: Grid hit detected. Resetting basket timer to now.")
+            new_basket_time_sql = ", basket_start_time = ?"
+            params.append(int(time.time()))
+        
+        params.append(bot_id)
+
+        sql = f"""
             UPDATE trades
             SET total_invested  = ?,
                 avg_entry_price = ?,
                 current_step    = ?,
                 entry_confirmed = CASE WHEN ? > 0 THEN 1 ELSE entry_confirmed END
+                {new_basket_time_sql}
             WHERE bot_id = ?
-        """, (
-            round(recomputed_cost, 8),
-            round(recomputed_avg, 8),
-            recomputed_step,   # 🚀 FUNDAMENTAL FIX: Ledger is the only truth. No clamps.
-            recomputed_cost,
-            bot_id
-        ))
+        """
+        cursor.execute(sql, params)
         conn.commit()
         return True
 
@@ -2490,23 +2580,131 @@ def sync_trades_from_orders(bot_id: int) -> bool:
 def reconcile_with_db(bot_id, current_price, open_orders, exchange_position):
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT t.total_invested, b.pair FROM trades t JOIN bots b ON t.bot_id = b.id WHERE t.bot_id = ?", (bot_id,))
+    cursor.execute("SELECT t.total_invested, b.pair, b.direction FROM trades t JOIN bots b ON t.bot_id = b.id WHERE t.bot_id = ?", (bot_id,))
     res = cursor.fetchone()
     if not res: return {'success': False}
-    total_invested, pair = res
+    total_invested, pair, direction = res
+
     if not exchange_position or float(exchange_position.get('size', 0)) == 0:
         if total_invested > 0:
+            # ============================================================
+            # 🚀 PHYSICAL-IMPRINT GUARD v1.8.6
+            # Before zeroing the ledger, cross-check TWO sources of truth:
+            #
+            # SOURCE A — active_positions table (persistent exchange snapshot):
+            #   If a row exists for this bot with size > 0, the exchange still
+            #   physically holds this position. The exchange_position argument
+            #   may be stale (REST lag, wrong symbol format, etc).
+            #
+            # SOURCE B — recompute_invested_from_orders (bot_orders fills):
+            #   If confirmed fill records exist above the wipe wall, a real
+            #   physical position was opened and not yet closed by the system.
+            #
+            # If EITHER source says the position is still open, ABORT the wipe.
+            # Only wipe when BOTH agree the position is truly flat.
+            # ============================================================
+
+            # Source A: check active_positions for a live physical imprint
+            norm_pair = pair.split(':')[0].replace('/', '')
+            ap_side = 'LONG' if str(direction).upper() == 'LONG' else 'SHORT'
+            ap_row = cursor.execute(
+                "SELECT size FROM active_positions WHERE bot_id = ? AND size > 0",
+                (bot_id,)
+            ).fetchone()
+            if ap_row and float(ap_row[0]) > 0:
+                logger.warning(
+                    f"🛡️ [RECONCILE-GUARD] Bot {bot_id}: exchange_position=None but "
+                    f"active_positions shows size={ap_row[0]:.6f}. "
+                    f"Skipping ledger wipe — physical imprint still present."
+                )
+                return {'success': True}  # Position is live — do NOT wipe
+
+            # Source B: check bot_orders ground truth
+            recomputed_cost, recomputed_avg, recomputed_qty, _ = recompute_invested_from_orders(bot_id)
+            if recomputed_qty > 1e-6:
+                logger.warning(
+                    f"🛡️ [RECONCILE-GUARD] Bot {bot_id}: exchange_position=None but "
+                    f"recompute confirms qty={recomputed_qty:.6f} still filled. "
+                    f"Skipping ledger wipe — fill records intact."
+                )
+                return {'success': True}  # bot_orders confirms fills — do NOT wipe
+
+            # Both sources agree: position is truly flat. Safe to wipe.
             try:
                 conn.execute("BEGIN IMMEDIATE")
-                cursor.execute("UPDATE trades SET current_step = 0, total_invested = 0, avg_entry_price = 0, target_tp_price = 0, last_exit_price = ?, last_exit_time = ?, basket_start_time = ?, entry_confirmed = 0, entry_order_id = NULL, tp_order_id = NULL, bot_position_id = NULL, close_type = 'RECONCILE' WHERE bot_id = ?", (current_price, int(time.time()), int(time.time()), bot_id))
+                cursor.execute("SELECT cycle_id FROM trades WHERE bot_id = ?", (bot_id,))
+                res_cyc = cursor.fetchone()
+                old_cycle = res_cyc[0] if res_cyc and res_cyc[0] else 1
+                new_cycle = old_cycle + 1
+                cursor.execute("UPDATE trades SET current_step = 0, total_invested = 0, avg_entry_price = 0, target_tp_price = 0, last_exit_price = ?, last_exit_time = ?, basket_start_time = ?, entry_confirmed = 0, entry_order_id = NULL, tp_order_id = NULL, bot_position_id = NULL, close_type = 'RECONCILE', cycle_id = ? WHERE bot_id = ?", (current_price, int(time.time()), int(time.time()), new_cycle, bot_id))
                 cursor.execute("UPDATE bot_orders SET status = 'auto_closed', updated_at = ? WHERE bot_id = ? AND status = 'open'", (int(time.time()), bot_id))
+                cursor.execute("UPDATE bot_orders SET status = 'reset_cleared', updated_at = ? WHERE bot_id = ? AND status NOT IN ('open', 'new', 'auto_closed', 'reset_cleared') AND order_type != 'hedge'", (int(time.time()), bot_id))
                 cursor.execute("UPDATE bots SET status='Scanning' WHERE id = ?", (bot_id,))
                 conn.commit()
+                logger.info(f"[RECONCILE] Bot {bot_id}: ledger zeroed (cycle {old_cycle} → {new_cycle}). Both AP and recompute confirmed flat.")
             except Exception as e:
                 logger.error(f"Reconcile DB update failed: {e}")
                 try: conn.rollback()
                 except: pass
     return {'success': True}
+
+# 🛡️ MANUAL WHITELIST HELPERS (V2.1.0)
+def add_manual_whitelist(pair: str, side: str, qty: float):
+    """Register a manual position that the bot should ignore during reconciliation."""
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        # Side must be normalized to 'LONG' or 'SHORT'
+        norm_side = side.upper()
+        # Side check
+        if norm_side not in ['LONG', 'SHORT']:
+            logger.error(f"Invalid side for manual whitelist: {side}")
+            return
+
+        # Simple delete-then-insert for clean state per pair/side
+        cursor.execute("DELETE FROM manual_whitelists WHERE pair = ? AND side = ?", (pair, norm_side))
+        cursor.execute("""
+            INSERT INTO manual_whitelists (pair, side, qty, created_at)
+            VALUES (?, ?, ?, ?)
+        """, (pair, norm_side, qty, int(time.time())))
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Failed to add manual whitelist for {pair}: {e}")
+
+def get_manual_whitelists(pair: str = None) -> List[Dict]:
+    """Retrieve all active manual whitelists, optionally filtered by pair."""
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        if pair:
+            cursor.execute("SELECT pair, side, qty, created_at FROM manual_whitelists WHERE pair = ?", (pair,))
+        else:
+            cursor.execute("SELECT pair, side, qty, created_at FROM manual_whitelists")
+        rows = cursor.fetchall()
+        return [{'pair': r[0], 'side': r[1], 'qty': float(r[2]), 'created_at': r[3]} for r in rows]
+    except Exception as e:
+        logger.error(f"Failed to fetch manual whitelists: {e}")
+        return []
+
+def remove_manual_whitelist(pair: str, side: str):
+    """Remove a specific manual whitelist."""
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM manual_whitelists WHERE pair = ? AND side = ?", (pair, side.upper()))
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Failed to remove manual whitelist for {pair}: {e}")
+
+def clear_manual_whitelists_for_pair(pair: str):
+    """Remove all manual whitelists for a pair (used when position is flattened)."""
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM manual_whitelists WHERE pair = ?", (pair,))
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Failed to clear manual whitelists for {pair}: {e}")
 
 def get_bot_close_settings(bot_id):
     params = get_bot_params(bot_id)
@@ -2665,8 +2863,19 @@ def log_trade(bot_id, action, symbol, price, amount, cost_usdc, order_id="UNKNOW
         except: pass
         return False
 
-def _log_trade_internal(cursor, bot_id, action, symbol, price, amount, cost_usdc, order_id="UNKNOWN", step=0, notes="", pnl=0.0, position_side="LONG"):
+def _log_trade_internal(cursor, bot_id, action, symbol, price, amount, cost_usdc, order_id="UNKNOWN", step=0, notes="", pnl=0.0, position_side=None):
     """Internal implementation that assumes an active transaction/cursor."""
+    # 🚀 FUNDAMENTAL FIX: side-locking (Prevent Crossover)
+    cursor.execute("SELECT direction FROM bots WHERE id=?", (bot_id,))
+    bot_row = cursor.fetchone()
+    bot_direction = bot_row[0].upper() if bot_row else 'LONG'
+    
+    # In Hedge Mode, we MUST strictly match. 'BOTH' is treated as a mismatch for directional bots.
+    resolved_side = str(position_side).upper() if position_side else bot_direction
+    if resolved_side != bot_direction:
+        logger.error(f"🛡️ [SIDE-LOCK REJECT] Attempted to log {resolved_side} trade for {bot_direction} Bot {bot_id} ({symbol}). Trade ignored.")
+        return False
+
     # Robust conversion for incorrect argument types from bot_executor
     if isinstance(notes, (int, float)): notes = str(notes)
     if isinstance(pnl, str): 
@@ -2676,7 +2885,8 @@ def _log_trade_internal(cursor, bot_id, action, symbol, price, amount, cost_usdc
     cursor.execute("""
         INSERT INTO trade_history (bot_id, timestamp, action, symbol, price, amount, cost_usdc, order_id, step, notes, pnl, position_side)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (bot_id, int(time.time()), action, symbol, price, amount, cost_usdc, order_id, step, notes, pnl, str(position_side).upper()))
+    """, (bot_id, int(time.time()), action, symbol, price, amount, cost_usdc, order_id, step, notes, pnl, bot_direction))
+    return True
 
 def get_trade_history(bot_id=None, limit=100):
     conn = get_connection()
@@ -2755,24 +2965,26 @@ def update_order_fill(order_id, filled_qty, bot_id=None):
         try: conn.rollback()
         except: pass
 
-def save_bot_order(bot_id, order_type, exchange_order_id, price, amount, step, status='open', client_order_id=None, notes=None):
+def save_bot_order(bot_id, order_type, exchange_order_id, price, amount, step, status='open', client_order_id=None, notes=None, position_side=None):
     conn = get_connection()
     cursor = conn.cursor()
     try:
-        # Resolve current cycle_id and side from trades table
-        cursor.execute("""
-            SELECT COALESCE(cycle_id, 1), COALESCE(position_side, 'LONG') 
-            FROM trades WHERE bot_id=?
-        """, (bot_id,))
-        row = cursor.fetchone()
-        if row:
-            cycle_id, bot_side = row
-        else:
-            # Fallback if trade row missing
-            cursor.execute("SELECT direction FROM bots WHERE id=?", (bot_id,))
-            b_row = cursor.fetchone()
-            bot_side = b_row[0].upper() if b_row else 'LONG'
-            cycle_id = 1
+        # Resolve current cycle_id and bot direction
+        cursor.execute("SELECT COALESCE(cycle_id, 1) FROM trades WHERE bot_id=?", (bot_id,))
+        c_row = cursor.fetchone()
+        cycle_id = c_row[0] if c_row else 1
+        
+        cursor.execute("SELECT direction FROM bots WHERE id=?", (bot_id,))
+        b_row = cursor.fetchone()
+        bot_direction = b_row[0].upper() if b_row else 'LONG'
+
+        # 🚀 FUNDAMENTAL FIX: side-locking (One-Way Mode tolerant)
+        # If a position_side is provided (e.g., from adoption or API), it MUST match bot direction.
+        # We allow 'BOTH' and NULL/Empty as they represent One-Way mode contributing to our side.
+        upper_side = str(position_side or 'BOTH').upper()
+        if upper_side not in (bot_direction, 'BOTH', 'NONE', ''):
+            logger.error(f"🛡️ [SIDE-LOCK REJECT] Attempted to save {position_side} order for {bot_direction} Bot {bot_id}. Cross-side crossover blocked.")
+            return None
 
         # 🚀 FUNDAMENTAL FIX: If the exchange immediately returns 'closed' or 'filled' on placement
         # (e.g. crossing the spread as a taker), we must stamp filled_amount immediately so 
@@ -2782,7 +2994,7 @@ def save_bot_order(bot_id, order_type, exchange_order_id, price, amount, step, s
         cursor.execute("""
             INSERT INTO bot_orders (bot_id, step, order_type, order_id, price, amount, filled_amount, status, created_at, client_order_id, notes, cycle_id, position_side) 
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (bot_id, step, order_type, exchange_order_id, price, amount, initial_fill, status, int(time.time()), client_order_id, notes, cycle_id, bot_side))
+        """, (bot_id, step, order_type, exchange_order_id, price, amount, initial_fill, status, int(time.time()), client_order_id, notes, cycle_id, bot_direction))
         row_id = cursor.lastrowid
         
         # CRITICAL FIX: Also update trades table so get_bot_order_ids() / Guardian can see them.
@@ -2842,8 +3054,16 @@ def update_bot_order_exchange_id(db_row_id, exchange_order_id, status='open'):
                         (exchange_order_id, bot_id_for_row)
                     )
         else:
+            # 🚀 INTEGRITY GUARD: A REST API timeout returning None MUST NOT overwrite a 
+            # WebSocket fill that arrived faster asynchronously.
             conn.execute(
-                "UPDATE bot_orders SET status='failed', updated_at=? WHERE id=?",
+                """
+                UPDATE bot_orders 
+                SET status='failed', updated_at=? 
+                WHERE id=? 
+                  AND status NOT IN ('filled', 'partially_filled', 'open')
+                  AND COALESCE(filled_amount, 0) = 0
+                """,
                 (int(time.time()), db_row_id)
             )
         conn.commit()
@@ -3010,3 +3230,67 @@ def update_full_snapshot(trade_updates: List[Dict[str, Any]], physical_positions
             try:
                 pass # conn.close() disabled for singleton safety
             except: pass
+
+
+# 🛡️ ARCHITECT'S SHIELD: Manual Whitelist Helpers
+
+def add_manual_whitelist(pair: str, side: str, qty: float):
+    """Adds a manual quantity to the whitelist to be ignored by reconciler."""
+    try:
+        conn = get_connection()
+        c = conn.cursor()
+        # Check if already exists for this exact pair/side - if so, update QTY (overwrite)
+        c.execute("SELECT id FROM manual_whitelists WHERE pair=? AND side=?", (pair, side.upper()))
+        existing = c.fetchone()
+        
+        if existing:
+            c.execute("UPDATE manual_whitelists SET qty=? WHERE id=?", (qty, existing[0]))
+        else:
+            c.execute("INSERT INTO manual_whitelists (pair, side, qty) VALUES (?, ?, ?)", (pair, side.upper(), qty))
+        
+        conn.commit()
+        logger.info(f"🛡️ [WHITELIST] Marked {qty} {pair} ({side}) as Manual.")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Failed to add manual whitelist: {e}")
+        return False
+
+def get_manual_whitelists(pair: str = None) -> List[Dict]:
+    """Retrieves all active manual whitelists, optionally filtered by pair."""
+    try:
+        conn = get_connection()
+        c = conn.cursor()
+        if pair:
+            c.execute("SELECT id, pair, side, qty FROM manual_whitelists WHERE pair=?", (pair,))
+        else:
+            c.execute("SELECT id, pair, side, qty FROM manual_whitelists")
+        
+        rows = c.fetchall()
+        return [{"id": r[0], "pair": r[1], "side": r[2], "qty": r[3]} for r in rows]
+    except Exception as e:
+        logger.error(f"❌ Failed to fetch manual whitelists: {e}")
+        return []
+
+def remove_manual_whitelist(whitelist_id: int):
+    """Removes a specific whitelist entry."""
+    try:
+        conn = get_connection()
+        c = conn.cursor()
+        c.execute("DELETE FROM manual_whitelists WHERE id=?", (whitelist_id,))
+        conn.commit()
+        return True
+    except Exception as e:
+        logger.error(f"❌ Failed to remove manual whitelist {whitelist_id}: {e}")
+        return False
+
+def clear_manual_whitelists_for_pair(pair: str):
+    """Clears all whitelists for a pair (used when position hits 0)."""
+    try:
+        conn = get_connection()
+        c = conn.cursor()
+        c.execute("DELETE FROM manual_whitelists WHERE pair=?", (pair,))
+        conn.commit()
+        return True
+    except Exception as e:
+        logger.error(f"❌ Failed to clear whitelists for {pair}: {e}")
+        return False

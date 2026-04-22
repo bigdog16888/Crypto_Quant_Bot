@@ -27,15 +27,17 @@ def calculate_early_exit_decay(
     
     # Calculate duration
     duration_seconds = (current_time - basket_start_time).total_seconds()
-    duration_hours = duration_seconds / 3600.0
     duration_mins = duration_seconds / 60.0
+    
+    grace_period_mins = float(settings.get('EEGracePeriodMins', 0.0))
+    adjusted_mins = max(0.0, duration_mins - grace_period_mins)
     
     ee_pc = 0.0
     
 
     # 2. Accelerated Interval-based decay (User Style: 30% per 15 mins)
-    if decay_per_interval > 0:
-        intervals_passed = math.floor(duration_mins / interval_mins)
+    if decay_per_interval > 0 and adjusted_mins > 0:
+        intervals_passed = math.floor(adjusted_mins / interval_mins)
         ee_pc += intervals_passed * decay_per_interval
         
 
