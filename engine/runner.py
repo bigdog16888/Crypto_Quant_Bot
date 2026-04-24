@@ -377,7 +377,38 @@ class BotRunner:
         logger.info("🔄 [STARTUP-SYNC] Analyzing Exchange Reality...")
         
         try:
-            # 0. 🛡️ Offline Fill Detection FIRST — must run before any trading decisions
+            # 0a. 📡 PRIME POSITION SNAPSHOT — fetch fresh exchange reality BEFORE any reconciliation.
+            # ─────────────────────────────────────────────────────────────────────────────────────────
+            # ROOT CAUSE FIX (v2.1.2):
+            #   reconstruct_offline_fills and adopt_from_physical_positions both read 'active_positions'
+            #   from SQLite to detect gaps. At startup, that table holds the last snapshot from the
+            #   *previous* session — which already matched the virtual ledger state at shutdown.
+            #   Any fills that occurred while the engine was offline are invisible to the gap detector,
+            #   so it reports "zero gap" and skips the history scan entirely.
+            #
+            #   Fix: populate active_positions from the live exchange FIRST, so all subsequent
+            #   reconciliation passes operate on ground-truth physical reality.
+            # ─────────────────────────────────────────────────────────────────────────────────────────
+            try:
+                from engine.database import update_active_positions_snapshot
+                logger.info("📡 [STARTUP-PRIME] Fetching live exchange positions to prime active_positions snapshot...")
+                _primed_any = False
+                for _mt, _ex in self.exchanges.items():
+                    try:
+                        _snap = _ex.fetch_positions()
+                        if _snap is not None:
+                            update_active_positions_snapshot(_snap)
+                            logger.info(f"✅ [STARTUP-PRIME] Primed active_positions from {_mt} ({len(_snap)} positions).")
+                            _primed_any = True
+                            break  # One exchange is sufficient for position snapshot
+                    except Exception as _pe:
+                        logger.warning(f"⚠️ [STARTUP-PRIME] Could not fetch positions from {_mt}: {_pe}")
+                if not _primed_any:
+                    logger.warning("⚠️ [STARTUP-PRIME] Could not prime active_positions — reconciler will use stale snapshot.")
+            except Exception as _prime_err:
+                logger.warning(f"⚠️ [STARTUP-PRIME] Position prime failed (non-fatal): {_prime_err}")
+
+            # 0b. 🛡️ Offline Fill Detection — now runs against fresh exchange reality.
             # This credits any fills that happened while the engine was offline,
             # so maintain_orders sees correct step/invested before placing new orders.
             if self._reconciler:
@@ -1148,7 +1179,12 @@ class BotRunner:
             pending_tp_cascades = drain_tp_cascade()
             if pending_tp_cascades:
                 logger.info(f"[TP-DRAIN] Processing {len(pending_tp_cascades)} pending TP cascades...")
-                for (tp_bot_id, tp_pair, tp_price) in pending_tp_cascades:
+                # Registry now yields (bot_id, pair, exit_price, exit_fill_ts) 4-tuples (v2.1.0)
+                for cascade_entry in pending_tp_cascades:
+                    tp_bot_id = cascade_entry[0]
+                    tp_pair   = cascade_entry[1]
+                    tp_price  = cascade_entry[2]
+                    tp_fill_ts = cascade_entry[3] if len(cascade_entry) > 3 else 0
                     try:
                         # Find the exchange for this pair
                         tp_ex = list(self.exchanges.values())[0] if self.exchanges else None
@@ -1157,10 +1193,11 @@ class BotRunner:
                                 bot_id=tp_bot_id,
                                 exit_price=tp_price,
                                 pair=tp_pair,
-                                exchange=tp_ex
+                                exchange=tp_ex,
+                                exit_fill_ts=tp_fill_ts
                             )
                             if success:
-                                logger.info(f"✅ [TP-DRAIN] Bot {tp_bot_id} {tp_pair} cascade complete.")
+                                logger.info(f"✅ [TP-DRAIN] Bot {tp_bot_id} {tp_pair} cascade complete (cst={tp_fill_ts}).")
                                 # Remove from this cycle's bot list (already reset)
                                 bots = [b for b in bots if b[0] != tp_bot_id]
                             else:
@@ -1168,7 +1205,7 @@ class BotRunner:
                         else:
                             logger.warning(f"[TP-DRAIN] No exchange available for bot {tp_bot_id}. Re-queuing.")
                             from engine.ledger import register_tp_cascade
-                            register_tp_cascade(tp_bot_id, tp_pair, tp_price)
+                            register_tp_cascade(tp_bot_id, tp_pair, tp_price, tp_fill_ts)  # preserve fill_ts on retry
                     except Exception as _tp_cascade_err:
                         logger.error(f"[TP-DRAIN] Exception for bot {tp_bot_id}: {_tp_cascade_err}")
         except Exception as _drain_err:
@@ -1187,9 +1224,11 @@ class BotRunner:
         if not bots:
             logger.warning("No active bots found to process in this cycle.")
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Process bots using the primed cache
-            raw_results = list(executor.map(lambda b: bot_executor.process_bot(b, exchange_snapshot=exchange_snapshot), bots))
+        if getattr(self, 'bot_pool', None) is None:
+            self.bot_pool = ThreadPoolExecutor(max_workers=20)
+
+        # Process bots using the primed cache
+        raw_results = list(self.bot_pool.map(lambda b: bot_executor.process_bot(b, exchange_snapshot=exchange_snapshot), bots))
         
         # Filter out None results (bots skipped or errored)
         processed_bot_results = [r for r in raw_results if r is not None and r[0] is not None]

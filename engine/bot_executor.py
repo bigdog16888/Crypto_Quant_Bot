@@ -180,91 +180,117 @@ class BotExecutor:
         # Standard baseline for all bot configurations (protects Maker rebates via PostOnly)
         ccxt_params = {'postOnly': True, 'timeInForce': 'GTX'}
 
-        # 1. Calculate THIS bot's own virtual open qty from its ledger
+        # 1. READ open_qty ACCUMULATOR — authoritative position size [v2.1]
+        # trades.open_qty is maintained atomically by credit_fill() on every fill.
+        # It is the exact qty confirmed by the exchange — no float-sum recomputation.
         try:
             from engine.database import get_connection as _gc_tp
             from engine.exchange_interface import normalize_symbol
             norm_pair = normalize_symbol(pair)
             with _gc_tp() as _c_tp:
                 _cur = _c_tp.cursor()
-                _cur.execute("SELECT t.cycle_id FROM trades t WHERE t.bot_id = ?", (bot_id,))
-                cycle_row = _cur.fetchone()
-                cycle_id = cycle_row[0] if (cycle_row and cycle_row[0] is not None) else 1
-                
-                _cur.execute("""
-                    SELECT 
-                        COALESCE(SUM(CASE WHEN order_type IN ('entry', 'grid', 'adoption_add', 'adoption') THEN filled_amount ELSE 0 END), 0),
-                        COALESCE(SUM(CASE WHEN order_type IN ('tp', 'close', 'adoption_reduce', 'dust_close', 'sl') THEN filled_amount ELSE 0 END), 0)
-                    FROM bot_orders
-                    WHERE bot_id = ? 
-                    AND status NOT IN ('reset_cleared', 'auto_closed', 'failed', 'placing')
-                    AND (cycle_id = ? OR cycle_id IS NULL)
-                    AND filled_amount > 0
-                """, (bot_id, cycle_id))
-                ledger_row = _cur.fetchone()
-                bot_entry_qty = float(ledger_row[0] or 0.0)
-                bot_exit_qty = float(ledger_row[1] or 0.0)
-                bot_virtual_open_qty = max(0.0, bot_entry_qty - bot_exit_qty)
-                
-                # 🚀 UNIVERSAL BOUND EQUATION (UBE) SAFE CAP [V1.7.0]
-                # Primary Truth: The bot's virtual_qty is strictly derived from Order-ID Proof (Case B.4).
-                # Redundant Guard: UBE prevents over-selling if the physical exchange state disagrees.
-                _cur.execute("""
-                    SELECT b.direction, (t.total_invested / t.avg_entry_price)
-                    FROM bots b JOIN trades t ON b.id = t.bot_id
-                    WHERE b.normalized_pair = ? AND t.total_invested > 0 AND b.id != ? AND t.avg_entry_price > 0
-                """, (norm_pair, bot_id))
-                neighbors = _cur.fetchall()
-                
-                bot_dir = direction.upper()
-                opposite_virtual_qty = sum(q for d, q in neighbors if d.upper() != bot_dir)
-                
-                # Fetch Physical snapshot context
-                # NOTE: row columns are [size, side, entry_price]
-                # FUNDAMENTAL FIX: Always normalize 'pair' when querying active_positions
-                _cur.execute("SELECT size, side FROM active_positions WHERE pair = ?", (norm_pair,))
+
+                # Primary: read the accumulator directly
+                _cur.execute(
+                    "SELECT open_qty, cycle_id FROM trades WHERE bot_id = ?", (bot_id,)
+                )
+                acc_row = _cur.fetchone()
+                bot_virtual_open_qty = float(acc_row[0] or 0.0) if acc_row else 0.0
+                cycle_id = int(acc_row[1] or 1) if acc_row else 1
+
+                # Fallback: if accumulator is zero but DB has fills, recompute (handles
+                # bots running before v2.1 migration where open_qty was not yet populated)
+                if bot_virtual_open_qty <= 0:
+                    _cur.execute("""
+                        SELECT
+                            COALESCE(SUM(CASE WHEN order_type IN ('entry','grid','adoption_add','adoption') THEN filled_amount ELSE 0 END), 0),
+                            COALESCE(SUM(CASE WHEN order_type IN ('tp','close','adoption_reduce','dust_close','sl') THEN filled_amount ELSE 0 END), 0)
+                        FROM bot_orders
+                        WHERE bot_id=? AND (cycle_id=? OR cycle_id IS NULL)
+                        AND status NOT IN ('reset_cleared','auto_closed','failed','placing')
+                        AND filled_amount > 0
+                    """, (bot_id, cycle_id))
+                    _leg = _cur.fetchone()
+                    _recomputed = max(0.0, float(_leg[0] or 0) - float(_leg[1] or 0))
+                    if _recomputed > 0:
+                        logger.debug(f"[TP-QTY] {name}: accumulator=0, recomputed={_recomputed:.8f} — using recomputed (pre-v2.1 bot)")
+                        bot_virtual_open_qty = _recomputed
+                        # Backfill the accumulator so next cycle uses it correctly
+                        _c_tp.execute(
+                            "UPDATE trades SET open_qty=? WHERE bot_id=?",
+                            (_recomputed, bot_id)
+                        )
+
+                # UBE SANITY CAP — verify we're not trying to close more than physically exists.
+                # ⚠️ ROOT CAUSE FIX (v2.3.1): The cap previously fired on ANY excess, including
+                # sub-step rounding diffs from stale active_positions snapshots. This caused TP
+                # qty to silently deflate (0.016 → 0.015 → 0.014), which the reconciler then
+                # "corrected" with adoption_reduce fills, permanently corrupting open_qty.
+                # FIX: Only cap if virtual qty exceeds physical by more than 20% (genuine corruption).
+                # Sub-20% differences are explained by snapshot lag, rounding, or pending order fills.
+                _cur.execute("SELECT size, side FROM active_positions WHERE pair=?", (norm_pair,))
                 phys_rows = _cur.fetchall()
-                
+                bot_dir = direction.upper()
                 phys_matching = sum(float(r[0]) for r in phys_rows if str(r[1]).upper() == bot_dir)
                 phys_opposite = sum(float(r[0]) for r in phys_rows if str(r[1]).upper() != bot_dir)
-                
-                # 🚀 UBE FIX [V1.7.0]: In One-Way mode (or when active_positions is stale),
-                # this bot's direction may have NO matching row in active_positions.
-                # Previously: phys_matching=0 → max_possible_qty=0 → Safe Cap kills all TPs. WRONG.
-                # Fix: When phys_matching=0 and the bot has confirmed virtual inventory,
-                # treat the bot's own virtual qty as the physical anchor. It is already
-                # proof-verified by order fills (the only way virtual > 0 is a confirmed fill).
-                # This allows the bot to close its own position while still bounding against
-                # true over-sells when opposite bots negate the physical position.
+
+                # Neighbor bots (for UBE context only)
+                _cur.execute("""
+                    SELECT b.direction, t.open_qty
+                    FROM bots b JOIN trades t ON b.id=t.bot_id
+                    WHERE b.normalized_pair=? AND t.open_qty>0 AND b.id!=?
+                """, (norm_pair, bot_id))
+                neighbors = _cur.fetchall()
+                opposite_virtual_qty = sum(q for d, q in neighbors if d.upper() != bot_dir)
+
                 if phys_matching > 0:
                     max_possible_qty = phys_matching + opposite_virtual_qty
                 elif bot_virtual_open_qty > 0 and phys_matching == 0 and phys_opposite == 0:
-                    # No physical record for this direction AND no opposite physical either.
-                    # The position may be in active_positions under a different bot_id (multi-bot same pair)
-                    # or active_positions is briefly stale. Trust the virtual ledger as the anchor.
                     max_possible_qty = bot_virtual_open_qty + opposite_virtual_qty
-                    logger.debug(f"🔍 {name}: UBE: No physical row for {bot_dir} {norm_pair}. Using virtual anchor ({bot_virtual_open_qty:.6f}).")
+                    logger.debug(f"🔍 {name}: UBE: No physical row for {bot_dir} {norm_pair}. Using accumulator anchor ({bot_virtual_open_qty:.6f}).")
                 else:
                     max_possible_qty = max(0.0, opposite_virtual_qty - phys_opposite)
-                
-                if bot_virtual_open_qty > (max_possible_qty + 0.0001):
-                    logger.warning(f"🛡️ {name}: Safe Cap triggered! Virtual={bot_virtual_open_qty:.6f} capped at Capacity={max_possible_qty:.6f}")
+
+                # Only cap if virtual is genuinely more than 20% above physical capacity.
+                # This filters out snapshot lag (e.g. phys=0.015 vs virtual=0.016 due to stale row).
+                ube_excess = bot_virtual_open_qty - max_possible_qty
+                ube_threshold = max(0.20 * max_possible_qty, 0.0001) if max_possible_qty > 0 else 0.0001
+                if ube_excess > ube_threshold:
+                    logger.warning(
+                        f"🛡️ {name}: UBE cap! accumulator={bot_virtual_open_qty:.6f} "
+                        f"capped at {max_possible_qty:.6f} (phys={phys_matching:.6f}, "
+                        f"excess={ube_excess:.6f} > threshold={ube_threshold:.6f}). "
+                        f"Possible DB corruption — investigate active_positions."
+                    )
                     bot_virtual_open_qty = max_possible_qty
+                elif ube_excess > 0:
+                    logger.debug(
+                        f"🔍 {name}: UBE sub-threshold excess={ube_excess:.6f} (phys={phys_matching:.6f} vs virtual={bot_virtual_open_qty:.6f}). "
+                        f"Within snapshot-lag tolerance — NOT capping. Trusting accumulator."
+                    )
 
         except Exception as e:
-            logger.warning(f"⚠️ {name}: Failed to calculate virtual ledger qty/UBE cap: {e}. Falling back to DB amount.")
-            bot_virtual_open_qty = amount  
+            logger.warning(f"⚠️ {name}: Failed to read open_qty accumulator: {e}. Falling back to passed amount.")
+            bot_virtual_open_qty = amount
+            phys_matching = 0.0
+            opposite_virtual_qty = 0.0
 
         if bot_virtual_open_qty <= 0.0:
-            logger.warning(f"⚠️ {name}: UBE resolved virtual qty to 0 — Safe Cap blocked TP. Physical={phys_matching:.6f} Opposite_virtual={opposite_virtual_qty:.6f}. If position is real, active_positions may be stale.")
+            logger.warning(f"⚠️ {name}: open_qty is 0 — no position to close.")
             return None, None
 
-        # 2. Derive raw TP purely from the Virtual ledger (now capped)
+        # 2. Derive TP qty from accumulator (already exchange-confirmed, rounding is final cleanup)
         prec = exchange.get_symbol_precision(pair)
         tp_qty = exchange.round_to_step(bot_virtual_open_qty, prec['step_size'])
 
         if tp_qty <= 0:
-            logger.info(f"INFO {name}: Ledger virtual qty rounds to 0 after step_size. Skipping.")
+            logger.info(f"INFO {name}: open_qty rounds to 0 after step_size. Snapping accumulator to 0.")
+            try:
+                from engine.database import get_connection as _gc_snap
+                with _gc_snap() as _sc:
+                    _sc.execute("UPDATE trades SET open_qty=0 WHERE bot_id=?", (bot_id,))
+            except Exception:
+                pass
             return None, None
 
         # 4. Log net-reducing direction for informational awareness
@@ -454,16 +480,57 @@ class BotExecutor:
             
             # 🚀 HARDENED: Verify cancellation before proceeding
             logger.info(f"🔄 [TP-SYNC] {name}: Cancelling stale TP {tp_order_id}...")
-            exchange.cancel_order(tp_order_id, pair)
-            
+            cancel_response = None
+            try:
+                cancel_response = exchange.cancel_order(tp_order_id, pair)
+            except Exception as e:
+                logger.warning(f"[TP-SYNC] {name}: Cancel failed ({e}). Attempting to fetch order status...")
+                try:
+                    cancel_response = exchange.fetch_order(tp_order_id, pair)
+                except Exception as inner_e:
+                    logger.error(f"[TP-SYNC] {name}: Could not fetch old TP status: {inner_e}")
+
+            # If we successfully obtained the cancelled/current order state, calculate precise remaining quantity
+            if cancel_response:
+                filled_qty = float(cancel_response.get('filled') or cancel_response.get('executedQty') or 0)
+                orig_qty = float(cancel_response.get('amount') or cancel_response.get('origQty') or 0)
+                status = str(cancel_response.get('status') or '').lower()
+                
+                if status in ('closed', 'filled') or (orig_qty > 0 and filled_qty >= orig_qty):
+                    logger.warning(f"⚠️ [TP-SYNC] {name}: Old TP {tp_order_id} is FULLY FILLED. Aborting replacement to prevent oversell.")
+                    return None
+                    
+                if orig_qty > 0:
+                    calculated_remaining = max(0.0, orig_qty - filled_qty)
+                    logger.info(f"✅ [TP-SYNC] {name}: Cancelled order {tp_order_id}. orig: {orig_qty:.4f}, filled: {filled_qty:.4f}, remaining: {calculated_remaining:.4f}")
+                    # Update db_qty to the mathematically exact remaining amount
+                    db_qty = calculated_remaining
+
             # Mandatory 500ms safety sleep to allow exchange state to propagate
             time.sleep(0.5)
-            
+
+            # 🚀 ROOT CAUSE FIX: Re-read open_qty from DB after sleep!
+            # If the cancelled order was partially or fully filled just before cancellation,
+            # the WebSocket will have processed the fill during the 500ms sleep.
+            # Using the statically passed db_qty would cause an oversell.
+            try:
+                from engine.database import get_connection
+                _conn = get_connection()
+                _latest_qty_row = _conn.execute("SELECT open_qty FROM trades WHERE bot_id=?", (bot_id,)).fetchone()
+                if _latest_qty_row:
+                    _latest_qty = float(_latest_qty_row[0] or 0)
+                    if _latest_qty < db_qty:
+                        logger.warning(f"⚠️ [TP-SYNC] {name}: open_qty dropped from {db_qty:.4f} to {_latest_qty:.4f} during sleep (WS processed a fill!). Adjusting to prevent oversell.")
+                        db_qty = _latest_qty
+            except Exception as e:
+                logger.error(f"[TP-SYNC] Failed to re-verify open_qty: {e}")
+
             # Mark cancelled in DB — but remember the old price so we can restore if placement fails
             old_placed_price = float(existing_tp_order.get('price') or existing_tp_order.get('stopPrice') or 0)
             update_order_status(tp_order_id, 'cancelled', bot_id=bot_id)
 
             if db_qty <= 0 or db_tp <= 0 or config.DRY_RUN:
+                logger.info(f"🛑 [TP-SYNC] {name}: db_qty is {db_qty:.4f} (<= 0) after verification. Aborting replacement.")
                 return None
 
             side = 'sell' if direction == 'LONG' else 'buy'
@@ -766,14 +833,18 @@ class BotExecutor:
                                    sibling_bots = get_all_active_trades_for_pair(pair)
                                    
                                    # 🚀 Calculate exact signed virtual quantities directly from the ledger
-                                   # This prevents floating point division drift from historical invested vs live notional
+                                   # TWO-TIER: current-cycle first, then historical net fallback.
+                                   # Physical exchange positions are cumulative across ALL cycles —
+                                   # prior-cycle (reset_cleared) fills still affect the physical qty.
                                    from engine.database import get_connection
                                    sib_net_qty = 0.0
+                                   sib_hist_net_qty = 0.0
                                    conn = get_connection()
                                    try:
                                         cursor = conn.cursor()
                                         for b in sibling_bots:
                                             sibling_id = b['bot_id']
+                                            # Current-cycle net (standard)
                                             cursor.execute("""
                                                 SELECT COALESCE(SUM(
                                                     CASE 
@@ -788,25 +859,67 @@ class BotExecutor:
                                             """, (sibling_id, sibling_id))
                                             row = cursor.fetchone()
                                             q = float(row[0]) if row else 0.0
-                                            
-                                            if b['direction'].upper() == 'LONG':
-                                                sib_net_qty += q
-                                            else:
-                                                sib_net_qty -= q
+
+                                            # Historical net (all cycles, includes reset_cleared fills)
+                                            cursor.execute("""
+                                                SELECT COALESCE(SUM(
+                                                    CASE 
+                                                        WHEN order_type IN ('entry', 'grid', 'adoption_add', 'adoption') THEN filled_amount
+                                                        WHEN order_type IN ('adoption_reduce', 'tp', 'close', 'dust_close', 'sl') THEN -filled_amount
+                                                        ELSE 0.0
+                                                    END
+                                                ), 0.0) 
+                                                FROM bot_orders 
+                                                WHERE bot_id = ? AND filled_amount > 0
+                                            """, (sibling_id,))
+                                            hist_row = cursor.fetchone()
+                                            hist_q = float(hist_row[0]) if hist_row else 0.0
+
+                                            sign = 1 if b['direction'].upper() == 'LONG' else -1
+                                            sib_net_qty += sign * q
+                                            sib_hist_net_qty += sign * hist_q
                                    finally:
                                         pass # conn.close() disabled for singleton safety
                                             
-                                   # 🚀 Compare actual quantities to ignore market price fluctuations
+                                   # 🚀 Compare actual quantities — two-tier drift check
                                    phys_net_qty_abs = abs(size)
                                    sib_net_qty_abs  = abs(sib_net_qty)
-                                   
-                                   # Convert quantity drift back to USD simply to keep the threshold metric ($50 tolerance)
+                                   sib_hist_net_qty_abs = abs(sib_hist_net_qty)
+
+                                   # Convert quantity drift back to USD to keep the $ threshold
+                                   _mismatch_threshold = exchange.get_symbol_precision(pair).get('min_notional', 5.0)
                                    drift_qty = abs(sib_net_qty_abs - phys_net_qty_abs)
                                    drift_usd = drift_qty * current_price
-                                   
-                                   if drift_usd > 50.0:
-                                        logger.critical(f"🛑 {name}: Blocked NEW ENTRY! Exchange magnitude {phys_net_qty_abs:.6f} vs System {sib_net_qty_abs:.6f} mismatch > $50. Resolve Mismatch first!")
-                                        can_enter = False
+                                   hist_drift_qty = abs(sib_hist_net_qty_abs - phys_net_qty_abs)
+                                   hist_drift_usd = hist_drift_qty * current_price
+
+                                   if drift_usd > _mismatch_threshold:
+                                        if hist_drift_usd <= _mismatch_threshold:
+                                            # ✅ Historical net explains the gap — prior-cycle accumulation.
+                                            logger.info(
+                                                f"⚠️ {name}: Current-cycle magnitude mismatch (${drift_usd:.2f} > ${_mismatch_threshold:.2f}) "
+                                                f"is explained by cross-cycle history (hist_drift=${hist_drift_usd:.2f}). "
+                                                f"Allowing entry — position is valid accumulation."
+                                            )
+                                            can_enter = True
+                                        else:
+                                            # BUG-FIX: Check if a recent fill (< 60s ago) explains the gap.
+                                            # The async DB-worker runs seal_trade_state after WS fills, so there
+                                            # is always a window where the physical position exists on exchange
+                                            # but the ledger (total_invested) still reads 0. Without this bypass,
+                                            # the very next cycle after a fast fill hits this block and deadlocks.
+                                            from engine.database import get_last_filled_order as _glfo
+                                            _recent = _glfo(bot_id)
+                                            _fill_age = time.time() - float(_recent.get('created_at', 0)) if _recent else 9999
+                                            if _fill_age < 90:
+                                                logger.info(
+                                                    f"⚠️ {name}: Magnitude mismatch (${drift_usd:.2f}) ignored — "
+                                                    f"recent fill {_fill_age:.0f}s ago, seal still propagating. Allowing entry."
+                                                )
+                                                can_enter = True
+                                            else:
+                                                logger.critical(f"🛑 {name}: Blocked NEW ENTRY! Exchange magnitude {phys_net_qty_abs:.6f} vs System {sib_net_qty_abs:.6f} mismatch ${drift_usd:.2f} > min_notional ${_mismatch_threshold:.2f}. Resolve Mismatch first!")
+                                                can_enter = False
                                    else:
                                         from engine.database import get_last_filled_order
                                         last_fill = get_last_filled_order(bot_id)
@@ -1006,17 +1119,26 @@ class BotExecutor:
         try:
             from engine.database import get_connection as _gc
             _conn = _gc()
-            # Look for entry rows created since the last reset
-            # Keep rows that are truly live (status=new/placing) OR that have a fill (even if status=cancelled)
+            # ── ANCHOR GUARD v2: scope to CURRENT cycle_id only ─────────────────────
+            # BUG-FIX: Without cycle_id scoping, historical filled rows from prior cycles
+            # remain in bot_orders (status='filled', not reset_cleared) and permanently
+            # trigger the anchor, deadlocking the bot even after a clean wipe+cycle-bump.
+            _cur_cycle_row = _conn.execute(
+                "SELECT COALESCE(cycle_id, 1) FROM trades WHERE bot_id=?", (bot_id,)
+            ).fetchone()
+            _cur_cycle = _cur_cycle_row[0] if _cur_cycle_row else 1
+
+            # Only look at entry rows from the CURRENT cycle that are not archived
             _live_entries = _conn.execute("""
                 SELECT order_id, client_order_id, filled_amount, price, status
                 FROM bot_orders
                 WHERE bot_id = ?
+                  AND cycle_id = ?
                   AND order_type = 'entry'
                   AND status NOT IN ('reset_cleared', 'auto_closed')
                   AND (filled_amount > 0 OR status NOT IN ('cancelled', 'canceled', 'failed'))
                 ORDER BY id DESC LIMIT 5
-            """, (bot_id,)).fetchall()
+            """, (bot_id, _cur_cycle)).fetchall()
 
             if _live_entries:
                 # Check if any are filled but not credited
@@ -1033,12 +1155,16 @@ class BotExecutor:
                             )
                             return None
 
-                # Even if no fills, if there's a non-cancelled entry row we didn't see in
-                # open_orders snapshot (WS lag), block placement to avoid duplicate
+                # WS-lag check: if there's a non-filled entry row not in open_orders,
+                # it may be mid-fill. Block to avoid duplicate.
+                # BUG-FIX: Do NOT block if the order is already status='filled'/'closed' —
+                # filled orders are correctly absent from open_orders (they're done).
+                # Blocking on a filled+credited order causes a permanent deadlock.
                 _newest = _live_entries[0]
                 _newest_oid = str(_newest[0])
+                _newest_status = str(_newest[4]).lower()
                 _seen_ids = {str(o['id']) for o in bot_open_orders}
-                if _newest_oid not in _seen_ids:
+                if _newest_oid not in _seen_ids and _newest_status not in ('filled', 'closed'):
                     logger.warning(
                         f"[ENTRY-ANCHOR] Bot {name}: DB has live entry {_newest_oid} "
                         f"(status={_newest[4]}) not in open_orders snapshot. "
@@ -1070,21 +1196,45 @@ class BotExecutor:
                     # A Limit Maker (postOnly) will fail with -2010 if it inadvertently crosses the active spread.
                     # We MUST align a LONG to the absolute Best Bid and a SHORT to the absolute Best Ask.
                     try:
-                        market_type = strategy.params.get('market_type', 'spot') if strategy and hasattr(strategy, 'params') else 'spot'
-                        
-                        if market_snapshot:
-                            ticker = market_snapshot.get(market_type, {}).get('tickers', {}).get(pair, {})
-                            best_bid = float(ticker.get('bid') or price)
-                            best_ask = float(ticker.get('ask') or price)
-                            
-                            if side.lower() == 'buy' and price >= best_ask:
-                                logger.info(f"🛡️ {name}: Aligning LONG Maker Entry from {price} to Best Bid {best_bid}")
-                                price = best_bid
-                            elif side.lower() == 'sell' and price <= best_bid:
-                                logger.info(f"🛡️ {name}: Aligning SHORT Maker Entry from {price} to Best Ask {best_ask}")
-                                price = best_ask
-                    except Exception as _m_err:
-                        logger.warning(f"⚠️ {name}: Failed to align Maker entry spread: {_m_err}")
+                        # ──────────────────────────────────────────────────────────────────
+                        # MAKER-PRICE RE-ALIGNMENT (Root Cause Fix)
+                        # ──────────────────────────────────────────────────────────────────
+                        # `price` from decide_action() is the LAST traded price — not the
+                        # current bid or ask. Placing a Post-Only sell at the bid (or a buy
+                        # at the ask) immediately crosses the spread and gets -5022 rejected.
+                        #
+                        # The previous fix read bid/ask from the runner snapshot ticker, but
+                        # the snapshot tickers dict is keyed by normalized symbol (SOLUSDC)
+                        # while `pair` is the CCXT symbol (SOL/USDC:USDC). On a key-miss,
+                        # both bid and ask defaulted back to `price` (last traded), so the
+                        # alignment condition never fired and the GTX rejection loop repeated
+                        # every 60s (chase cancel → re-enter at last price → reject → repeat).
+                        #
+                        # Fix: always fetch LIVE bid/ask from exchange before placement.
+                        # This is the same "use current best bid/ask" logic used for offline
+                        # fills: when price has passed the original target, just use the best
+                        # available maker price on the correct side right now.
+                        # ──────────────────────────────────────────────────────────────────
+                        live_bid, live_ask = exchange.get_best_bid_ask(pair)
+                        if live_bid and live_ask and live_bid > 0 and live_ask > 0:
+                            prec_info = exchange.get_symbol_precision(pair)
+                            tick = prec_info.get('tick_size', 0.0001)
+                            if side.lower() == 'buy':
+                                # Maker BUY: must sit at or below best bid (never cross ask)
+                                aligned = exchange.round_to_step(live_bid, tick)
+                                if price >= live_ask or abs(price - aligned) / max(aligned, 1e-9) > 0.0001:
+                                    logger.info(f"🛡️ {name}: Aligning LONG Maker Entry {price:.6f} → Best Bid {aligned:.6f} (bid={live_bid:.6f} ask={live_ask:.6f})")
+                                    price = aligned
+                            else:  # sell (SHORT entry)
+                                # Maker SELL: must sit at or above best ask (never cross bid)
+                                aligned = exchange.ceil_to_step(live_ask, tick)
+                                if price <= live_bid or abs(price - aligned) / max(aligned, 1e-9) > 0.0001:
+                                    logger.info(f"🛡️ {name}: Aligning SHORT Maker Entry {price:.6f} → Best Ask {aligned:.6f} (bid={live_bid:.6f} ask={live_ask:.6f})")
+                                    price = aligned
+                        else:
+                            logger.warning(f"⚠️ {name}: Could not fetch live bid/ask for maker alignment. Using strategy price {price:.6f}.")
+                    except Exception as e:
+                        logger.error(f"⚠️ {name}: Maker alignment error: {e}")
 
                     valid, amount, price, msg = exchange.validate_order(pair, side, amount, price)
                     if not valid:
@@ -1124,6 +1274,8 @@ class BotExecutor:
                         # Credit it here immediately so DB reflects reality without waiting.
                         order_status = str(order.get('status', '')).lower()
                         order_filled = float(order.get('filled', 0) or 0)
+                        if order_status in ('filled', 'closed') and order_filled <= 0:
+                            order_filled = float(order.get('amount') or 0)
                         if order_status in ('filled', 'closed', 'partially_filled') and order_filled > 0:
                             try:
                                 from engine.ledger import credit_fill, seal_trade_state
@@ -1770,11 +1922,18 @@ class BotExecutor:
                             
                             # v2.0: Register in cascade registry — runner will do atomic cancel+reset
                             from engine.ledger import register_tp_cascade, credit_fill as _cf_tp
+                            
+                            # 🚀 ROOT CAUSE FIX (v2.1.1): Extract REST fill timestamp and pass to cascade
+                            # Without this, REST-detected TP fills resulted in cycle_start_time=0,
+                            # breaking the cycle poisoning guard on the next restart.
+                            _rest_ts = order_status.get('lastTradeTimestamp') or order_status.get('timestamp') or (time.time() * 1000)
+                            _exit_fill_ts = int(_rest_ts / 1000)
+                            
                             _cf_tp(bot_id=bot_id, order_id=str(local_tp_id),
                                    cumulative_qty=filled_amount, avg_price=actual_exit,
                                    order_type='tp', is_cumulative=True)
-                            register_tp_cascade(bot_id, pair, actual_exit)
-                            logger.info(f"[TP-EVICTOR] {name}: REST-detected TP fill registered for cascade. Runner will complete reset.")
+                            register_tp_cascade(bot_id, pair, actual_exit, _exit_fill_ts)
+                            logger.info(f"[TP-EVICTOR] {name}: REST-detected TP fill registered for cascade (ts={_exit_fill_ts}). Runner will complete reset.")
                         else:
                             logger.debug(f"⏭️ {name}: Stored TP ID {local_tp_id} is FILLED, but bot state already zeroed. Skipping.")
                         return None # Exit cycle
@@ -1825,31 +1984,31 @@ class BotExecutor:
                 tp_price = strategy.calculate_take_profit_price(bot_status, current_price)
                 tp_amount = strategy.calculate_take_profit_amount(bot_status, current_price, pair, exchange)
             
-                # 🚀 OFFLINE PROFIT GAP FIX (Maker Edition)
-                # To prevent Binance Maker-Only ('GTX') -2010 rejections when filling offline gaps,
-                # we must clip the order exactly to the top of the orderbook (Bid1/Ask1) instead of 
-                # crossing the spread with a Taker limit order.
-                gap_occurred = False
-                if (direction == 'LONG' and current_price > tp_price) or (direction == 'SHORT' and current_price < tp_price):
-                    gap_occurred = True
-                    try:
-                        bid, ask = exchange.get_best_bid_ask(pair)
-                        if bid is None or ask is None:
-                            raise ValueError("Failed to fetch bid/ask")
-                        
-                        # We are Selling to close a Long. Must join the Asks.
+                # 🚀 SPREAD-CROSSING MAKER LOOP FIX (Root Cause of Flashing)
+                # If a Post-Only (GTX) limit order crosses the active spread, Binance accepts the API payload 
+                # but silently/instantly cancels it in the matching engine (status becomes EXPIRED). 
+                # This caused the engine to endlessly re-place the order every cycle, causing UI flashes.
+                # Standard TP: LONG bot sells to close. Must be >= Best Ask to remain Maker.
+                #              SHORT bot buys to close. Must be <= Best Bid to remain Maker.
+                try:
+                    bid, ask = exchange.get_best_bid_ask(pair)
+                    if bid is not None and ask is not None:
+                        bid_val = float(bid)
+                        ask_val = float(ask)
                         if direction == 'LONG':
-                            ask_val = float(ask) if ask else current_price
-                            tp_price = max(tp_price, ask_val)
-                            logger.info(f"🚀 {name}: Offline Gap! Current price > TP. Adjusting TP to Ask {tp_price} to preserve Maker.")
-                        # We are Buying to close a Short. Must join the Bids.
+                            # We are Selling to close. If TP is lower than or equals the best bid, it crosses the spread and acts as Taker.
+                            if tp_price <= bid_val:
+                                old_tp = tp_price
+                                tp_price = ask_val # Join the asks to stay Maker
+                                logger.info(f"🚀 {name}: TP Spread Cross Prevented! (Sell {old_tp} <= Bid {bid_val}). Adjusted to Ask {tp_price} to preserve GTX.")
                         else:
-                            bid_val = float(bid) if bid else current_price
-                            tp_price = min(tp_price, bid_val)
-                            logger.info(f"🚀 {name}: Offline Gap! Current price < TP. Adjusting TP to Bid {tp_price} to preserve Maker.")
-                    except Exception as e:
-                        logger.warning(f"⚠️ {name}: Offline Gap, but fetching bid/ask failed ({e}). Falling back to Taker gap adjustment.")
-                        tp_price = current_price
+                            # We are Buying to close. If TP is higher than or equals the best ask, it crosses the spread and acts as Taker.
+                            if tp_price >= ask_val:
+                                old_tp = tp_price
+                                tp_price = bid_val # Join the bids to stay Maker
+                                logger.info(f"🚀 {name}: TP Spread Cross Prevented! (Buy {old_tp} >= Ask {ask_val}). Adjusted to Bid {tp_price} to preserve GTX.")
+                except Exception as e:
+                    logger.warning(f"⚠️ {name}: Market Gap check failed ({e}). Proceeding without spread-cross protection.")
 
                 # Re-round just in case
                 try:
@@ -1891,9 +2050,10 @@ class BotExecutor:
                                         dust_cid = self._generate_deterministic_id(bot_id, 'DUST', bot_status.get('cycle_id', 0), bot_status.get('current_step', 1))
                                         
                                         # Market close — no price needed, taker execution
+                                        # 🚀 FIX: Add reduceOnly=True to bypass MIN_NOTIONAL filter for sub-$5 orders
                                         dust_order = exchange.create_order(
                                             pair, 'market', dust_side, dust_qty,
-                                            params={'newClientOrderId': dust_cid}
+                                            params={'newClientOrderId': dust_cid, 'reduceOnly': True}
                                         )
                                         
                                         if dust_order:
@@ -2021,16 +2181,18 @@ class BotExecutor:
 
         # 3. Check for missing / filled Grid order
         if not existing_grid_order and bot_status['current_step'] < strategy.max_steps:
-             # 🚀 GRID IDEMPOTENCY LOCK: Check DB for in-flight grids that CCXT hasn't seen yet.
+             # 🚀 GRID IDEMPOTENCY LOCK: Absolute State Enforcement
+             # Check DB for ANY proof that we already placed this exact step in this cycle.
+             # We check all active/terminal statuses, trusting the DB truth over lagging exchange sync.
              try:
                  from engine.database import get_connection
                  _conn = get_connection()
-                 _placing_grid = _conn.execute(
-                     "SELECT 1 FROM bot_orders WHERE bot_id=? AND order_type='grid' AND status IN ('placing', 'new', 'open') AND created_at > ?", 
-                     (bot_id, int(time.time() - 30))
+                 _placed_grid = _conn.execute(
+                     "SELECT 1 FROM bot_orders WHERE bot_id=? AND cycle_id=? AND step=? AND order_type='grid' AND status IN ('placing', 'new', 'open', 'partially_filled', 'filled', 'closed')", 
+                     (bot_id, bot_status.get('cycle_id', 0), expected_grid_step)
                  ).fetchone()
-                 if _placing_grid:
-                     logger.warning(f"🛡️ {name}: Grid order already pending in DB. Yielding Grid placement to prevent double-tap.")
+                 if _placed_grid:
+                     logger.warning(f"🛡️ {name}: DB mathematically proves Grid step {expected_grid_step} is ALREADY placed/filled. Yielding Grid placement to prevent double-tap.")
                      return None
              except: pass
 
@@ -2106,33 +2268,94 @@ class BotExecutor:
 
 
 
-             # 🚀 STEP-PROGRESSION-PROOF: Before placing Step N+1, prove Step N is actually filled!
+             # ══════════════════════════════════════════════════════════════
+             # STEP-PROGRESSION-PROOF  (3-Tier, Self-Healing)
+             # ══════════════════════════════════════════════════════════════
+             # Tier 1: entry_confirmed DB flag (set by seal_trade_state / WS)
+             # Tier 2: bot_orders filled row for current_step
+             # Tier 3: Math proof — total_invested > 0 AND avg_entry_price > 0
+             #         → position is provably real; auto-heal entry_confirmed=1
+             #         so the deadlock never recurs.
+             #
+             # WHY a math fallback:
+             #   bot_orders rows can be missing after DB migration, engine restarts
+             #   during a fill, or when the position was adopted from the exchange
+             #   (forensic / manual import paths). The trades table math
+             #   (total_invested / avg_entry_price) is ALWAYS the ground truth;
+             #   if it says we hold a position, we trust it unconditionally.
+             # ══════════════════════════════════════════════════════════════
              if bot_status['current_step'] > 0:
                  try:
-                     # 🛡️ FUNDAMENTAL FIX: Trust the `entry_confirmed` flag as primary proof.
-                     if bot_status.get('entry_confirmed', 0) == 1:
-                         logger.info(f"🛡️ {name}: Bypassing fill-proof check because trade/step is natively confirmed.")
+                     _ec = bot_status.get('entry_confirmed', 0)
+                     _invested = float(bot_status.get('total_invested', 0) or 0)
+                     _avg      = float(bot_status.get('avg_entry_price', 0) or 0)
+
+                     # ── Tier 1: entry_confirmed flag ──────────────────────
+                     if _ec == 1:
+                         logger.debug(f"🛡️ {name}: Step proof T1 passed (entry_confirmed=1).")
+
                      else:
-                         from engine.database import get_connection
-                         conn = get_connection()
-                         cursor = conn.cursor()
-                         # Fallback to order history (30-day window)
-                         cursor.execute("""
-                             SELECT COUNT(*) FROM bot_orders 
-                             WHERE bot_id=? AND status IN ('filled', 'closed') AND step=? AND created_at >= (? - 2592000)
-                         """, (bot_id, bot_status['current_step'], bot_status.get('basket_start_time', 0)))
-                         row = cursor.fetchone()
-                         pass # conn.close() disabled for singleton safety
-                         if not row or row[0] == 0:
+                         # ── Tier 2: bot_orders filled row ─────────────────
+                         from engine.database import get_connection as _gcsp
+                         _csp = _gcsp()
+                         _row = _csp.execute("""
+                             SELECT COUNT(*) FROM bot_orders
+                             WHERE bot_id=? AND status IN ('filled','closed')
+                               AND step=? AND created_at >= (? - 2592000)
+                         """, (bot_id, bot_status['current_step'],
+                               bot_status.get('basket_start_time', 0))).fetchone()
+
+                         if _row and _row[0] > 0:
+                             logger.debug(f"🛡️ {name}: Step proof T2 passed (bot_orders filled row found).")
+                             # Promote to T1 so next cycle skips this query
+                             try:
+                                 _csp.execute(
+                                     "UPDATE trades SET entry_confirmed=1 WHERE bot_id=?", (bot_id,)
+                                 )
+                                 _csp.commit()
+                             except Exception: pass
+
+                         elif _invested > 0.01 and _avg > 0:
+                             # ── Tier 3: Math proof — auto-heal ────────────
+                             # total_invested and avg_entry_price are non-zero,
+                             # meaning seal_trade_state already wrote the ledger
+                             # from real fills. The bot_orders row is simply missing
+                             # (migration, adoption, restart). Trust the math.
                              logger.warning(
-                                 f"🛑 {name}: Step Progression Blocked! Step {bot_status['current_step']} proof-of-fill not found in DB. "
-                                 f"Waiting for reconciler/WS to confirm."
+                                 f"🩹 [PROOF-T3] {name}: bot_orders fill record absent for step "
+                                 f"{bot_status['current_step']} but math proves position "
+                                 f"(invested=${_invested:.2f} avg={_avg:.4f}). "
+                                 f"Auto-healing entry_confirmed=1."
+                             )
+                             try:
+                                 _csp.execute(
+                                     "UPDATE trades SET entry_confirmed=1 WHERE bot_id=?", (bot_id,)
+                                 )
+                                 _csp.commit()
+                             except Exception as _heal_e:
+                                 logger.error(f"[PROOF-T3] {name}: Failed to write entry_confirmed: {_heal_e}")
+                             # Continue to grid placement — proof accepted
+
+                         else:
+                             # All 3 tiers failed: no flag, no order row, no math.
+                             # The bot genuinely has no fill proof — block and wait.
+                             logger.warning(
+                                 f"🛑 {name}: Step Progression Blocked (all 3 proof tiers failed). "
+                                 f"step={bot_status['current_step']} invested=${_invested:.4f} "
+                                 f"entry_confirmed={_ec}. Waiting for reconciler/WS."
                              )
                              return None
+
                  except Exception as e:
-                     logger.error(f"❌ Error checking step progression proof for {name}: {e}")
-                     logger.warning(f"🛑 {name}: Returning None because Exception checking step progression proof.")
-                     return None
+                     logger.error(f"❌ {name}: Step progression proof raised exception: {e}")
+                     # On unexpected error: fall through ONLY if math says we hold
+                     _invested = float(bot_status.get('total_invested', 0) or 0)
+                     _avg      = float(bot_status.get('avg_entry_price', 0) or 0)
+                     if _invested > 0.01 and _avg > 0:
+                         logger.warning(f"⚠️ {name}: Proof exception but math confirms position. Continuing.")
+                     else:
+                         logger.warning(f"🛑 {name}: Proof exception and no math backup. Blocking grid.")
+                         return None
 
 
              # 🚀 FUNDAMENTAL FIX: Re-calculate base size dynamically here
@@ -2158,6 +2381,7 @@ class BotExecutor:
                      exchange_min_notional = 100.0 if (getattr(config, 'TESTNET', False) or getattr(config, 'DEMO_TRADING', False)) else 5.0
                  if bot_config.get('base_size', 0) < exchange_min_notional:
                      logger.error(f"⛔ CONFIG ERROR [{pair}]: Configured base_size=${bot_config.get('base_size',0):.2f} is below exchange minimum ${exchange_min_notional:.2f}. Halting grid.")
+                     update_bot_error(bot_id, f"CONFIG ERROR: Base Size (${bot_config.get('base_size',0):.2f}) < Min Notional (${exchange_min_notional:.2f})")
                      return
              # 🚀 STRICT SYNCHRONOUS STATE LOCK (GRID)
              # Wait if the DB already thinks a Grid is open, but CCXT was just too slow to show it.
@@ -2264,28 +2488,29 @@ class BotExecutor:
                  update_bot_error(bot_id, f"Grid Error: {grid_explain}")
                  return None
 
-             # 🚀 OFFLINE GRID GAP FIX (Maker Edition)
-             # If the market swept past our intended grid target, placing a standard grid limit order
-             # will cross the spread and trigger a -2010 GTX Maker-Only rejection.
-             if (direction == 'LONG' and current_price < grid_price) or (direction == 'SHORT' and current_price > grid_price):
-                 try:
-                     bid, ask = exchange.get_best_bid_ask(pair)
-                     if bid is None or ask is None:
-                         raise ValueError("Failed to fetch bid/ask")
-                     
-                     # We are Buying to open a Long grid. Must join the Bids.
+             # 🚀 SPREAD-CROSSING MAKER LOOP FIX (Root Cause of Flashing)
+             # Same as TP logic: If a Post-Only Grid crosses the active spread, Binance silently EXPIRES it.
+             # Standard Grid: LONG bot buys to open line. Must be <= Best Bid.
+             #                SHORT bot sells to open line. Must be >= Best Ask.
+             try:
+                 bid, ask = exchange.get_best_bid_ask(pair)
+                 if bid is not None and ask is not None:
+                     bid_val = float(bid)
+                     ask_val = float(ask)
                      if direction == 'LONG':
-                         bid_val = float(bid) if bid else current_price
-                         grid_price = min(grid_price, bid_val)
-                         logger.info(f"🚀 {name}: Grid Gap! Price Dropped. Adjusting Grid to Bid {grid_price} to preserve Maker.")
-                     # We are Selling to open a Short grid. Must join the Asks.
+                         # We are Buying to open. If Grid is higher than or equals Ask, it's a Taker.
+                         if grid_price >= ask_val:
+                             old_px = grid_price
+                             grid_price = bid_val
+                             logger.info(f"🚀 {name}: Grid Spread Cross Prevented! (Buy {old_px} >= Ask {ask_val}). Adjusted to Bid {grid_price} to preserve GTX.")
                      else:
-                         ask_val = float(ask) if ask else current_price
-                         grid_price = max(grid_price, ask_val)
-                         logger.info(f"🚀 {name}: Grid Gap! Price Rallied. Adjusting Grid to Ask {grid_price} to preserve Maker.")
-                 except Exception as e:
-                     logger.warning(f"⚠️ {name}: Grid Gap, but fetching bid/ask failed ({e}). Falling back to Taker grid adjustment.")
-                     grid_price = current_price
+                         # We are Selling to open. If Grid is lower than or equals Bid, it's a Taker.
+                         if grid_price <= bid_val:
+                             old_px = grid_price
+                             grid_price = ask_val
+                             logger.info(f"🚀 {name}: Grid Spread Cross Prevented! (Sell {old_px} <= Bid {bid_val}). Adjusted to Ask {grid_price} to preserve GTX.")
+             except Exception as e:
+                 logger.warning(f"⚠️ {name}: Market Gap check failed ({e}). Proceeding without spread-cross protection.")
                      
              logger.info(f"🔍 [GRID-MAINTENANCE] {name}: Target=${grid_price} | {grid_explain}")
 
@@ -2321,8 +2546,10 @@ class BotExecutor:
                                 f"(notional=${grid_amount * grid_price:.2f}). "
                                 f"Increase base_size in bot config to resolve."
                             )
+                            update_bot_error(bot_id, f"Grid Qty too small for exchange. Base Size too low?")
                         else:
                             logger.error(f"[GRID-VAL-FAIL] {name}: Grid validation failed: {msg}")
+                            update_bot_error(bot_id, f"Grid Validation Failed: {msg}")
                     else:
                         try:
                             cycle_id = bot_status.get('cycle_id', 0)
@@ -2370,6 +2597,7 @@ class BotExecutor:
                                    flag_bot_pos_limit(bot_id, True)
                             else:
                                 logger.error(f"❌ {name}: Error maintaining Grid: {e}")
+                                update_bot_error(bot_id, f"Exchange Error: {e}")
                             
         # 3b. MAX-STEP LOCK: If we reached max steps, there should be NO Grid orders. Clean them completely!
         elif bot_status['current_step'] >= strategy.max_steps:

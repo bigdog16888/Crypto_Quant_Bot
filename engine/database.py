@@ -93,37 +93,94 @@ def heal_zombie_bots(conn):
     """
     On startup, structurally repairs any bot that has become mathematical 'zombies'.
     This covers 1. bots with total_invested > 0 but ledger evaluates to 0,
-    and 2. bots with current_step > 0 but total_invested is 0.
+    2. bots with current_step > 0 but total_invested is 0,
+    and 3. (v2.2) bots with step=0, invested=0 but open_qty > 0 (phantom accumulator).
     """
     try:
         c = conn.cursor()
+        # v2.2: include open_qty so we can detect phantom accumulator values
         c.execute('''
-            SELECT t.bot_id, b.pair, t.total_invested, t.avg_entry_price, t.current_step, t.cycle_id 
-            FROM trades t JOIN bots b ON t.bot_id = b.id 
+            SELECT t.bot_id, b.pair, t.total_invested, t.avg_entry_price, t.current_step, t.cycle_id,
+                   COALESCE(t.open_qty, 0) as open_qty
+            FROM trades t JOIN bots b ON t.bot_id = b.id
         ''')
         trades = c.fetchall()
         for t in trades:
-            bot_id, pair, invested, avg_price, step, cycle_id = t
+            bot_id, pair, invested, avg_price, step, cycle_id, open_qty = t
             invested = float(invested or 0)
             avg_price = float(avg_price or 0)
             step = int(step or 0)
-            
+            open_qty = float(open_qty or 0)
+
             # Scenario 1: Ghost step stuck (0 physical investment, but step > 0)
             # This causes the "0/2 limit orders missing" alert
-            if step > 0 and invested <= 0.0001:
-                c.execute("UPDATE trades SET current_step = 0, total_invested = 0, avg_entry_price = 0, target_tp_price = 0, cycle_id = NULL WHERE bot_id = ?", (bot_id,))
+            # Guard: skip if open_qty > 0 — the WS fill loop credited a real fill and
+            # seal is still propagating. Wiping here would erase a confirmed position.
+            if step > 0 and invested <= 0.0001 and open_qty <= 0.0001:
+                c.execute("UPDATE trades SET current_step = 0, total_invested = 0, avg_entry_price = 0, target_tp_price = 0, open_qty = 0, cycle_id = NULL WHERE bot_id = ?", (bot_id,))
                 conn.commit()
                 logger.info(f"🩹 [HEALED] Bot {bot_id} ({pair}): Reset stranded ghost step back to 0. Cleared metrics.")
                 continue
 
             # Scenario 3: Phantom Invested Amount (Stuck metrics on a Scanning Bot)
-            # This corrects databases where the user manually reverted step=0 but forgot to zero metrics.
-            if step == 0 and (invested > 0.001 or avg_price > 0.001):
-                c.execute("UPDATE trades SET total_invested = 0, avg_entry_price = 0, target_tp_price = 0, cycle_id = NULL WHERE bot_id = ?", (bot_id,))
+            # Corrects databases where step was manually reverted to 0 but metrics weren't cleared.
+            # GUARD: skip if open_qty > 0 — the WS fill loop credited a real position fill;
+            # seal wrote step=0 because cycle_id=NULL broke recompute_invested_from_orders.
+            # Wiping here would erase a confirmed physical position.
+            if step == 0 and (invested > 0.001 or avg_price > 0.001) and open_qty <= 0.0001:
+                c.execute("UPDATE trades SET total_invested = 0, avg_entry_price = 0, target_tp_price = 0, open_qty = 0, cycle_id = NULL WHERE bot_id = ?", (bot_id,))
                 conn.commit()
                 logger.info(f"🩹 [HEALED] Bot {bot_id} ({pair}): Purged phantom ${invested:.2f} invested memory on a SCANNING bot.")
                 continue
-                
+
+            # Scenario 4 (v2.2): Phantom open_qty on a Scanning bot (step=0, invested=0, open_qty > 0)
+            # Root cause: sync_exchange_to_db.py previously placed raw market orders that bypassed
+            # credit_fill(), leaving the accumulator frozen. Also triggered by the integrity bootstrap
+            # setting open_qty from recompute without a corresponding total_invested update.
+            # FIX: Check bot_orders for a real net fill backing this qty. If found → seal_trade_state
+            # will correctly propagate it. If not found → it is a phantom; zero it.
+            if step == 0 and invested <= 0.0001 and open_qty > 0.0001:
+                ledger_net = c.execute("""
+                    SELECT COALESCE(SUM(
+                        CASE WHEN order_type IN ('entry','grid','adoption_add','adoption') THEN filled_amount
+                             WHEN order_type IN ('tp','close','adoption_reduce','dust_close','sl') THEN -filled_amount
+                             ELSE 0 END
+                    ), 0)
+                    FROM bot_orders
+                    WHERE bot_id = ? AND filled_amount > 0
+                      AND status NOT IN ('reset_cleared','auto_closed','cancelled','canceled','failed')
+                """, (bot_id,)).fetchone()[0]
+                ledger_net = max(0.0, float(ledger_net or 0))
+                if ledger_net > 0.0001:
+                    # Real fills exist in bot_orders — sync_trades_from_orders will propagate correctly.
+                    # 🚀 ROOT CAUSE FIX (v2.3.1): If cycle_id is NULL in trades, recompute_invested_from_orders
+                    # queries `WHERE cycle_id = NULL` which matches nothing in SQL, returning 0 forever.
+                    # Restore cycle_id from the highest cycle in bot_orders BEFORE sealing.
+                    trades_cycle_row = c.execute("SELECT cycle_id FROM trades WHERE bot_id=?", (bot_id,)).fetchone()
+                    trades_cycle_id = trades_cycle_row[0] if trades_cycle_row else None
+                    if trades_cycle_id is None:
+                        backing_cycle = c.execute(
+                            "SELECT MAX(cycle_id) FROM bot_orders WHERE bot_id=? AND filled_amount > 0 "
+                            "AND status NOT IN ('reset_cleared','auto_closed','cancelled','canceled','failed')",
+                            (bot_id,)
+                        ).fetchone()[0]
+                        if backing_cycle is not None:
+                            c.execute("UPDATE trades SET cycle_id=? WHERE bot_id=?", (backing_cycle, bot_id))
+                            conn.commit()
+                            logger.warning(
+                                f"🩹 [CYCLE-RESTORE] Bot {bot_id} ({pair}): trades.cycle_id was NULL. "
+                                f"Restored to cycle {backing_cycle} from bot_orders. This was causing phantom open_qty."
+                            )
+                    conn.commit()
+                    sync_trades_from_orders(bot_id)
+                    logger.info(f"🩹 [HEALED] Bot {bot_id} ({pair}): Phantom open_qty={open_qty:.8f} backed by {ledger_net:.8f} bot_orders net — triggered seal.")
+                else:
+                    # No bot_orders basis → this is a true ghost accumulator; zero it
+                    c.execute("UPDATE trades SET open_qty = 0 WHERE bot_id = ?", (bot_id,))
+                    conn.commit()
+                    logger.info(f"🩹 [HEALED] Bot {bot_id} ({pair}): Zeroed phantom open_qty={open_qty:.8f} — no backing fills in bot_orders.")
+                continue
+
             if invested > 0.0001 and avg_price > 0:
                 # Replace legacy manual SQL gap-check with the single-source-of-truth function
                 # This ensures any drift is immediately healed using the proof-only reconciliation engine
@@ -244,6 +301,8 @@ def init_db():
                 close_type TEXT DEFAULT NULL,
                 cycle_id INTEGER DEFAULT 1,
                 cycle_phase TEXT DEFAULT 'ACTIVE',
+                open_qty REAL DEFAULT 0,
+                wipe_wall_ts INTEGER DEFAULT 0,
                 FOREIGN KEY (bot_id) REFERENCES bots (id)
             )
         """)
@@ -304,7 +363,30 @@ def init_db():
                 )
             """)
             conn.commit()
-        
+
+        # ── v2.1.0 CYCLE TIMESTAMP ARCHITECTURE ──────────────────────────────────
+        # cycle_start_time: unix timestamp (seconds) of the exchange event that
+        # STARTED this cycle (the TP fill that ended the previous one, or the first
+        # fill adoption timestamp for new bots).  This is the authoritative cycle
+        # boundary — NOT basket_start_time which is an engine-operation timestamp.
+        # Immutable for the life of the cycle; only updated when cycle_id increments.
+        try:
+            cursor.execute('SELECT cycle_start_time FROM trades LIMIT 1')
+        except sqlite3.OperationalError:
+            cursor.execute('ALTER TABLE trades ADD COLUMN cycle_start_time INTEGER DEFAULT 0')
+            conn.commit()
+            logger.info("🛠️ DB Migration v2.1.0: Added cycle_start_time column to trades table.")
+            # Backfill: use last_exit_time as best available approximation for existing rows.
+            # For rows with no prior exit (first cycle ever), this stays 0 — correct behaviour
+            # (0 means no boundary, reconciler will not demote any fills).
+            cursor.execute("""
+                UPDATE trades SET cycle_start_time = last_exit_time
+                WHERE last_exit_time > 0 AND cycle_start_time = 0
+            """)
+            conn.commit()
+            logger.info("🛠️ DB Migration v2.1.0: Backfilled cycle_start_time from last_exit_time.")
+        # ─────────────────────────────────────────────────────────────────────────
+
         # Migration for manual close percentage in config
         try:
             cursor.execute('SELECT manual_close_pct FROM bots LIMIT 1')
@@ -372,9 +454,32 @@ def init_db():
             """)
             conn.commit()
 
+        # ── v2.1.0 FILL TIMESTAMP ─────────────────────────────────────────────────
+        # filled_at: unix timestamp (seconds) from the exchange when this order was
+        # actually executed (lastTradeTimestamp from Binance WS/REST). Stored in
+        # seconds for consistency with all other timestamp columns.
+        # This is the permanent, immutable audit record of WHEN the fill occurred.
+        # Used by recompute_invested_from_orders and the reconciler cycle guard.
+        try:
+            cursor.execute('SELECT filled_at FROM bot_orders LIMIT 1')
+        except sqlite3.OperationalError:
+            cursor.execute('ALTER TABLE bot_orders ADD COLUMN filled_at INTEGER DEFAULT 0')
+            conn.commit()
+            logger.info("🛠️ DB Migration v2.1.0: Added filled_at column to bot_orders table.")
+            # Backfill: updated_at was set at fill-confirmation time — good approximation.
+            cursor.execute("""
+                UPDATE bot_orders SET filled_at = updated_at
+                WHERE status IN ('filled', 'closed', 'partially_filled', 'reset_cleared')
+                  AND updated_at > 0 AND filled_at = 0
+            """)
+            conn.commit()
+            logger.info("🛠️ DB Migration v2.1.0: Backfilled filled_at from updated_at for confirmed fills.")
+        # ─────────────────────────────────────────────────────────────────────────
+
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_bot_orders_bot ON bot_orders(bot_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_bot_orders_order_id ON bot_orders(order_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_bot_orders_client_id ON bot_orders(client_order_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_bot_orders_filled_at ON bot_orders(bot_id, filled_at)')
         
         # Trade history table
         cursor.execute("""
@@ -418,6 +523,7 @@ def init_db():
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_bots_pair ON bots(pair)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_bot_orders_status ON bot_orders(status)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_bot_orders_type ON bot_orders(order_type)')
+        cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_uniq_exchange_oid ON bot_orders(order_id) WHERE order_id IS NOT NULL AND order_id != ''")
         # Notifications table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS notifications (
@@ -679,7 +785,9 @@ def get_bot_status(bot_id):
                COALESCE(t.entry_confirmed, 0) as entry_confirmed,
                COALESCE(t.cycle_id, 1) as cycle_id,
                COALESCE(b.pos_limit_hit, 0) as pos_limit_hit,
-               COALESCE(t.cycle_phase, 'ACTIVE') as cycle_phase
+               COALESCE(t.cycle_phase, 'ACTIVE') as cycle_phase,
+               COALESCE(t.cycle_start_time, 0) as cycle_start_time,
+               COALESCE(t.open_qty, 0) as open_qty
         FROM bots b 
         LEFT JOIN trades t ON b.id = t.bot_id 
         WHERE b.id = ?
@@ -705,6 +813,8 @@ def get_bot_status(bot_id):
         'cycle_id': row[13],
         'pos_limit_hit': bool(row[14]),
         'cycle_phase': row[15],
+        'cycle_start_time': row[16],   # v2.1.0 — authoritative cycle boundary
+        'open_qty': row[17],           # v2.1.0 — running confirmed position qty
     }
 
     # --- SAFETY GUARD: Log suspicious entry prices but do NOT wipe state ---
@@ -857,10 +967,17 @@ def calculate_step_from_position(total_invested: float, base_size: float, multip
         
     return max(0, int(round(step)))
 
-def _reset_bot_after_tp_internal(cursor, bot_id, exit_price, direction=None, action_label='TP_HIT', notes=''):
+def _reset_bot_after_tp_internal(cursor, bot_id, exit_price, direction=None, action_label='TP_HIT', notes='', exit_fill_ts: int = 0):
     """
     Internal implementation of reset_bot_after_tp.
     Assumes an active transaction cursor is passed in. Does NOT call conn.commit().
+
+    Args:
+        exit_fill_ts: Unix timestamp (seconds) of the exchange fill event that triggered
+                      this reset (e.g. TP order's lastTradeTimestamp / 1000).
+                      This becomes cycle_start_time for the NEW cycle — the authoritative
+                      boundary that the reconciler uses for fill attribution.
+                      Defaults to int(time.time()) if not provided.
     """
     cursor.execute("SELECT total_invested, current_step, avg_entry_price, name, pair, direction, config FROM trades t JOIN bots b ON t.bot_id = b.id WHERE t.bot_id = ?", (bot_id,))
     row = cursor.fetchone()
@@ -895,8 +1012,8 @@ def _reset_bot_after_tp_internal(cursor, bot_id, exit_price, direction=None, act
     # Snap sub-epsilon dust to zero to prevent ghost carry-over
     old_net_qty = max(0.0, float(raw_net) if abs(float(raw_net)) > 1e-8 else 0.0)
 
-    cursor.execute("UPDATE bot_orders SET status = 'auto_closed', updated_at = ? WHERE bot_id = ? AND status = 'open'", (int(time.time()), bot_id))
-    cursor.execute("UPDATE bot_orders SET status = 'reset_cleared', updated_at = ? WHERE bot_id = ? AND status NOT IN ('open', 'new', 'auto_closed', 'reset_cleared') AND order_type != 'hedge'", (int(time.time()), bot_id))
+    cursor.execute("UPDATE bot_orders SET status = 'auto_closed', updated_at = ? WHERE bot_id = ? AND status IN ('open', 'new')", (int(time.time()), bot_id))
+    cursor.execute("UPDATE bot_orders SET status = 'reset_cleared', updated_at = ? WHERE bot_id = ? AND status NOT IN ('auto_closed', 'reset_cleared') AND order_type != 'hedge'", (int(time.time()), bot_id))
 
     # 🚀 ROOT CAUSE FIX B: Clamp carry-over qty against exchange physical reality.
     # Previously, old_net_qty was pure arithmetic from bot_orders (entry fills - TP fills).
@@ -955,13 +1072,26 @@ def _reset_bot_after_tp_internal(cursor, bot_id, exit_price, direction=None, act
         cursor.execute("UPDATE bot_orders SET status = 'filled' WHERE client_order_id = ?", (carry_cid,))
 
     new_cycle_phase = 'CARRY_PENDING' if (abs(old_net_qty) > 0.0001 and residue_notional > 1.0 and action_label not in excluded_carry_labels) else 'IDLE'
+    # Determine cycle_start_time for the new cycle:
+    # Use the actual exchange fill timestamp if provided; fall back to now.
+    # This is the authoritative cycle boundary for all future fill attribution.
+    new_cycle_start_time = exit_fill_ts if exit_fill_ts > 0 else int(time.time())
+
     cursor.execute(
         "UPDATE trades SET current_step = 0, total_invested = 0, avg_entry_price = 0, "
         "target_tp_price = 0, last_exit_price = ?, last_exit_time = ?, basket_start_time = ?, "
         "entry_confirmed = 0, entry_order_id = NULL, tp_order_id = NULL, "
-        "bot_position_id = NULL, close_type = ?, cycle_id = ?, cycle_phase = ? WHERE bot_id = ?",
-        (exit_price, int(time.time()), int(time.time()), action_label, new_cycle, new_cycle_phase, bot_id)
+        "bot_position_id = NULL, close_type = ?, cycle_id = ?, cycle_phase = ?, "
+        "open_qty = 0, wipe_wall_ts = ?, cycle_start_time = ? WHERE bot_id = ?",
+        (exit_price, int(time.time()), int(time.time()), action_label, new_cycle, new_cycle_phase,
+         int(time.time()), new_cycle_start_time, bot_id)
     )
+    logger.info(
+        f"🕐 [CYCLE-START] Bot {bot_id}: New cycle {new_cycle} anchored at "
+        f"cycle_start_time={new_cycle_start_time} "
+        f"({'exchange fill ts' if exit_fill_ts > 0 else 'engine time fallback'})"
+    )
+
     cursor.execute("UPDATE bots SET pos_limit_hit = 0 WHERE id = ?", (bot_id,))
     try:
         clear_active_position_for_bot(bot_id, pair, cursor=cursor)
@@ -984,13 +1114,20 @@ def _reset_bot_after_tp_internal(cursor, bot_id, exit_price, direction=None, act
         cursor.execute("UPDATE bots SET status='Scanning' WHERE id = ?", (bot_id,))
 
 
-def reset_bot_after_tp(bot_id, exit_price, direction=None, action_label='TP_HIT', notes=''):
-    """Public wrapper that manages its own transaction."""
+def reset_bot_after_tp(bot_id, exit_price, direction=None, action_label='TP_HIT', notes='', exit_fill_ts: int = 0):
+    """
+    Public wrapper that manages its own transaction.
+
+    Args:
+        exit_fill_ts: Unix timestamp (seconds) of the exchange fill event.
+                      Passed through to _reset_bot_after_tp_internal to anchor
+                      cycle_start_time to the actual trade execution time.
+    """
     conn = get_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
         cursor = conn.cursor()
-        _reset_bot_after_tp_internal(cursor, bot_id, exit_price, direction, action_label, notes)
+        _reset_bot_after_tp_internal(cursor, bot_id, exit_price, direction, action_label, notes, exit_fill_ts=exit_fill_ts)
         conn.commit()
     except Exception as e:
         try: conn.rollback()
@@ -1052,7 +1189,7 @@ def safe_wipe_bot(
     if row:
         cycle_phase = row[0] or 'ACTIVE'
         total_invested = float(row[1] or 0)
-        if cycle_phase == 'CARRY_PENDING':
+        if cycle_phase == 'CARRY_PENDING' and not bypass_ledger_guard:
             logger.warning(
                 f"🛡️ [SAFE-WIPE BLOCKED] Bot {bot_id} is CARRY_PENDING. "
                 f"This is NOT a ghost — it's a carried position waiting for fills. "
@@ -1147,12 +1284,49 @@ def check_and_fix_integrity():
     conn = get_connection()
     cursor = conn.cursor()
     
+    # ── Step 0: Bootstrap missing trades rows ─────────────────────────────────
+    # If the trades table was wiped or a bot was added without a matching row,
+    # seal_trade_state silently returns {} (no-op), causing every guard to see
+    # total_invested=0 and every entry to get ENTRY-ANCHOR or MAGNITUDE blocked.
+    cursor.execute("""
+        SELECT b.id, b.direction
+        FROM bots b
+        LEFT JOIN trades t ON t.bot_id = b.id
+        WHERE b.is_active = 1 AND t.bot_id IS NULL
+    """)
+    missing_trades = cursor.fetchall()
+    for _bid, _dir in missing_trades:
+        _side = 'SHORT' if 'short' in str(_dir or '').lower() else 'LONG'
+        cursor.execute("""
+            INSERT INTO trades (bot_id, current_step, total_invested, avg_entry_price,
+                                entry_confirmed, basket_start_time, cycle_id, position_side)
+            VALUES (?, 0, 0, 0, 0, 0, 1, ?)
+        """, (_bid, _side))
+        logger.warning(f"🔧 Integrity Fix: Created missing trades row for bot {_bid} (side={_side}).")
+        fixed_count = fixed_count + 1 if 'fixed_count' in dir() else 1
+    if missing_trades:
+        conn.commit()
+    # ──────────────────────────────────────────────────────────────────────────
+
+    # ── Step 0.5: Bootstrap missing open_qty (v2.1) ───────────────────────────
+    # For bots that were active before v2.1 migration, open_qty might be 0
+    # even though they have an actual position. Backfill from recompute.
+    cursor.execute("SELECT bot_id FROM trades WHERE COALESCE(open_qty, 0) <= 0 AND total_invested > 0")
+    for (bid,) in cursor.fetchall():
+        cost, avg, qty, step = recompute_invested_from_orders(bid)
+        if qty > 0:
+            cursor.execute("UPDATE trades SET open_qty=? WHERE bot_id=? AND COALESCE(open_qty, 0) <= 0", (qty, bid))
+            logger.info(f"🔧 Integrity Fix: Backfilled open_qty={qty:.8f} for bot {bid} (v2.1 upgrade state).")
+    conn.commit()
+    # ──────────────────────────────────────────────────────────────────────────
+
+    fixed_count = 0
+
     # 0. Fix Corrupted Data (The $9M PnL Bug)
-    # Wipe any trade with impossible entry prices OR where total_invested / avg_entry_price * avg_entry_price != total_invested
+    # Wipe any trade with impossible entry prices OR where total_invested / avg_entry_price != self-consistent
     cursor.execute("SELECT bot_id, name, avg_entry_price, total_invested FROM trades t JOIN bots b ON t.bot_id = b.id WHERE avg_entry_price > 0 AND total_invested > 0")
     corrupted_candidates = cursor.fetchall()
-    
-    fixed_count = 0
+
     for bid, bname, bprice, btotal in corrupted_candidates:
         # Check for impossible entry prices (e.g. practically zero due to API flaws)
         if float(bprice) > 0 and float(bprice) < 0.0001:
@@ -2150,17 +2324,22 @@ def get_active_bot_id_by_symbol_direction(symbol: str, direction: str) -> Option
                 # Confirmed: this bot placed a real order for this symbol AND matches the position direction.
                 return bid
 
-        # --- FALLBACK: Direction + In-Trade check ---
-        # Only accept if the bot is genuinely IN TRADE (has invested capital).
-        # This catches cases where WS filled the entry but bot_orders row has no CQB prefix.
+        # --- FALLBACK: Direction + Active-Position check ---
+        # v2.2: Accept ownership via EITHER total_invested > 0 OR open_qty > 0.
+        # Root cause of BNB/XAU orphan: the original query required total_invested > 0.
+        # After a reset that zeroed total_invested but left open_qty intact (e.g. from
+        # the integrity bootstrap or a bypassed sync order), the bot was invisible here
+        # and the snapshot assigned bot_id=0 (orphan) causing false REALITY-ORPHAN logs,
+        # grace-period stalls, and the Orphan panel showing in the UI.
+        # FIX: include open_qty > 0 as an equivalent ownership signal.
         cursor.execute("""
-            SELECT b.id, b.pair, b.direction, t.total_invested
+            SELECT b.id, b.pair, b.direction
             FROM bots b
             JOIN trades t ON b.id = t.bot_id
             WHERE b.is_active = 1
-              AND t.total_invested > 0
+              AND (t.total_invested > 0 OR t.open_qty > 0)
         """)
-        for bid, bpair, bdir, invested in cursor.fetchall():
+        for bid, bpair, bdir in cursor.fetchall():
             if (normalize_symbol(bpair).upper() == norm_symbol
                     and bdir.strip().upper() == norm_direction):
                 return bid
@@ -2200,9 +2379,9 @@ def _calculate_formula_step(bot_id: int, total_cost: float, fallback_step: int, 
     Validates and corrects the current_step using the ABSOLUTE LEDGER SUCCESSION PROOF:
     Truth Hierarchy:
     1. PROOF (Ledger): Count highest verified 'filled' step in bot_orders for this cycle.
-    2. SANITY (Fallback): If no ledger fills exist, Step is 0. 
-    
-    Mathematical derivation is strictly for cross-referencing in logs/UI and MUST NOT 
+    2. SANITY (Fallback): If no ledger fills exist, Step is 0.
+
+    Mathematical derivation is strictly for cross-referencing in logs/UI and MUST NOT
     automatically move the bot's current_step, as that leads to 'Step Inflation' (fixing drift).
     """
     try:
@@ -2210,24 +2389,20 @@ def _calculate_formula_step(bot_id: int, total_cost: float, fallback_step: int, 
         import logging
         logger = logging.getLogger(__name__)
 
-        # 🚀 1. ABSOLUTE SUCCESSION PROOF: Highest milestone reached with ≥ 99% fill ratio.
-        # We query all orders for this bot/cycle with fills.
+        # 🚀 1. ABSOLUTE SUCCESSION PROOF: Highest milestone reached with >= 99% fill ratio.
         orders = cursor.execute(
-            """SELECT step, amount, filled_amount FROM bot_orders 
-               WHERE bot_id=? AND cycle_id=? 
-               AND filled_amount > 0 
+            """SELECT step, amount, filled_amount FROM bot_orders
+               WHERE bot_id=? AND cycle_id=?
+               AND filled_amount > 0
                AND status IN ('filled', 'closed', 'canceled', 'cancelled', 'partially_filled')
-               ORDER BY step DESC""", 
+               ORDER BY step DESC""",
             (bot_id, cycle_id)
         ).fetchall()
-        
-        # Determine the highest 'Mastered' step. 
-        # A step is only mastered if it reached near-total completion (99%).
-        # This absorbs exchange dust while preventing 'Step Skipping' on tiny fills.
+
         ledger_step = 0
         for o_step, o_amount, o_filled in orders:
             if o_step is None: continue
-            
+
             target = float(o_amount or 0)
             filled = float(o_filled or 0)
             
@@ -2502,10 +2677,17 @@ def sync_trades_from_orders(bot_id: int) -> bool:
             # Ledger is empty. Ensure trades row is cleared.
             if cached_invested > 0 or cached_step > 0:
                 logger.warning(f"🧹 [DNA-WIPE] Bot {bot_id}: No ledger fills found. Resetting phantom state (was ${cached_invested:.2f}, Step {cached_step}).")
+                # 🚀 ROOT CAUSE FIX (v2.1.1): Do NOT clear basket_start_time here.
+                # Clearing BST to 0 caused a silent oscillation with the offline DNA-guard:
+                #   DNA-WIPE clears BST → next pass: bot_start=0 → old 1h cutoff drops fills
+                #   → recompute still returns 0 → DNA-WIPE fires again → permanent deadlock.
+                # BST is an EE-timer (engine-operation timestamp), not a cycle boundary.
+                # It is safe to preserve it; CST (cycle_start_time) is the authoritative boundary.
+                # BST will be refreshed naturally by seal_trade_state when the bot re-enters.
                 cursor.execute("""
                     UPDATE trades 
                     SET total_invested = 0, avg_entry_price = 0, current_step = 0, 
-                        entry_confirmed = 0, basket_start_time = 0
+                        entry_confirmed = 0
                     WHERE bot_id = ?
                 """, (bot_id,))
                 conn.commit()
@@ -2990,6 +3172,45 @@ def save_bot_order(bot_id, order_type, exchange_order_id, price, amount, step, s
         # (e.g. crossing the spread as a taker), we must stamp filled_amount immediately so 
         # the net_qty math in reset_bot_after_tp is balanced, even if websockets/reconciler misses it.
         initial_fill = amount if status.lower() in ('filled', 'closed') else 0.0
+
+        # 🛡️ CID DEDUP GUARD (v2.1.2): Prevent WS+REST dual-fire race from inflating the ledger.
+        # When both the WebSocket fill event and the REST reconciler call save_bot_order for the
+        # same logical order (same client_order_id), each path receives a different native exchange
+        # order_id, bypassing the old order_id UNIQUE constraint and creating phantom duplicate rows.
+        # SOLUTION: If a non-cancelled row already exists for this (bot_id, client_order_id, cycle_id),
+        # UPDATE it in place (stamping the new exchange order_id) instead of inserting a new row.
+        # This is safe: we always prefer the most recent exchange order_id (REST confirmation > WS).
+        if client_order_id:
+            cursor.execute("""
+                SELECT id, status, filled_amount FROM bot_orders
+                WHERE bot_id=? AND client_order_id=? AND cycle_id=?
+                  AND status NOT IN ('cancelled','canceled','failed','reset_cleared','auto_closed')
+                ORDER BY id DESC LIMIT 1
+            """, (bot_id, client_order_id, cycle_id))
+            existing_cid_row = cursor.fetchone()
+            if existing_cid_row:
+                ex_row_id, ex_status, ex_filled = existing_cid_row
+                # Only upgrade status/filled — never downgrade a 'filled' row back to 'open'
+                final_status = status
+                if ex_status in ('filled', 'closed') and status not in ('filled', 'closed'):
+                    final_status = ex_status
+                final_fill = max(float(ex_filled or 0), initial_fill)
+                cursor.execute("""
+                    UPDATE bot_orders
+                    SET order_id=?, price=?, amount=?, filled_amount=?, status=?, updated_at=?
+                    WHERE id=?
+                """, (exchange_order_id, price, amount, final_fill, final_status, int(time.time()), ex_row_id))
+                logger.debug(
+                    f"[CID-DEDUP] Bot {bot_id} {order_type} cid={client_order_id}: "
+                    f"updated existing row (id={ex_row_id}) instead of inserting duplicate."
+                )
+                # Still sync trades.*_order_id pointer to the latest exchange order_id
+                if order_type == 'entry':
+                    cursor.execute("UPDATE trades SET entry_order_id=? WHERE bot_id=?", (exchange_order_id, bot_id))
+                elif order_type == 'tp':
+                    cursor.execute("UPDATE trades SET tp_order_id=? WHERE bot_id=?", (exchange_order_id, bot_id))
+                conn.commit()
+                return ex_row_id
 
         cursor.execute("""
             INSERT INTO bot_orders (bot_id, step, order_type, order_id, price, amount, filled_amount, status, created_at, client_order_id, notes, cycle_id, position_side) 

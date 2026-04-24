@@ -144,7 +144,7 @@ class ExchangeInterface:
         FIXED: System is strictly designed for ONE-WAY MODE to support multi-bot netting.
         """
         ExchangeInterface._position_mode_hedge = False
-        self.logger.info(f"🛡️ [MODE-DETECT] System forced to ONE-WAY MODE as required.")
+        self.logger.debug(f"🛡️ [MODE-DETECT] System forced to ONE-WAY MODE as required.")
 
     def _raw_request(self, endpoint: str, method: str = 'GET', params: dict = None) -> Any:
         """

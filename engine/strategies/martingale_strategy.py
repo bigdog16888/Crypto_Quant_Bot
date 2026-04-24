@@ -408,76 +408,133 @@ class MartingaleStrategy(BaseStrategy):
         """
         Calculates the next grid price using configured logic (Fixed or ATR).
         Returns: (price, explanation_string)
+
+        ATR fallback hierarchy (ATR fails → fixed-%, NOT zero):
+          1. ATR from configured timeframe
+          2. ATR from 1m data if specialised TF unavailable
+          3. Fixed-% grid using dist_pct (≥ 0.3% floor to prevent near-zero gaps)
+
+        SAFETY BOUNDARIES:
+          - grid_dist can NEVER be zero or negative (floor enforced below)
+          - GapRecovery places at current_price ± final_dist (same magnitude, fresh ref)
+          - If GapRecovery-INVALID triggers it means dist is degenerate → return 0.0
+            (executor skips this cycle; next cycle price has moved and reanchors cleanly)
+          - Fixed-% fallback uses avg_entry_price, NOT current_price, so the gap is
+            anchored to where we actually entered — not to where price is now
         """
         try:
             dist_pct = float(self.params.get('grid_dist_pct', self.params.get('StepPct', 1.0)))
-            dist_pct = max(0.1, dist_pct)
-            
+            # 🛡️ SAFETY FLOOR: Never allow a grid gap < 0.3% — prevents near-market placement
+            dist_pct = max(0.3, dist_pct)
+
             direction = self.params.get('direction', 'LONG').upper()
-            base_grid = float(self.params.get('base_grid', 100.0))
             use_atr = self.params.get('UseATRGrid', False)
             step = int(bot_status.get('current_step', 0))
             avg_entry = float(bot_status.get('avg_entry_price', 0))
-            
+
             explanation = []
-            
+            grid_dist = None   # None sentinel: ATR not resolved yet
+
             if use_atr:
-                 try:
-                     atr_period = int(self.params.get('ATRPeriods', 14))
-                     atr_factor = float(self.params.get('ATRGridFactor', 1.0))
-                     atr_tf = (self.params.get('ATR_Timeframe') or self.params.get('ATRTimeframe') or self.params.get('atr_tf', ''))
-                     atr_df = None
-                     if multi_tf_data and atr_tf and atr_tf in multi_tf_data:
-                         candidate = multi_tf_data[atr_tf]
-                         if hasattr(candidate, 'empty') and not candidate.empty and len(candidate) >= atr_period:
-                             atr_df = candidate
-                     if atr_df is None and hasattr(market_data, 'empty') and not market_data.empty:
-                         atr_df = market_data
+                try:
+                    atr_period = int(self.params.get('ATRPeriods', 14))
+                    atr_factor = float(self.params.get('ATRGridFactor', 1.0))
+                    atr_tf = (self.params.get('ATR_Timeframe') or
+                              self.params.get('ATRTimeframe') or
+                              self.params.get('atr_tf', ''))
 
-                     def _fmt(v): return f"{v:.6f}".rstrip('0').rstrip('.') if v < 0.01 else f"{v:.4f}" if v < 1.0 else f"{v:.2f}"
+                    # Candidate 1: dedicated ATR timeframe
+                    atr_df = None
+                    if multi_tf_data and atr_tf and atr_tf in multi_tf_data:
+                        candidate = multi_tf_data[atr_tf]
+                        if hasattr(candidate, 'empty') and not candidate.empty and len(candidate) >= atr_period:
+                            atr_df = candidate
 
-                     if atr_df is not None and len(atr_df) >= atr_period:
-                          atr_val = iATR(atr_df['high'], atr_df['low'], atr_df['close'], atr_period)
-                          # 🚀 STRICT STRATEGY: No fallbacks.
-                          if atr_val > 0:
-                              grid_dist = atr_val * atr_factor
-                              explanation.append(f"ATR({atr_period},{atr_tf or '1m'})={_fmt(atr_val)} * {atr_factor}")
-                          else:
-                              logger.warning(f"ATR is 0 for {atr_tf or '1m'}. Aborting.")
-                              return 0.0, "ERROR_ATR_ZERO"
-                     else:
-                          logger.warning(f"ATR: insufficient {atr_tf or '1m'} data. Aborting.")
-                          return 0.0, "ERROR_INSUFFICIENT_DATA"
-                 except Exception as e:
-                      logger.error(f"ATR Calc failed: {e}")
-                      return 0.0, f"ERROR_ATR_EXCEPTION"
-            else:
-                 grid_dist = current_price * (dist_pct/100.0)
-                 explanation.append(f"Fixed {dist_pct}%")
+                    # Candidate 2: 1m data if specialised TF unavailable
+                    if atr_df is None and hasattr(market_data, 'empty') and not market_data.empty and len(market_data) >= atr_period:
+                        atr_df = market_data
+
+                    def _fmt(v): return f"{v:.6f}".rstrip('0').rstrip('.') if v < 0.01 else f"{v:.4f}" if v < 1.0 else f"{v:.2f}"
+
+                    if atr_df is not None:
+                        atr_val = iATR(atr_df['high'], atr_df['low'], atr_df['close'], atr_period)
+                        if atr_val > 0:
+                            grid_dist = atr_val * atr_factor
+                            explanation.append(f"ATR({atr_period},{atr_tf or '1m'})={_fmt(atr_val)}*{atr_factor}")
+                        else:
+                            # ATR=0 means perfectly flat market on that TF — degrade
+                            logger.warning(f"ATR({atr_period},{atr_tf or '1m'})=0 → fixed-% fallback ({dist_pct}%)")
+                            explanation.append("ATR=0→fixed-%")
+                    else:
+                        logger.warning(f"ATR: <{atr_period} bars on {atr_tf or '1m'} → fixed-% fallback ({dist_pct}%)")
+                        explanation.append("ATR-data→fixed-%")
+
+                except Exception as e:
+                    logger.error(f"ATR calc exception ({e}) → fixed-% fallback ({dist_pct}%)")
+                    explanation.append("ATR-ex→fixed-%")
+
+            # ── Resolve grid_dist ──────────────────────────────────────────────────────
+            # If ATR was not used OR failed, resolve from configured dist_pct.
+            # Use avg_entry_price as the reference base (not current_price) — this means
+            # the gap is proportional to where we entered, not where price is right now,
+            # so a falling market doesn't compress the DCA safety net.
+            if grid_dist is None:
+                ref_dist_base = avg_entry if avg_entry > 0 else current_price
+                grid_dist = ref_dist_base * (dist_pct / 100.0)
+                if not use_atr:
+                    explanation.append(f"Fixed {dist_pct}% (base={ref_dist_base:.4f})")
+
+            # 🛡️ SAFETY: grid_dist must always be a meaningful positive number
+            # Enforce a minimum of 0.01% of current price as absolute floor
+            min_dist = current_price * 0.0001
+            if grid_dist <= 0 or grid_dist < min_dist:
+                logger.error(
+                    f"grid_dist={grid_dist} is degenerate (< {min_dist:.6f}) — "
+                    f"aborting grid to prevent near-market placement."
+                )
+                return 0.0, "ERROR_DEGENERATE_DIST"
 
             grid_mult = float(self.params.get('GridMultiplier', 1.0))
             final_dist = grid_dist * (grid_mult ** step)
             if grid_mult != 1.0:
-                explanation.append(f"Step {step} dist (mult={grid_mult}^{step})")
+                explanation.append(f"x{grid_mult}^{step}")
 
             ref_price = avg_entry if avg_entry > 0 else current_price
             price = ref_price - final_dist if direction == 'LONG' else ref_price + final_dist
 
-            # Gap Recovery
-            is_invalid = (direction == 'LONG' and price > current_price) or (direction == 'SHORT' and price < current_price)
+            # ── Gap Recovery ──────────────────────────────────────────────────────────
+            # Market moved past the grid anchor before we placed.
+            # Re-anchor to current_price keeping the same distance magnitude.
+            # LONG:  grid must be BELOW current price (buy lower as market dips)
+            # SHORT: grid must be ABOVE current price (sell higher as market rises)
+            is_invalid = (direction == 'LONG' and price >= current_price) or \
+                         (direction == 'SHORT' and price <= current_price)
             if is_invalid:
                 price = current_price - final_dist if direction == 'LONG' else current_price + final_dist
                 explanation.append("GapRecovery")
-                
-                if (direction == 'LONG' and price > current_price) or (direction == 'SHORT' and price < current_price):
+
+                # Second sanity check: price must now be strictly on the correct side.
+                # This only fails if final_dist itself is <= 0 (guarded above), so this
+                # branch is only reached by floating-point edge cases. Return 0.0 to
+                # skip this cycle cleanly — next cycle current_price has moved and the
+                # re-anchor will succeed.
+                if (direction == 'LONG' and price >= current_price) or \
+                   (direction == 'SHORT' and price <= current_price):
+                    logger.error(
+                        f"GapRecovery-INVALID: direction={direction} price={price:.6f} "
+                        f"current={current_price:.6f} dist={final_dist:.6f}. "
+                        f"Skipping cycle — will reanchor next tick."
+                    )
                     return 0.0, "GapRecovery-INVALID"
 
             final_price = self._round_price(price)
-            return final_price, f"Grid: {' | '.join(explanation)} -> Dist {final_dist:.6f}"
+            return final_price, f"Grid: {' | '.join(explanation)} → dist={final_dist:.6f}"
 
         except Exception as e:
-            logger.error(f"Error calculating grid price: {e}")
+            logger.error(f"calculate_grid_order_price unhandled exception: {e}")
             return 0.0, "Error"
+
+
 
     def calculate_grid_order_amount(self, bot_status: Dict, current_price: float, pair: str, exchange: Any) -> float:
         step = int(bot_status.get('current_step', 0))

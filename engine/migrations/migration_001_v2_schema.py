@@ -1,21 +1,22 @@
 """
-engine/migrations/001_v2_schema.py — v2.0 Database Schema Migration
+engine/migrations/migration_001_v2_schema.py — v2.0 + v2.1 Database Schema Migration
 
-One-time migrations to initialize v2.0 schema changes. Safe to run multiple
-times (idempotent) — all operations check before modifying.
-
-Run order (called from engine startup or manually):
-    python -m engine.migrations.001_v2_schema
+Safe to run multiple times (idempotent). All operations check before modifying.
 
 Changes:
   1. Add `cumulative_filled REAL DEFAULT 0` to bot_orders
-     (stores the Binance WS 'z' field — authoritative cumulative fill qty)
   2. Ensure `position_side TEXT` exists on bot_orders
-     (needed for LONG/SHORT segregation in recompute_invested_from_orders)
   3. Ensure `cycle_id INTEGER` exists on bot_orders
-     (needed for cycle-aware ledger queries)
   4. Add `notes TEXT` column to bot_orders if missing
-     (for adoption/heal audit trail)
+  5. Ensure reconciliation_logs table exists
+  6. [v2.1] Add `open_qty REAL DEFAULT 0` to trades
+     — The authoritative running position accumulator. Incremented on every
+       confirmed entry fill, decremented on every TP/close fill. TP is placed
+       for exactly this value. Eliminates float-sum dust permanently.
+  7. [v2.1] Add `wipe_wall_ts INTEGER DEFAULT 0` to trades
+     — Written on every reset (TP, Force SL, Market Close). The offline fill
+       scanner skips any exchange fill older than this timestamp, permanently
+       preventing restart-contamination of the DB from historical fills.
 """
 
 import logging
@@ -26,7 +27,7 @@ logger = logging.getLogger("Migration001")
 
 def run(db_path: str = None) -> dict:
     """
-    Execute all v2.0 schema migrations. Safe to call multiple times.
+    Execute all schema migrations. Safe to call multiple times.
 
     Args:
         db_path: Explicit path to SQLite DB. If None, uses engine.database.DB_PATH.
@@ -118,6 +119,33 @@ def run(db_path: str = None) -> dict:
             applied.append("reconciliation_logs (new table)")
         else:
             skipped.append("reconciliation_logs (already exists)")
+
+        # ---------- Migration 6 [v2.1]: open_qty on trades ----------
+        # The authoritative running position size accumulator.
+        # Eliminates float-sum dust: TP is placed for exactly this value,
+        # incremented/decremented atomically with every exchange-confirmed fill.
+        if _table_exists("trades") and not _column_exists("trades", "open_qty"):
+            conn.execute(
+                "ALTER TABLE trades ADD COLUMN open_qty REAL DEFAULT 0"
+            )
+            conn.commit()
+            logger.info("✅ [M001] Added open_qty to trades (v2.1 accumulator).")
+            applied.append("trades.open_qty")
+        else:
+            skipped.append("trades.open_qty (already exists or table missing)")
+
+        # ---------- Migration 7 [v2.1]: wipe_wall_ts on trades ----------
+        # Written on every reset. Gates offline fill scanner to skip pre-wipe fills.
+        # Permanently ends the restart-contamination loop.
+        if _table_exists("trades") and not _column_exists("trades", "wipe_wall_ts"):
+            conn.execute(
+                "ALTER TABLE trades ADD COLUMN wipe_wall_ts INTEGER DEFAULT 0"
+            )
+            conn.commit()
+            logger.info("✅ [M001] Added wipe_wall_ts to trades (v2.1 session boundary).")
+            applied.append("trades.wipe_wall_ts")
+        else:
+            skipped.append("trades.wipe_wall_ts (already exists or table missing)")
 
         conn.close()
         logger.info(

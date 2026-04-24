@@ -306,6 +306,10 @@ def _handle_order_partial_fill(bot_id: int, order_type: str, event: Dict):
     try:
         from engine.ledger import credit_fill, seal_trade_state
 
+        # Extract exchange fill timestamp (ms) and convert to seconds for filled_at
+        event_ts_ms = event.get('lastTradeTimestamp') or event.get('timestamp') or 0
+        fill_ts = int(event_ts_ms / 1000) if event_ts_ms else 0
+
         # Use client_order_id as lookup key (works even if exchange order_id not yet stamped)
         lookup_id = order_id if order_id else client_id
         credited = credit_fill(
@@ -314,7 +318,8 @@ def _handle_order_partial_fill(bot_id: int, order_type: str, event: Dict):
             cumulative_qty=cumulative_filled,
             avg_price=avg_price,
             order_type=order_type.lower(),
-            is_cumulative=True
+            is_cumulative=True,
+            fill_ts=fill_ts
         )
 
         if credited:
@@ -367,6 +372,9 @@ def _handle_order_filled(bot_id: int, order_type: str, event: Dict):
         # v2.0: TP hit — credit fill then register cascade for runner
         try:
             from engine.ledger import register_tp_cascade, credit_fill
+            # Extract exchange fill timestamp for filled_at + cycle_start_time anchor
+            event_ts_ms = event.get('lastTradeTimestamp') or event.get('timestamp') or 0
+            fill_ts = int(event_ts_ms / 1000) if event_ts_ms else 0
             lookup_id = str(order_id) if order_id else client_id
             credit_fill(
                 bot_id=bot_id,
@@ -374,11 +382,12 @@ def _handle_order_filled(bot_id: int, order_type: str, event: Dict):
                 cumulative_qty=cumulative_fill_qty,
                 avg_price=avg_price,
                 order_type='tp',
-                is_cumulative=True
+                is_cumulative=True,
+                fill_ts=fill_ts
             )
             if symbol:
-                register_tp_cascade(bot_id, symbol, avg_price)
-                logger.info(f"[TP-CASCADE] Bot {bot_id} {symbol} @ {avg_price:.6f} queued.")
+                register_tp_cascade(bot_id, symbol, avg_price, exit_fill_ts=fill_ts)
+                logger.info(f"[TP-CASCADE] Bot {bot_id} {symbol} @ {avg_price:.6f} queued (fill_ts={fill_ts}).")
         except Exception as e:
             logger.error(f"[WS-FILL] TP credit failed for bot {bot_id}: {e}")
 
@@ -386,6 +395,9 @@ def _handle_order_filled(bot_id: int, order_type: str, event: Dict):
         # v2.0: credit_fill → seal_trade_state
         try:
             from engine.ledger import credit_fill, seal_trade_state
+            # Extract exchange fill timestamp for filled_at
+            event_ts_ms = event.get('lastTradeTimestamp') or event.get('timestamp') or 0
+            fill_ts = int(event_ts_ms / 1000) if event_ts_ms else 0
             lookup_id = str(order_id) if order_id else client_id
             credited = credit_fill(
                 bot_id=bot_id,
@@ -393,7 +405,8 @@ def _handle_order_filled(bot_id: int, order_type: str, event: Dict):
                 cumulative_qty=cumulative_fill_qty,
                 avg_price=avg_price,
                 order_type=order_type.lower(),
-                is_cumulative=True
+                is_cumulative=True,
+                fill_ts=fill_ts
             )
             if credited:
                 _enqueue_db_write(seal_trade_state, bot_id)

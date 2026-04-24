@@ -43,18 +43,27 @@ logger = logging.getLogger("Ledger")
 # cascade because ws_event_handlers has no exchange object. Instead, we
 # register the intent here. runner.run_cycle() drains this every cycle.
 _tp_cascade_lock = threading.Lock()
-_tp_cascade_registry: Set[Tuple[int, str, float]] = set()  # (bot_id, pair, exit_price)
+_tp_cascade_registry: Set[Tuple] = set()  # (bot_id, pair, exit_price, exit_fill_ts)
 
 
-def register_tp_cascade(bot_id: int, pair: str, exit_price: float) -> None:
-    """Register a TP fill that needs the full cascade (cancel orders + reset)."""
+def register_tp_cascade(bot_id: int, pair: str, exit_price: float, exit_fill_ts: int = 0) -> None:
+    """
+    Register a TP fill that needs the full cascade (cancel orders + reset).
+
+    Args:
+        exit_fill_ts: Unix timestamp (seconds) from the exchange TP fill event.
+                      Passed through to reset_bot_after_tp to anchor cycle_start_time
+                      to the actual trade-close moment on the exchange.
+    """
     with _tp_cascade_lock:
-        _tp_cascade_registry.add((bot_id, pair, exit_price))
-    logger.info(f"[TP-REGISTRY] Bot {bot_id} {pair} @ {exit_price:.6f} queued for cascade.")
+        _tp_cascade_registry.add((bot_id, pair, exit_price, exit_fill_ts))
+    logger.info(f"[TP-REGISTRY] Bot {bot_id} {pair} @ {exit_price:.6f} queued (fill_ts={exit_fill_ts}).")
 
 
-def drain_tp_cascade() -> Set[Tuple[int, str, float]]:
-    """Pop all pending TP cascades for processing. Thread-safe."""
+def drain_tp_cascade() -> Set[Tuple]:
+    """Pop all pending TP cascades for processing. Thread-safe.
+    Returns set of (bot_id, pair, exit_price, exit_fill_ts) tuples.
+    """
     with _tp_cascade_lock:
         pending = set(_tp_cascade_registry)
         _tp_cascade_registry.clear()
@@ -77,7 +86,8 @@ def credit_fill(
     cumulative_qty: float,
     avg_price: float,
     order_type: str = 'grid',
-    is_cumulative: bool = True
+    is_cumulative: bool = True,
+    fill_ts: int = 0
 ) -> bool:
     """
     Record a fill (or partial fill) in bot_orders.
@@ -92,6 +102,10 @@ def credit_fill(
         is_cumulative: If True (default), uses MAX() protection —
                        filled_amount is updated only if cumulative_qty > existing.
                        Set False only for incremental delta values.
+        fill_ts: Unix timestamp (seconds) from the exchange when this fill occurred.
+                 Source: order.get('lastTradeTimestamp', 0) // 1000 from Binance WS/REST.
+                 Stored in bot_orders.filled_at as an immutable audit record.
+                 Defaults to int(time.time()) if not provided (engine-side fallback).
 
     Returns:
         True if fill was credited, False if no matching order found.
@@ -151,14 +165,49 @@ def credit_fill(
                  f"but WS delivered fill ({cumulative_qty:.6f}). Overwriting to {new_status}."
              )
 
+        # Resolve actual fill timestamp: use exchange-provided if available, else engine time
+        actual_fill_ts = fill_ts if fill_ts > 0 else int(time.time())
+
         conn.execute(
-            "UPDATE bot_orders SET filled_amount = ?, price = ?, status = ?, updated_at = ? WHERE id = ?",
-            (cumulative_qty, avg_price if avg_price > 0 else 
+            "UPDATE bot_orders SET filled_amount = ?, price = ?, status = ?, "
+            "filled_at = CASE WHEN filled_at = 0 THEN ? ELSE filled_at END, "
+            "updated_at = ? WHERE id = ?",
+            (cumulative_qty, avg_price if avg_price > 0 else
              conn.execute("SELECT price FROM bot_orders WHERE id=?", (db_id,)).fetchone()[0],
              new_status,
+             actual_fill_ts,    # filled_at — only set once (first fill wins; idempotent)
              int(time.time()),
              db_id)
         )
+
+        # ── OPEN_QTY ACCUMULATOR [v2.1] ─────────────────────────────────────────
+        # Maintain trades.open_qty as an explicit running total of confirmed fills.
+        # delta = net NEW qty credited this call (cumulative_qty - prior existing_fill).
+        # This is the authoritative position size used for TP sizing — it mirrors
+        # exactly what the exchange has confirmed, with no floating-point recomputation.
+        _ENTRY_TYPES = ('entry', 'grid', 'adoption_add', 'adoption')
+        _EXIT_TYPES  = ('tp', 'close', 'sl', 'dust_close', 'adoption_reduce')
+        delta = cumulative_qty - existing_fill  # always > 0 (guarded above by MAX check)
+        try:
+            if order_type in _ENTRY_TYPES:
+                conn.execute(
+                    "UPDATE trades SET open_qty = ROUND(COALESCE(open_qty, 0) + ?, 8) "
+                    "WHERE bot_id = ?",
+                    (delta, bot_id)
+                )
+                logger.debug(f"[OPEN-QTY] Bot {bot_id}: +{delta:.8f} (entry) delta")
+            elif order_type in _EXIT_TYPES:
+                conn.execute(
+                    "UPDATE trades SET open_qty = MAX(0, ROUND(COALESCE(open_qty, 0) - ?, 8)) "
+                    "WHERE bot_id = ?",
+                    (delta, bot_id)
+                )
+                logger.debug(f"[OPEN-QTY] Bot {bot_id}: -{delta:.8f} (exit) delta")
+        except Exception as _oq_err:
+            # Non-fatal: open_qty will be backfilled by check_and_fix_integrity on next startup
+            logger.warning(f"[OPEN-QTY] Bot {bot_id}: accumulator update failed: {_oq_err}")
+        # ────────────────────────────────────────────────────────────────────────
+
         conn.commit()
 
         logger.debug(
@@ -237,6 +286,54 @@ def seal_trade_state(bot_id: int) -> Dict[str, Any]:
         logger.error(f"[SEAL] recompute_invested_from_orders failed for bot {bot_id}: {e}")
         return {}
 
+    # ── OPEN_QTY ACCUMULATOR CROSS-CHECK [v2.3.2] ──────────────────────────────
+    # trades.open_qty is the authoritative running total — it was incremented/decremented
+    # atomically with every exchange-confirmed fill via credit_fill().
+    # For minor drifts (<20%) the accumulator wins (it reflects real-time fills).
+    # For large drifts (>20%) the recompute wins — a stale accumulator from a failed
+    # adoption_reduce/TP credit would otherwise cause the next TP to be oversized.
+    try:
+        conn = get_connection()
+        _accum_row = conn.execute(
+            "SELECT open_qty FROM trades WHERE bot_id=?", (bot_id,)
+        ).fetchone()
+        if _accum_row is not None:
+            accumulator_qty = float(_accum_row[0] or 0)
+            if accumulator_qty > 0:
+                drift = abs(accumulator_qty - qty)
+                drift_pct = drift / accumulator_qty if accumulator_qty > 0 else 0
+                if drift_pct > 0.20:
+                    # ── LARGE-DRIFT SELF-HEAL [v2.3.2] ─────────────────────────
+                    # >20% gap is structurally impossible under normal operation.
+                    # A past adoption_reduce or TP fill likely failed to update
+                    # open_qty, leaving a stale value that would cause the NEXT
+                    # TP replacement to size for too many contracts (oversell).
+                    # Recompute (SUM of actual fills from bot_orders) is the ground
+                    # truth — self-heal open_qty in DB and use the correct value.
+                    logger.warning(
+                        f"[QTY-DRIFT-HEAL] Bot {bot_id}: accumulator={accumulator_qty:.8f} "
+                        f"vs recomputed={qty:.8f} (drift={drift_pct:.2%} > 20%). "
+                        f"Recompute wins — self-healing open_qty in DB."
+                    )
+                    conn.execute(
+                        "UPDATE trades SET open_qty=? WHERE bot_id=?",
+                        (qty, bot_id)
+                    )
+                    conn.commit()
+                    # qty already holds the correct recomputed value — do not override
+                elif drift_pct > 0.001:  # 0.1%–20%: minor drift → accumulator wins
+                    logger.warning(
+                        f"[QTY-DRIFT] Bot {bot_id}: accumulator={accumulator_qty:.8f} "
+                        f"vs recomputed={qty:.8f} (drift={drift_pct:.2%}). "
+                        f"Accumulator is authoritative — using it."
+                    )
+                    qty = accumulator_qty
+                else:
+                    qty = accumulator_qty  # No meaningful drift — use accumulator
+    except Exception as _acc_err:
+        logger.warning(f"[SEAL] Bot {bot_id}: accumulator read failed: {_acc_err}")
+    # ────────────────────────────────────────────────────────────────────────────
+
     try:
         conn = get_connection()
 
@@ -258,6 +355,15 @@ def seal_trade_state(bot_id: int) -> Dict[str, Any]:
         if qty > prev_qty * 1.01 and qty > 1e-8:
             basket_time_update = int(time.time())
 
+        # Invariant: a bot with physical position (qty > 0) must have step >= 1.
+        # step=0 is the Scanning state. If recompute returned 0 (e.g. adoption rows
+        # have step=0 and _calculate_formula_step can't resolve martingale config),
+        # clamp to 1. This prevents heal_zombie_bots Scenario 1 from seeing
+        # "step=0, invested=0" and wiping a genuinely active position.
+        if qty > 1e-8 and step == 0:
+            step = 1
+            logger.info(f"[SEAL] Bot {bot_id}: clamped step 0→1 (qty={qty:.6f} > 0, position is active)")
+
         # Write to trades
         conn.execute("""
             UPDATE trades SET
@@ -265,9 +371,11 @@ def seal_trade_state(bot_id: int) -> Dict[str, Any]:
                 avg_entry_price  = ?,
                 current_step     = ?,
                 entry_confirmed  = CASE WHEN ? > 0 THEN 1 ELSE 0 END,
-                basket_start_time = COALESCE(?, basket_start_time)
+                basket_start_time = COALESCE(?, basket_start_time),
+                cycle_phase      = CASE WHEN cycle_phase = 'CARRY_PENDING' AND ? >= 5.0 THEN 'ACTIVE' ELSE cycle_phase END
             WHERE bot_id = ?
-        """, (cost, avg, step, qty, basket_time_update, bot_id))
+        """, (cost, avg, step, qty, basket_time_update, cost, bot_id))
+
 
         # Derive and update bot status
         if qty > 1e-8:
@@ -391,30 +499,17 @@ def handle_tp_completion(
     exit_price: float,
     pair: str,
     exchange,
-    cycle_id: Optional[int] = None
+    cycle_id: Optional[int] = None,
+    exit_fill_ts: int = 0
 ) -> bool:
     """
     THE complete TP workflow. Atomic. No orphan orders possible after completion.
 
-    Steps (ALL must succeed before status → 'Scanning'):
-      1. Validate: confirm physical position is reducing (sanity check)
-      2. Cancel ALL pending CQB_{bot_id}_* orders on exchange
-      3. Wait for confirmation (or REST-verify after 5s timeout)
-      4. Credit TP fill to bot_orders (if not already there from WS)
-      5. Write trade_history entry (PnL, qty, duration)
-      6. Mark all bot_orders for current cycle as 'reset_cleared'
-      7. Increment cycle_id, zero trades row
-      8. Set bots.status = 'Scanning'
-
     Args:
-        bot_id: The bot to reset.
-        exit_price: The TP fill price.
-        pair: Exchange symbol (e.g. 'ETHUSDC').
-        exchange: ExchangeInterface instance for order cancellation.
-        cycle_id: The cycle that was completed (resolved from DB if None).
-
-    Returns:
-        True if cascade completed successfully, False if any step failed.
+        exit_fill_ts: Unix timestamp (seconds) of the TP fill event from the exchange.
+                      Written to trades.cycle_start_time for the new cycle, anchoring
+                      the cycle boundary to the actual exchange execution time.
+                      Defaults to int(time.time()) inside reset_bot_after_tp if 0.
     """
     from engine.database import (
         get_connection, reset_bot_after_tp, log_trade, get_bot_status
@@ -487,11 +582,15 @@ def handle_tp_completion(
                         pnl = qty * (avg_entry - exit_price)
                     duration_s = int(time.time()) - basket_start if basket_start > 0 else 0
 
+                    cost_usdc = qty * avg_entry
                     log_trade(
                         bot_id=bot_id,
                         action='TP_HIT',
+                        symbol=pair,
                         price=exit_price,
                         amount=qty,
+                        cost_usdc=cost_usdc,
+                        pnl=pnl,
                         notes=(
                             f"TP @ {exit_price:.6f} | entry_avg={avg_entry:.6f} | "
                             f"pnl=${pnl:.4f} | step={current_step} | duration={duration_s}s"
@@ -502,14 +601,17 @@ def handle_tp_completion(
 
         # --- Step 3: Full atomic reset via existing reset_bot_after_tp ---
         # This handles: mark reset_cleared, increment cycle_id, zero trades row
+        # Pass the exchange fill timestamp so cycle_start_time is anchored to
+        # the actual TP execution moment, not the engine processing time.
         try:
             reset_bot_after_tp(
                 bot_id=bot_id,
                 exit_price=exit_price,
                 action_label='TP_HIT',
-                notes=f'Cascade via ledger.handle_tp_completion @ {exit_price:.6f}'
+                notes=f'Cascade via ledger.handle_tp_completion @ {exit_price:.6f}',
+                exit_fill_ts=exit_fill_ts
             )
-            logger.info(f"[TP-CASCADE] ✅ Bot {bot_id}: Reset to Scanning. Cycle {cycle_id} → {cycle_id + 1}.")
+            logger.info(f"[TP-CASCADE] ✅ Bot {bot_id}: Reset to Scanning. Cycle {cycle_id} → {cycle_id + 1} (cst={exit_fill_ts}).")
             return True
 
         except Exception as e_reset:

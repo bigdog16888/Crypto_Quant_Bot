@@ -465,34 +465,52 @@ def render_monitor_view():
             virtual_qty_by_pair = {}
             physical_qty_by_pair = {}
             pair_prices = {} # For converting qty back to USD for readability
+
             
             # Helper: normalize symbol to strip colon suffix and slashes (BTC/USDC:USDC → BTCUSDC)
             from engine.exchange_interface import normalize_symbol
             _norm = normalize_symbol
 
             # 1. Fetch Virtual Positions (grouped by normalized pair + side)
+            # v2.2: include open_qty — the canonical v2.1 accumulator.
+            # Root cause of phantom NET mismatch: the old query required total_invested > 0,
+            # making bots with open_qty > 0 but total_invested = 0 invisible here.
+            # Their physical footprint then appeared as an unaccounted orphan.
             query_virtual = """
                 SELECT b.pair, b.direction,
-                       t.total_invested, t.avg_entry_price
+                       t.total_invested, t.avg_entry_price,
+                       COALESCE(t.open_qty, 0) as open_qty
                 FROM bots b
                 JOIN trades t ON b.id = t.bot_id
-                WHERE b.is_active = 1 AND t.total_invested > 0 AND t.avg_entry_price > 0
+                WHERE b.is_active = 1
+                  AND (t.total_invested > 0 OR t.open_qty > 0)
             """
             df_virt = pd.read_sql(query_virtual, conn_fresh)
             conn_fresh.close()
             
             if not df_virt.empty:
                 for _, row in df_virt.iterrows():
-                    invested = float(row['total_invested'] or 0)
-                    avg_price = float(row['avg_entry_price'] or 0)
-                    if invested <= 0 or avg_price <= 0:
-                        continue
-                    qty_abs = invested / avg_price
-                    pair_key = _norm(row['pair'])
-                    side_key = str(row['direction']).upper()  # LONG or SHORT
+                    invested   = float(row['total_invested'] or 0)
+                    avg_price  = float(row['avg_entry_price'] or 0)
+                    open_qty_v = float(row['open_qty'] or 0)
+                    pair_key   = _norm(row['pair'])
+                    side_key   = str(row['direction']).upper()  # LONG or SHORT
                     composite_key = (pair_key, side_key)
+
+                    # v2.2: prefer open_qty accumulator (exact confirmed qty) over
+                    # the total_invested / avg_price derived qty (can diverge on reset).
+                    # Fallback to the invested-based calculation for pre-v2.1 bots.
+                    if open_qty_v > 0:
+                        qty_abs = open_qty_v
+                        ref_price = avg_price if avg_price > 0 else 1.0
+                    elif invested > 0 and avg_price > 0:
+                        qty_abs = invested / avg_price
+                        ref_price = avg_price
+                    else:
+                        continue
+
                     if pair_key not in pair_prices:
-                        pair_prices[pair_key] = avg_price
+                        pair_prices[pair_key] = ref_price
                     # 🚀 HEDGE-MODE: Group by (pair, side) so LONG and SHORT bots are tracked independently.
                     virtual_qty_by_pair[composite_key] = virtual_qty_by_pair.get(composite_key, 0.0) + qty_abs
             
@@ -800,12 +818,26 @@ def render_monitor_view():
                                             _involved_bots = [r[0] for r in _c_mkt.fetchall()]
                                             
                                             for _bid in _involved_bots:
-                                                _c_mkt.execute("UPDATE bot_orders SET status='auto_closed' WHERE bot_id=? AND status NOT IN ('filled', 'canceled', 'auto_closed', 'reset_cleared')", (_bid,))
-                                                _c_mkt.execute("UPDATE trades SET total_invested=0, current_step=0, cycle_phase='IDLE' WHERE bot_id=?", (_bid,))
+                                                try:
+                                                    ex_mkt.cancel_orders_by_bot_id(_bid, _pair_root)
+                                                except Exception as e_cancel:
+                                                    st.warning(f"Could not cancel limit orders for bot {_bid}: {e_cancel}")
+                                                    
+                                                # 3. 🧹 WIPE VIRTUAL (Force-SL all bots on this pair to 0)
+                                                # We must aggressively wipe the DB state so the "Entry Anchor" is freed.
+                                                # Marking all bot_orders as reset_cleared ensures they fall behind the mathematical Wipe Wall.
+                                                _c_mkt.execute("UPDATE bot_orders SET status='reset_cleared' WHERE bot_id=?", (_bid,))
+                                                _c_mkt.execute("""
+                                                    UPDATE trades SET 
+                                                        total_invested=0, avg_entry_price=0, current_step=0, 
+                                                        entry_confirmed=0, basket_start_time=0,
+                                                        open_qty=0, wipe_wall_ts=?
+                                                    WHERE bot_id=?
+                                                """, (int(time.time()), _bid))
                                                 _c_mkt.execute("UPDATE bots SET status='Scanning' WHERE id=?", (_bid,))
-                                            
+
                                             _conn_mkt.commit()
-                                            st.success(f"✅ Neutralized {_pair_root}: Physical closed & {len(_involved_bots)} bots reset to Scanning.")
+                                            st.success(f"✅ Neutralized {_pair_root}: Physical closed, limits cancelled & {len(_involved_bots)} bots reset to Scanning.")
                                             time.sleep(1)
                                             st.rerun()
                                         except Exception as _mkt_e:
@@ -1242,14 +1274,15 @@ def render_monitor_view():
                 df_pos['Active Orders'] = info_df['Orders']
 
                 def format_tp_price(x):
-                    if x <= 0: return "-"
-                    if x < 1.0:  return f"${x:.4f}"
-                    if x < 10.0: return f"${x:.3f}"
-                    return f"${x:,.2f}"
+                    x_val = float(x) if x is not None else 0.0
+                    if x_val <= 0: return "-"
+                    if x_val < 1.0:  return f"${x_val:.4f}"
+                    if x_val < 10.0: return f"${x_val:.3f}"
+                    return f"${x_val:,.2f}"
 
                 df_pos['Active TP'] = info_df['TP_Price'].apply(format_tp_price)
                 df_pos['Next Grid'] = info_df.apply(
-                    lambda row: f"{row['Grid_Amount']} @ {format_tp_price(row['Grid_Price'])}" if row.get('Grid_Price', 0) > 0 else "-",
+                    lambda row: f"{row['Grid_Amount']} @ {format_tp_price(row['Grid_Price'])}" if (float(row.get('Grid_Price') or 0.0)) > 0 else "-",
                     axis=1
                 )
 
@@ -1259,20 +1292,24 @@ def render_monitor_view():
                     matrix_df = df_pos.copy()
 
                     def est_profit(row):
-                        if row['total_invested'] > 0 and row['avg_entry_price'] > 0 and row['target_tp_price'] > 0:
+                        inv = float(row.get('total_invested', 0) or 0)
+                        avg = float(row.get('avg_entry_price', 0) or 0)
+                        target = float(row.get('target_tp_price', 0) or 0)
+                        
+                        if inv > 0 and avg > 0 and target > 0:
                             ee_full_decay = False
                             if 'Trigger Condition' in row and isinstance(row['Trigger Condition'], str):
                                 if '-100.0%]' in row['Trigger Condition'] or '-100%]' in row['Trigger Condition']:
                                     ee_full_decay = True
                             if ee_full_decay:
                                 return "$0.00 (Break-Even)"
-                            qty = row['total_invested'] / row['avg_entry_price']
-                            if row['direction'] == 'LONG':
-                                profit = (row['target_tp_price'] - row['avg_entry_price']) * qty
+                            qty = inv / avg
+                            if row.get('direction', 'LONG') == 'LONG':
+                                profit = (target - avg) * qty
                             else:
-                                profit = (row['avg_entry_price'] - row['target_tp_price']) * qty
+                                profit = (avg - target) * qty
                             try:
-                                roi_pct = (profit / row['total_invested']) * 100
+                                roi_pct = (profit / inv) * 100
                                 try:
                                     cfg_raw = json.loads(row.get('config', '{}') or '{}')
                                     lev = float(cfg_raw.get('leverage', 1) or 1)
@@ -1293,8 +1330,10 @@ def render_monitor_view():
 
                     current_time = time.time()
                     def time_in_trade(row):
-                        if row['total_invested'] > 0 and row['basket_start_time'] > 0:
-                            sec = current_time - row['basket_start_time']
+                        inv = float(row.get('total_invested', 0) or 0)
+                        bst = float(row.get('basket_start_time', 0) or 0)
+                        if inv > 0 and bst > 0:
+                            sec = current_time - bst
                             m, s = divmod(sec, 60)
                             h, m = divmod(m, 60)
                             return f"{int(h)}h {int(m)}m"
@@ -1304,7 +1343,7 @@ def render_monitor_view():
 
                     cols_matrix = ['name', 'pair', 'direction', 'current_step', 'total_invested', 'Active TP', 'Next Grid', 'Expected Profit', 'Time in Trade', 'status']
                     matrix_df = matrix_df[[c for c in cols_matrix if c in matrix_df.columns]]
-                    matrix_df['total_invested'] = matrix_df['total_invested'].apply(lambda x: f"${x:,.2f}" if x > 0 else "-")
+                    matrix_df['total_invested'] = matrix_df['total_invested'].apply(lambda x: f"${float(x):,.2f}" if x and float(x) > 0 else "-")
                     st.dataframe(matrix_df, width="stretch")
                 except Exception as e:
                     st.warning(f"Failed to render Batch Matrix: {e}")

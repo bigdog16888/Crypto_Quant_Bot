@@ -65,19 +65,20 @@ def flag_unmatched_positions(runner, snapshot: Dict[str, Any]):
 
     # 2. Aggregate Virtual Positions (Query directly from DB for accurate avg_entry_price)
     virtual_map = {}  # {norm_pair: {'long': qty, 'short': qty}}
-    
+    bot_by_pair_side = {}  # {(norm_pair, side): [bot_id, ...]} for self-heal lookups
+
     conn = database.get_connection()
     c = conn.cursor()
     c.execute("""
-        SELECT b.pair, t.position_side, t.total_invested, t.avg_entry_price 
-        FROM bots b 
-        JOIN trades t ON b.id = t.bot_id 
+        SELECT b.id, b.pair, t.position_side, t.total_invested, t.avg_entry_price
+        FROM bots b
+        JOIN trades t ON b.id = t.bot_id
         WHERE b.is_active = 1 AND t.total_invested > 0
     """)
     active_bot_trades = c.fetchall()
 
     for row in active_bot_trades:
-        b_pair, b_side, b_invested, b_avg_entry = row
+        b_id, b_pair, b_side, b_invested, b_avg_entry = row
         pair = normalize_symbol(b_pair)
         direction = str(b_side or 'LONG').lower()
         invested = float(b_invested or 0)
@@ -90,33 +91,72 @@ def flag_unmatched_positions(runner, snapshot: Dict[str, Any]):
             qty = invested / avg_entry
             virtual_map[pair][direction] += qty
 
-    # 3. Compare — SIDE-AWARE (Hedge-Mode) validation
-    # Compares LONG and SHORT independently to avoid math contamination
+        bot_by_pair_side.setdefault((pair, direction), []).append(b_id)
+
+    # 3. Compare — ONE-WAY MODE Netting validation
+    # Since Binance operates in One-Way mode for multi-bot hedging, we must net the virtual
+    # positions before comparing them to the exchange's netted physical position.
     all_pairs = set(list(physical_map.keys()) + list(virtual_map.keys()))
     
     for pair in all_pairs:
         p_data = physical_map.get(pair, {'long': 0.0, 'short': 0.0})
         v_data = virtual_map.get(pair, {'long': 0.0, 'short': 0.0})
 
-        for side in ('long', 'short'):
-            p_qty = p_data[side]
-            v_qty = v_data[side]
-            diff_qty = abs(p_qty - v_qty)
+        # Calculate Net Positions (LONG is positive, SHORT is negative)
+        p_net = p_data['long'] - p_data['short']
+        v_net = v_data['long'] - v_data['short']
+        
+        diff_qty = abs(p_net - v_net)
+        
+        if diff_qty > _MISMATCH_TOLERANCE_QTY:
+            # Determine the dominant side for logging
+            side_label = "LONG" if v_net >= 0 else "SHORT"
             
-            if diff_qty > _MISMATCH_TOLERANCE_QTY:
-                side_label = side.upper()
-                if v_qty < _MISMATCH_TOLERANCE_QTY:
-                    logger.warning(
-                        f"⚠️ UNMATCHED {side_label} POSITION: {pair} "
-                        f"PhysQty={p_qty:.4f} SystemQty={v_qty:.4f} — "
-                        f"Possibly manual trade or cross-bot leak. Reconciler will solve."
-                    )
+            if abs(v_net) < _MISMATCH_TOLERANCE_QTY and abs(p_net) > _MISMATCH_TOLERANCE_QTY:
+                # Exchange has a position we don't know about — possibly manual trade
+                logger.warning(
+                    f"⚠️ UNMATCHED {side_label} POSITION: {pair} "
+                    f"PhysNet={p_net:.4f} SystemNet={v_net:.4f} — "
+                    f"Possibly manual trade or cross-bot leak. Reconciler will solve."
+                )
+
+            elif abs(p_net) < _MISMATCH_TOLERANCE_QTY and abs(v_net) > _MISMATCH_TOLERANCE_QTY:
+                # ── GHOST VIRTUAL POSITION ───────────────────────────────────────
+                logger.warning(
+                    f"👻 GHOST {side_label} POSITION: {pair} "
+                    f"PhysNet={p_net:.4f} SystemNet={v_net:.4f} — "
+                    f"Exchange shows zero, system has phantom. Triggering seal heal."
+                )
+                # Heal ALL active bots for this pair since we don't know which is wrong
+                affected_bots = bot_by_pair_side.get((pair, 'long'), []) + bot_by_pair_side.get((pair, 'short'), [])
+                if affected_bots:
+                    try:
+                        from engine.ledger import seal_trade_state
+                        for bot_id in set(affected_bots): # Deduplicate
+                            logger.info(f"🩺 [INTEGRITY-HEAL] Sealing bot {bot_id} ({pair} {side_label}) to resolve ghost position.")
+                            seal_trade_state(bot_id)
+                    except Exception as heal_err:
+                        logger.error(f"[INTEGRITY-HEAL] seal_trade_state failed for {pair} {side_label}: {heal_err}")
                 else:
-                    logger.warning(
-                        f"⚠️ {side_label} SIZE DISCREPANCY: {pair} "
-                        f"PhysQty={p_qty:.4f} SystemQty={v_qty:.4f} "
-                        f"(Diff: {diff_qty:.4f} qty). NO ACTION TAKEN."
-                    )
+                    logger.warning(f"[INTEGRITY-HEAL] No bots found for ({pair}) — orphaned DB row.")
+
+            else:
+                logger.warning(
+                    f"⚠️ SIZE DISCREPANCY: {pair} "
+                    f"PhysNet={p_net:.4f} SystemNet={v_net:.4f} (Diff: {diff_qty:.4f} qty)"
+                )
+                # Heal ALL active bots for this pair
+                affected_bots = bot_by_pair_side.get((pair, 'long'), []) + bot_by_pair_side.get((pair, 'short'), [])
+                if affected_bots:
+                    try:
+                        from engine.ledger import seal_trade_state
+                        for bot_id in set(affected_bots):
+                            logger.info(f"🩺 [INTEGRITY-HEAL] Sealing bot {bot_id} ({pair}) to resolve size discrepancy.")
+                            seal_trade_state(bot_id)
+                    except Exception as heal_err:
+                        logger.error(f"[INTEGRITY-HEAL] seal_trade_state failed for {pair}: {heal_err}")
+                else:
+                    logger.warning(f"[INTEGRITY-HEAL] No bots found for ({pair}) — orphaned DB row.")
 
 
 # Use strict quantity rounding tolerance to avoid floating point math errors
