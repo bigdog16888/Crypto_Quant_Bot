@@ -96,17 +96,33 @@ def check_moving_profit_target(current_price: float, average_price: float, targe
                 
     return new_sl
 
-def check_hedge_entry(current_step: int, settings: dict) -> dict | None:
+def check_hedge_entry(current_step: int, settings: dict, avg_entry_price: float = 0.0, current_price: float = 0.0, direction: str = 'LONG') -> dict | None:
     """
     Determines if a hedge lock order should be placed.
-    Triggers when the bot reaches HedgeStartStep (step-based, not drawdown%).
+    Triggers when the bot reaches HedgeStartStep OR the drawdown exceeds HedgeStart percentage.
     Returns a mission dict or None.
     """
     if not settings.get('UseHedge', False):
         return None
+    
+    # 1. Step Threshold Check
     hedge_step = int(settings.get('HedgeStartStep', 7))
-    if current_step >= hedge_step:
-        return {'action': 'open_hedge', 'trigger_step': current_step}
+    step_triggered = current_step >= hedge_step
+    
+    # 2. Drawdown Percentage Check
+    drawdown_triggered = False
+    hedge_start_loss = float(settings.get('HedgeStart', 0.0))
+    if hedge_start_loss > 0.0 and avg_entry_price > 0.0 and current_price > 0.0:
+        if direction.upper() == 'LONG':
+            loss_pct = ((avg_entry_price - current_price) / avg_entry_price) * 100.0
+        else:
+            loss_pct = ((current_price - avg_entry_price) / avg_entry_price) * 100.0
+            
+        if loss_pct >= hedge_start_loss:
+            drawdown_triggered = True
+
+    if step_triggered or drawdown_triggered:
+        return {'action': 'open_hedge', 'trigger_step': current_step, 'reason': 'step' if step_triggered else 'drawdown'}
     return None
 
 def calculate_hedge_lot(main_basket_lots: float, settings: dict) -> float:

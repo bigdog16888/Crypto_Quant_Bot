@@ -1,11 +1,11 @@
-# 🤖 Crypto Quant Bot (v2.0.0)
+# 🤖 Crypto Quant Bot (v2.4.2)
 
 A professional-grade, multi-bot algorithmic trading system designed for **Binance Futures (USDT/USDC)**. It features a robust **Virtual Position Manager** that allows multiple bots to trade the same pair independently (e.g., Hedging Long/Short) without conflict.
 
 ## 🌟 Key Features
 
 *   **Virtual Position System:** Each bot tracks its own position logic (`trades` table) while the engine reconciles with the exchange.
-*   **Fully Autonomous Reconciliation (v2.0.0):** Achieved strict zero-drift ledger stability. The engine relies on cryptographic proof-of-fill (Deterministic ID mapping) and handles complex One-Way mode netting.
+*   **Fully Autonomous Reconciliation (v2.4.2):** Achieved strict zero-drift ledger stability. The engine relies on cryptographic proof-of-fill (Deterministic ID mapping) and handles complex One-Way mode netting and Hedge-aware ledger recovery.
 *   **Ghost-Proof Order Management:** Advanced string-parsing logic for `clientOrderId` eliminates infinite cancel/recreate loops and stale order "ghosting."
 *   **Drift-Aware Consensus:** Pair-consensus logic accounts for sibling virtual positions on the same pair, preventing false-positive drift alerts in One-Way accounts.
 *   **Atomic State Integrity:** Consolidates snapshots into `BEGIN IMMEDIATE` transaction blocks with fail-safe recovery for TP and Grid placements.

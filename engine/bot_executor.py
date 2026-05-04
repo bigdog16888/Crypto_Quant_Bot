@@ -468,13 +468,27 @@ class BotExecutor:
                           existing_tp_order: dict) -> Optional[dict]:
         """Cancel the out-of-date TP order and place a fresh one at db_tp / db_qty.
         Returns the new order dict, or None on failure.
-        
-        ATOMIC GUARANTEE: If the new placement fails (e.g. GTX rejected because
-        EE-decayed price is below market bid), the old DB row is restored to 'open'
-        so placed_tp remains anchored to the exchange-live price. This prevents
-        the infinite cancel-replace storm that occurs when EE decay produces an
-        un-makeable price below current market.
         """
+        # 🚀 API LAG GUARD (v2.3.5)
+        # If we just placed a TP order in the last 15 seconds, skip sync.
+        # This prevents "Double Placement" loops where the exchange API lags 
+        # and doesn't show the new order in the next maintain_orders cycle.
+        try:
+            from engine.database import get_connection
+            _conn = get_connection()
+            recent_check = _conn.execute("""
+                SELECT id FROM bot_orders 
+                WHERE bot_id = ? AND order_type = 'tp' 
+                AND status IN ('new', 'open', 'filled')
+                AND (created_at > ? OR updated_at > ?)
+                LIMIT 1
+            """, (bot_id, int(time.time()) - 15, int(time.time()) - 15)).fetchone()
+            if recent_check:
+                logger.debug(f"⏳ [SYNC-LAG-GUARD] {name}: TP recently placed in DB. Waiting for API/WS propagation...")
+                return None
+        except Exception as _lag_err:
+            logger.warning(f"[SYNC-LAG-GUARD] DB check failed: {_lag_err}")
+
         try:
             tp_order_id = existing_tp_order.get('order_id', existing_tp_order.get('id'))
             
@@ -483,6 +497,14 @@ class BotExecutor:
             cancel_response = None
             try:
                 cancel_response = exchange.cancel_order(tp_order_id, pair)
+                
+                # 🚀 CACHE EVICTION (v2.3.5)
+                # Immediately remove the cancelled order from the memory cache 
+                # so the NEXT loop cycle (which might be in < 1s) doesn't see it as "open".
+                try:
+                    from engine.ws_cache import get_ws_cache
+                    get_ws_cache().remove_order(tp_order_id)
+                except: pass
             except Exception as e:
                 logger.warning(f"[TP-SYNC] {name}: Cancel failed ({e}). Attempting to fetch order status...")
                 try:
@@ -500,27 +522,47 @@ class BotExecutor:
                     logger.warning(f"⚠️ [TP-SYNC] {name}: Old TP {tp_order_id} is FULLY FILLED. Aborting replacement to prevent oversell.")
                     return None
                     
+                # 🚀 PARTIAL FILL SYNC (v2.3.5)
+                # If the cancel response shows a fill that the DB hasn't seen yet,
+                # credit it immediately to keep the ledger in 1:1 parity.
+                if filled_qty > 0:
+                    try:
+                        from engine.ledger import credit_fill
+                        logger.info(f"⚡ [TP-SYNC] {name}: Detected partial fill of {filled_qty} on cancelled order {tp_order_id}. Syncing ledger...")
+                        credit_fill(
+                            bot_id=bot_id,
+                            order_id=tp_order_id,
+                            cumulative_qty=filled_qty,
+                            avg_price=float(cancel_response.get('average') or cancel_response.get('price') or 0),
+                            order_type='tp',
+                            is_cumulative=True
+                        )
+                    except Exception as _sync_err:
+                        logger.warning(f"[TP-SYNC] Ledger sync failed: {_sync_err}")
+
                 if orig_qty > 0:
                     calculated_remaining = max(0.0, orig_qty - filled_qty)
                     logger.info(f"✅ [TP-SYNC] {name}: Cancelled order {tp_order_id}. orig: {orig_qty:.4f}, filled: {filled_qty:.4f}, remaining: {calculated_remaining:.4f}")
-                    # Update db_qty to the mathematically exact remaining amount
-                    db_qty = calculated_remaining
+                    # 🚀 CRITICAL: Do NOT overwrite db_qty (the target) with calculated_remaining (the stale size).
+                    # We only use calculated_remaining to verify if the order filled while we were cancelling.
+                    # The next block (Root Cause Fix) will sync db_qty to the absolute ledger truth.
+                    pass
 
             # Mandatory 500ms safety sleep to allow exchange state to propagate
             time.sleep(0.5)
 
             # 🚀 ROOT CAUSE FIX: Re-read open_qty from DB after sleep!
-            # If the cancelled order was partially or fully filled just before cancellation,
-            # the WebSocket will have processed the fill during the 500ms sleep.
-            # Using the statically passed db_qty would cause an oversell.
+            # The ledger (trades.open_qty) is the absolute ground truth.
+            # If the cancelled order was partially filled just before cancellation,
+            # the WebSocket will have updated open_qty during the 500ms sleep.
             try:
                 from engine.database import get_connection
                 _conn = get_connection()
                 _latest_qty_row = _conn.execute("SELECT open_qty FROM trades WHERE bot_id=?", (bot_id,)).fetchone()
                 if _latest_qty_row:
                     _latest_qty = float(_latest_qty_row[0] or 0)
-                    if _latest_qty < db_qty:
-                        logger.warning(f"⚠️ [TP-SYNC] {name}: open_qty dropped from {db_qty:.4f} to {_latest_qty:.4f} during sleep (WS processed a fill!). Adjusting to prevent oversell.")
+                    if abs(_latest_qty - db_qty) > 1e-8:
+                        logger.info(f"🔄 [TP-SYNC] {name}: Ledger changed from {db_qty:.4f} to {_latest_qty:.4f} (WS processed a fill). Syncing to absolute ledger truth.")
                         db_qty = _latest_qty
             except Exception as e:
                 logger.error(f"[TP-SYNC] Failed to re-verify open_qty: {e}")
@@ -534,6 +576,30 @@ class BotExecutor:
                 return None
 
             side = 'sell' if direction == 'LONG' else 'buy'
+
+            # 🚀 SPREAD-CROSSING MAKER LOOP FIX (v2.4.1)
+            # Re-apply Best Bid/Ask logic during SYNC to prevent GTX rejection loops.
+            # If the target TP crosses the spread, we adjust it to the 'Maker' side.
+            try:
+                bid, ask = exchange.get_best_bid_ask(pair)
+                if bid is not None and ask is not None:
+                    bid_val = float(bid)
+                    ask_val = float(ask)
+                    if direction == 'LONG':
+                        # TP is a SELL. To be a Maker, Sell must be >= Best Ask.
+                        if db_tp <= bid_val:
+                            old_tp = db_tp
+                            db_tp = ask_val # Join the asks to stay Maker
+                            logger.info(f"🚀 [TP-SYNC] {name}: Spread Cross Prevented! (Sell {old_tp} <= Bid {bid_val}). Adjusted to Ask {db_tp} to preserve GTX.")
+                    else:
+                        # TP is a BUY. To be a Maker, Buy must be <= Best Bid.
+                        if db_tp >= ask_val:
+                            old_tp = db_tp
+                            db_tp = bid_val # Join the bids to stay Maker
+                            logger.info(f"🚀 [TP-SYNC] {name}: Spread Cross Prevented! (Buy {old_tp} >= Ask {ask_val}). Adjusted to Bid {db_tp} to preserve GTX.")
+            except Exception as e:
+                logger.warning(f"⚠️ [TP-SYNC] {name}: Market Gap check failed ({e}). Proceeding with raw price.")
+
             valid, db_qty, db_tp, msg = exchange.validate_order(pair, side, db_qty, db_tp, is_closing=True)
             if not valid:
                 logger.warning(f"[TP-SYNC] {name}: Validation failed — {msg}")
@@ -712,9 +778,8 @@ class BotExecutor:
                 }
             
             # 🚀 GHOST ORDER CLEANUP (Scanning/Idle Bots)
-            # If we are NOT in a trade (invested < 1.0), we should have NO orders.
-            # This logic captures the 'Scanning' bot scenario that maintain_orders misses.
-            if bot_status.get('total_invested', 0.0) < 1.0:
+            # v2.3.7: Use cent-level threshold.
+            if bot_status.get('total_invested', 0.0) < 0.01:
                  # Fetch open orders for this pair to check for ghosts
                  try:
                      # Use snapshot if available, else fetch
@@ -1164,7 +1229,8 @@ class BotExecutor:
                 _newest_oid = str(_newest[0])
                 _newest_status = str(_newest[4]).lower()
                 _seen_ids = {str(o['id']) for o in bot_open_orders}
-                if _newest_oid not in _seen_ids and _newest_status not in ('filled', 'closed'):
+                _terminal_statuses = ('filled', 'closed', 'cancelled', 'canceled', 'rejected', 'failed', 'expired')
+                if _newest_oid not in _seen_ids and _newest_status not in _terminal_statuses:
                     logger.warning(
                         f"[ENTRY-ANCHOR] Bot {name}: DB has live entry {_newest_oid} "
                         f"(status={_newest[4]}) not in open_orders snapshot. "
@@ -1458,8 +1524,8 @@ class BotExecutor:
                 return
 
             cur.execute(
-                "SELECT SUM(amount * price) / SUM(amount), SUM(amount), side FROM bot_orders "
-                "WHERE bot_id=? AND order_type='hedge' AND status='filled' GROUP BY side",
+                "SELECT SUM(amount * price) / SUM(amount), SUM(amount), position_side FROM bot_orders "
+                "WHERE bot_id=? AND order_type='hedge' AND status='filled' GROUP BY position_side",
                 (bot_id,)
             )
             res = cur.fetchone()
@@ -1681,11 +1747,10 @@ class BotExecutor:
 
         # CASE 2: SCANNING (No Position) -> NO TP/GRID ALLOWED 
         # (This is handled by 'untracked order' cleanup, but let's be explicit)
-        # 🚀 ZERO-INVESTED RACE CONDITION FIX:
-        # If the bot's `total_invested` still says 0.0 because the DB hasn't caught up,
-        # but `current_step > 0` or we JUST placed an Entry order, it is actively in a trade.
-        # Do NOT purge orders in this state.
-        if bot_status['total_invested'] == 0 and bot_status['current_step'] == 0:
+        # 🚀 ZERO-INVESTED RACE CONDITION FIX (v2.3.4):
+        # If the bot's `total_invested` is practically zero ($0.01), and `current_step == 0`,
+        # it is truly Scanning.
+        if bot_status['total_invested'] <= 0.01 and bot_status['current_step'] == 0:
             for stale_grid in grid_orders:
                 logger.warning(f"👻 {name}: Found dangling GRID order {stale_grid['id']} while SCANNING (Invested=0.0). Purging...")
                 try:
@@ -1700,7 +1765,7 @@ class BotExecutor:
                     exchange.cancel_order(stale_tp['id'], pair)
                     update_order_status(stale_tp['id'], 'cancelled', bot_id=bot_id)
                 except: pass
-            tp_orders = []
+            tp_orders = [] # Clear local list
 
             for stale_dust in dust_orders:
                 logger.warning(f"👻 {name}: Found dangling DUST order {stale_dust['id']} while SCANNING (Invested=0.0). Purging...")
@@ -1709,6 +1774,22 @@ class BotExecutor:
                     update_order_status(stale_dust['id'], 'cancelled', bot_id=bot_id)
                 except: pass
             dust_orders = []
+
+            return None # Exit early for truly empty bots
+            
+        # 🚀 RESIDUE PROMOTION (v2.3.5):
+        # If the bot has money (>0.01) but `current_step == 0`, it is a "Scanning Residue".
+        # We must promote it to `IN TRADE` immediately so its maintenance logic (TP/Grid)
+        # is mathematically sound and the UI stops flashing "STRAY ORDERS".
+        if bot_status['total_invested'] > 0.01 and bot_status['current_step'] == 0:
+            logger.warning(f"🔧 {name}: Residue detected (${bot_status['total_invested']:.2f}). Promoting to IN TRADE for professional management.")
+            from engine.ledger import seal_trade_state as _sts_prom
+            _new_state = _sts_prom(bot_id)
+            if _new_state:
+                bot_status.update(_new_state) # Sync local state for this cycle
+                # Re-calculate direction if needed
+                direction = bot_status.get('direction', 'LONG').upper()
+
 
             # 🛡️ HEDGE AUTO-CLEANUP: If SCANNING, purge dangling PENDING/OPEN hedges
             # (Note: FILLED hedges are now managed by _manage_hedge_exit below)
@@ -1830,16 +1911,34 @@ class BotExecutor:
 
         if len(tp_orders) > 1:
             logger.warning(f"⚠️ {name}: Found {len(tp_orders)} total TP orders. Restricting to strict 1 max (Sweeping Ghosts)...")
-            # Sort to prefer the matching step, otherwise just keep newest
-            tp_orders.sort(key=lambda x: 1 if get_step_from_cid(x.get('clientOrderId', ''), 'TP') == expected_tp_step or (stored_tp_id and x.get('id', '') == stored_tp_id) else 0, reverse=True)
+            # Sort to prefer the matching step AND matching quantity, otherwise just keep newest
+            def _tp_sort_key(x):
+                # Priority 1: Step matches expected_tp_step (100 pts)
+                # Priority 2: Stored ID matches (50 pts)
+                # Priority 3: Quantity matches target virtual_qty (25 pts)
+                # Priority 4: Newer order (1-0.9 pts)
+                score = 0
+                if get_step_from_cid(x.get('clientOrderId', ''), 'TP') == expected_tp_step: score += 100
+                if stored_tp_id and x.get('id', '') == stored_tp_id: score += 50
+                if abs(float(x.get('amount', 0) or 0) - virtual_qty) < 1e-8: score += 25
+                score += (float(x.get('timestamp', 0)) / 2e12) # Subtle bias for newer
+                return score
+
+            tp_orders.sort(key=_tp_sort_key, reverse=True)
             for o in tp_orders[1:]:
                 try: 
                     exchange.cancel_order(o['id'], pair)
                     filled_qty = float(o.get('filled', 0) or 0)
                     update_order_status(o['id'], 'cancelled', bot_id=bot_id, filled_qty=filled_qty)
                 except: pass
-            valid_tp_orders = [tp_orders[0]] if get_step_from_cid(tp_orders[0].get('clientOrderId',''), 'TP') == expected_tp_step or (stored_tp_id and tp_orders[0].get('id', '') == stored_tp_id) else []
-            existing_tp_order = tp_orders[0]
+            
+            # Re-verify that the chosen winner actually matches the target step
+            best_order = tp_orders[0]
+            if get_step_from_cid(best_order.get('clientOrderId',''), 'TP') == expected_tp_step or (stored_tp_id and best_order.get('id', '') == stored_tp_id):
+                valid_tp_orders = [best_order]
+            else:
+                valid_tp_orders = []
+            existing_tp_order = best_order
         else:
             existing_tp_order = valid_tp_orders[0] if valid_tp_orders else None
             
@@ -1981,6 +2080,28 @@ class BotExecutor:
                          local_tp_id = None
             
             if local_tp_id is None:
+                # 🚀 API LAG GUARD (v2.3.5)
+                # If we just placed a TP order in the last 15 seconds, skip fresh placement.
+                # This prevents "Double Placement" loops where the exchange API lags 
+                # and doesn't show the new order in the next maintain_orders cycle.
+                try:
+                    from engine.database import get_connection as _gc_lag
+                    _c_lag = _gc_lag()
+                    recent_check = _c_lag.execute("""
+                        SELECT id FROM bot_orders 
+                        WHERE bot_id = ? AND order_type = 'tp' 
+                        AND status IN ('new', 'open', 'filled')
+                        AND (created_at > ? OR updated_at > ?)
+                        LIMIT 1
+                    """, (bot_id, int(time.time()) - 15, int(time.time()) - 15)).fetchone()
+                    if recent_check:
+                        logger.debug(f"⏳ [LAG-GUARD] {name}: TP recently placed in DB. Waiting for API/WS propagation...")
+                        # Skip the placement block
+                        local_tp_id = "LAG_PENDING"
+                except Exception as _lag_err:
+                    logger.warning(f"[LAG-GUARD] DB check failed: {_lag_err}")
+
+            if local_tp_id is None:
                 tp_price = strategy.calculate_take_profit_price(bot_status, current_price)
                 tp_amount = strategy.calculate_take_profit_amount(bot_status, current_price, pair, exchange)
             
@@ -2072,7 +2193,8 @@ class BotExecutor:
                                                 is_cumulative=True
                                             )
                                             _uos_dust(dust_order['id'], 'filled', bot_id=bot_id, filled_qty=dust_qty)
-                                            if _credited:
+                                            # v2.3.4: Use cent-level seal check
+                                            if _credited or dust_qty > 1e-8:
                                                 _sts_dust(bot_id)
                                             logger.info(f"✅ [DUST-FLUSH] {name}: Ledger sealed. Bot will resume scanning next cycle.")
                                     except Exception as e_dust:
@@ -2147,7 +2269,17 @@ class BotExecutor:
             # Tolerance: 0.1% — only covers exchange rounding noise (tick_size).
             # We do NOT need wider tolerance because we compare placed vs live,
             # not recomputed vs live.
-            db_qty = strategy.calculate_take_profit_amount(bot_status, current_price, pair, exchange)
+            # 🚀 ROOT FIX (v2.3.5): Use open_qty accumulator (maintained atomically by credit_fill)
+            # instead of total_invested/avg_price. The two can diverge when partial fills occur
+            # on cancelled orders (e.g., cancelled entry with filled_amount>0), causing a permanent
+            # 50%+ qty-drift signal that fires a TP cancel storm every cycle.
+            # open_qty IS the exchange-confirmed position size — it IS the TP qty.
+            _open_qty_acc = float(bot_status.get('open_qty', 0) or 0)
+            if _open_qty_acc > 0:
+                db_qty = _open_qty_acc
+                logger.debug(f"[TP-QTY-v2.3.5] {name}: Using open_qty accumulator {db_qty:.6f} for drift check.")
+            else:
+                db_qty = strategy.calculate_take_profit_amount(bot_status, current_price, pair, exchange)
             valid, db_qty, _, _ = exchange.validate_order(pair, 'sell' if direction == 'LONG' else 'buy', db_qty, placed_tp, is_closing=True)
 
             ee_interval_fired = (new_ee_tp != placed_tp and new_ee_tp > 0 and placed_tp > 0)
@@ -2670,9 +2802,15 @@ class BotExecutor:
         # Evaluated purely parallel to TP/Grid maintenance to preserve the core ecosystem.
         try:
             from engine.manager import check_hedge_entry, calculate_hedge_lot
-            hedge_mission = check_hedge_entry(int(bot_status.get('current_step', 0)), bot_config)
+            avg_price = max(float(bot_status.get('avg_entry_price', 1)), 1e-9)
+            hedge_mission = check_hedge_entry(
+                current_step=int(bot_status.get('current_step', 0)),
+                settings=bot_config,
+                avg_entry_price=avg_price,
+                current_price=current_price,
+                direction=direction
+            )
             if hedge_mission:
-                avg_price = max(float(bot_status.get('avg_entry_price', 1)), 1e-9)
                 raw_invested_qty = float(bot_status.get('total_invested', 0)) / avg_price
                 hedge_qty = calculate_hedge_lot(raw_invested_qty, bot_config)
                 
@@ -2771,6 +2909,7 @@ class BotExecutor:
             step_size = float(prec_data.get('step_size', 0.001))
 
             # 🚀 UNIVERSAL PRECISION: Use strategy's Decimal Guardian for all rounding
+            strat = self._get_strategy_instance(bot_id, bot_config)
             delta_qty = strat._round_qty(delta_qty)
             lock_price_r = strat._round_price(lock_price)
 

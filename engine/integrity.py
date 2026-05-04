@@ -130,13 +130,14 @@ def flag_unmatched_positions(runner, snapshot: Dict[str, Any]):
                 # Heal ALL active bots for this pair since we don't know which is wrong
                 affected_bots = bot_by_pair_side.get((pair, 'long'), []) + bot_by_pair_side.get((pair, 'short'), [])
                 if affected_bots:
-                    try:
-                        from engine.ledger import seal_trade_state
-                        for bot_id in set(affected_bots): # Deduplicate
-                            logger.info(f"🩺 [INTEGRITY-HEAL] Sealing bot {bot_id} ({pair} {side_label}) to resolve ghost position.")
-                            seal_trade_state(bot_id)
-                    except Exception as heal_err:
-                        logger.error(f"[INTEGRITY-HEAL] seal_trade_state failed for {pair} {side_label}: {heal_err}")
+                    # try:
+                    #     from engine.ledger import seal_trade_state
+                    #     for bot_id in set(affected_bots): # Deduplicate
+                    #         logger.info(f"🩺 [INTEGRITY-HEAL] Sealing bot {bot_id} ({pair} {side_label}) to resolve ghost position.")
+                    #         seal_trade_state(bot_id)
+                    # except Exception as heal_err:
+                    #     logger.error(f"[INTEGRITY-HEAL] seal_trade_state failed for {pair} {side_label}: {heal_err}")
+                    logger.info(f"🩺 [INTEGRITY-REPORT] Bots {set(affected_bots)} ({pair} {side_label}) flagged for ghost position. Reconciler will handle.")
                 else:
                     logger.warning(f"[INTEGRITY-HEAL] No bots found for ({pair}) — orphaned DB row.")
 
@@ -148,13 +149,14 @@ def flag_unmatched_positions(runner, snapshot: Dict[str, Any]):
                 # Heal ALL active bots for this pair
                 affected_bots = bot_by_pair_side.get((pair, 'long'), []) + bot_by_pair_side.get((pair, 'short'), [])
                 if affected_bots:
-                    try:
-                        from engine.ledger import seal_trade_state
-                        for bot_id in set(affected_bots):
-                            logger.info(f"🩺 [INTEGRITY-HEAL] Sealing bot {bot_id} ({pair}) to resolve size discrepancy.")
-                            seal_trade_state(bot_id)
-                    except Exception as heal_err:
-                        logger.error(f"[INTEGRITY-HEAL] seal_trade_state failed for {pair}: {heal_err}")
+                    # try:
+                    #     from engine.ledger import seal_trade_state
+                    #     for bot_id in set(affected_bots):
+                    #         logger.info(f"🩺 [INTEGRITY-HEAL] Sealing bot {bot_id} ({pair}) to resolve size discrepancy.")
+                    #         seal_trade_state(bot_id)
+                    # except Exception as heal_err:
+                    #     logger.error(f"[INTEGRITY-HEAL] seal_trade_state failed for {pair}: {heal_err}")
+                    logger.info(f"🩺 [INTEGRITY-REPORT] Bots {set(affected_bots)} ({pair}) flagged for size discrepancy. Reconciler will handle.")
                 else:
                     logger.warning(f"[INTEGRITY-HEAL] No bots found for ({pair}) — orphaned DB row.")
 

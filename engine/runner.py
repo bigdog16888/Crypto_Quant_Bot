@@ -540,6 +540,17 @@ class BotRunner:
             else:
                 logger.info("✅ [STARTUP-CLEANUP] No host orders (or only stray CQB orders) found.")
 
+            # 🚀 [v2.4.1] FINAL GATE: FULL RECONCILIATION.
+            # Runs the complete resolve_net_mismatch logic to identify and clear
+            # wrong-side residues (ghosts) immediately on startup.
+            try:
+                if self._reconciler:
+                    logger.info("🛡️ [STARTUP-RECON] Executing full reconciliation pass...")
+                    self._reconciler.reconcile_all()
+                    logger.info("✅ [STARTUP-RECON] Full reconciliation complete.")
+            except Exception as _recon_err:
+                logger.error(f"❌ [STARTUP-RECON] Full reconciliation failed: {_recon_err}")
+
             # 3. Scan Positions (Adoption is verified in run_cycle via snapshot logic)
             # We explicitly run one cycle of 'update_active_positions_snapshot' to map reality to DB
             self.run_cycle() # Force specific cycle logic update
@@ -844,7 +855,7 @@ class BotRunner:
                     # 🚀 FAST-PATH: Use WebSocket Memory Cache if fresh
                     ws_cache = get_ws_cache()
                     
-                    if ws_cache.is_fresh(max_age_seconds=30):
+                    if ws_cache.is_fresh(max_age_seconds=15):
                         logger.debug(f"⚡ [WS-CACHE] Reading positions and orders from memory for {mt}")
                         snap_pos = ws_cache.get_all_positions()
                         snap_orders = ws_cache.get_all_open_orders()

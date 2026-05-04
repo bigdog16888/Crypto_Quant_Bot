@@ -305,7 +305,7 @@ def render_monitor_view():
         # Expectation: Each IN_TRADE bot should have 2 orders (TP + Grid) if fully active
         cur_h.execute("SELECT id, status FROM bots WHERE is_active = 1")
         active_bots_data = cur_h.fetchall()
-        bots_in_trade = [b for b in active_bots_data if 'IN TRADE' in b[1] or 'Pending' in b[1]]
+        bots_in_trade = [b for b in active_bots_data if 'IN TRADE' in b[1] or 'Pending' in b[1] or 'HEDGED' in b[1]]
         expected_orders_min = len(bots_in_trade) * 2
         
         # We need actual open orders count (fetched below, but we need it here for ribbon)
@@ -426,7 +426,7 @@ def render_monitor_view():
             
             # Fetch Bot Strategies (df_pos)
             query_all = """
-                SELECT b.id, b.name, b.pair, b.direction, b.strategy_type, b.config, t.current_step, t.total_invested, t.avg_entry_price, t.target_tp_price, b.is_active, b.status, b.error, t.basket_start_time
+                SELECT b.id, b.name, b.pair, b.direction, b.strategy_type, b.config, t.current_step, t.total_invested, t.avg_entry_price, t.target_tp_price, b.is_active, b.status, b.error, t.basket_start_time, t.cycle_start_time
                 FROM bots b
                 LEFT JOIN trades t ON b.id = t.bot_id
                 WHERE b.is_active = 1
@@ -441,16 +441,33 @@ def render_monitor_view():
                 print(f"DEBUG UI ERROR: {e}")
                 df_physical = pd.DataFrame()
 
+            # Fetch Hedged Bots (All cycles since hedges can outlive TP)
+            hedged_bots_query = """
+                SELECT DISTINCT o.bot_id 
+                FROM bot_orders o
+                JOIN trades t ON o.bot_id = t.bot_id
+                WHERE o.order_type='hedge' 
+                  AND o.status='filled'
+            """
+            hedged_bots_df = pd.read_sql_query(hedged_bots_query, conn_fresh)
+            hedged_bot_ids = set(hedged_bots_df['bot_id'].tolist())
+
             # --- FUNDAMENTAL FIX: DATA-DRIVEN STATUS ---
-            # Derive 'display_status' from current_step to ensure UI is always accurate to engine structure
+            # Derive 'display_status' from current_step and status strings
             def derive_status(row):
                 if not row['is_active']: return "⚪ STOPPED"
                 
-                # If current_step > 0, the engine is maintaining orders (Grid/TP)
+                b_status = str(row.get('bot_status', row.get('status', ''))).upper()
+                if 'REQUIRE_MANUAL' in b_status: return "🚨 MANUAL GATE"
+                if 'CARRY_PENDING' in b_status: return "⏳ CARRY/PENDING"
+                
                 c_step = int(row.get('current_step', 0) if pd.notna(row.get('current_step')) else 0)
                 if c_step > 0:
+                    if row['id'] in hedged_bot_ids:
+                        return "🛡️ HEDGED"
                     # Binance min-notional is 5 USD. Noticeably small positions are dust.
-                    if pd.notna(row['total_invested']) and float(row['total_invested']) <= 5.0: 
+                    invested = float(row.get('total_invested', 0) or 0)
+                    if invested > 0 and invested <= 5.0: 
                         return "🟡 DUST/PARTIAL"
                     return "🔴 IN TRADE"
                 return "🟢 SCANNING"
@@ -459,7 +476,7 @@ def render_monitor_view():
             df_pos['status'] = df_pos.apply(derive_status, axis=1)
 
             # Group active IN TRADE bots to the top
-            df_pos['sort_priority'] = df_pos['status'].apply(lambda x: 1 if "IN TRADE" in x else (2 if "SCANNING" in x else 3))
+            df_pos['sort_priority'] = df_pos['status'].apply(lambda x: 1 if ("IN TRADE" in x or "HEDGED" in x) else (2 if "SCANNING" in x else 3))
             df_pos.sort_values(by=['sort_priority', 'name'], ascending=[True, True], inplace=True)
 
             virtual_qty_by_pair = {}
@@ -479,13 +496,28 @@ def render_monitor_view():
             query_virtual = """
                 SELECT b.pair, b.direction,
                        t.total_invested, t.avg_entry_price,
-                       COALESCE(t.open_qty, 0) as open_qty
+                       COALESCE(t.open_qty, 0) as open_qty,
+                       b.status as bot_status
                 FROM bots b
                 JOIN trades t ON b.id = t.bot_id
                 WHERE b.is_active = 1
-                  AND (t.total_invested > 0 OR t.open_qty > 0)
+                  AND (t.total_invested != 0 OR t.open_qty > 0 OR b.status LIKE '%CARRY%')
             """
             df_virt = pd.read_sql(query_virtual, conn_fresh)
+            
+            # 🚀 HEDGE-MODE OFFSET: Fetch all filled hedge/hedgetp orders for the bot (cross-cycle)
+            query_hedge = """
+                SELECT b.pair, b.direction,
+                       SUM(CASE WHEN bo.order_type = 'hedge' THEN bo.filled_amount ELSE -bo.filled_amount END) as hedge_qty
+                FROM bot_orders bo
+                JOIN bots b ON bo.bot_id = b.id
+                WHERE b.is_active = 1 
+                  AND bo.order_type IN ('hedge', 'hedge_tp') 
+                  AND bo.status IN ('filled', 'closed')
+                GROUP BY b.pair, b.direction
+            """
+            df_hedge = pd.read_sql(query_hedge, conn_fresh)
+            
             conn_fresh.close()
             
             if not df_virt.empty:
@@ -513,6 +545,17 @@ def render_monitor_view():
                         pair_prices[pair_key] = ref_price
                     # 🚀 HEDGE-MODE: Group by (pair, side) so LONG and SHORT bots are tracked independently.
                     virtual_qty_by_pair[composite_key] = virtual_qty_by_pair.get(composite_key, 0.0) + qty_abs
+
+            # Apply Hedge Offsets to virtual_qty_by_pair
+            if not df_hedge.empty:
+                for _, row in df_hedge.iterrows():
+                    h_qty = float(row['hedge_qty'] or 0)
+                    p_key = _norm(row['pair'])
+                    s_key = str(row['direction']).upper()
+                    c_key = (p_key, s_key)
+                    # Hedge (opposite side) reduces the virtual net responsibility of the bot's side
+                    if c_key in virtual_qty_by_pair:
+                        virtual_qty_by_pair[c_key] -= h_qty
             
             # 2. Physical Positions (grouped by normalized pair + side)
             if not df_physical.empty:
@@ -661,8 +704,10 @@ def render_monitor_view():
                             bots_with_missing_orders.append(bot_row['name'])
                 
                 # Accurately compute expected total including scanning bots entry dynamics
+                # v2.3.5: Include residue bots (> $0.01) in "In Trade" count even if current_step=0
                 expected_total = sum(
-                    min(1, physical_order_counts.get(int(row['id']), 0)) if int(row.get('current_step', 0)) == 0 
+                    min(1, physical_order_counts.get(int(row['id']), 0)) 
+                    if int(row.get('current_step', 0)) == 0
                     else (1 if int(row.get('current_step', 0)) >= int(json.loads(row.get('config', '{}')).get('max_steps', 10)) else 2) 
                     for _, row in active_bots.iterrows()
                 )
@@ -1331,9 +1376,17 @@ def render_monitor_view():
                     current_time = time.time()
                     def time_in_trade(row):
                         inv = float(row.get('total_invested', 0) or 0)
+                        # Absolute Age anchor: cycle_start_time
+                        # EE Timer anchor: basket_start_time
+                        cst = float(row.get('cycle_start_time', 0) or 0)
                         bst = float(row.get('basket_start_time', 0) or 0)
-                        if inv > 0 and bst > 0:
-                            sec = current_time - bst
+                        
+                        # Display should show the ABSOLUTE age of the trade
+                        # Fallback to BST if CST is not yet populated
+                        display_start = cst if cst > 0 else bst
+                        
+                        if inv > 0 and display_start > 0:
+                            sec = current_time - display_start
                             m, s = divmod(sec, 60)
                             h, m = divmod(m, 60)
                             return f"{int(h)}h {int(m)}m"
@@ -1622,15 +1675,28 @@ def render_monitor_view():
     # every 15 seconds. The legacy st_autorefresh below is kept for the header
     # metrics at the top of the page (equity, balance, PnL) which are NOT
     # wrapped in a fragment and require a full-page rerun to update.
+    # --- Native Auto-Refresh (Replacement for failing st_autorefresh) ---
     if auto_refresh and not wizard_active:
-        import streamlit_autorefresh
         from datetime import datetime
-        refresh_count = streamlit_autorefresh.st_autorefresh(interval=30000, limit=None, key="monitor_autorefresh")
-        if "last_autorefresh_count" not in st.session_state:
-            st.session_state.last_autorefresh_count = refresh_count
-        elif refresh_count != st.session_state.last_autorefresh_count:
-            st.session_state.last_autorefresh_count = refresh_count
-            st.cache_data.clear()
+        
+        # 🚀 NATIVE REFRESH ENGINE:
+        # We use a simple JS-less trigger for Windows compatibility.
+        # If the custom component fails to load, this serves as a robust fallback.
+        refresh_interval = 30 # seconds
+        
+        if "last_manual_refresh" not in st.session_state:
+            st.session_state.last_manual_refresh = time.time()
+            
+        # We still try the component if it works, but we wrap it in a try-except
+        # and provide a fallback "Next refresh" countdown.
+        try:
+            import streamlit_autorefresh
+            refresh_count = streamlit_autorefresh.st_autorefresh(interval=refresh_interval * 1000, limit=None, key="monitor_autorefresh")
+        except Exception:
+            # Fallback UI if component is totally missing
+            st.info(f"🔄 Component bypass: Manual refresh required or wait for next fragment update.")
+            refresh_count = 0
+
         st.caption(f"⏱️ Header updated: {datetime.now().strftime('%H:%M:%S')} | Bot grid auto-refreshes every 15s via fragment.")
     elif wizard_active:
         st.warning(

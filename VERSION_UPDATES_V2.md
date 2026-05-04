@@ -1,5 +1,106 @@
 # VERSION UPDATES V2
 
+## v2.5.3 — Cross-Cycle Hedge Parity & Phantom Purge (2026-04-30)
+- **Architectural Adjustment**: Removed `cycle_id` filtering on `hedge` order evaluation in both UI and Reconciler Pass 3. Because hedges mathematically survive basic TP cycles, they must be globally offset against the physical inventory.
+- **Ghost Hedge Fix**: Modified `database.py` (`_reset_bot_after_tp_internal`) to properly sweep `order_type='hedge'` during destructive wipes (`SYSTEM_WIPE`, `MANUAL_CLOSE`, `RESET_STRUCTURAL_GHOST`). Previously, a hardcoded exclusion preserved old hedges forever, generating permanent math corruption when they were unmasked by the cycle-id removal.
+- **Forensic Cleanup**: Executed a one-off database purge to clear all historical phantom hedges that were stuck in `filled` status, instantly unlocking BNB, SOL, XRP, and XAU bots.
+- **Formalized Proof-Only Consensus**: The 1.154 SHORT (BTC) and 82.2 SHORT (XRP) adoptions are explicitly grounded in raw exchange footprint tracing (`fetch_my_trades`), eliminating guessing and anchoring all offsets to cryptographic ledger proofs.
+
+## v2.5.2 — Multi-Bot Parity & Virtual Allocation (2026-04-29)
+- **NEW**: Implemented "Virtual Component Allocation" in `active_positions` snapshot logic.
+- **FIX**: Resolved multi-bot hedge drift alerts by distributing physical net into bot-level virtual shares.
+- **FORENSIC**: Wiped SUI ghost position (5.1) and adopted XAU zombie position (0.0020).
+- **STATE**: Unlocked SUI, BTC, and XAU bots from `REQUIRE_MANUAL_PROOF` deadlock.
+
+## v2.5.0 — Order-ID-Proof Step Saturation Guard (2026-04-29)
+
+
+### Root Cause Fixed
+GTX (Good-Till-Cancelled) chase retry orders place **new `order_id`s** on the exchange
+for the same logical step when the previous maker order times out. If the FIRST order
+eventually fills (after the cancel raced with the fill), all three orders fill and
+`credit_fill()` — lacking a step-capacity check — credited all three, causing **SUI
+ledger inflation of 11.2 SUI** (~$10.84 drift) and triggering `REQUIRE_MANUAL_PROOF`.
+
+### Hardening — `engine/ledger.py` `credit_fill()` [v2.5]
+**ORDER-ID-PROOF STEP SATURATION GUARD:**
+- Before crediting `open_qty`, `credit_fill()` now sums the `filled_amount` of ALL
+  OTHER rows for the same `(bot_id, step, cycle_id)` via a single SQL query.
+- If `already_credited + delta > order_amount * 1.05` → the row is marked `auto_closed`
+  (preserving the audit trail) and `open_qty` is **NOT incremented**.
+- Guard fires on **all fill paths**: WS live, history-orphan, REST deferred.
+- Also fetches `cycle_id` from `bot_orders` in the row lookup (previously only `step` was fetched).
+- Fail-open: if the guard SQL itself raises, the credit proceeds normally so no
+  legitimate fills are lost.
+
+### Hardening — `engine/reconciler.py` PASS 3 [v2.5]
+**RECENT-FILL GRACE PERIOD:**
+- Before entering the forensic scan / `REQUIRE_MANUAL_PROOF` escalation path, PASS 3
+  now checks if any bot on the ticker had a fill within the last **90 seconds**.
+- If yes → PASS 3 skips escalation (likely `seal_trade_state` lag) and waits for the
+  next reconciler cycle to see a clean ledger.
+- Resolves the ETHUSDC transient $1,248 mismatch that was caused by the brief window
+  between a WS fill event and the async DB commit from `seal_trade_state`.
+
+### Surgical DB Recovery — `scratch/fix_sui_triple_count.py`
+- Identified bot 10018 (sui long) step 1 cycle 33 triple-count: 3 rows × 5.6 SUI.
+- Kept the first (order_id=77285861), marked 2 duplicates (95115, 95126) `auto_closed`.
+- Ran `sync_trades_from_orders(10018)` → recomputed `open_qty = 13.0` (was 29.8).
+- Cleared `REQUIRE_MANUAL_PROOF` from both SUI bots (10018, 100000) → `IN TRADE`.
+
+---
+
+## v2.4.2 — Ledger Parity & Startup Recon Hardening (2026-04-28)
+
+### 1. Virtual Netting Protocol (v2.0)
+**Objective:** Resolve "Zombie" residues and wrong-side positions via auditable proofs.
+- **Fix:** Cleared `UnboundLocalError` by removing shadowing imports in `reconciler.py`.
+- **Logic:** Now correctly identifies "Wrong-side residue" (e.g. Bot SHORT but exchange FLAT/LONG) and executes a `virtual_netting` proof entry in `bot_orders`.
+- **Audit:** Every Ghost resolution is now a `reset_cleared` order in the ledger, maintaining 1:1 forensic parity.
+
+### 2. Startup Reconciliation Gate
+**Objective:** Eliminate residue persistence after engine restarts.
+- **New:** Injected `reconcile_all()` into `runner.py`'s `startup_sync`.
+- **Result:** The bot now heals its ledger **BEFORE** the first trading heartbeat. No more "ghosts" surviving a restart.
+
+### 3. UI Sync Logic Alignment
+- **Fix:** Updated `expected_total` logic in `monitor.py` to correctly handle bots in Step 0 (Residue/New Entry). 
+- **Result:** Accurate "Order Health" reporting (Found X, Expected X).
+
+---
+
+## v2.4.1 - Ghost/Zombie Virtual Netting (2026-04-28)
+- **Active-Ghost Resolution**: Expanded the Virtual Netting Protocol to target bots in the `ACTIVE` state if they are on the "Wrong Side" of a One-Way position. This prevents "Delusional" bots from trapping the ledger when their physical position has already been flipped or consumed.
+- **Proof-Based Consolidation**: Enforced the insertion of a `virtual_netting` order record for all cross-bot residues, ensuring that even "Zombies" are cleared with a permanent audit trail.
+- **Precision Hardening**: Increased the netting threshold to align with `MIN_NOTIONAL` + 5% buffer, resolving the `ETHUSDC` $20.58 residue deadlock.
+
+## v2.3.9 - Reconciler False-Positive Neutralization (2026-04-27)
+- **Symbol Normalization Fix**: Resolved a critical bug where the State Reconciler used raw exchange symbols (e.g., `SUI/USDC:USDC`) as keys for the order cache, while the cache was keyed by normalized symbols (`SUIUSDC`). This caused the reconciler to falsely report "NO orders found" for all active bots, triggering unnecessary mismatch warnings.
+- **Improved Logging**: Added the `[NORMALIZED]` tag to reconciler logs to verify symbol matching during individual bot validation.
+
+## v2.3.8 - Hedge-Aware Accounting (v2.3.8)
+- **Hedge-Offset Logic**: Implemented `internal_hedge_qty` tracking in the `StateReconciler`. In Binance One-Way Mode, when a bot hedges its position (shorting a long), the physical exchange position reduces while the virtual bot ledger remains large.
+- **Mismatch Tolerance**: The reconciler now subtracts active `hedge` minus `hedge_tp` fills from the "Virtual Gross" before comparing with the physical net. This prevents the system from triggering `[UNAUTHORIZED POSITION LOSS]` alerts when a bot is successfully hedged to a physical zero.
+- **UI Consistency**: Synchronized `monitor.py` to use the same hedge-offset math, ensuring the UI accurately reflects the bot's responsibility even when the exchange net is 0.0.
+
+## v2.3.7 - Ledger Finality & Net Consensus
+- **Ledger Finality**: Enforced the "Architectural Gate" (`safe_wipe_bot`) across the entire system. `StateReconciler` no longer bypasses the ledger when resetting bots, eliminating "Zombie Loops" where the engine would revive killed bots.
+- **Net-Consensus Consolidation**: Implemented auto-consolidation for One-Way mode. Opposite-side dust residues (< $5.0) are now force-wiped and consolidated into the primary bot, resolving the `ReduceOnly` deadlock professionally.
+- **Unified Thresholds**: Synchronized all integrity, maintenance, and wipe guards to the **$0.01** cent-level standard.
+
+# v2.3.6 - Residue Mastery & Hedge Conflict Resolution (Superseded)
+# v2.3.5 - Precision Promotion & UI Alignment
+- **Residue Promotion**: Bots with trapped funds ($0.01+) now auto-promote from `Scanning` to `IN TRADE` on every maintenance cycle, ensuring active TP/Grid management.
+- **UI Order Health Fix**: Updated `monitor.py` to recognize residue bots as "In Trade," eliminating false-positive "STRAY ORDERS" alerts.
+- **Race Condition Guard**: Hardened the transition from Scanning to In Trade to prevent accidental order purging during the promotion phase.
+
+# v2.3.4 - Cent-Level Parity & Professional Integrity
+- **Precision Grounding**: Lowered all integrity and maintenance thresholds from $1.0/$5.0 to **$0.01** (cent-level precision).
+- **Scanning Deadlock Resolution**: Fixed the "Scanning but Invested" state by enforcing auto-synchronization for bots with residues.
+- **Cost/Qty Consistency**: Hardened `seal_trade_state` to ensure `total_invested` remains consistent with `open_qty` when the accumulator overrides recompute, preventing PnL explosion.
+- **Reconciler Visibility**: Extended the `StateReconciler` to include `Scanning` bots with non-zero residues in the virtual gross math, enabling high-precision ghost detection.
+- **Professional Standard**: Eliminated legacy "guess-based" bypasses; all position residues are now strictly managed or fact-based purged.
+
 ## v2.3.3 - Ledger Parity & One-Way Mode Optimization
 - **Reconciliation**: Refactored `IntegrityEnforcer` to use **One-Way Netting logic**. The system now compares net virtual positions to net physical positions, eliminating false-positive "Ghost Short" warnings in multi-bot hedging scenarios.
 - **Order Execution**: Updated `StateReconciler` to include orders with status `new` in its open-order query, ensuring bots don't falsely report "NO orders" during the execution transition.

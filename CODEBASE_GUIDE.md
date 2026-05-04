@@ -241,6 +241,13 @@ To ensure the Virtual Ledger remains the "Absolute Ground Truth," bot steps only
 - **Rule**: `current_step` only advances if `filled_amount / target_amount >= 0.99`.
 - **Reasoning**: This prevents the bot from "calculating forward" on partial fills, ensuring that the ledger and exchange stay in locked parity.
 
+### 3.16. One-Way Mode Residue Consolidation (The "Finished State" Gate)
+In One-Way mode, residues on the opposite side of the physical net cannot be closed via exchange orders (ReduceOnly rejection). These are neutralized via the **Consolidation Protocol**:
+1. **Dynamic Dust Gate**: A position is "Dust" ONLY if `abs(qty * price) < symbol_min_notional` OR `abs(qty) < symbol_min_qty` (queried from exchange metadata).
+2. **Phase Gate**: Only bots in `Scanning` status or `cycle_phase = 'IDLE'` are eligible. This ensures active trading bots are never wiped.
+3. **Action**: The trapped residue is neutralized via `safe_wipe_bot(reason='CONSOLIDATION')`.
+4. **Healing**: The Reconciler detects the resulting gap and executes an **Adoption-Reduce** on the primary (physical-side) bot.
+
 ---
 
 ## 4. Reconciler Architecture
@@ -569,3 +576,13 @@ If `.env` ever gains extra garbage lines (e.g. after a test run), restore this e
 ### Dust-Aware Completion
 - Bots will automatically transition to **Step 0 (Scanning)** if the residual notional value is **< $1.00 USD** after an Exit Order (TP).
 - The residual "dust" is cleared from the database to prevent "Impossible Loop" deadlocks.
+
+### 🛡️ Hedge-Aware Accounting & Cross-Cycle Parity (v2.5.3)
+In Binance **One-Way Mode**, a 'hedge' order belonging to a LONG bot is executed as a SELL. This physically reduces or zeroes out the position on the exchange, while the bot remains virtually LONG in the system ledger.
+
+To prevent the reconciliation engine from being "shocked" by this physical/virtual divergence, the system employs **Hedge-Aware Offsets**:
+1.  **Reconciler**: The Math Capacity bound is extended by the sum of filled `hedge` minus `hedge_tp` orders. Crucially, this offset transcends `cycle_id` boundaries, as physical hedges survive TP cycles until explicitly closed.
+2.  **Monitor**: The UI subtracts cross-cycle `hedge` and `hedge_tp` fills from the bot's virtual responsibility when comparing against physical net exposure.
+3.  **Persistence**: The bot maintains its full gross martingale mass (`open_qty`) in the `trades` table, ensuring grid and TP logic continues to function while the position is locked.
+4.  **Ghost Hedge Purge**: A strict rule exists in `database.py` (`_reset_bot_after_tp_internal`) — any destructive or manual wipe (`SYSTEM_WIPE`, `MANUAL_CLOSE`) forcibly clears all active hedges, ensuring dead positions do not mathematically corrupt the cross-cycle offset.
+5.  **Proof-Only Consensus**: The reconciliation engine no longer performs algorithmic "guess" patches. If a physical position gap exists, the engine directly parses `fetch_my_trades` from the exchange. Only raw, cryptographically verified exchange footprints are translated into `adoption` offsets.

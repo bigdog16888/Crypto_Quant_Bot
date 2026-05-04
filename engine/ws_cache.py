@@ -60,11 +60,17 @@ class WSCache:
         """Update or insert an open order from WS event."""
         with self.data_lock:
             status = order_data.get('status', '').upper()
-            if status in ['FILLED', 'CANCELED', 'EXPIRED', 'REJECTED']:
+            if status in ['FILLED', 'CANCELED', 'CANCELLED', 'EXPIRED', 'REJECTED', 'CLOSED']:
                 # Order no longer open, remove from cache
                 self.open_orders.pop(str(order_id), None)
             else:
                 self.open_orders[str(order_id)] = order_data
+            self.last_update_time = time.time()
+
+    def remove_order(self, order_id: str):
+        """Manually remove an order (e.g. after REST cancel) to keep cache in sync."""
+        with self.data_lock:
+            self.open_orders.pop(str(order_id), None)
             self.last_update_time = time.time()
 
     def get_all_positions(self) -> List[Dict]:

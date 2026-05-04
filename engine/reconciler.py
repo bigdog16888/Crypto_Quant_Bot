@@ -66,6 +66,7 @@ class BotState:
     tp_order_id: Optional[str]
     has_confirmed_entry: bool
     cycle_id: int = 1  # Current trading cycle. Increments on each TP reset.
+    cycle_start_time: int = 0  # 🚀 authoritative cycle boundary (Absolute Age)
     # Bot configuration for mathematical step recovery
     base_size: float = 0.0          # First-step notional (e.g. $100)
     martingale_multiplier: float = 1.0  # Each step size = prev_step * multiplier
@@ -198,7 +199,7 @@ class StateReconciler:
         """
         pass
 
-    def reconstruct_offline_fills(self, since_hours: int = 6, pair_filter: Optional[str] = None) -> Dict[str, int]:
+    def reconstruct_offline_fills(self, since_hours: int = 6, pair_filter: Optional[str] = None, forensic_mode: bool = False) -> Dict[str, int]:
         """
         Scans exchange history for orders that filled while we were offline.
         Updates the DB immediately so subsequent checks see the correct state.
@@ -411,7 +412,7 @@ class StateReconciler:
                        COALESCE(SUM(
                            CASE 
                                WHEN bo.order_type IN ('entry', 'grid', 'adoption_add', 'adoption') THEN bo.filled_amount
-                               WHEN bo.order_type IN ('tp', 'close', 'exit', 'adoption_reduce', 'dust_close', 'sl') THEN -bo.filled_amount
+                               WHEN bo.order_type IN ('tp', 'close', 'exit', 'adoption_reduce', 'dust_close', 'sl', 'virtual_netting', 'hedge') THEN -bo.filled_amount
                                ELSE 0.0
                            END
                        ), 0.0) as bot_net_qty
@@ -508,10 +509,36 @@ class StateReconciler:
                                     o_cid = existing_row[0]
                                     logger.info(f"🔍 [ID-RECOVERY] Recovered stripped CID {o_cid} via native orderId {o_id}")
 
-                            if not o_cid.startswith('CQB_'): continue
+                            is_forensic = False
+                            if not o_cid.startswith('CQB_'):
+                                if forensic_mode:
+                                    # Match bot by pair
+                                    attributed_bot_id = None
+                                    for b_id, b_data in bot_states.items():
+                                        if normalize_symbol(b_data.get('pair','')) == gap_pair:
+                                            attributed_bot_id = b_id
+                                            break
+                                    
+                                    if attributed_bot_id:
+                                        o_side = str(o.get('side', '')).upper()
+                                        b_dir = bot_states[attributed_bot_id].get('direction', '').upper()
+                                        
+                                        # Determine if this is an ADD or REDUCE forensic fill
+                                        is_add = (o_side == 'BUY' and b_dir == 'LONG') or (o_side == 'SELL' and b_dir == 'SHORT')
+                                        otype_r = 'forensic_adoption_add' if is_add else 'forensic_adoption_reduce'
+                                        
+                                        o_cid = f"CQB_{attributed_bot_id}_FORENSIC_{o_id}"
+                                        is_forensic = True
+                                        logger.info(f"🕵️‍♂️ [FORENSIC-MATCH] Attributed anonymous {o_side} fill ({o_id}) to Bot {attributed_bot_id} ({otype_r})")
+                                    else:
+                                        continue
+                                else:
+                                    continue
 
                             parts = o_cid.split('_')
-                            try: attributed_bot_id = int(parts[1])
+                            try: 
+                                if not is_forensic:
+                                    attributed_bot_id = int(parts[1])
                             except (IndexError, ValueError): continue
 
                             # ── WIPE WALL GATE [v2.1] ──────────────────────────────────
@@ -560,28 +587,12 @@ class StateReconciler:
                             if existing_order:
                                 ex_id, ex_filled, ex_status, ex_cyc = existing_order
                                 # 🚀 ROOT CAUSE FIX: If the existing row is 'reset_cleared',
-                                # ONLY revive if the original cycle had NO successful TP fill.
-                                # If a TP filled in that same cycle, the position was already properly
-                                # closed — we must NOT re-adopt those entry fills or we inflate the
-                                # ledger by every past TP-completed martingale cycle.
+                                # it means this order was INTENTIONALLY wiped (e.g. system wipe, manual reset).
+                                # We must NEVER revive a reset_cleared order, otherwise we undo the wipe
+                                # and inflate the ledger with ancient dead cycles.
                                 if ex_status == 'reset_cleared':
-                                    tp_in_orig_cycle = 0
-                                    if ex_cyc:
-                                        tp_row = _oi_cur.execute("""
-                                            SELECT COUNT(*) FROM bot_orders
-                                            WHERE bot_id=? AND cycle_id=?
-                                              AND order_type IN ('tp','close','dust_close')
-                                              AND status IN ('filled','closed','reset_cleared')
-                                              AND filled_amount > 0
-                                        """, (attributed_bot_id, ex_cyc)).fetchone()
-                                        tp_in_orig_cycle = tp_row[0] if tp_row else 0
-                                    if tp_in_orig_cycle > 0:
-                                        logger.debug(f"⏭️ [REVIVE-SKIP] Order {o_cid}: cycle {ex_cyc} had a TP fill — position was closed. Not reviving.")
-                                        continue  # Cycle completed normally; do not re-adopt
-                                    else:
-                                        is_orphan_insert = False
-                                        is_revive = True
-                                        logger.info(f"🔄 [REVIVE] Order {o_cid} (cycle {ex_cyc}) had no TP — position still open. Reviving for current cycle.")
+                                    logger.debug(f"⏭️ [REVIVE-SKIP] Order {o_cid}: row is explicitly reset_cleared. Not reviving.")
+                                    continue
                                 elif float(ex_filled or 0) <= 0 and o_filled > 0:
                                     logger.info(f"🩹 [HEALING] Order {o_cid} exists with 0 fill but exchange reports {o_filled}. Healing ledger.")
                                     _oi_cur.execute("UPDATE bot_orders SET filled_amount=?, price=?, status=?, updated_at=? WHERE id=?",
@@ -593,8 +604,12 @@ class StateReconciler:
                             else:
                                 is_orphan_insert = True
 
-                            raw_otype = parts[2].upper() if len(parts)>2 else 'GRID'
-                            otype_r = raw_otype if raw_otype in ('ENTRY','GRID','TP','HEDGETP') else 'GRID'
+                            if is_forensic:
+                                # otype_r was already set in the forensic block above
+                                pass 
+                            else:
+                                raw_otype = parts[2].upper() if len(parts)>2 else 'GRID'
+                                otype_r = raw_otype if raw_otype in ('ENTRY','GRID','TP','HEDGETP') else 'GRID'
 
                             _oi_cur.execute(
                                 "SELECT COALESCE(cycle_id,1), basket_start_time, "
@@ -623,6 +638,12 @@ class StateReconciler:
                                 # Prefer cycle_start_time; fall back to basket_start_time
                                 effective_boundary = cst if cst > 0 else bst
                                 if effective_boundary > 0 and o_ts > 0 and o_ts < (effective_boundary * 1000 - 60000):
+                                    if is_orphan_insert:
+                                        # 🚀 ZOMBIE DEFENSE: If we don't have this fill in our DB AND it's ancient,
+                                        # do NOT adopt it. It belongs to a dead session/cycle.
+                                        logger.debug(f"⏭️ [ZOMBIE-SKIP] Bot {attributed_bot_id}: fill {o_cid} is ancient ({o_ts}). Not reviving orphan.")
+                                        continue
+                                    
                                     # Fill is clearly older than the authoritative cycle boundary — demote it.
                                     cyc = max(0, cyc - 1)
                                     logger.debug(
@@ -641,13 +662,39 @@ class StateReconciler:
                             orphan_fill_ts = int((o.get('lastTradeTimestamp') or o.get('timestamp') or time.time()*1000) / 1000)
 
                             if is_orphan_insert:
-                                _oi_cur.execute("""INSERT OR IGNORE INTO bot_orders
-                                    (bot_id,step,order_type,order_id,price,amount,filled_amount,status,created_at,updated_at,client_order_id,notes,cycle_id,filled_at)
-                                    VALUES (?,?,?,?,?,?,?,?,?,?,?,'history-orphan',?,?)""",
-                                    (attributed_bot_id, step_g, otype_r.lower(), o_id, o_price, o_filled, o_filled, final_status,
-                                     int((o.get('timestamp') or time.time()*1000)/1000), int(time.time()), o_cid, cyc,
-                                     orphan_fill_ts))
-                                logger.info(f"   ➕ [HISTORY-ORPHAN] Inserted missing bot_order: Bot {attributed_bot_id} {otype_r} qty={o_filled}@{o_price} order_id={o_id} cycle={cyc} filled_at={orphan_fill_ts}")
+                                # ── CID-LEVEL DEDUPLICATION GUARD (v2.3.5) ──────────────────────
+                                # The DB check above (line ~555) only deduplicates by exchange order_id.
+                                # But the same CQB_ client_order_id can legitimately appear on multiple
+                                # exchange orders when the GTX retry loop cancels one and places another
+                                # for the same logical step. If the first (cancelled) order had a partial
+                                # fill AND the second (filled) order is also credited, inserting the
+                                # cancelled one as a history-orphan would DOUBLE-COUNT the position qty.
+                                #
+                                # Guard: if any existing row with the same (bot_id, cycle_id, CID,
+                                # entry-type) already has filled_amount > 0, this fill was already
+                                # credited — skip insertion to prevent open_qty inflation.
+                                _cid_dup_check = _oi_cur.execute(
+                                    """SELECT id, filled_amount FROM bot_orders
+                                       WHERE bot_id=? AND cycle_id=? AND client_order_id=?
+                                         AND order_type IN ('entry','grid','adoption','adoption_add','tp','close')
+                                         AND filled_amount > 0
+                                         AND order_id != ?""",
+                                    (attributed_bot_id, cyc, o_cid, o_id)
+                                ).fetchone()
+                                if _cid_dup_check:
+                                    logger.info(
+                                        f"⏭️ [CID-DEDUP] Skipping history-orphan insert for {o_cid} (order_id={o_id}): "
+                                        f"CID already credited via row id={_cid_dup_check[0]} qty={_cid_dup_check[1]}. "
+                                        f"Preventing double-count of {o_filled} qty."
+                                    )
+                                else:
+                                    _oi_cur.execute("""INSERT OR IGNORE INTO bot_orders
+                                        (bot_id,step,order_type,order_id,price,amount,filled_amount,status,created_at,updated_at,client_order_id,notes,cycle_id,filled_at)
+                                        VALUES (?,?,?,?,?,?,?,?,?,?,?,'history-orphan',?,?)""",
+                                        (attributed_bot_id, step_g, otype_r.lower(), o_id, o_price, o_filled, o_filled, final_status,
+                                         int((o.get('timestamp') or time.time()*1000)/1000), int(time.time()), o_cid, cyc,
+                                         orphan_fill_ts))
+                                    logger.info(f"   ➕ [HISTORY-ORPHAN] Inserted missing bot_order: Bot {attributed_bot_id} {otype_r} qty={o_filled}@{o_price} order_id={o_id} cycle={cyc} filled_at={orphan_fill_ts}")
 
                             elif is_revive:
                                 _oi_cur.execute("""UPDATE bot_orders 
@@ -891,22 +938,6 @@ class StateReconciler:
                         is_fully_closed = (order_status in ('filled', 'closed'))
                         
                         if is_fully_closed:
-                            try:
-                                ex_for_guard = self.exchanges.get('future') or self.exchanges.get('spot')
-                                if ex_for_guard:
-                                    live_positions = ex_for_guard.fetch_positions()
-                                    norm_fill_sym = normalize_symbol(fill_symbol)
-                                    still_has_position = any(
-                                        normalize_symbol(p['symbol']) == norm_fill_sym and abs(float(p.get('contracts', 0))) > 0.001
-                                        for p in live_positions
-                                    )
-                                    if still_has_position:
-                                        logger.warning(f"🛡️ [TP-GUARD] Skipping OFFLINE_TP reset for Bot {bot_id} ({fill_symbol}): Exchange STILL has an open position.")
-                                        cursor.execute("UPDATE bot_orders SET status='auto_closed' WHERE (order_id=? OR client_order_id=?)", (order['id'], cid))
-                                        continue
-                            except Exception as guard_err:
-                                logger.error(f"TP position guard failed for Bot {bot_id}: {guard_err}. Skipping reset to be safe.")
-                                continue
                             self._handle_offline_tp_fill(bot_id, bot_name, fill_price, fill_symbol)
                             stats['tp_fills'] += 1
                         else:
@@ -1044,7 +1075,7 @@ class StateReconciler:
             if (time.time() - bot.basket_start_time) < 60:
                 continue
 
-            pair_orders = all_orders.get(bot.pair, [])
+            pair_orders = all_orders.get(normalize_symbol(bot.pair), [])
             
             # -----------------------------------------------------------
             # CASE A: BOT IS IN TRADE (Zombie Check)
@@ -1119,10 +1150,18 @@ class StateReconciler:
                     )
                     results.append(res)
                     
-                    # 🗑️ NO AUTO-CLEAN: We wait for the user to use the "Manual Link Recovery Tool"
-                    # or force an aggressive cleanup explicitly.
+                    # 🗑️ AUTO-CLEAN: The bot is IDLE. Any hanging limit orders are dangerous orphans 
+                    # that will block MARKET-FLATTEN reduceOnly operations.
+                    logger.warning(f"🧹 [ORPHAN-CLEAN] Cancelling {len(my_orders)} physical orphans for IDLE bot {bot.name}.")
+                    for o in my_orders:
+                        try:
+                            ex_heal = self.exchanges.get('future')
+                            if ex_heal:
+                                ex_heal.cancel_order(o.order_id, pair_normalized)
+                        except Exception as e:
+                            logger.error(f"Failed to cancel orphan order {o.order_id}: {e}")
                     
-                    # Also mark them closed in DB to stop the cycle
+                    # Mark them closed in DB to stop the cycle
                     conn = get_connection()
                     for o in my_orders:
                         conn.execute("UPDATE bot_orders SET status='cancelled', updated_at=? WHERE order_id=?", (int(time.time()), o.order_id))
@@ -1133,6 +1172,23 @@ class StateReconciler:
     # ------------------------------------------------------------------
     # STEP 3: NET-SUM VERIFICATION
     # ------------------------------------------------------------------
+    def _get_dust_thresholds(self, pair: str) -> Tuple[float, float]:
+        """
+        Fetches live minNotional and minQty for a pair from the exchange metadata.
+        Returns (min_notional, min_qty). Defaults to (5.0, 0.0) if fetch fails.
+        """
+        try:
+            ex = self.exchanges.get('future') or (list(self.exchanges.values())[0] if self.exchanges else None)
+            if not ex: return 5.0, 0.0
+            
+            market = ex.exchange.market(pair)
+            min_notional = float(market.get('limits', {}).get('cost', {}).get('min', 5.0) or 5.0)
+            min_qty = float(market.get('limits', {}).get('amount', {}).get('min', 0.0) or 0.0)
+            return min_notional, min_qty
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to fetch market limits for {pair}: {e}. Using $5.0 fallback.")
+            return 5.0, 0.0
+
     def resolve_net_mismatch(self, bot_states: List[BotState], positions: Dict[str, List[ExchangePosition]], all_orders: Dict[str, List[ExchangeOrder]] = {}, force_adoption: bool = False) -> List[ReconciliationResult]:
         """
         Calculates Net Virtual Position and compares with Net Physical Position.
@@ -1179,7 +1235,7 @@ class StateReconciler:
                                     WHEN status IN ('filled', 'closed') THEN
                                         CASE 
                                             WHEN order_type IN ('entry', 'grid', 'adoption_add', 'adoption') THEN filled_amount
-                                            WHEN order_type IN ('adoption_reduce', 'tp', 'close', 'dust_close', 'sl') THEN -filled_amount
+                                            WHEN order_type IN ('adoption_reduce', 'tp', 'close', 'dust_close', 'sl', 'hedge') THEN -filled_amount
                                             ELSE 0.0
                                         END
                                     ELSE 0.0
@@ -1199,7 +1255,7 @@ class StateReconciler:
                                 CASE 
                                     WHEN status IN ('new', 'open', 'placing') THEN
                                         CASE 
-                                            WHEN order_type IN ('tp', 'close', 'dust_close', 'sl', 'adoption_reduce') THEN (amount - filled_amount)
+                                            WHEN order_type IN ('tp', 'close', 'dust_close', 'sl', 'adoption_reduce', 'hedge') THEN (amount - filled_amount)
                                             ELSE 0.0
                                         END
                                     ELSE 0.0
@@ -1236,7 +1292,11 @@ class StateReconciler:
             virtual_short_usd = 0.0
             
             for b in bots:
-                if b.in_trade and b.avg_entry_price > 0:
+                # v2.3.4: Professional Cent-Level Parity.
+                # Include ANY bot that holds a ledger quantity (even if Scanning).
+                # This ensures residues are correctly identified vs the exchange.
+                qty = bot_qtys.get(b.bot_id, 0.0)
+                if (b.in_trade or qty > 1e-8) and b.avg_entry_price > 0:
                     qty = bot_qtys.get(b.bot_id, 0.0)
                     if b.direction.upper() == 'LONG':
                         virtual_long_qty += qty
@@ -1297,7 +1357,9 @@ class StateReconciler:
             # than the entire gross sum existing on the exchange (plus any virtual opposing bots in one-way mode).
             # This occurs if a user manually closes the position or if it was liquidated/ADL'd.
             for b in bots:
-                if b.in_trade:
+                # v2.3.4: Ghost detection must see residues in Scanning bots.
+                bot_qty = bot_qtys.get(b.bot_id, 0.0)
+                if b.in_trade or bot_qty > 1e-8:
                     bot_qty = bot_qtys.get(b.bot_id, 0.0)
                     
                     opposite_virtual_qty = sum(
@@ -1313,13 +1375,52 @@ class StateReconciler:
                         abs(p.size) for p in pair_positions if p.side != b.direction.upper()
                     )
                     
+                    # 🚀 INTERNAL HEDGE OFFSET (v2.3.8)
+                    # If this bot has filled 'hedge' orders in the current cycle, 
+                    # its GROSS claim is allowed to exceed physical net.
+                    # Hedge (opposite side) reduces physical net; HedgeTP (closing hedge) restores it.
+                    internal_hedge_qty = cursor.execute("""
+                        SELECT COALESCE(SUM(
+                            CASE 
+                                WHEN order_type = 'hedge' THEN filled_amount
+                                WHEN order_type = 'hedge_tp' THEN -filled_amount
+                                ELSE 0.0
+                            END
+                        ), 0.0)
+                        FROM bot_orders
+                        WHERE bot_id = ? AND status IN ('filled', 'closed')
+                    """, (b.bot_id,)).fetchone()[0]
+                    
                     # 🚀 UNIVERSAL BOUND EQUATION (Hedge & One-Way Compatible)
                     # If this side exists physically, the bot can claim up to (Physical + Opposing Virtual).
                     # If this side DOES NOT exist physically, it can claim AT MOST (Opposing Virtual - Physical Opposing).
                     if physical_matching_direction_qty > 0:
-                        max_possible_qty = physical_matching_direction_qty + opposite_virtual_qty
+                        max_possible_qty = physical_matching_direction_qty + opposite_virtual_qty + float(internal_hedge_qty)
                     else:
-                        max_possible_qty = max(0.0, opposite_virtual_qty - physical_opposite_direction_qty)
+                        max_possible_qty = max(0.0, opposite_virtual_qty - physical_opposite_direction_qty + float(internal_hedge_qty))
+                    
+                    # --- v2.4.1 INTER-BOT VIRTUAL NETTING (ONE-WAY MODE RESIDUE) ---
+                    # Professional resolution for "Wrong-Side" residue in One-Way Mode.
+                    # If a bot holds residue on the opposite side of the physical exchange position,
+                    # it is mathematically impossible to trade it out. Consolidate via virtual entry.
+                    if len(pair_positions) <= 1:
+                        # Only target bots on the OPPOSITE side of the physical reality
+                        if physical_matching_direction_qty < 0.0001 and bot_qty > 0.0001:
+                            cycle_phase = getattr(b, 'cycle_phase', 'IDLE')
+                            is_finished = (b.in_trade is False) or (cycle_phase in ('IDLE', 'CARRY_PENDING'))
+                            
+                            # v2.4.1: If on wrong side of a physical position, it is a Ghost/Zombie 
+                            # and is eligible for consolidation even if 'ACTIVE'.
+                            is_wrong_side = (physical_opposite_direction_qty > 0.0001)
+                            
+                            if (is_finished or is_wrong_side) and (b.total_invested != 0 or bot_qty > 0):
+                                # Threshold check: Only net if it's below min_notional (avoiding accidental wipes of large errors)
+                                # --- v2.5.0 FORENSIC PARITY PROTOCOL ---
+                                # We NO LONGER wipe "Wrong-Side" residue. 
+                                # We must find the physical trade ID that caused it.
+                                logger.info(f"🔍 [FORENSIC-TRIGGER] {b.name}: Persistent residue detected. Triggering deep history scan.")
+                                self.reconstruct_offline_fills(pair_filter=b.pair, forensic_mode=True)
+                                continue
                     
                     # Exact precision enforced.
                     if bot_qty > (max_possible_qty + 0.0001):
@@ -1400,16 +1501,11 @@ class StateReconciler:
                 # Do not execute Structural Ghost destruction if the bot's entry is explicitly confirmed. 
                 # 'entry_confirmed=1' indicates the position was successfully spawned via WebSocket fill, 
                 # or was manually adopted/audited by the user/system.
-                # NEW FIX: Also EXEMPT bots that were just anchored from physical exchange data (Step 0 but invested > 1)
-                # 🔥 MID-FILL GUARD: If the bot's entry_order_id is STILL OPEN on the exchange, the bot is
-                # currently being filled via partial fills. NEVER reset a bot mid-fill!
-                # 🚀 COMMIT GRACE PERIOD (ROOT CAUSE FIX):
-                # If the bot is extremely new (basket_start_time within last 15s),
-                # the database commit for the entry may still be in transit.
-                # Skip strict ghost enforcement to prevent "Zero-Parity Reset" race conditions.
-                import time
-                if (int(time.time()) - b.basket_start_time) < 15:
-                    logger.info(f"⏳ [RECON-GRACE] Bot {b.name}: Recently started ({int(time.time() - b.basket_start_time)}s ago). Immunity active.")
+                # Use cycle_start_time (Absolute Age) for immunity checks.
+                # Immunity active if the trade cycle started within last 15s.
+                trade_age = int(time.time()) - (b.cycle_start_time if b.cycle_start_time > 0 else b.basket_start_time)
+                if trade_age < 15:
+                    logger.info(f"⏳ [RECON-GRACE] Bot {b.name}: Recently started ({trade_age}s ago). Immunity active.")
                     continue
 
                 if b.in_trade and b.total_invested > 1.0 and not b.has_confirmed_entry and b.current_step > 0:
@@ -1451,20 +1547,24 @@ class StateReconciler:
                                 f"Autonomous recovery will preserve this position."
                             )
                         else:
+                            # 🚀 FIX (v2.6): Use cycle_id for Ghost detection.
+                            # All fills belonging to the current session share the same cycle_id.
+                            # The volatile basket_start_time (EE timer) resets on DCA hits,
+                            # so we must NOT use it as a temporal filter for proof-of-mass.
                             cursor.execute("""
                                 SELECT COUNT(*), SUM(amount * price) FROM bot_orders 
-                                WHERE bot_id=? AND status IN ('filled', 'closed') AND created_at >= (? - 120)
+                                WHERE bot_id=? AND status IN ('filled', 'closed') 
                                 AND cycle_id = ?
-                            """, (b.bot_id, b.basket_start_time, b.cycle_id))
+                            """, (b.bot_id, b.cycle_id))
                             row = cursor.fetchone()
                             
-                            # If bot has money invested, but ZERO filled orders in the current basket session
+                            # If bot has money invested, but ZERO filled orders in the current cycle
                             if not row or row[0] == 0:
-                                logger.critical(f"👻 [STRUCTURAL-GHOST] Bot {b.name} claims ${b.total_invested:.2f} (Step {b.current_step}) but has NO filled orders since basket start ({b.basket_start_time}) AND exchange shows 0 physical. Resetting to truth.")
+                                logger.critical(f"👻 [STRUCTURAL-GHOST] Bot {b.name} claims ${b.total_invested:.2f} (Step {b.current_step}) but has NO filled orders in current cycle {b.cycle_id} AND exchange shows 0 physical. Resetting to truth.")
                                 # 🗡️ ARCHITECTURAL: Route through safe_wipe_bot() — will block if CARRY_PENDING or physical > 0
                                 wiped = safe_wipe_bot(
                                     b.bot_id, b.pair, b.direction,
-                                    reason=f"STRUCTURAL_GHOST: ${b.total_invested:.2f} claimed, 0 fills since basket_start, 0 physical",
+                                    reason=f"STRUCTURAL_GHOST: ${b.total_invested:.2f} claimed, 0 cycle fills, 0 physical",
                                     exit_price=0.0, bypass_ledger_guard=True
                                 )
                                 if wiped:
@@ -1485,16 +1585,52 @@ class StateReconciler:
 
             # --- CASE C: SIGNIFICANT NOTIONAL DEVIATION (AUTO-REPAIR) ---
             # 🚀 FIX: Compare QTY directly, not USD notional.
-            # USD threshold was fundamentally wrong — a 23.6 SUI gap or 0.65 SOL gap
-            # could be below $50 USD and would never be fixed. QTY must match exactly.
             # Compute net QTY for each side (virtual from trades, physical from exchange positions).
             virtual_net_qty = 0.0
             for b in bots:
-                # 🚀 FUNDAMENTAL FIX: Include all bots with total_invested > 0.
-                # CARRY_PENDING bots have entry_confirmed=0 (in_trade=False) but hold real ledger mass.
+                # Include all bots with total_invested > 0 (includes CARRY_PENDING).
                 if b.total_invested > 0 and b.avg_entry_price > 0:
                     qty = b.total_invested / b.avg_entry_price
                     virtual_net_qty += qty if b.direction.upper() == 'LONG' else -qty
+
+            # 🛡️ HEDGE-AWARE VIRTUAL NET (Proof-Only Consensus):
+            # IDLE bots (total_invested=0) with outstanding filled hedge orders are INVISIBLE
+            # to the virtual_net calculation above — but their hedge SHORT is still physically
+            # on the exchange and nets against the pair's total position.
+            # Without this correction, the reconciler sees a fake LONG gap and blindly adopts
+            # exchange inventory that is actually offset by an untracked hedge SHORT.
+            #
+            # Fix: for each bot on this pair, compute outstanding_hedge = filled_hedge_qty - filled_hedge_tp_qty.
+            # If > 0, that quantity is a SHORT obligation on the exchange that must be reflected virtually.
+            try:
+                _hconn = get_connection()
+                _hcur = _hconn.cursor()
+                for b in bots:
+                    _hrow = _hcur.execute("""
+                        SELECT
+                            COALESCE(SUM(CASE WHEN order_type='hedge'    THEN filled_amount ELSE 0 END), 0) as hedge_sold,
+                            COALESCE(SUM(CASE WHEN order_type='hedge_tp' THEN filled_amount ELSE 0 END), 0) as hedge_bought
+                        FROM bot_orders
+                        WHERE bot_id=? AND status IN ('filled','closed','hedge_exited')
+                          AND order_type IN ('hedge','hedge_tp')
+                    """, (b.bot_id,)).fetchone()
+                    if _hrow:
+                        _net_hedge_short = float(_hrow[0]) - float(_hrow[1])
+                        if _net_hedge_short > 1e-6:
+                            # This bot opened a SHORT hedge that was never fully closed.
+                            # In one-way mode, a LONG bot's hedge is a SELL (reduces the pooled LONG).
+                            # Deduct from virtual_net to represent the real exchange obligation.
+                            if b.direction.upper() == 'LONG':
+                                virtual_net_qty -= _net_hedge_short
+                            else:
+                                virtual_net_qty += _net_hedge_short
+                            logger.debug(
+                                f"🛡️ [HEDGE-AWARE-NET] {b.name} (ID {b.bot_id}): "
+                                f"Outstanding hedge SHORT={_net_hedge_short:.6f} deducted from virtual_net."
+                            )
+            except Exception as _he:
+                logger.warning(f"[HEDGE-AWARE-NET] Could not apply hedge correction for {pair}: {_he}")
+
 
             physical_net_qty = 0.0
             for p in pair_positions:
@@ -1561,15 +1697,13 @@ class StateReconciler:
                             dust_cleared = True # Exchange already 0
                         
                         if dust_cleared:
-                            from .database import save_bot_order
-                            import time
                             # Wipe all bots on this pair that hold dust
                             active_bots = [x for x in bots if x.total_invested > 0]
                             for d_bot in active_bots:
                                 dust_qty = (d_bot.total_invested / d_bot.avg_entry_price) if d_bot.avg_entry_price > 0 else 0.0
                                 if dust_qty > 0:
                                     save_bot_order(
-                                        bot_id=d_bot.bot_id, order_type='dust_close', exchange_order_id=f"DUST_WIPE_{d_bot.bot_id}_{int(time.time())}",
+                                        bot_id=d_bot.bot_id, order_type='dust_close', order_id=f"DUST_WIPE_{d_bot.bot_id}_{int(time.time())}",
                                         price=d_bot.avg_entry_price, amount=dust_qty, step=0, status='filled', client_order_id=f"CQB_{d_bot.bot_id}_DUSTWIPE"
                                     )
                                 safe_wipe_bot(d_bot.bot_id, d_bot.pair, d_bot.direction, reason="DUST_CHASER: Scenario A - Total Pair Wipe", exit_price=0.0, bypass_ledger_guard=True)
@@ -1586,13 +1720,10 @@ class StateReconciler:
                         # issue an `adoption_reduce` to the healthy bot.
                         # -------------------------------------------------------------
                         logger.info(f"🧹 [DUST-CHASER] Scenario B: Pair physical notional is ${total_physical_notional:.2f} (>=$5). Executing Virtual Liquidation on {b.name}.")
-                        
-                        from .database import save_bot_order
-                        import time
                         dust_qty = (b.total_invested / b.avg_entry_price) if b.avg_entry_price > 0 else 0.0
                         if dust_qty > 0:
                             save_bot_order(
-                                bot_id=b.bot_id, order_type='dust_close', exchange_order_id=f"VIRTUAL_LIQ_{b.bot_id}_{int(time.time())}",
+                                bot_id=b.bot_id, order_type='dust_close', order_id=f"VIRTUAL_LIQ_{b.bot_id}_{int(time.time())}",
                                 price=b.avg_entry_price, amount=dust_qty, step=0, status='filled', client_order_id=f"CQB_{b.bot_id}_VIRTLIQ"
                             )
                         safe_wipe_bot(b.bot_id, b.pair, b.direction, reason="DUST_CHASER: Scenario B - Virtual Liquidation", exit_price=0.0, bypass_ledger_guard=True)
@@ -1637,8 +1768,19 @@ class StateReconciler:
             # is_sole_direction must be computed BEFORE the if-block.
             # It checks if there is exactly ONE active bot for the direction of the error.
             phys_dir = 'LONG' if physical_net_qty > 0 else ('SHORT' if physical_net_qty < 0 else 'FLAT')
-            error_side = 'LONG' if (virtual_net_qty - physical_net_qty) > 0 else 'SHORT'
+            virt_dir = 'LONG' if virtual_net_qty > 0 else ('SHORT' if virtual_net_qty < 0 else 'FLAT')
             
+            # 🚀 ROOT CAUSE FIX: Ambiguous Error Side
+            # If physical > virtual, we are MISSING virtual mass. The bot to adopt is on the physical side.
+            # If virtual > physical, we have GHOST virtual mass. The bot to wipe is on the virtual side.
+            if abs(virtual_net_qty) < abs(physical_net_qty):
+                error_side = phys_dir
+            else:
+                error_side = virt_dir
+                
+            if error_side == 'FLAT': # Fallback if exactly matched magnitudes but wrong side (rare)
+                error_side = 'LONG' if (virtual_net_qty - physical_net_qty) > 0 else 'SHORT'
+                
             # Find the bot governing the error direction
             governing_bots = [b for b in bots if b.is_active and b.direction.upper() == error_side]
             is_sole_direction = len(governing_bots) == 1
@@ -1659,8 +1801,33 @@ class StateReconciler:
                   # If the exchange physically holds absolutely zero contracts, then NO active bot can hold mass.
                   # This catches anomalies when the user clicks 'Market Close' sequentially on multi-bot pairs.
                   if abs(physical_net_qty) < QTY_EPSILON:
+                      # 🧹 Clean Phantom Hedges [v2.6.1]: Only clean hedges for IDLE bots.
+                      # Active hedged bots naturally have physical=0.0 in one-way mode!
+                      try:
+                          _gconn = get_connection()
+                          _gcur = _gconn.cursor()
+                          for b in bots:
+                              if not b.in_trade:
+                                  _gcur.execute("""
+                                      UPDATE bot_orders 
+                                      SET status='reset_cleared', updated_at=?, notes=COALESCE(notes,'') || ' [PHANTOM_HEDGE_CLEARED]'
+                                      WHERE bot_id=? AND order_type IN ('hedge', 'hedge_tp') 
+                                        AND status IN ('open','new','filled')
+                                  """, (int(time.time()), b.bot_id))
+                          _gconn.commit()
+                      except Exception as _ghe:
+                          logger.error(f"Error clearing phantom hedges on global flatten: {_ghe}")
+                          
                       for b in bots:
                           if not b.in_trade: continue
+                          
+                          # 🚀 HEDGE AWARENESS: Do not auto-wipe if the bot is legally hedged!
+                          # In One-Way mode, a hedged bot naturally pulls physical to 0.0.
+                          _is_hedged = any(o.order_type == 'hedge' and o.status == 'filled' for o in b.orders)
+                          if _is_hedged:
+                              logger.info(f"🛡️ [GLOBAL-FLATTEN SKIPPED] {b.name} is legally HEDGED. Physical=0.0 is expected.")
+                              continue
+
                           logger.warning(f"🛡️ [GLOBAL-FLATTEN] Exchange physically holds 0.0 units for {pair}. Auto-zeroing orphaned Bot {b.name}.")
                           
                           # 1. Search for proof of exit
@@ -1669,20 +1836,15 @@ class StateReconciler:
                               logger.info(f"✅ [GLOBAL-FLATTEN PROOF FOUND] Found manual exit or liquidation order: {proof.get('id')}")
                           else:
                               # 2. No proof found — but physical IS already 0.
-                              # The exchange is the source of truth. If physical=0, virtual MUST be 0.
-                              # Requiring proof blocks recovery indefinitely for small dust or manually-closed positions.
-                              # ARCHITECTURAL DECISION [V1.7.1]: Auto-wipe when physical truth is already zero.
-                              # There is no physical risk: we are not closing anything on the exchange.
                               logger.warning(
                                   f"⚡ [GLOBAL-FLATTEN AUTO-WIPE] {b.name}: Physical is 0.0. "
                                   f"No proof of exit found, but exchange is ground truth. "
                                   f"Auto-clearing virtual ledger (${b.total_invested:.2f})."
                               )
-                              # Fall through to the safe_wipe_bot call below (proof is None, that's OK)
                               proof = None  # Allow wipe path to proceed
 
                           from .database import log_reconciliation
-                          # 🗡️ ARCHITECTURAL: Route through safe_wipe_bot() gate (only reached if proof found)
+                          # 🗡️ ARCHITECTURAL: Route through safe_wipe_bot() gate
                           wiped = safe_wipe_bot(
                               b.bot_id, b.pair, b.direction,
                               reason="GLOBAL_FLATTEN: Proof of exit verified",
@@ -1779,20 +1941,14 @@ class StateReconciler:
 
                 # 🧹 Pre-emptive Dust Chaser removed. Unified under Scenario A/B block below.
 
-                # Consensus Strategy A: Directional Confident Adoption
+                # Consensus Strategy A: Directional Confident Adoption (REMOVED)
                 if is_sole_direction and bot:
                     if bot.direction.upper() == phys_dir or phys_dir == 'FLAT':
-                        # 🚀 PROFESSOR'S CONFIDENT ADOPTION (Directional):
-                        # Even if other bots exist on the pair (e.g. a SHORT bot),
-                        # if only ONE bot is LONG and we have a LONG mismatch, we heal that bot.
-                        if delta_notional < 5000:
-                            self._execute_accounting_adjustment(bot, physical_net_usd, physical_net_qty, "Directional Gap Adoption")
-                            results.append(ReconciliationResult(
-                                bot_id=bot.bot_id, bot_name=bot.name, pair=bot.pair, action_taken=ReconciliationAction.SYSTEM_FIX_ZOMBIE,
-                                details=f"Directional Auto-Adjustment: Synced {bot.direction} side to physical net (${physical_net_usd:.2f}).",
-                                requires_manual_intervention=False
-                            ))
-                            continue 
+                        # 🚀 PROFESSOR'S CONFIDENT ADOPTION (Directional) has been removed.
+                        # Pure guessing is strictly forbidden under v2.5.0 Proof-Only Consensus.
+                        # We no longer blindly adopt unproven ledger gaps. We must fall through
+                        # to Strategy B.4 which requires cryptographically verified DNA (Order IDs).
+                        logger.warning(f"🚫 [ADOPTION-BLOCKED] {pair_normalized}: Directional guessing removed. Falling through to Proof-Only B.4.")
                     else:
                         logger.warning(f"🚫 [ADOPTION-BLOCKED] {pair_normalized}: Physical is {phys_dir} but governing bot {bot.name} is {bot.direction.upper()}.")
                         # Falls through to Strategy B/C for manual intervention flag
@@ -1813,11 +1969,18 @@ class StateReconciler:
                 # B.4 ALSO CLEARS PHANTOMS: any bot claiming a position with ZERO
                 # evidence from both proofs is reset to 0 (it's a ghost).
                 # ================================================================
-                # error_side = the side where virtual exposure EXCEEDS physical.
-                # net_error = virt_net - phys_net:
-                #   > 0 → system over-reports LONG (ghost LONG bot)  → heal via LONG wipe
-                #   < 0 → system over-reports SHORT (ghost SHORT bot) → heal via SHORT wipe
-                error_side = 'LONG' if net_error > 0 else 'SHORT'
+                # 🚀 ROOT CAUSE FIX [v2.5.2]: Correctly identify error side for Orphans vs Ghosts
+                # If physical magnitude > virtual magnitude, we have an orphaned physical position.
+                # The error is on the physical side (phys_dir).
+                # If virtual magnitude > physical magnitude, we have a ghost virtual position.
+                # The error is on the virtual side (virt_dir).
+                if abs(physical_net_qty) > abs(virtual_net_qty) + QTY_EPSILON:
+                    error_side = phys_dir
+                else:
+                    error_side = virt_dir
+                    
+                if error_side == 'FLAT':
+                    error_side = 'LONG' if net_error > 0 else 'SHORT'
 
                 # Pre-calculate physical capacity for the error direction
                 opposite_tracked_qty_for_b4 = sum(b.total_invested / b.avg_entry_price for b in bots if b.in_trade and b.avg_entry_price > 0 and b.direction.upper() != error_side)
@@ -1863,7 +2026,11 @@ class StateReconciler:
                         _lcur.execute(f"""
                             SELECT bo.bot_id,
                                    SUM(CASE WHEN bo.order_type IN ('entry', 'grid', 'adoption_add', 'adoption') THEN bo.filled_amount ELSE 0 END) as entry_qty,
-                                   SUM(CASE WHEN bo.order_type IN ('tp', 'exit', 'close', 'adoption_reduce', 'dust_close', 'sl') THEN bo.filled_amount ELSE 0 END) as exit_qty
+                                   SUM(CASE WHEN bo.order_type IN ('tp', 'exit', 'close', 'adoption_reduce', 'dust_close', 'sl', 'hedge') THEN bo.filled_amount ELSE 0 END) as exit_qty
+                                   -- FIX [V2.4.2]: 'hedge' orders are position-closing events.
+                                   -- A filled HEDGE BUY on a SHORT bot closes the short on exchange.
+                                   -- Excluding 'hedge' caused net=0.126 instead of 0, triggering
+                                   -- a spurious adoption_add that created a phantom position.
                             FROM bot_orders bo
                             WHERE bo.bot_id IN ({placeholders}) AND bo.status IN ('filled','closed') AND bo.filled_amount > 0
                             GROUP BY bo.bot_id
@@ -1990,7 +2157,129 @@ class StateReconciler:
                         b4_phantom_cleared = True
 
                 if b4_ran:
+                    # ──────────────────────────────────────────────────────────
+                    # 🚀 RESIDUAL SIDE-ORPHAN DETECTOR [v2.5.1]
+                    # ──────────────────────────────────────────────────────────
+                    # B.4 resolved the "dominant" net-gap claimant, but in a
+                    # multi-bot pair the NET calculation can mask an orphan on
+                    # the OPPOSITE side.
+                    #
+                    # Example: BTC/USDC has bots 10016 (LONG 1.222) + 10022 (SHORT, scanning).
+                    #   Physical: LONG 1.222, SHORT 0.002
+                    #   Virtual:  LONG 1.222, SHORT 0.000
+                    #   Net:      physical=1.220, virtual=1.222 → gap=0.002 LONG-error
+                    #   B.4 finds 10016 TP-proof → adopts/confirms 1.222, marks b4_ran=True.
+                    #   But exchange still has 0.002 SHORT with NO bot owner → the orphan.
+                    #
+                    # Fix: For each position side present on the exchange, compute the
+                    # total virtual tracking for that side. If exchange_side_qty > virtual_side_qty
+                    # and no active bot in that side is scanning (i.e. all in-trade bots for that
+                    # side have positive invested), the gap is a true orphaned position — market close it.
+                    # ──────────────────────────────────────────────────────────
+                    try:
+                        _ex_heal = self.exchanges.get('future') or (list(self.exchanges.values())[0] if self.exchanges else None)
+                        for _orphan_side in ('LONG', 'SHORT'):
+                            # Sum physical qty on this side
+                            _phys_side_qty = sum(
+                                abs(p.size) for p in pair_positions if p.side == _orphan_side
+                            )
+                            if _phys_side_qty < QTY_EPSILON:
+                                continue  # No physical position on this side → nothing to check
+
+                            # Sum virtual tracking for all bots on this side
+                            _virt_side_qty = sum(
+                                (b.total_invested / b.avg_entry_price)
+                                for b in bots
+                                if b.direction.upper() == _orphan_side
+                                and b.in_trade
+                                and b.avg_entry_price > 0
+                            )
+
+                            _side_residual = _phys_side_qty - _virt_side_qty
+                            if _side_residual < QTY_EPSILON:
+                                continue  # Physical fully explained by virtual tracking
+
+                            # Residual exists! Check if any scanning bot on this side holds it
+                            _scanning_bots_this_side = [
+                                b for b in bots
+                                if b.direction.upper() == _orphan_side and not b.in_trade
+                            ]
+
+                            logger.warning(
+                                f"🔍 [RESIDUAL-ORPHAN] {pair_normalized} {_orphan_side}: "
+                                f"Physical={_phys_side_qty:.6f}, Virtual={_virt_side_qty:.6f}, "
+                                f"Residual={_side_residual:.6f}. Scanning bots on this side: "
+                                f"{[b.name for b in _scanning_bots_this_side]}. Evaluating close."
+                            )
+
+                            # Only auto-close if the residual notional is below a safe threshold
+                            # (prevents accidental nuke of large legitimate positions)
+                            _orphan_price = next(
+                                (p.entry_price for p in pair_positions if p.side == _orphan_side), 0.0
+                            ) or (abs(physical_net_usd / physical_net_qty) if physical_net_qty else 0.0)
+                            _orphan_notional = _side_residual * _orphan_price
+
+                            _min_notional, _min_qty = self._get_dust_thresholds(pair_normalized)
+
+                            if _orphan_notional > 500.0:
+                                # Too large to auto-close without manual confirmation
+                                logger.warning(
+                                    f"⚠️ [RESIDUAL-ORPHAN] {pair_normalized}: Orphan {_orphan_side} "
+                                    f"${_orphan_notional:.2f} too large (>$500) for auto-close. "
+                                    f"Manual intervention required."
+                                )
+                                results.append(ReconciliationResult(
+                                    bot_id=0, bot_name=f"ORPHAN-{_orphan_side}",
+                                    pair=pair_normalized,
+                                    action_taken=ReconciliationAction.REQUIRE_MANUAL,
+                                    details=(
+                                        f"Residual Orphan: {_orphan_side} {_side_residual:.6f} "
+                                        f"(${_orphan_notional:.2f}) has no DB owner and exceeds auto-close threshold. "
+                                        f"Manually close this position or run Forensic Adopt."
+                                    ),
+                                    requires_manual_intervention=True
+                                ))
+                                continue
+
+                            # Safe to auto-close
+                            _close_side = 'buy' if _orphan_side == 'SHORT' else 'sell'
+                            _closed = False
+                            if _ex_heal:
+                                try:
+                                    _ex_heal.create_order(
+                                        symbol=pair_normalized,
+                                        type='market',
+                                        side=_close_side,
+                                        amount=_side_residual,
+                                        params={'reduceOnly': True, 'positionSide': _orphan_side}
+                                    )
+                                    logger.info(
+                                        f"✅ [RESIDUAL-ORPHAN-CLOSE] {pair_normalized}: "
+                                        f"Market {_close_side.upper()} {_side_residual:.6f} "
+                                        f"executed to close orphaned {_orphan_side} position."
+                                    )
+                                    _closed = True
+                                except Exception as _roe:
+                                    logger.error(
+                                        f"❌ [RESIDUAL-ORPHAN-CLOSE] {pair_normalized}: "
+                                        f"Failed to close orphaned {_orphan_side}: {_roe}"
+                                    )
+
+                            results.append(ReconciliationResult(
+                                bot_id=0, bot_name=f"ORPHAN-{_orphan_side}",
+                                pair=pair_normalized,
+                                action_taken=ReconciliationAction.SYSTEM_FIX_ZOMBIE,
+                                details=(
+                                    f"Residual Orphan Closed: {_orphan_side} {_side_residual:.6f} "
+                                    f"(${_orphan_notional:.2f}). Exchange close={'SUCCESS' if _closed else 'FAILED'}."
+                                ),
+                                requires_manual_intervention=not _closed
+                            ))
+                    except Exception as _rod_err:
+                        logger.warning(f"[RESIDUAL-ORPHAN-DETECTOR] Non-fatal error for {pair_normalized}: {_rod_err}")
+                    # ── End Residual Side-Orphan Detector ─────────────────────
                     continue  # B.4 fully resolved claimants — skip B.5 and Strategy C
+
 
                 # Calculate adjusted physical quantities BEFORE B.5 / Strategy C
                 opposite_tracked_usd = sum(b.total_invested for b in bots if b.in_trade and b.direction.upper() != error_side)
@@ -2042,19 +2331,20 @@ class StateReconciler:
                         logger.info(f"✅ [FORENSIC-PARITY] Gap resolved via scan for {pair_normalized}.")
                         continue
 
+                    # Fetch dynamic dust limits
+                    min_notional, min_qty = self._get_dust_thresholds(pair_normalized)
+                    
                     # Fetch current price for notional threshold check
                     ex_heal = self.exchanges.get('future') or (list(self.exchanges.values())[0] if self.exchanges else None)
                     current_price = ex_heal.get_last_price(pair_normalized) if ex_heal else 0.0
-                    
                     if current_price <= 0:
-                        # Fallback to bot's avg if API is down
                         current_price = suspects[0].avg_entry_price if suspects else 0.0
 
                     gap_notional = abs(gap_qty_signed * current_price)
                     
-                    if gap_notional < 5.0 and is_sole:
+                    if (gap_notional < min_notional * 1.05 or abs(gap_qty_signed) < min_qty) and is_sole:
                         # 🧹 DUST CHASER PATH: Sole-bot residue detected.
-                        logger.warning(f"🧹 [DUST-CHASER] {pair_normalized}: Orphan residue ${gap_notional:.2f} (<$5) on sole-bot. Auto-flattening parity.")
+                        logger.warning(f"🧹 [DUST-CHASER] {pair_normalized}: Orphan residue ${gap_notional:.2f} (<min) on sole-bot. Auto-flattening parity.")
                         
                         if ex_heal:
                             heal_side = 'sell' if error_side == 'LONG' else 'buy'
@@ -2069,8 +2359,8 @@ class StateReconciler:
                                 
                                 # Zero out any dusty bots for this pair
                                 for d_bot in suspects:
-                                    self._execute_accounting_adjustment(d_bot, 0.0, 0.0, "Forensic Parity: Dust Chaser")
-                                    safe_wipe_bot(d_bot.bot_id, d_bot.pair, d_bot.direction, reason="DUST_CHASER: Residue < $5", exit_price=0.0, bypass_ledger_guard=True)
+                                    # safe_wipe_bot handles the ledger clearing correctly
+                                    safe_wipe_bot(d_bot.bot_id, d_bot.pair, d_bot.direction, reason=f"DUST_CHASER: Residue ${gap_notional:.2f} < ${min_notional:.2f}", force=True)
                                 continue
                             except Exception as _heale:
                                 logger.error(f"❌ [DUST-CHASER] Flatten failed: {_heale}")
@@ -2115,12 +2405,27 @@ class StateReconciler:
                                             if normalize_symbol(p.get('symbol', '')) == pair_normalized
                                         )
                                         # How much existing reduce capacity is already pending?
+                                        # FIX #4 [V2.4.1]: Only count THIS BOT'S CQB_ TP orders,
+                                        # not ALL open orders on the pair. Previously, any open buy/sell
+                                        # orders from other bots could inflate pending_reduce_qty and
+                                        # cause a false RACE-HEAL, masking a real offline fill gap.
                                         reduce_side = 'sell' if gap_qty_signed > 0 else 'buy'
+                                        # We can identify our own bots' TP orders by CQB_ prefix in clientOrderId
+                                        _our_bot_ids = [str(b.bot_id) for b in suspects]
                                         pending_reduce_qty = sum(
                                             float(o.get('amount', o.get('origQty', 0)))
                                             for o in fresh_orders
                                             if str(o.get('side', '')).lower() == reduce_side
-                                            and o.get('reduceOnly', True)  # assume TP orders reduce
+                                            and (
+                                                # Accept if it's one of our bots' TP/SL orders
+                                                any(
+                                                    str(o.get('clientOrderId', '')).startswith(f'CQB_{bid}_TP_') or
+                                                    str(o.get('clientOrderId', '')).startswith(f'CQB_{bid}_SL_')
+                                                    for bid in _our_bot_ids
+                                                )
+                                                # Or if no clientOrderId and reduceOnly is explicitly set
+                                                or (not o.get('clientOrderId') and o.get('reduceOnly', False))
+                                            )
                                         )
                                         # Gap is healed if: (a) position now near target parity (0)
                                         #                  (b) pending TP already covers position
@@ -2322,13 +2627,10 @@ class StateReconciler:
                 f"👻 [PHANTOM-ENTRY] Bot {bot_name} (ID {bot_id}): "
                 f"invested=${invested:.2f} but entry_confirmed=0 and avg_entry=0. Auto-resetting."
             )
-            cursor.execute("""
-                UPDATE trades 
-                SET total_invested=0, current_step=0, avg_entry_price=0, 
-                    entry_confirmed=0, basket_start_time=?
-                WHERE bot_id=?
-            """, (int(time.time()), bot_id))  # 🚀 FUNDAMENTAL FIX: Never set basket_start_time=0. Always stamp reset time so EE fires on next cycle.
-            cursor.execute("UPDATE bots SET status='Scanning' WHERE id=?", (bot_id,))
+            # 🚀 ARCHITECTURAL GATE (v2.3.7):
+            # Never manually wipe trades. Use safe_wipe_bot to ensure the ledger
+            # is correctly marked with 'reset_cleared'.
+            safe_wipe_bot(bot_id, pair, "LONG" if "LONG" in bot_name.upper() else "SHORT", "RESET_PHANTOM_ENTRY", force=True)
             
             from .database import log_reconciliation
             log_reconciliation(
@@ -2405,6 +2707,12 @@ class StateReconciler:
         
         Safety: only acts when phys_qty is non-zero. Zero-out calls go through safe_wipe_bot.
         """
+        # FIX #1 [V2.4.1]: Import get_connection at the TOP of the function to prevent
+        # Python UnboundLocalError. If imported only at line ~2751, Python treats
+        # get_connection as a local variable for the ENTIRE function scope, causing
+        # the earlier call in the hedge-proof-check block to crash with:
+        # "local variable 'get_connection' referenced before assignment"
+        from .database import get_connection, log_reconciliation, recompute_invested_from_orders
         try:
             # The signed physical quantity: positive=LONG, negative=SHORT
             # The bot's virtual qty is always stored positive (magnitude only), direction is on the bot.
@@ -2423,11 +2731,49 @@ class StateReconciler:
                 logger.info(f"  ✅ [RECON] Gap is negligible (<0.0001 units). No action needed.")
                 return True
 
+            # 🛡️ PRE-ADOPTION HEDGE PROOF CHECK (Proof-Only Consensus):
+            # Before writing ANY adoption, verify this gap is not the exchange netting effect
+            # of an outstanding hedge. A LONG bot's filled hedge (SELL) reduces the pooled
+            # LONG position on the exchange. If the reconciler then sees virtual=X but physical<X,
+            # it may try to adoption_reduce — but the deficit is just the hedge being open.
+            # Adopting would incorrectly shrink the bot's virtual ledger to match a hedged-net position.
+            try:
+                _hconn_pre = get_connection()
+                _hcur_pre = _hconn_pre.cursor()
+                _hrow_pre = _hcur_pre.execute("""
+                    SELECT
+                        COALESCE(SUM(CASE WHEN order_type='hedge'    THEN filled_amount ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN order_type='hedge_tp' THEN filled_amount ELSE 0 END), 0)
+                    FROM bot_orders
+                    WHERE bot_id=? AND status IN ('filled','closed','hedge_exited')
+                      AND order_type IN ('hedge','hedge_tp')
+                """, (bot.bot_id,)).fetchone()
+                if _hrow_pre:
+                    _outstanding_hedge = float(_hrow_pre[0]) - float(_hrow_pre[1])
+                    if _outstanding_hedge > 1e-6:
+                        # If the gap is within epsilon of the outstanding hedge, it is NOT orphaned
+                        # inventory — it is the hedge net effect. Block the adoption.
+                        if abs(abs(delta_qty) - _outstanding_hedge) < 0.001:
+                            logger.warning(
+                                f"🛡️ [HEDGE-PROOF-BLOCK] {bot.name}: Adoption blocked. "
+                                f"Gap={delta_qty:+.6f} is fully explained by outstanding hedge SHORT={_outstanding_hedge:.6f}. "
+                                f"The gap is a hedge netting artifact, NOT orphaned inventory. "
+                                f"hedge_tp must fire first to close the SHORT position."
+                            )
+                            return True  # Not an error — gap is hedge-explained
+                        elif _outstanding_hedge > 0.001:
+                            logger.warning(
+                                f"⚠️ [HEDGE-PARTIAL] {bot.name}: Gap={delta_qty:+.6f} but "
+                                f"outstanding hedge={_outstanding_hedge:.6f}. Gap may be partially hedge-explained. "
+                                f"Proceeding with adoption of residual={abs(delta_qty)-_outstanding_hedge:.6f}."
+                            )
+            except Exception as _hpe:
+                logger.warning(f"[HEDGE-PROOF-CHECK] Could not verify hedge for {bot.name}: {_hpe}")
+
             # 🚨 ARCHITECTURAL FIX: Restored Proof-Based Physical Ledger Sync
             # Instead of forcing a panic SL which causes API failures and ghost bots,
             # we write the verified delta as an adoption row into the bot's track record.
-            import time
-            from .database import get_connection, log_reconciliation, recompute_invested_from_orders
+            # NOTE: get_connection is imported at the top of this function (Fix #1 V2.4.1)
             conn = get_connection()
             cursor = conn.cursor()
             
@@ -2450,17 +2796,16 @@ class StateReconciler:
             # 🚀 V2.3.0 LEDGER-ONLY ARCHITECTURE (Atomic Credit/Seal)
             # We insert an 'open' bot_orders row and process it through the core engine's
             # fill and sealing logic, ensuring the `open_qty` accumulator tracks it perfectly.
-            import time
             sync_ts = int(time.time())
             client_order_id = f"CQB_{bot.bot_id}_ADOPT_{cycle_id}_{sync_ts}"
-            exchange_order_id = f"LEDGER_SYNC_{bot.bot_id}_{sync_ts}"
+            order_id = f"LEDGER_SYNC_{bot.bot_id}_{sync_ts}"
 
             # Insert as 'open' with filled_amount=0 so `credit_fill` handles the delta
             cursor.execute("""
                 INSERT INTO bot_orders
-                (bot_id, cycle_id, order_type, price, amount, filled_amount, status, created_at, updated_at, notes, client_order_id, exchange_order_id)
+                (bot_id, cycle_id, order_type, price, amount, filled_amount, status, created_at, updated_at, notes, client_order_id, order_id)
                 VALUES (?, ?, ?, ?, ?, 0.0, 'open', ?, ?, ?, ?, ?)
-            """, (bot.bot_id, cycle_id, action_type, implied_price, adj_mag, sync_ts, sync_ts, reason, client_order_id, exchange_order_id))
+            """, (bot.bot_id, cycle_id, action_type, implied_price, adj_mag, sync_ts, sync_ts, reason, client_order_id, order_id))
             conn.commit()
 
             from .ledger import credit_fill, seal_trade_state
@@ -2480,6 +2825,64 @@ class StateReconciler:
                 # 2. Seal the state (propagates accumulator to trades)
                 seal_trade_state(bot.bot_id)
                 logger.info(f"⚡ [ATOMIC-ADOPTION] {bot.name}: Successfully settled ledger transfer of {adj_mag:.6f} units.")
+
+                # 3. CARRY_PENDING DEADLOCK FIX:
+                # The ledger seal only promotes CARRY_PENDING→ACTIVE if total_invested >= $5.
+                # For small carries (e.g. $2.54 SOL), this threshold is never met and the bot
+                # stays suspended forever with 0 open orders.
+                # After a physically-verified adoption, we MUST promote to ACTIVE unconditionally
+                # so the bot resumes placing its TP and grids.
+                phase_row = cursor.execute(
+                    "SELECT cycle_phase FROM trades WHERE bot_id=?", (bot.bot_id,)
+                ).fetchone()
+                if phase_row and phase_row[0] == 'CARRY_PENDING':
+                    cursor.execute(
+                        "UPDATE trades SET cycle_phase='ACTIVE' WHERE bot_id=?", (bot.bot_id,)
+                    )
+                    conn.commit()
+                    logger.info(
+                        f"🔓 [CARRY-PENDING-UNLOCK] {bot.name}: Promoted CARRY_PENDING→ACTIVE "
+                        f"after physical adoption ({adj_mag:.6f} units). Bot will resume order maintenance."
+                    )
+
+                # 4. ADOPTION STEP-CAP: Prevent martingale snowball on inherited positions.
+                # base_size is stored in USD. Max USD capacity = base_size * SUM(grid_mult^i).
+                # If total_invested (USD) after adoption > bot's max USD capacity, pin to max_steps
+                # so the engine places ONLY a TP order — no additional grids on the orphaned mass.
+                if action_type == 'adoption_add':
+                    import json as _json
+                    try:
+                        cfg_row = cursor.execute(
+                            "SELECT config, base_size FROM bots WHERE id=?", (bot.bot_id,)
+                        ).fetchone()
+                        if cfg_row:
+                            cfg             = _json.loads(cfg_row[0]) if cfg_row[0] else {}
+                            max_steps       = int(cfg.get('max_steps', 8))
+                            grid_mult       = float(cfg.get('GridMultiplier', 1.1))
+                            base_size_usd   = float(cfg_row[1] or cfg.get('base_size', 0.0))
+                            if base_size_usd > 0:
+                                # Max USD capacity: geometric series sum
+                                max_capacity_usd = sum(
+                                    base_size_usd * (grid_mult ** i) for i in range(max_steps)
+                                )
+                                t_row = cursor.execute(
+                                    "SELECT total_invested FROM trades WHERE bot_id=?", (bot.bot_id,)
+                                ).fetchone()
+                                current_invested_usd = float(t_row[0]) if t_row else 0.0
+                                if current_invested_usd > max_capacity_usd * 0.9:
+                                    cursor.execute(
+                                        "UPDATE trades SET current_step=? WHERE bot_id=?",
+                                        (max_steps, bot.bot_id)
+                                    )
+                                    conn.commit()
+                                    logger.warning(
+                                        f"🛑 [ADOPTION-STEP-CAP] {bot.name}: Adopted ${current_invested_usd:.2f} "
+                                        f"exceeds bot max=${max_capacity_usd:.2f} (base_usd=${base_size_usd}, max_steps={max_steps}). "
+                                        f"Pinned current_step={max_steps} — bot will ONLY place TP, no new grids."
+                                    )
+                    except Exception as e_cap:
+                        logger.warning(f"[ADOPTION-STEP-CAP] Could not apply step cap for {bot.name}: {e_cap}")
+
             except Exception as e:
                 logger.error(f"❌ [ATOMIC-ADOPTION] Failed to settle adoption transfer for {bot.name}: {e}")
 
@@ -2689,6 +3092,7 @@ class StateReconciler:
                 tp_order_id=str(order_ids.get('tp_order_id')) if order_ids.get('tp_order_id') else None,
                 has_confirmed_entry=confirmed,
                 cycle_id=status.get('cycle_id', 1),
+                cycle_start_time=status.get('cycle_start_time', 0),
                 base_size=base_size,
                 martingale_multiplier=mart_mult,
             ))
@@ -2760,16 +3164,8 @@ class StateReconciler:
                                 logger.warning(
                                     f"🔧 [DNA-ALIGN] Bot {b_id} ({b_name}): IDLE + zero ledger + zero physical. Force-resetting phantom memory."
                                 )
-                                cursor.execute(
-                                    "UPDATE trades SET total_invested=0, current_step=0, avg_entry_price=0, "
-                                    "entry_confirmed=0 WHERE bot_id=?", (b_id,)
-                                )
-                                # Mark unfilled standing orders as auto_closed — they won't fill
-                                cursor.execute(
-                                    "UPDATE bot_orders SET status='auto_closed' WHERE bot_id=? "
-                                    "AND status IN ('new','open') AND filled_amount=0", (b_id,)
-                                )
-                                cursor.execute("UPDATE bots SET status='Scanning' WHERE id=?", (b_id,))
+                                # 🚀 ARCHITECTURAL GATE (v2.3.7): Use safe_wipe_bot
+                                safe_wipe_bot(b_id, pair_normalized, "LONG" if "LONG" in b_name.upper() else "SHORT", "DNA_ALIGN_IDLE", force=True)
                             else:
                                 logger.warning(
                                     f"⚠️ [DNA-HOLD] Bot {b_id} ({b_name}): entry_confirmed=1, "
@@ -2777,8 +3173,8 @@ class StateReconciler:
                                 )
                         else:
                             logger.warning(f"🔧 [DNA-ALIGN] Bot {b_id} ({b_name}): Ledger empty, entry not confirmed. Resetting.")
-                            cursor.execute("UPDATE trades SET total_invested=0, current_step=0, avg_entry_price=0, entry_confirmed=0, basket_start_time=0 WHERE bot_id=?", (b_id,))
-                            cursor.execute("UPDATE bots SET status='Scanning' WHERE id=?", (b_id,))
+                            # 🚀 ARCHITECTURAL GATE (v2.3.7): Use safe_wipe_bot
+                            safe_wipe_bot(b_id, pair_normalized, "LONG" if "LONG" in b_name.upper() else "SHORT", "DNA_ALIGN_RESET", force=True)
                     else:
                         cursor.execute("UPDATE trades SET total_invested=?, avg_entry_price=? WHERE bot_id=?", (true_inv, avg_entry, b_id))
             conn.commit()
@@ -2871,19 +3267,20 @@ class StateReconciler:
                 if not symbol or side not in ('LONG', 'SHORT'): continue
                 phys_positions[(symbol, side)] = {'qty': abs(pos_qty), 'entry_price': float(p.get('entryPrice') or 0)}
 
-            all_bots = conn.execute("SELECT b.id, b.pair, b.direction, b.name, t.current_step, t.basket_start_time, t.total_invested, t.entry_confirmed, COALESCE(t.cycle_id, 1), t.position_side FROM bots b LEFT JOIN trades t ON t.bot_id=b.id WHERE b.is_active=1").fetchall()
+            all_bots = conn.execute("SELECT b.id, b.pair, b.direction, b.name, t.current_step, t.basket_start_time, t.total_invested, t.entry_confirmed, COALESCE(t.cycle_id, 1), t.position_side, t.cycle_start_time FROM bots b LEFT JOIN trades t ON t.bot_id=b.id WHERE b.is_active=1").fetchall()
             from collections import defaultdict
             # Aggregation step: map symbol -> list of bots sharing that ticker
             sym_group = defaultdict(list)
             for row in all_bots:
-                bid, pair, direction, name, cur_step, bst, cur_inv, entry_conf, cycle_id, t_side = row
+                bid, pair, direction, name, cur_step, bst, cur_inv, entry_conf, cycle_id, t_side, cst = row
                 sym = normalize_symbol(pair)
                 d = str(t_side or direction or 'LONG').upper()
                 sym_group[sym].append({
                     'bot_id': bid, 'name': name or '', 'pair': pair, 
                     'direction': d, 'current_step': int(cur_step or 0), 
                     'basket_start_time': int(bst or 0), 'total_invested': float(cur_inv or 0), 
-                    'entry_confirmed': int(entry_conf or 0), 'cycle_id': int(cycle_id or 1)
+                    'entry_confirmed': int(entry_conf or 0), 'cycle_id': int(cycle_id or 1),
+                    'cycle_start_time': int(cst or bst or 0)
                 })
 
             # Fetch net physical positions (Normalised in Pass 1 to LONG/SHORT based on sign)
@@ -2975,8 +3372,24 @@ class StateReconciler:
                     
                     from engine.database import recompute_invested_from_orders, sync_trades_from_orders
                     _, _, true_qty, _ = recompute_invested_from_orders(bot_id)
+
+                    bot_hedge_qty = cursor.execute("""
+                        SELECT COALESCE(SUM(
+                            CASE 
+                                WHEN order_type = 'hedge' THEN filled_amount
+                                WHEN order_type = 'hedge_tp' THEN -filled_amount
+                                ELSE 0.0
+                            END
+                        ), 0.0)
+                        FROM bot_orders
+                        WHERE bot_id=? AND status IN ('filled', 'closed')
+                    """, (bot_id,)).fetchone()[0] or 0.0
+
+                    # Hedge is always placed on the opposite side of the bot's direction.
+                    bot_net_qty = true_qty - float(bot_hedge_qty)
+                    
                     # Signed contribution to net sum:
-                    total_net_proved_qty += (true_qty if bot_dir == 'LONG' else -true_qty)
+                    total_net_proved_qty += (bot_net_qty if bot_dir == 'LONG' else -bot_net_qty)
 
                     # 🔬 HISTORICAL NET: also compute the cross-cycle cumulative sum
                     # for use in PASS 3. Physical positions are cumulative across ALL cycles,
@@ -2993,10 +3406,11 @@ class StateReconciler:
                         SELECT COALESCE(SUM(filled_amount), 0.0)
                         FROM bot_orders
                         WHERE bot_id=? AND filled_amount > 0
-                        AND order_type IN ('tp','close','exit','adoption_reduce','dust_close','sl')
+                        AND order_type IN ('tp','close','exit','adoption_reduce','dust_close','sl','hedge')
                     """, (bot_id,)).fetchone()[0] or 0.0
 
-                    hist_net = float(hist_opened) - float(hist_closed)
+                    # Historical net must also deduct historical hedges
+                    hist_net = float(hist_opened) - float(hist_closed) - float(bot_hedge_qty)
                     bot_info['_hist_net'] = hist_net  # Stash for PASS 3
 
                     # Promotion Gate: Individually promote bots if they match their own ledger
@@ -3011,6 +3425,55 @@ class StateReconciler:
                 #         Physical positions are cumulative — they include prior cycles' fills
                 #         that were marked reset_cleared after cycle turnovers.
                 if abs(total_net_proved_qty - net_phys_qty) > max(abs(net_phys_qty)*0.02, 0.01):
+
+                    # ── RECENT-FILL GRACE PERIOD [v2.5] ──────────────────────────────────
+                    # After a WS fill event fires, the DB commit from seal_trade_state runs
+                    # asynchronously. There is a 1–5s window where the physical position
+                    # already exists on the exchange but the ledger has not yet been sealed.
+                    # If PASS 3 runs inside this window, the mismatch is transient — NOT
+                    # structural. Triggering REQUIRE_MANUAL_PROOF here would be a false alarm.
+                    #
+                    # Guard: if ANY bot on this ticker had a bot_orders row created or updated
+                    # within the last 90 seconds (filled_at or updated_at), skip escalation.
+                    # The next reconciler cycle (30–60s away) will see a clean ledger.
+                    try:
+                        _bot_ids_on_ticker = [b['bot_id'] for b in bots_on_ticker]
+                        _placeholders = ','.join('?' * len(_bot_ids_on_ticker))
+                        _recent_fill_cutoff = int(time.time()) - 90  # 90s grace window
+                        _recent_fill = cursor.execute(
+                            f"SELECT COUNT(*) FROM bot_orders "
+                            f"WHERE bot_id IN ({_placeholders}) "
+                            f"AND (filled_at >= ? OR updated_at >= ?) "
+                            f"AND filled_amount > 0 "
+                            f"AND order_type IN ('entry','grid','adoption','adoption_add','tp','close')",
+                            (*_bot_ids_on_ticker, _recent_fill_cutoff, _recent_fill_cutoff)
+                        ).fetchone()[0]
+                        # FIX #3 [V2.4.1]: Add a size threshold to PASS3-GRACE.
+                        # After a 3+ day offline window, gaps of 80-180+ units can appear because
+                        # offline TP fills are not in bot_orders. Gracing these large gaps causes
+                        # the bot to run with the wrong open_qty for minutes, triggering cascading
+                        # mismatches. Only grace-skip if the gap is small (likely a DB seal lag).
+                        _GRACE_MAX_UNITS = 20.0  # Units threshold — gaps > 20 always get forensic scan
+                        _gap_abs = abs(total_net_proved_qty - net_phys_qty)
+                        if _recent_fill > 0 and _gap_abs <= _GRACE_MAX_UNITS:
+                            logger.info(
+                                f"⏳ [PASS3-GRACE] Ticker {symbol}: "
+                                f"Net mismatch detected (Proved={total_net_proved_qty:.4f} vs Phys={net_phys_qty:.4f}) "
+                                f"but {_recent_fill} recent fill(s) within 90s window and gap={_gap_abs:.2f} ≤ {_GRACE_MAX_UNITS} units. "
+                                f"Skipping forensic scan / REQUIRE_MANUAL_PROOF — likely seal_trade_state lag."
+                            )
+                            continue  # Skip to next ticker
+                        elif _recent_fill > 0 and _gap_abs > _GRACE_MAX_UNITS:
+                            logger.warning(
+                                f"⚠️ [PASS3-GRACE-OVERRIDE] Ticker {symbol}: "
+                                f"Gap={_gap_abs:.2f} units EXCEEDS grace threshold ({_GRACE_MAX_UNITS}). "
+                                f"Forcing forensic scan despite {_recent_fill} recent fill(s). "
+                                f"Large gaps may indicate offline fill loss — exchange truth wins."
+                            )
+                    except Exception as _grace_err:
+                        logger.debug(f"[PASS3-GRACE] Grace period check failed (non-blocking): {_grace_err}")
+                    # ─────────────────────────────────────────────────────────────────────
+
                     # Compute cross-cycle historical net sum
                     hist_total_net = sum(
                         (b['_hist_net'] if b.get('direction') == 'LONG' else -b.get('_hist_net', 0.0))

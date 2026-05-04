@@ -112,6 +112,13 @@ def credit_fill(
 
     IDEMPOTENT: Calling with the same cumulative_qty twice is safe —
     the second call is a no-op because MAX(existing, same_value) = existing.
+
+    ORDER-ID-PROOF STEP SATURATION GUARD [v2.5]:
+    For entry/grid order types, before incrementing open_qty this function checks
+    the TOTAL filled_amount already credited for the same (bot_id, step, cycle_id)
+    across ALL other order_ids. If the step is already saturated, the row is marked
+    auto_closed (preserving the audit trail) and open_qty is NOT incremented.
+    This is the definitive fix for GTX chase-retry double-credit inflation.
     """
     from engine.database import get_connection
     if cumulative_qty <= 0:
@@ -122,7 +129,7 @@ def credit_fill(
 
         # Find the bot_orders row — try order_id first, then client_order_id
         row = conn.execute(
-            "SELECT id, filled_amount, amount, status FROM bot_orders "
+            "SELECT id, filled_amount, amount, status, step, cycle_id FROM bot_orders "
             "WHERE (order_id = ? OR client_order_id = ?) AND bot_id = ? "
             "ORDER BY created_at DESC LIMIT 1",
             (order_id, order_id, bot_id)
@@ -135,7 +142,7 @@ def credit_fill(
             )
             return False
 
-        db_id, existing_fill, order_amount, current_status = row
+        db_id, existing_fill, order_amount, current_status, row_step, row_cycle = row
         existing_fill = float(existing_fill or 0)
         order_amount = float(order_amount or 0)
 
@@ -157,16 +164,77 @@ def credit_fill(
                 f"[CREDIT-FILL] Bot {bot_id} order {order_id}: status is {current_status} — skip."
             )
             return False
-        
+
         # If it was cancelled but we are now recording a fill, log the resurrection
         if current_status in ('cancelled', 'canceled'):
-             logger.warning(
-                 f"🧟 [FILL-RESURRECTION] Bot {bot_id} order {order_id} was {current_status} "
-                 f"but WS delivered fill ({cumulative_qty:.6f}). Overwriting to {new_status}."
-             )
+            logger.warning(
+                f"🧟 [FILL-RESURRECTION] Bot {bot_id} order {order_id} was {current_status} "
+                f"but WS delivered fill ({cumulative_qty:.6f}). Overwriting to {new_status}."
+            )
 
         # Resolve actual fill timestamp: use exchange-provided if available, else engine time
         actual_fill_ts = fill_ts if fill_ts > 0 else int(time.time())
+
+        # ── ORDER-ID-PROOF STEP SATURATION GUARD [v2.5] ──────────────────────────
+        # For entry-type fills, verify that crediting this fill will not inflate the
+        # step beyond its physical capacity. GTX chase retries place new exchange orders
+        # (new order_id) for the same logical step — if the FIRST attempt already filled
+        # and was credited, all subsequent retries must be rejected here.
+        #
+        # Mechanism: sum the filled_amount of ALL OTHER rows for the same
+        # (bot_id, step, cycle_id) with entry-type order_types, excluding this db_id.
+        # If that sum + our delta exceeds order_amount * 1.05 (5% tolerance), this is
+        # a duplicate credit. We mark the row auto_closed and return False WITHOUT
+        # touching open_qty. The row is preserved for audit trail.
+        #
+        # This guard fires on ALL fill paths: WS live, history-orphan, REST deferred.
+        _ENTRY_TYPES = ('entry', 'grid', 'adoption_add', 'adoption')
+        _EXIT_TYPES  = ('tp', 'close', 'sl', 'dust_close', 'adoption_reduce')
+
+        if order_type in _ENTRY_TYPES and row_step is not None and row_cycle is not None and order_amount > 0:
+            try:
+                already_credited = conn.execute(
+                    "SELECT COALESCE(SUM(filled_amount), 0.0) FROM bot_orders "
+                    "WHERE bot_id = ? AND step = ? AND cycle_id = ? "
+                    "AND order_type IN ('entry','grid','adoption_add','adoption') "
+                    "AND filled_amount > 0 "
+                    "AND status NOT IN ('reset_cleared','auto_closed','cancelled','canceled','failed','rejected') "
+                    "AND id != ?",
+                    (bot_id, row_step, row_cycle, db_id)
+                ).fetchone()[0] or 0.0
+
+                delta_proposed = cumulative_qty - existing_fill
+                capacity_limit = order_amount * 1.05  # 5% tolerance for rounding
+
+                if already_credited > 0 and (already_credited + delta_proposed) > capacity_limit:
+                    # Step is already saturated by another order_id. This is a GTX chase
+                    # duplicate. Mark this row auto_closed and do NOT credit open_qty.
+                    logger.warning(
+                        f"🛡️ [STEP-SATURATED] Bot {bot_id} {order_type} step={row_step} cycle={row_cycle}: "
+                        f"already credited {already_credited:.6f} via other order_id(s). "
+                        f"Proposed delta {delta_proposed:.6f} would exceed capacity {capacity_limit:.6f}. "
+                        f"Marking order {order_id} (db_id={db_id}) as auto_closed. "
+                        f"open_qty NOT incremented — ledger integrity preserved."
+                    )
+                    conn.execute(
+                        "UPDATE bot_orders SET status='auto_closed', notes=?, updated_at=? WHERE id=?",
+                        (
+                            f"STEP_SATURATED:already_credited={already_credited:.6f},capacity={capacity_limit:.6f}",
+                            int(time.time()),
+                            db_id
+                        )
+                    )
+                    conn.commit()
+                    return False  # Do not credit open_qty
+            except Exception as _sg_err:
+                # Non-fatal: if the guard itself fails, log and continue with the credit
+                # to avoid losing legitimate fills. The seal_trade_state cross-check will
+                # catch any resulting drift on the next run.
+                logger.error(
+                    f"[STEP-SATURATED] Guard check failed for bot {bot_id} order {order_id}: "
+                    f"{_sg_err}. Proceeding with credit (fail-open to preserve fills)."
+                )
+        # ─────────────────────────────────────────────────────────────────────────
 
         conn.execute(
             "UPDATE bot_orders SET filled_amount = ?, price = ?, status = ?, "
@@ -183,10 +251,6 @@ def credit_fill(
         # ── OPEN_QTY ACCUMULATOR [v2.1] ─────────────────────────────────────────
         # Maintain trades.open_qty as an explicit running total of confirmed fills.
         # delta = net NEW qty credited this call (cumulative_qty - prior existing_fill).
-        # This is the authoritative position size used for TP sizing — it mirrors
-        # exactly what the exchange has confirmed, with no floating-point recomputation.
-        _ENTRY_TYPES = ('entry', 'grid', 'adoption_add', 'adoption')
-        _EXIT_TYPES  = ('tp', 'close', 'sl', 'dust_close', 'adoption_reduce')
         delta = cumulative_qty - existing_fill  # always > 0 (guarded above by MAX check)
         try:
             if order_type in _ENTRY_TYPES:
@@ -206,7 +270,6 @@ def credit_fill(
         except Exception as _oq_err:
             # Non-fatal: open_qty will be backfilled by check_and_fix_integrity on next startup
             logger.warning(f"[OPEN-QTY] Bot {bot_id}: accumulator update failed: {_oq_err}")
-        # ────────────────────────────────────────────────────────────────────────
 
         conn.commit()
 
@@ -328,8 +391,14 @@ def seal_trade_state(bot_id: int) -> Dict[str, Any]:
                         f"Accumulator is authoritative — using it."
                     )
                     qty = accumulator_qty
+                    # 🚀 FIX: If we use accumulator qty, we must update cost to match
+                    # to prevent PnL explosion in the UI. cost = qty * avg.
+                    if avg > 0:
+                        cost = qty * avg
                 else:
                     qty = accumulator_qty  # No meaningful drift — use accumulator
+                    if avg > 0:
+                        cost = qty * avg
     except Exception as _acc_err:
         logger.warning(f"[SEAL] Bot {bot_id}: accumulator read failed: {_acc_err}")
     # ────────────────────────────────────────────────────────────────────────────
@@ -372,7 +441,7 @@ def seal_trade_state(bot_id: int) -> Dict[str, Any]:
                 current_step     = ?,
                 entry_confirmed  = CASE WHEN ? > 0 THEN 1 ELSE 0 END,
                 basket_start_time = COALESCE(?, basket_start_time),
-                cycle_phase      = CASE WHEN cycle_phase = 'CARRY_PENDING' AND ? >= 5.0 THEN 'ACTIVE' ELSE cycle_phase END
+                cycle_phase      = CASE WHEN cycle_phase = 'CARRY_PENDING' AND ? >= 0.10 THEN 'ACTIVE' ELSE cycle_phase END
             WHERE bot_id = ?
         """, (cost, avg, step, qty, basket_time_update, cost, bot_id))
 
@@ -564,15 +633,50 @@ def handle_tp_completion(
         except Exception as e_fetch:
             logger.warning(f"[TP-CASCADE] Bot {bot_id}: Could not fetch open orders: {e_fetch}")
 
+        # --- Step 1b: DB-Level Blanket Auto-Close Gate (Race-Condition Guard) ---
+        # Root cause of "leaked fill" orphan: an entry/grid order may be placed but not
+        # yet visible in fetch_open_orders() due to API propagation lag. That order can
+        # then fill minutes or hours AFTER the TP cascade resets the cycle, creating a
+        # phantom exchange position with no matching system record.
+        #
+        # Fix: After the exchange-level cancellation sweep, DB-lock ALL remaining
+        # open/new/placing orders for this bot to 'auto_closed'. credit_fill() blocks
+        # auto_closed rows, so any subsequent exchange fill for these orders is silently
+        # rejected at the DB level — preventing the zombie ledger entry.
+        try:
+            db_locked = conn.execute(
+                "UPDATE bot_orders SET status='auto_closed', notes=?, updated_at=? "
+                "WHERE bot_id=? AND status IN ('open', 'new', 'placing') AND order_type NOT IN ('hedge', 'hedge_tp')",
+                (
+                    f"TP_CASCADE_RACE_GUARD: locked at tp_ts={exit_fill_ts}",
+                    int(time.time()),
+                    bot_id
+                )
+            ).rowcount
+            conn.commit()
+            if db_locked > 0:
+                logger.warning(
+                    f"[TP-CASCADE] 🔒 RACE-GUARD: Bot {bot_id}: DB-locked {db_locked} "
+                    f"in-flight orders to 'auto_closed' BEFORE cycle reset. "
+                    f"These orders may still fill on exchange but will be silently rejected at credit_fill."
+                )
+        except Exception as e_lock:
+            logger.warning(f"[TP-CASCADE] Bot {bot_id}: DB race-guard lock failed (non-fatal): {e_lock}")
+
         # --- Step 2: Log to trade_history ---
         try:
+            from engine.database import recompute_invested_from_orders, get_bot_status
+            
+            # 🚀 RACE-CONDITION FIX (v2.3.5)
+            # Do NOT trust the trades table for the TP Hit log. 
+            # If seal_trade_state hasn't run yet, total_invested might be stale.
+            # Recompute from the absolute ledger truth (bot_orders).
+            invested, avg_entry, qty, current_step = recompute_invested_from_orders(bot_id)
+            
             bot_state = get_bot_status(bot_id)
             if bot_state:
-                invested = float(bot_state.get('total_invested', 0) or 0)
-                avg_entry = float(bot_state.get('avg_entry_price', 0) or 0)
-                current_step = int(bot_state.get('current_step', 0) or 0)
-                basket_start = int(bot_state.get('basket_start_time', 0) or 0)
                 direction = bot_state.get('direction', 'LONG')
+                basket_start = int(bot_state.get('basket_start_time', 0) or 0)
 
                 if avg_entry > 0 and exit_price > 0:
                     qty = invested / avg_entry
