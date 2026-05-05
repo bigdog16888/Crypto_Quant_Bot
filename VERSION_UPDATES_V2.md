@@ -526,7 +526,13 @@ ATR from configured TF  →  ATR from 1m data  →  Fixed-% grid (dist_pct)
 
 ---
 
-## v2.0.2 — Root Cause Stabilization (2026-04-23)
+## v2.4.4 - Hedge Reconciliation Stability (2026-05-04)
+- **Hedge-Aware Reconciler**: Updated `outstanding_hedge` logic to include `reset_cleared` and `auto_closed` statuses, ensuring netting artifacts are correctly explained after system wipes.
+- **BotExecutor Safety**: Added a specific guard for `ReduceOnly` order rejections. If a hedge order is rejected due to position mismatch, the bot logs a critical error and defers to the `IntegrityEnforcer`.
+- **UI Health Accuracy**: Fixed `expected_total` calculation in `monitor.py` to account for scanning bots with active entry orders, eliminating false-positive "STRAY ORDERS" alerts.
+- **Forensic Seal**: Successfully recovered the `XAUUSDT` bot from an infinite hedge-lock loop via a surgical database patch.
+
+# v2.4.3 - Order Health Resilience (2026-05-04)
 
 
 ### Context

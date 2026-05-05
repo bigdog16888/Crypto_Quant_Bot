@@ -427,6 +427,14 @@ def init_db():
             conn.commit()
             logger.info("🛠️ DB Migration v2.1.0: Backfilled cycle_start_time from last_exit_time.")
         # ─────────────────────────────────────────────────────────────────────────
+        
+        # 🚀 HEDGE-MODE FIX: hedge_qty column in trades
+        try:
+            cursor.execute('SELECT hedge_qty FROM trades LIMIT 1')
+        except sqlite3.OperationalError:
+            cursor.execute("ALTER TABLE trades ADD COLUMN hedge_qty REAL DEFAULT 0")
+            conn.commit()
+            logger.info("🛠️ DB Migration: Added hedge_qty column to trades table.")
 
         # Migration for manual close percentage in config
         try:
@@ -828,7 +836,8 @@ def get_bot_status(bot_id):
                COALESCE(b.pos_limit_hit, 0) as pos_limit_hit,
                COALESCE(t.cycle_phase, 'ACTIVE') as cycle_phase,
                COALESCE(t.cycle_start_time, 0) as cycle_start_time,
-               COALESCE(t.open_qty, 0) as open_qty
+               COALESCE(t.open_qty, 0) as open_qty,
+               COALESCE(t.hedge_qty, 0) as hedge_qty
         FROM bots b 
         LEFT JOIN trades t ON b.id = t.bot_id 
         WHERE b.id = ?
@@ -856,6 +865,7 @@ def get_bot_status(bot_id):
         'cycle_phase': row[15],
         'cycle_start_time': row[16],   # v2.1.0 — authoritative cycle boundary
         'open_qty': row[17],           # v2.1.0 — running confirmed position qty
+        'hedge_qty': row[18],          # v3.0.3 — tracking offsetting hedge qty
     }
 
     # --- SAFETY GUARD: Log suspicious entry prices but do NOT wipe state ---
@@ -1047,8 +1057,8 @@ def _reset_bot_after_tp_internal(cursor, bot_id, exit_price, direction=None, act
 
 
     cursor.execute("""
-        SELECT ROUND(COALESCE(SUM(CASE WHEN order_type IN ('entry', 'grid', 'adoption_add', 'adoption') THEN filled_amount ELSE 0 END), 0) -
-               COALESCE(SUM(CASE WHEN order_type IN ('tp', 'close', 'adoption_reduce', 'dust_close', 'sl') THEN filled_amount ELSE 0 END), 0), 8)
+        SELECT ROUND(COALESCE(SUM(CASE WHEN order_type IN ('entry', 'grid', 'adoption_add', 'adoption', 'hedge_tp') THEN filled_amount ELSE 0 END), 0) -
+               COALESCE(SUM(CASE WHEN order_type IN ('tp', 'close', 'adoption_reduce', 'dust_close', 'sl', 'hedge') THEN filled_amount ELSE 0 END), 0), 8)
         FROM bot_orders WHERE bot_id = ? AND filled_amount > 0 AND (cycle_id = ? OR cycle_id IS NULL)
         AND status NOT IN ('reset_cleared', 'auto_closed')
     """, (bot_id, old_cycle))
@@ -1062,7 +1072,7 @@ def _reset_bot_after_tp_internal(cursor, bot_id, exit_price, direction=None, act
     if action_label in excluded_carry_labels:
         cursor.execute("UPDATE bot_orders SET status = 'reset_cleared', updated_at = ? WHERE bot_id = ? AND status NOT IN ('auto_closed', 'reset_cleared')", (int(time.time()), bot_id))
     else:
-        cursor.execute("UPDATE bot_orders SET status = 'reset_cleared', updated_at = ? WHERE bot_id = ? AND status NOT IN ('auto_closed', 'reset_cleared') AND order_type != 'hedge'", (int(time.time()), bot_id))
+        cursor.execute("UPDATE bot_orders SET status = 'reset_cleared', updated_at = ? WHERE bot_id = ? AND status NOT IN ('auto_closed', 'reset_cleared')", (int(time.time()), bot_id))
 
     # 🚀 ROOT CAUSE FIX B: Clamp carry-over qty against exchange physical reality.
     # Previously, old_net_qty was pure arithmetic from bot_orders (entry fills - TP fills).
@@ -1129,7 +1139,7 @@ def _reset_bot_after_tp_internal(cursor, bot_id, exit_price, direction=None, act
         "target_tp_price = 0, last_exit_price = ?, last_exit_time = ?, basket_start_time = ?, "
         "entry_confirmed = 0, entry_order_id = NULL, tp_order_id = NULL, "
         "bot_position_id = NULL, close_type = ?, cycle_id = ?, cycle_phase = ?, "
-        "open_qty = 0, wipe_wall_ts = ?, cycle_start_time = ? WHERE bot_id = ?",
+        "open_qty = 0, hedge_qty = 0, wipe_wall_ts = ?, cycle_start_time = ? WHERE bot_id = ?",
         (exit_price, int(time.time()), int(time.time()), action_label, new_cycle, new_cycle_phase,
          int(time.time()), new_cycle_start_time, bot_id)
     )
@@ -1221,31 +1231,31 @@ def safe_wipe_bot(
     conn = get_connection()
     cursor = conn.cursor()
 
-    # ── Guard 0: Force mode (manual admin wipe only) ──────────────────────
-    if force:
-        logger.warning(
-            f"⚠️ [SAFE-WIPE] FORCE override for bot {bot_id} ({pair} {direction}). "
-            f"Skipping all safety checks. Reason: {reason}"
-        )
-        reset_bot_after_tp(bot_id, exit_price, direction=direction, action_label='SYSTEM_WIPE')
-        return True
-
-    # ── Guard 1: cycle_phase == CARRY_PENDING ────────────────────────────
+    # ── Guard 1: cycle_phase == CARRY_PENDING (ABSOLUTE BLOCKER) ─────────
     row = cursor.execute(
         "SELECT cycle_phase, total_invested FROM trades WHERE bot_id=?", (bot_id,)
     ).fetchone()
     if row:
         cycle_phase = row[0] or 'ACTIVE'
         total_invested = float(row[1] or 0)
-        if cycle_phase == 'CARRY_PENDING' and not bypass_ledger_guard:
+        if cycle_phase == 'CARRY_PENDING':
             logger.warning(
                 f"🛡️ [SAFE-WIPE BLOCKED] Bot {bot_id} is CARRY_PENDING. "
                 f"This is NOT a ghost — it's a carried position waiting for fills. "
-                f"Wipe blocked. Reason attempted: {reason}"
+                f"Wipe blocked even if forced. Reason attempted: {reason}"
             )
             return False
     else:
         total_invested = 0.0
+
+    # ── Guard 0: Force mode (manual admin wipe only) ──────────────────────
+    if force:
+        logger.warning(
+            f"⚠️ [SAFE-WIPE] FORCE override for bot {bot_id} ({pair} {direction}). "
+            f"Skipping physical/ledger checks. Reason: {reason}"
+        )
+        reset_bot_after_tp(bot_id, exit_price, direction=direction, action_label='SYSTEM_WIPE')
+        return True
 
     # ── Guard 2: Physical position on exchange ───────────────────────────
     # First check active_positions table (fast, cached from last snapshot)
@@ -1384,7 +1394,7 @@ def check_and_fix_integrity():
     # even though they have an actual position. Backfill from recompute.
     cursor.execute("SELECT bot_id FROM trades WHERE COALESCE(open_qty, 0) <= 0 AND total_invested > 0")
     for (bid,) in cursor.fetchall():
-        cost, avg, qty, step = recompute_invested_from_orders(bid)
+        cost, avg, qty, step, h_qty = recompute_invested_from_orders(bid)
         if qty > 0:
             cursor.execute("UPDATE trades SET open_qty=? WHERE bot_id=? AND COALESCE(open_qty, 0) <= 0", (qty, bid))
             logger.info(f"🔧 Integrity Fix: Backfilled open_qty={qty:.8f} for bot {bid} (v2.1 upgrade state).")
@@ -1501,6 +1511,35 @@ def check_and_fix_integrity():
     conn.commit()
     if fixed_count > 0:
         logger.info(f"✅ DB Integrity Check: Fixed {fixed_count} bot states.")
+
+def update_bot_status(bot_id: int, cycle_phase: str = None, total_invested: float = None):
+    """
+    Update specific bot status fields in the trades table.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    updates = []
+    params = []
+    if cycle_phase is not None:
+        updates.append("cycle_phase = ?")
+        params.append(cycle_phase)
+    if total_invested is not None:
+        updates.append("total_invested = ?")
+        params.append(total_invested)
+        if total_invested == 0:
+            updates.append("open_qty = 0")
+            updates.append("avg_entry_price = 0")
+    
+    if not updates:
+        return
+        
+    params.append(bot_id)
+    cursor.execute(f"UPDATE trades SET {', '.join(updates)} WHERE bot_id = ?", params)
+    
+    if cycle_phase == 'HEDGE_EXIT_PENDING':
+        cursor.execute("UPDATE bots SET status = 'HEDGE_EXIT_PENDING' WHERE id = ?", (bot_id,))
+    
+    conn.commit()
 
 def update_bot_display_status(bot_id: int, status: str):
     conn = get_connection()
@@ -2552,6 +2591,11 @@ def _calculate_formula_step(bot_id: int, total_cost: float, fallback_step: int, 
         ).fetchall()
 
         ledger_step = 0
+        if orders:
+            # If any verified fills exist, the bot is at least at Step 1.
+            # This prevents Carry/Adoption Step-0 rows from causing Scanning-loops.
+            ledger_step = 1
+            
         for o_step, o_amount, o_filled in orders:
             if o_step is None: continue
 
@@ -2559,13 +2603,43 @@ def _calculate_formula_step(bot_id: int, total_cost: float, fallback_step: int, 
             filled = float(o_filled or 0)
             
             if target > 0 and (filled / target) >= 0.99:
-                ledger_step = int(o_step)
+                ledger_step = max(ledger_step, int(o_step))
                 break # Found highest completed step
             elif target == 0 and filled > 0:
                 # Edge case: adoptions/carries with 0 target but positive fill
-                ledger_step = max(ledger_step, int(o_step))
+                ledger_step = max(ledger_step, int(o_step), 1)
 
-        # 🚀 2. THE IDENTITY GUARD
+        # 🚀 2. MARTINGALE CROSS-REFERENCE (v3.0.1)
+        # If ledger is empty or says Step 1, but total_cost suggests higher,
+        # we cross-reference the math to provide a "Succession Proof" for recovery.
+        if total_cost > 0:
+            try:
+                # Resolve base_size and multiplier for this bot
+                cursor.execute("SELECT strategy_config FROM bots WHERE id=?", (bot_id,))
+                cfg_row = cursor.fetchone()
+                if cfg_row and cfg_row[0]:
+                    import json as _json
+                    c = _json.loads(cfg_row[0])
+                    base = float(c.get('base_size', 10.0))
+                    mult = float(c.get('multiplier', 1.5))
+                    
+                    if mult > 1.0:
+                        # Formula: step = log( (cost * (mult-1) / base) + 1 ) / log(mult)
+                        import math as _math
+                        math_step = _math.log((total_cost * (mult - 1) / base) + 1) / _math.log(mult)
+                        math_step = int(round(math_step))
+                        
+                        if math_step > ledger_step:
+                            logger.info(f"📐 [SUCCESSION-PROOF] Bot {bot_id}: Math derived Step {math_step} from ${total_cost:.2f} (Ledger only saw {ledger_step}). Using Math for recovery.")
+                            ledger_step = math_step
+                    elif mult == 1.0:
+                        math_step = int(round(total_cost / base))
+                        if math_step > ledger_step:
+                            ledger_step = math_step
+            except Exception as e_math:
+                logger.debug(f"Math cross-ref failed for bot {bot_id}: {e_math}")
+
+        # 🚀 3. THE IDENTITY GUARD
         if ledger_step != fallback_step:
             logger.info(f"📐 [SUCCESSION-PROOF] Bot {bot_id}: Milestone Ledger confirms Step {ledger_step} (Previously {fallback_step}).")
         
@@ -2575,121 +2649,96 @@ def _calculate_formula_step(bot_id: int, total_cost: float, fallback_step: int, 
     return fallback_step
 
 
-def recompute_invested_from_orders(bot_id: int) -> tuple:
+def recompute_invested_from_orders(bot_id: int, cycle_id: int = None) -> tuple:
     """
     Derive (total_invested, avg_entry_price, current_step) from confirmed filled
     bot_orders for the bot's current cycle.
 
     This is the ORDER-ID-ANCHORED ground truth.  The trades table is a cache;
     this function always reads the underlying confirmed fills directly.
-
-    Two-pass approach:
-    Pass 1 — Count regular entry/grid fills (price > 0, no CARRY rows).
-              Normal case: bot entered fresh this cycle.
-
-    Pass 2 — If Pass 1 returns 0 AND the cycle has a CARRY row (qty > 0):
-              The bot completed a TP and carried residual qty into this cycle.
-              CARRY rows have price=0 (bookkeeping only, not an exchange fill).
-              Use CARRY qty + active_positions avg_price to reconstruct invested.
-
-    Returns (0.0, 0.0, 0) if the bot truly has no confirmed position this cycle.
     """
     conn = get_connection()
     try:
         cursor = conn.cursor()
-        # Resolve current cycle_id and side from trades table
-        row = cursor.execute(
-            "SELECT COALESCE(cycle_id, 1), COALESCE(position_side, 'LONG') FROM trades WHERE bot_id = ?", (bot_id,)
+        
+        row_trade = cursor.execute(
+            "SELECT cycle_id, open_qty, wipe_wall_ts, position_side FROM trades WHERE bot_id = ?",
+            (bot_id,)
         ).fetchone()
-        if not row:
-            return 0.0, 0.0, 0.0, 0
-        cycle_id, bot_side = row
+        if not row_trade:
+            return 0.0, 0.0, 0.0, 0, 0.0
 
-        # ... (Healing block omitted for brevity)
+        target_cycle = row_trade[0]
+        wall_ts = int(row_trade[2] or 0)
+        bot_side = row_trade[3] or 'LONG'
 
-        # 🚀 HEDGE-MODE FIX: Filter fills by the bot's position_side.
-        # This prevents a LONG bot from adopting SHORT fills (and vice versa).
-        # Find the wipe wall: the highest row ID of any reset_cleared/auto_closed marker
-        # in this cycle. Rows at id <= wall_id were definitively archived at that point
-        # and must stay dead, even if they have filled_amount > 0 (historical ghosts).
-        # Rows with id > wall_id genuinely belong to the current active cycle.
-        # This is more reliable than basket_start_time (which is continuously updated
-        # as new orders are placed and can postdate legitimate fills within this cycle).
-        wipe_wall_row = cursor.execute("""
-            SELECT COALESCE(MAX(id), 0)
-            FROM bot_orders
-            WHERE bot_id = ? AND cycle_id = ?
-              AND status IN ('reset_cleared', 'auto_closed')
-        """, (bot_id, cycle_id)).fetchone()
-        wipe_wall_id = int(wipe_wall_row[0]) if wipe_wall_row else 0
-
+        # 🚀 THE SUPREME LEDGER TRUTH (v3.2)
         cursor.execute("""
-            SELECT
+            SELECT 
                 ROUND(COALESCE(SUM(
-                    CASE WHEN bo.order_type IN ('entry', 'grid', 'adoption_add', 'adoption', 'forensic_adoption_add') THEN (bo.filled_amount * bo.price) ELSE 0.0 END
+                    CASE WHEN bo.cycle_id = ? AND bo.status NOT IN ('auto_closed', 'reset_cleared') AND (? = 0 OR bo.created_at >= ?)
+                         AND bo.order_type IN ('entry', 'grid', 'adoption_add', 'adoption', 'forensic_adoption_add') 
+                    THEN (bo.filled_amount * bo.price) ELSE 0.0 END
                 ), 0.0), 8) AS bought_cost,
+                
                 ROUND(COALESCE(SUM(
-                    CASE WHEN bo.order_type IN ('entry', 'grid', 'adoption_add', 'adoption', 'forensic_adoption_add') THEN bo.filled_amount ELSE 0.0 END
+                    CASE 
+                        WHEN bo.cycle_id = ? AND bo.status NOT IN ('auto_closed', 'reset_cleared') AND (? = 0 OR bo.created_at >= ?)
+                             AND bo.order_type IN ('entry', 'grid', 'adoption', 'adoption_add', 'forensic_adoption_add', 'carry') 
+                        THEN bo.filled_amount ELSE 0.0 END
                 ), 0.0), 8) AS bought_qty,
+                
+                COALESCE(SUM(
+                    CASE 
+                        WHEN bo.cycle_id = ? AND bo.status NOT IN ('auto_closed', 'reset_cleared') AND (? = 0 OR bo.created_at >= ?)
+                             AND bo.order_type IN ('adoption_reduce', 'tp', 'close', 'dust_close', 'sl', 'virtual_netting', 'forensic_adoption_reduce') 
+                        THEN bo.filled_amount ELSE 0.0 END
+                ), 0.0) AS sold_qty,
+                
                 ROUND(COALESCE(SUM(
-                    CASE WHEN bo.order_type IN ('adoption_reduce', 'tp', 'close', 'dust_close', 'sl', 'virtual_netting', 'forensic_adoption_reduce') THEN bo.filled_amount ELSE 0.0 END
-                ), 0.0), 8) AS sold_qty,
-                COALESCE(MAX(bo.step), 0) AS max_step
+                    CASE 
+                        WHEN bo.cycle_id = ? AND bo.status NOT IN ('auto_closed', 'reset_cleared') AND (? = 0 OR bo.created_at >= ?)
+                             AND bo.order_type LIKE 'hedge%' AND bo.order_type NOT LIKE '%tp%' THEN bo.filled_amount 
+                        WHEN bo.cycle_id = ? AND bo.status NOT IN ('auto_closed', 'reset_cleared') AND (? = 0 OR bo.created_at >= ?)
+                             AND (bo.order_type LIKE 'hedge%tp%' OR bo.order_type LIKE 'hedgetp%') THEN -bo.filled_amount
+                        ELSE 0.0 
+                    END
+                ), 0.0), 8) AS hedge_qty,
+                
+                COALESCE(MAX(CASE WHEN bo.cycle_id = ? AND (bo.created_at >= ? OR ? = 0) THEN bo.step ELSE 0 END), 0) AS max_step
+                
             FROM bot_orders bo
-            WHERE bo.bot_id  = ?
-              AND bo.cycle_id = ?
-              AND (bo.position_side = ? OR bo.position_side IS NULL OR bo.position_side = 'BOTH' OR bo.position_side = '')  -- 🚀 FUNDAMENTAL FIX: NULL-tolerant Side filter (v2.1)
+            WHERE bo.bot_id = ?
+              AND (bo.position_side = ? OR bo.position_side IS NULL OR bo.position_side = 'BOTH' OR bo.position_side = '')
+              AND bo.status IN ('filled', 'closed', 'auto_closed', 'hedge_exited')
               AND bo.filled_amount > 0
-              AND bo.price > 0
-              AND bo.client_order_id LIKE 'CQB_%'
-              -- 🚀 WIPE-WALL INTEGRITY GUARD:
-              -- Hard exclude all structurally archived rows (they are history).
-              AND bo.status NOT IN ('auto_closed', 'reset_cleared')
-              -- Exclude rows at or behind the wipe wall — they belong to a previous
-              -- sub-cycle that was explicitly closed. 0 means no wall (fresh cycle).
-              AND (? = 0 OR bo.id > ?)
-              -- For 'failed' rows: only include if they have genuine fills AND sit
-              -- above the wipe wall (i.e., they are true REST-timeout races on
-              -- WebSocket-confirmed fills, not ancient pre-wipe ghosts).
-              AND (
-                  bo.status NOT IN ('placing', 'failed')
-                  OR (bo.status = 'failed' AND bo.filled_amount > 0)
-              )
-        """, (bot_id, cycle_id, bot_side, wipe_wall_id, wipe_wall_id))
+        """, (
+            target_cycle, wall_ts, wall_ts, # bought_cost
+            target_cycle, wall_ts, wall_ts, # bought_qty
+            target_cycle, wall_ts, wall_ts, # sold_qty
+            target_cycle, wall_ts, wall_ts, # hedge_qty (+)
+            target_cycle, wall_ts, wall_ts, # hedge_qty (-)
+            target_cycle, wall_ts, wall_ts, # max_step
+            bot_id, bot_side
+        ))
+        
+        res = cursor.fetchone()
+        bought_cost, bought_qty, sold_qty, hedge_qty, max_step = res
+        
+        total_qty = round(bought_qty - sold_qty, 8)
+        total_net_qty = round(total_qty - hedge_qty, 8)
 
-        r = cursor.fetchone()
-        bought_cost = float(r[0] or 0.0)
-        bought_qty  = float(r[1] or 0.0)
-        sold_qty    = float(r[2] or 0.0)
-        max_step    = int(r[3] or 0)
-        # Snap sub-epsilon fractions to zero — prevents invisible IEEE 754 dust
-        # from triggering spurious CARRY-OVER rows on the next cycle.
-        # Remove early return based on bought_cost alone — 
-        # a bot could technically have non-zero net qty but zero cost (though rare).
-        # We check total_qty below.
-
-        net_qty_raw = float(r[1] or 0.0) - float(r[2] or 0.0)
-        total_qty = round(net_qty_raw, 8)  # Normalized net position quantity
-
-        if total_qty > 1e-8:
+        if total_qty > 1e-8 or abs(hedge_qty) > 1e-8:
             avg_price = bought_cost / bought_qty if bought_qty > 1e-8 else 0.0
-            total_cost = total_qty * avg_price
-            if max_step == 0:
-                max_step = 1
+            total_invested = total_qty * avg_price
+            
+            # Use formula to check if step needs refinement (e.g. carry trades)
+            if total_invested > 0:
+                max_step = _calculate_formula_step(bot_id, total_invested, max_step, cursor, target_cycle)
+            
+            return total_invested, avg_price, total_net_qty, max_step, hedge_qty
 
-            # ✅ MARTINGALE CROSS-REFERENCE: Validate/correct max_step using the
-            # inverse geometric series formula.  Adoption rows may have been written
-            # with step=1 even when total_invested covers multiple martingale steps.
-            # This catches those stale rows every sync cycle without re-scanning orders.
-            if total_cost > 0:
-                max_step = _calculate_formula_step(bot_id, total_cost, max_step, cursor, cycle_id)
-            return total_cost, avg_price, total_qty, max_step
-
-        # ------------------------------------------------------------------
-        # PASS 2: CARRY-only cycle (bot just reset from a TP, no new fills yet)
-        # CARRY rows have price=0 — they record residual qty carried forward,
-        # not a new exchange execution. Use active_positions for the avg price.
-        # ------------------------------------------------------------------
+        # PASS 2: Check for CARRY residues
         carry_row = cursor.execute("""
             SELECT COALESCE(SUM(filled_amount), 0.0)
             FROM bot_orders
@@ -2699,11 +2748,11 @@ def recompute_invested_from_orders(bot_id: int) -> tuple:
               AND client_order_id LIKE '%_CARRY_%'
               AND filled_amount > 0
               AND status NOT IN ('open', 'new', 'placing', 'failed', 'auto_closed', 'reset_cleared')
-        """, (bot_id, cycle_id)).fetchone()
-        carry_qty = float(carry_row[0] or 0.0)
+        """, (bot_id, target_cycle)).fetchone()
+        carry_qty_val = float(carry_row[0] or 0.0)
 
-        if carry_qty <= 1e-8:
-            return 0.0, 0.0, 0.0, 0  # Truly no position this cycle
+        if carry_qty_val <= 1e-8 and abs(hedge_qty) <= 1e-8:
+            return 0.0, 0.0, 0.0, 0, 0.0  # Truly no position this cycle
 
         # Compute avg price for carry position
         # Priority: (1) bot_orders CARRY fills directly, (2) active_positions, (3) trades cache
@@ -2711,7 +2760,7 @@ def recompute_invested_from_orders(bot_id: int) -> tuple:
             "SELECT pair, direction FROM bots WHERE id = ?", (bot_id,)
         ).fetchone()
         if not bot_row:
-            return 0.0, 0.0, 0.0, 0
+            return 0.0, 0.0, 0.0, 0, 0.0
 
         pair, direction = bot_row
         norm_pair = pair.split(':')[0].replace('/', '')
@@ -2741,7 +2790,7 @@ def recompute_invested_from_orders(bot_id: int) -> tuple:
                 f"(from bot_orders CARRY fills). total_invested={carry_cost:.4f}"
             )
             carry_step = _calculate_formula_step(bot_id, carry_cost, 1, cursor, cycle_id)
-            return carry_cost, carry_avg_price, carry_qty, carry_step
+            return carry_cost, carry_avg_price, carry_qty, carry_step, hedge_qty
 
         # ── SOURCE 2: active_positions snapshot (available after prime_startup_snapshot) ──
         snap_row = cursor.execute(
@@ -2757,7 +2806,7 @@ def recompute_invested_from_orders(bot_id: int) -> tuple:
                 f"(from active_positions). total_invested={carry_cost:.4f}"
             )
             carry_step = _calculate_formula_step(bot_id, carry_cost, 1, cursor, cycle_id)
-            return carry_cost, carry_avg_price, carry_qty, carry_step
+            return carry_cost, carry_avg_price, carry_qty, carry_step, hedge_qty
 
         # ── SOURCE 3: Last resort — cached avg from trades row ──
         cached_avg = cursor.execute(
@@ -2771,17 +2820,27 @@ def recompute_invested_from_orders(bot_id: int) -> tuple:
                 f"(no CARRY fills or active_positions). qty={carry_qty:.8f}, cost={carry_cost:.4f}"
             )
             carry_step = _calculate_formula_step(bot_id, carry_cost, 1, cursor, cycle_id)
-            return carry_cost, carry_avg_price, carry_qty, carry_step
+            return carry_cost, carry_avg_price, carry_qty, carry_step, hedge_qty
 
         logger.warning(
             f"[RECOMPUTE-CARRY] Bot {bot_id}: CARRY qty={carry_qty:.8f} — "
             f"no CARRY fills, no active_positions, no cached avg. Cannot price position."
         )
-        return 0.0, 0.0, 0.0, 0
-
+        return 0.0, 0.0, 0.0, 0, hedge_qty
     except Exception as e:
         logger.error(f"Error in recompute_invested_from_orders (bot {bot_id}): {e}")
-        return 0.0, 0.0, 0.0, 0
+        return 0.0, 0.0, 0.0, 0, 0.0
+
+
+def get_bot_hedge_qty(bot_id: int) -> float:
+    """
+    Returns the current filled hedge quantity for a bot's active cycle.
+    """
+    try:
+        _, _, _, _, hedge_qty = recompute_invested_from_orders(bot_id)
+        return float(hedge_qty)
+    except:
+        return 0.0
 
 
 def sync_trades_from_orders(bot_id: int) -> bool:
@@ -2803,87 +2862,78 @@ def sync_trades_from_orders(bot_id: int) -> bool:
     QTY_EPSILON = 1e-6  # float addition rounding tolerance in units (not dollars)
 
     try:
-        recomputed_cost, recomputed_avg, recomputed_qty, recomputed_step = recompute_invested_from_orders(bot_id)
+        recomputed_cost, recomputed_avg, recomputed_qty, recomputed_step, recomputed_hedge = recompute_invested_from_orders(bot_id)
 
         conn = get_connection()
         cursor = conn.cursor()
         row = cursor.execute(
-            "SELECT total_invested, avg_entry_price, current_step FROM trades WHERE bot_id = ?",
+            "SELECT total_invested, avg_entry_price, current_step, cycle_phase, hedge_qty FROM trades WHERE bot_id = ?",
             (bot_id,)
         ).fetchone()
         if not row:
             return False
 
-        cached_invested, cached_avg, cached_step = float(row[0] or 0), float(row[1] or 0), int(row[2] or 0)
+        cached_invested, cached_avg, cached_step, cached_phase, cached_hedge = float(row[0] or 0), float(row[1] or 0), int(row[2] or 0), str(row[3] or 'IDLE'), float(row[4] or 0)
+
+        # 🚀 SELF-HEALING PHASE PROTOCOL (v3.2 - Hedge Aware)
+        # Derive phase from ledger truth:
+        derived_phase = cached_phase
+        if recomputed_qty > 1e-8 or abs(recomputed_hedge) > 1e-8:
+            if abs(recomputed_hedge) > 1e-8:
+                derived_phase = 'HEDGED'
+            elif cached_phase in ('IDLE', 'SCANNING', 'HEDGED'):
+                derived_phase = 'ACTIVE'
+        else:
+            if cached_phase not in ('IDLE', 'SCANNING'):
+                derived_phase = 'IDLE'
 
         # Derive quantity from the cached trades table source for comparison
         cached_qty = (cached_invested / cached_avg) if cached_avg > 0 else 0.0
 
         delta_qty = abs(recomputed_qty - cached_qty)
+        is_phase_diff = (derived_phase != cached_phase)
 
-        # 🚀 THE ABSOLUTE GROUND TRUTH [V1.8.6]
-        # Recomputed fills are authoritative. If the ledger is empty, the bot is IDLE.
-        # We do NOT allow 'Math Proof' to override an empty ledger here because that 
-        # is how 'Step Inflation' happens (by trusting legacy total_invested).
-        
-        if recomputed_qty <= QTY_EPSILON:
+        if recomputed_qty <= QTY_EPSILON and abs(recomputed_hedge) <= 1e-8:
             # Ledger is empty. Ensure trades row is cleared.
-            if cached_invested > 0 or cached_step > 0:
-                logger.warning(f"🧹 [DNA-WIPE] Bot {bot_id}: No ledger fills found. Resetting phantom state (was ${cached_invested:.2f}, Step {cached_step}).")
-                # 🚀 ROOT CAUSE FIX (v2.1.1): Do NOT clear basket_start_time here.
-                # Clearing BST to 0 caused a silent oscillation with the offline DNA-guard:
-                #   DNA-WIPE clears BST → next pass: bot_start=0 → old 1h cutoff drops fills
-                #   → recompute still returns 0 → DNA-WIPE fires again → permanent deadlock.
-                # BST is an EE-timer (engine-operation timestamp), not a cycle boundary.
-                # It is safe to preserve it; CST (cycle_start_time) is the authoritative boundary.
-                # BST will be refreshed naturally by seal_trade_state when the bot re-enters.
+            if cached_invested > 0 or cached_step > 0 or is_phase_diff:
+                logger.warning(f"🧹 [DNA-WIPE] Bot {bot_id}: No ledger fills found. Resetting phantom state.")
                 cursor.execute("""
                     UPDATE trades 
                     SET total_invested = 0, avg_entry_price = 0, current_step = 0, 
-                        entry_confirmed = 0
+                        entry_confirmed = 0, cycle_phase = 'IDLE'
                     WHERE bot_id = ?
                 """, (bot_id,))
+                cursor.execute("UPDATE bots SET status = 'Scanning' WHERE id = ?", (bot_id,))
                 conn.commit()
                 return True
             return False
 
-        if delta_qty <= QTY_EPSILON and recomputed_step == cached_step:
-            conn.commit()
+        is_hedge_diff = abs(recomputed_hedge - cached_hedge) > 1e-8
+
+        if delta_qty <= QTY_EPSILON and recomputed_step == cached_step and not is_phase_diff and not is_hedge_diff:
             return False
 
-        # 🚀 CYCLE-CONTAMINATION GUARD [V1.7.3]:
-        # If recomputed_cost is NEGATIVE, it means historical entries and exits
-        # across many sub-cycles all share the same cycle_id and exits dominate.
-        # This is NOT a real position change — it's ledger pollution.
-        # A negative total_invested is physically impossible (can't short by accident).
-        # Skip the overwrite to preserve any physical imprint written by the reconciler.
         if recomputed_cost < 0:
-            logger.warning(
-                f"⚠️ [LEDGER-SYNC] Bot {bot_id}: Recomputed cost is NEGATIVE "
-                f"({recomputed_cost:.4f}) — cycle contamination detected. "
-                f"Skipping overwrite to preserve physical imprint."
-            )
-            conn.commit()
+            logger.warning(f"⚠️ [LEDGER-SYNC] Bot {bot_id}: Recomputed cost is NEGATIVE. Cycle contamination?")
             return False
 
         # Discrepancy detected — recomputed fills are authoritative
-        logger.warning(
-            f"🔧 [LEDGER-SYNC] Bot {bot_id}: qty drift detected. "
-            f"Cached={cached_qty:.8f} vs Confirmed={recomputed_qty:.8f} (Δ={delta_qty:.8f}). "
-            f"Correcting trades row from order fills."
-        )
-
-        # 🚀 EE TIMER RESET [V1.9.0]
-        # If the quantity is increasing significantly (a safety order/grid hit), 
-        # we reset the basket_start_time to 'now'. This restarts the Early Exit 
-        # countdown for the new, averaged position.
-        new_basket_time_sql = ""
-        params = [round(recomputed_cost, 8), round(recomputed_avg, 8), recomputed_step, recomputed_cost]
+        params = [
+            round(recomputed_cost, 8), 
+            round(recomputed_avg, 8), 
+            recomputed_step, 
+            derived_phase, 
+            round(recomputed_hedge, 8), 
+            round(recomputed_qty, 8),
+            round(recomputed_qty, 8),  # For entry_confirmed ? check
+            round(recomputed_cost, 8)  # For entry_confirmed ? check
+        ]
         
-        # Reset if step increases or qty increases by more than 1% (avoid noise resets)
+        # Reset EE timer if step increases or qty increases significantly
+        sql_ee = ""
         if recomputed_step > cached_step or recomputed_qty > (cached_qty * 1.01):
-            logger.info(f"⏳ [EE-RESET] Bot {bot_id}: Grid hit detected. Resetting basket timer to now.")
-            new_basket_time_sql = ", basket_start_time = ?"
+            logger.info(f"⏳ [EE-RESET] Bot {bot_id}: Ledger expansion detected. Resetting EE timer.")
+            sql_ee = ", basket_start_time = ?"
             params.append(int(time.time()))
         
         params.append(bot_id)
@@ -2893,11 +2943,19 @@ def sync_trades_from_orders(bot_id: int) -> bool:
             SET total_invested  = ?,
                 avg_entry_price = ?,
                 current_step    = ?,
-                entry_confirmed = CASE WHEN ? > 0 THEN 1 ELSE entry_confirmed END
-                {new_basket_time_sql}
+                cycle_phase     = ?,
+                hedge_qty       = ?,
+                open_qty        = ?,
+                entry_confirmed = CASE WHEN (? > 1e-8 OR ? > 0.01) THEN 1 ELSE entry_confirmed END
+                {sql_ee}
             WHERE bot_id = ?
         """
         cursor.execute(sql, params)
+
+        # Update bots table status
+        new_bot_status = 'IN TRADE' if recomputed_qty > 1e-8 else 'Scanning'
+        cursor.execute("UPDATE bots SET status = ? WHERE id = ?", (new_bot_status, bot_id))
+
         conn.commit()
         return True
 
@@ -2955,7 +3013,7 @@ def reconcile_with_db(bot_id, current_price, open_orders, exchange_position):
                 return {'success': True}  # Position is live — do NOT wipe
 
             # Source B: check bot_orders ground truth
-            recomputed_cost, recomputed_avg, recomputed_qty, _ = recompute_invested_from_orders(bot_id)
+            recomputed_cost, recomputed_avg, recomputed_qty, _, _ = recompute_invested_from_orders(bot_id)
             if recomputed_qty > 1e-6:
                 logger.warning(
                     f"🛡️ [RECONCILE-GUARD] Bot {bot_id}: exchange_position=None but "
@@ -3207,7 +3265,9 @@ def _log_trade_internal(cursor, bot_id, action, symbol, price, amount, cost_usdc
     
     # In Hedge Mode, we MUST strictly match. 'BOTH' is treated as a mismatch for directional bots.
     resolved_side = str(position_side).upper() if position_side else bot_direction
-    if resolved_side != bot_direction:
+    # We exempt hedge actions as they naturally oppose the bot side.
+    is_hedge_action = action and ('HEDGE' in action.upper())
+    if resolved_side != bot_direction and not is_hedge_action:
         logger.error(f"🛡️ [SIDE-LOCK REJECT] Attempted to log {resolved_side} trade for {bot_direction} Bot {bot_id} ({symbol}). Trade ignored.")
         return False
 
@@ -3222,6 +3282,104 @@ def _log_trade_internal(cursor, bot_id, action, symbol, price, amount, cost_usdc
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (bot_id, int(time.time()), action, symbol, price, amount, cost_usdc, order_id, step, notes, pnl, bot_direction))
     return True
+
+def get_pair_virtual_net(pair):
+    """
+    Calculates the total virtual net position for a pair (Bots + Hedges).
+    LONG is positive, SHORT is negative. Used for global parity validation.
+    """
+    try:
+        # DEBUG: Trace calls from UI
+        with open("scratch/net_debug.log", "a") as f:
+            f.write(f"{time.ctime()} - get_pair_virtual_net('{pair}') called\n")
+        
+        conn = get_connection()
+        cursor = conn.cursor()
+        
+        # 🛡️ ARCHITECT'S GUARD: Resolve normalized symbols (e.g. BTCUSDC -> BTC/USDC:USDC)
+        # If the pair doesn't contain standard delimiters, it's likely coming from the UI's normalized view.
+        actual_pair = pair
+        if '/' not in pair and ':' not in pair:
+            cursor.execute("SELECT DISTINCT pair FROM bots")
+            all_db_pairs = [row[0] for row in cursor.fetchall()]
+            
+            # Local copy of normalize_symbol logic to avoid circular imports
+            def _local_norm(s):
+                if not s: return ""
+                return s.replace('/', '').replace('-', '').split(':')[0].upper()
+                
+            for dbp in all_db_pairs:
+                if _local_norm(dbp) == pair:
+                    actual_pair = dbp
+                    logger.info(f"🛡️ Resolved normalized pair '{pair}' to database pair '{actual_pair}'")
+                    break
+        
+        pair = actual_pair
+        
+        # 🛡️ v3.0.7 DOCTRINE: The Ledger is the Supreme Truth.
+        # We calculate the expected physical net by summing all filled orders 
+        # (Entries - Reductions + Hedges) for the ACTIVE cycles of all bots on this pair.
+        # 🛡️ PROOF-ONLY: Status filter excludes canceled/failed; created_at respects Wipe Wall.
+        cursor.execute("""
+            SELECT 
+                ROUND(SUM(CASE 
+                    -- Standard directional positions (Cycle-Locked or Orphaned-NULL)
+                    WHEN (o.cycle_id = t.cycle_id OR (o.cycle_id IS NULL AND t.cycle_id IS NULL)) 
+                         AND o.status NOT IN ('auto_closed', 'reset_cleared', 'canceled', 'cancelled', 'rejected', 'failed')
+                         AND (t.wipe_wall_ts = 0 OR o.created_at >= t.wipe_wall_ts)
+                         AND o.order_type IN ('entry', 'grid', 'adoption', 'adoption_add', 'forensic_adoption_add', 'carry') THEN (CASE WHEN b.direction = 'LONG' THEN o.filled_amount ELSE -o.filled_amount END)
+                    WHEN (o.cycle_id = t.cycle_id OR (o.cycle_id IS NULL AND t.cycle_id IS NULL))
+                         AND o.status NOT IN ('auto_closed', 'reset_cleared', 'canceled', 'cancelled', 'rejected', 'failed')
+                         AND (t.wipe_wall_ts = 0 OR o.created_at >= t.wipe_wall_ts)
+                         AND o.order_type IN ('tp', 'close', 'sl', 'dust_close', 'adoption_reduce', 'forensic_adoption_reduce', 'virtual_netting') THEN (CASE WHEN b.direction = 'LONG' THEN -o.filled_amount ELSE o.filled_amount END)
+                    
+                    -- Internal Hedges (Sum ACTIVE fills for the current cycle)
+                    WHEN (o.cycle_id = t.cycle_id OR (o.cycle_id IS NULL AND t.cycle_id IS NULL))
+                         AND o.status NOT IN ('auto_closed', 'reset_cleared', 'canceled', 'cancelled', 'rejected', 'failed')
+                         AND (t.wipe_wall_ts = 0 OR o.created_at >= t.wipe_wall_ts)
+                         AND o.order_type LIKE 'hedge%' AND o.order_type NOT LIKE '%tp%' THEN (CASE WHEN b.direction = 'LONG' THEN -o.filled_amount ELSE o.filled_amount END)
+                    WHEN (o.cycle_id = t.cycle_id OR (o.cycle_id IS NULL AND t.cycle_id IS NULL))
+                         AND o.status NOT IN ('auto_closed', 'reset_cleared', 'canceled', 'cancelled', 'rejected', 'failed')
+                         AND (t.wipe_wall_ts = 0 OR o.created_at >= t.wipe_wall_ts)
+                         AND (o.order_type LIKE 'hedge%tp%' OR o.order_type LIKE 'hedgetp%') THEN (CASE WHEN b.direction = 'LONG' THEN o.filled_amount ELSE -o.filled_amount END)
+                    
+                    ELSE 0 END), 8)
+            FROM bot_orders o
+            JOIN bots b ON o.bot_id = b.id
+            JOIN trades t ON b.id = t.bot_id
+            WHERE b.pair = ? 
+              AND b.is_active = 1
+              AND o.filled_amount > 0
+        """, (pair,))
+        
+        expected_physical_net = cursor.fetchone()[0] or 0.0
+        
+        return expected_physical_net
+    except Exception as e:
+        logger.error(f"Error calculating pair virtual net for {pair}: {e}")
+        return 0.0
+
+def get_outstanding_hedge(bot_id):
+    """
+    Calculates the outstanding hedge quantity for a specific bot.
+    Used for local bot reconciliation proofs.
+    """
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT 
+                SUM(CASE 
+                    WHEN order_type LIKE 'hedge%' AND order_type NOT LIKE '%tp%' THEN filled_amount 
+                    WHEN order_type LIKE 'hedge%tp%' OR order_type LIKE 'hedgetp%' THEN -filled_amount
+                    ELSE 0 END)
+            FROM bot_orders
+            WHERE bot_id = ? AND status NOT IN ('auto_closed', 'reset_cleared', 'canceled', 'cancelled', 'rejected')
+        """, (bot_id,))
+        return float(cursor.fetchone()[0] or 0.0)
+    except Exception as e:
+        logger.error(f"Error getting outstanding hedge for bot {bot_id}: {e}")
+        return 0.0
 
 def get_trade_history(bot_id=None, limit=100):
     conn = get_connection()
@@ -3316,8 +3474,10 @@ def save_bot_order(bot_id, order_type, exchange_order_id, price, amount, step, s
         # 🚀 FUNDAMENTAL FIX: side-locking (One-Way Mode tolerant)
         # If a position_side is provided (e.g., from adoption or API), it MUST match bot direction.
         # We allow 'BOTH' and NULL/Empty as they represent One-Way mode contributing to our side.
+        # We exempt hedge-related orders as they intentionally oppose the primary bot direction.
         upper_side = str(position_side or 'BOTH').upper()
-        if upper_side not in (bot_direction, 'BOTH', 'NONE', ''):
+        if (upper_side not in (bot_direction, 'BOTH', 'NONE', '') 
+            and order_type not in ('hedge', 'hedge_tp', 'hedge_exit', 'adoption_add', 'adoption_sub')):
             logger.error(f"🛡️ [SIDE-LOCK REJECT] Attempted to save {position_side} order for {bot_direction} Bot {bot_id}. Cross-side crossover blocked.")
             return None
 

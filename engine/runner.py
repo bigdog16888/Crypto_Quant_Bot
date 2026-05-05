@@ -7,6 +7,7 @@ import pandas as pd
 from concurrent.futures import ThreadPoolExecutor
 import threading
 import psutil # Added for robust PID checking
+import signal
 from logging.handlers import RotatingFileHandler
 
 # Add root to sys.path to ensure module resolution
@@ -553,7 +554,7 @@ class BotRunner:
 
             # 3. Scan Positions (Adoption is verified in run_cycle via snapshot logic)
             # We explicitly run one cycle of 'update_active_positions_snapshot' to map reality to DB
-            self.run_cycle() # Force specific cycle logic update
+            # self.run_cycle() # REMOVED: Premature cycle execution before reconciliation settles
 
         except Exception as e:
             logger.error(f"❌ [STARTUP-SYNC] Failed: {e}")
@@ -1415,6 +1416,14 @@ if __name__ == "__main__":
         lock.release()
         sys.exit(1)
     runner.running = True
+
+    # 🚀 ROOT CAUSE FIX: Graceful Signal Handling
+    def _graceful_shutdown(signum, frame):
+        logger.info(f"Signal {signum} received. Initiating graceful shutdown...")
+        runner.running = False  # Triggers the main loop exit
+
+    signal.signal(signal.SIGTERM, _graceful_shutdown)
+    signal.signal(signal.SIGINT, _graceful_shutdown)
     
     # BUG FIX: Clear emergency file on successful startup (prevents false liquidation on restart)
     if os.path.exists(EMERGENCY):
@@ -1521,4 +1530,14 @@ if __name__ == "__main__":
         time.sleep(cycle_sleep)
     # === METRICS SERVER STOP ===
     metrics_server.stop()
+    
+    # 🚀 ROOT CAUSE FIX: Drain async DB write queue before exit
+    try:
+        from engine.ws_event_handlers import stop_db_worker
+        logger.info("Flushing async DB write queue before exit...")
+        stop_db_worker(timeout=10.0)
+        logger.info("✅ DB write queue flushed.")
+    except Exception as e:
+        logger.error(f"Failed to flush DB write queue: {e}")
+
     lock.release()

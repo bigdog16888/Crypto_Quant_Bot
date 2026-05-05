@@ -344,7 +344,7 @@ def seal_trade_state(bot_id: int) -> Dict[str, Any]:
         return {}
 
     try:
-        cost, avg, qty, step = recompute_invested_from_orders(bot_id)
+        cost, avg, qty, step, h_qty = recompute_invested_from_orders(bot_id)
     except Exception as e:
         logger.error(f"[SEAL] recompute_invested_from_orders failed for bot {bot_id}: {e}")
         return {}
@@ -439,21 +439,23 @@ def seal_trade_state(bot_id: int) -> Dict[str, Any]:
                 total_invested   = ?,
                 avg_entry_price  = ?,
                 current_step     = ?,
-                entry_confirmed  = CASE WHEN ? > 0 THEN 1 ELSE 0 END,
+                entry_confirmed  = CASE WHEN ? > 0.01 THEN 1 ELSE 0 END,
                 basket_start_time = COALESCE(?, basket_start_time),
                 cycle_phase      = CASE WHEN cycle_phase = 'CARRY_PENDING' AND ? >= 0.10 THEN 'ACTIVE' ELSE cycle_phase END
             WHERE bot_id = ?
-        """, (cost, avg, step, qty, basket_time_update, cost, bot_id))
+        """, (cost, avg, step, cost, basket_time_update, cost, bot_id))
 
 
         # Derive and update bot status
-        if qty > 1e-8:
+        # 🚀 HEDGE-AWARE STATUS: Even if net qty is 0, if cost > 0 we are in a cycle.
+        if cost > 0.01 or abs(h_qty) > 1e-8:
             new_status = 'IN TRADE'
         else:
             new_status = 'Scanning'
 
         conn.execute("UPDATE bots SET status = ? WHERE id = ?", (new_status, bot_id))
         conn.commit()
+
 
         logger.debug(
             f"[SEAL] ✅ Bot {bot_id}: cost=${cost:.4f} avg={avg:.4f} "
@@ -671,7 +673,7 @@ def handle_tp_completion(
             # Do NOT trust the trades table for the TP Hit log. 
             # If seal_trade_state hasn't run yet, total_invested might be stale.
             # Recompute from the absolute ledger truth (bot_orders).
-            invested, avg_entry, qty, current_step = recompute_invested_from_orders(bot_id)
+            invested, avg_entry, qty, current_step, h_qty = recompute_invested_from_orders(bot_id)
             
             bot_state = get_bot_status(bot_id)
             if bot_state:

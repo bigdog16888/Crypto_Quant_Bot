@@ -16,6 +16,7 @@ from engine.database import (
 )
 from engine.reconciler import StateReconciler, ReconciliationAction
 from config.settings import config as global_config
+from engine.exchange_interface import normalize_symbol as _norm_universal
 
 # --- Performance Caching Wrappers ---
 @st.cache_resource(ttl=3600, show_spinner=False)
@@ -418,728 +419,455 @@ def render_monitor_view():
         physical_by_pair = {}
         mismatched_pairs = []
         
+        # --- Mismatch Alert Logic (v2.5.5) ---
+        # 🛡️ ARCHITECT'S DOCTRINE: Universal Parity & Ghost Exclusion
+        # We calculate the global virtual net for every pair by summing active bot positions 
+        # and subtracting active (un-reset) hedges.
+        
         # --- Mismatch Alert Logic ---
         try:
             # FUNDAMENTAL FIX: Use a fresh connection to bypass thread-local staleness in Streamlit
             db_path = global_config.PATHS['DB_FILE']
-            conn_fresh = sqlite3.connect(db_path, timeout=10)
+            with sqlite3.connect(db_path, timeout=10) as conn_fresh:
             
-            # Fetch Bot Strategies (df_pos)
-            query_all = """
-                SELECT b.id, b.name, b.pair, b.direction, b.strategy_type, b.config, t.current_step, t.total_invested, t.avg_entry_price, t.target_tp_price, b.is_active, b.status, b.error, t.basket_start_time, t.cycle_start_time
-                FROM bots b
-                LEFT JOIN trades t ON b.id = t.bot_id
-                WHERE b.is_active = 1
-            """
-            df_pos = pd.read_sql(query_all, conn_fresh)
-            
-            # Fetch Physical Positions (df_physical)
-            try:
-                df_physical = pd.read_sql("SELECT pair, side, size, entry_price, datetime(last_checked, 'unixepoch', 'localtime') as updated FROM active_positions", conn_fresh)
-            except Exception as e:
-                st.error(f"Failed to fetch physical positions: {e}")
-                print(f"DEBUG UI ERROR: {e}")
-                df_physical = pd.DataFrame()
-
-            # Fetch Hedged Bots (All cycles since hedges can outlive TP)
-            hedged_bots_query = """
-                SELECT DISTINCT o.bot_id 
-                FROM bot_orders o
-                JOIN trades t ON o.bot_id = t.bot_id
-                WHERE o.order_type='hedge' 
-                  AND o.status='filled'
-            """
-            hedged_bots_df = pd.read_sql_query(hedged_bots_query, conn_fresh)
-            hedged_bot_ids = set(hedged_bots_df['bot_id'].tolist())
-
-            # --- FUNDAMENTAL FIX: DATA-DRIVEN STATUS ---
-            # Derive 'display_status' from current_step and status strings
-            def derive_status(row):
-                if not row['is_active']: return "⚪ STOPPED"
+                # Fetch Bot Strategies (df_pos)
+                query_all = """
+                    SELECT b.id, b.name, b.pair, b.direction, b.strategy_type, b.config, t.current_step, t.total_invested, t.avg_entry_price, t.target_tp_price, b.is_active, b.status, b.error, t.basket_start_time, t.cycle_start_time, t.cycle_phase
+                    FROM bots b
+                    LEFT JOIN trades t ON b.id = t.bot_id
+                    WHERE b.is_active = 1
+                """
+                df_pos = pd.read_sql(query_all, conn_fresh)
                 
-                b_status = str(row.get('bot_status', row.get('status', ''))).upper()
-                if 'REQUIRE_MANUAL' in b_status: return "🚨 MANUAL GATE"
-                if 'CARRY_PENDING' in b_status: return "⏳ CARRY/PENDING"
-                
-                c_step = int(row.get('current_step', 0) if pd.notna(row.get('current_step')) else 0)
-                if c_step > 0:
-                    if row['id'] in hedged_bot_ids:
-                        return "🛡️ HEDGED"
-                    # Binance min-notional is 5 USD. Noticeably small positions are dust.
-                    invested = float(row.get('total_invested', 0) or 0)
-                    if invested > 0 and invested <= 5.0: 
-                        return "🟡 DUST/PARTIAL"
-                    return "🔴 IN TRADE"
-                return "🟢 SCANNING"
-
-            # Apply fix to df_pos BEFORE rendering
-            df_pos['status'] = df_pos.apply(derive_status, axis=1)
-
-            # Group active IN TRADE bots to the top
-            df_pos['sort_priority'] = df_pos['status'].apply(lambda x: 1 if ("IN TRADE" in x or "HEDGED" in x) else (2 if "SCANNING" in x else 3))
-            df_pos.sort_values(by=['sort_priority', 'name'], ascending=[True, True], inplace=True)
-
-            virtual_qty_by_pair = {}
-            physical_qty_by_pair = {}
-            pair_prices = {} # For converting qty back to USD for readability
-
-            
-            # Helper: normalize symbol to strip colon suffix and slashes (BTC/USDC:USDC → BTCUSDC)
-            from engine.exchange_interface import normalize_symbol
-            _norm = normalize_symbol
-
-            # 1. Fetch Virtual Positions (grouped by normalized pair + side)
-            # v2.2: include open_qty — the canonical v2.1 accumulator.
-            # Root cause of phantom NET mismatch: the old query required total_invested > 0,
-            # making bots with open_qty > 0 but total_invested = 0 invisible here.
-            # Their physical footprint then appeared as an unaccounted orphan.
-            query_virtual = """
-                SELECT b.pair, b.direction,
-                       t.total_invested, t.avg_entry_price,
-                       COALESCE(t.open_qty, 0) as open_qty,
-                       b.status as bot_status
-                FROM bots b
-                JOIN trades t ON b.id = t.bot_id
-                WHERE b.is_active = 1
-                  AND (t.total_invested != 0 OR t.open_qty > 0 OR b.status LIKE '%CARRY%')
-            """
-            df_virt = pd.read_sql(query_virtual, conn_fresh)
-            
-            # 🚀 HEDGE-MODE OFFSET: Fetch all filled hedge/hedgetp orders for the bot (cross-cycle)
-            query_hedge = """
-                SELECT b.pair, b.direction,
-                       SUM(CASE WHEN bo.order_type = 'hedge' THEN bo.filled_amount ELSE -bo.filled_amount END) as hedge_qty
-                FROM bot_orders bo
-                JOIN bots b ON bo.bot_id = b.id
-                WHERE b.is_active = 1 
-                  AND bo.order_type IN ('hedge', 'hedge_tp') 
-                  AND bo.status IN ('filled', 'closed')
-                GROUP BY b.pair, b.direction
-            """
-            df_hedge = pd.read_sql(query_hedge, conn_fresh)
-            
-            conn_fresh.close()
-            
-            if not df_virt.empty:
-                for _, row in df_virt.iterrows():
-                    invested   = float(row['total_invested'] or 0)
-                    avg_price  = float(row['avg_entry_price'] or 0)
-                    open_qty_v = float(row['open_qty'] or 0)
-                    pair_key   = _norm(row['pair'])
-                    side_key   = str(row['direction']).upper()  # LONG or SHORT
-                    composite_key = (pair_key, side_key)
-
-                    # v2.2: prefer open_qty accumulator (exact confirmed qty) over
-                    # the total_invested / avg_price derived qty (can diverge on reset).
-                    # Fallback to the invested-based calculation for pre-v2.1 bots.
-                    if open_qty_v > 0:
-                        qty_abs = open_qty_v
-                        ref_price = avg_price if avg_price > 0 else 1.0
-                    elif invested > 0 and avg_price > 0:
-                        qty_abs = invested / avg_price
-                        ref_price = avg_price
-                    else:
-                        continue
-
-                    if pair_key not in pair_prices:
-                        pair_prices[pair_key] = ref_price
-                    # 🚀 HEDGE-MODE: Group by (pair, side) so LONG and SHORT bots are tracked independently.
-                    virtual_qty_by_pair[composite_key] = virtual_qty_by_pair.get(composite_key, 0.0) + qty_abs
-
-            # Apply Hedge Offsets to virtual_qty_by_pair
-            if not df_hedge.empty:
-                for _, row in df_hedge.iterrows():
-                    h_qty = float(row['hedge_qty'] or 0)
-                    p_key = _norm(row['pair'])
-                    s_key = str(row['direction']).upper()
-                    c_key = (p_key, s_key)
-                    # Hedge (opposite side) reduces the virtual net responsibility of the bot's side
-                    if c_key in virtual_qty_by_pair:
-                        virtual_qty_by_pair[c_key] -= h_qty
-            
-            # 2. Physical Positions (grouped by normalized pair + side)
-            if not df_physical.empty:
-                for _, row in df_physical.iterrows():
-                    if pd.notna(row['size']) and pd.notna(row['entry_price']):
-                        qty = abs(float(row['size']))
-                        price = float(row['entry_price'])
-                        side = str(row['side']).upper().strip()
-                        side_key = 'LONG' if side in ('BUY', 'LONG') else 'SHORT'
-                        pair_key = _norm(row['pair'])
-                        composite_key = (pair_key, side_key)
-                        if pair_key not in pair_prices:
-                            pair_prices[pair_key] = price
-                        physical_qty_by_pair[composite_key] = physical_qty_by_pair.get(composite_key, 0.0) + qty
-            
-            # 3. Symbol-Level NET comparison (One-Way Mode Awareness)
-            all_keys = set(virtual_qty_by_pair.keys()) | set(physical_qty_by_pair.keys())
-            distinct_symbols = set([k[0] for k in all_keys])
-            virtual_net_usd = 0.0
-            physical_net_usd = 0.0
-            
-            for p in distinct_symbols:
-                # Calculate NET sums for this symbol
-                v_net_qty = virtual_qty_by_pair.get((p, 'LONG'), 0.0) - virtual_qty_by_pair.get((p, 'SHORT'), 0.0)
-                ph_net_qty = physical_qty_by_pair.get((p, 'LONG'), 0.0) - physical_qty_by_pair.get((p, 'SHORT'), 0.0)
-                
-                # 🛡️ ARCHITECT'S SHIELD: Apply manual whitelists to ignore personal trades
-                whitelists = get_manual_whitelists(p)
-                for w in whitelists:
-                    w_qty = float(w['qty'])
-                    ph_net_qty -= w_qty if w['side'] == 'LONG' else -w_qty
-                
-                ref_price = pair_prices.get(p, 1.0)
-                net_qty_diff = abs(v_net_qty - ph_net_qty)
-                net_usd_diff = net_qty_diff * ref_price
-                
-                # Global metrics update
-                virtual_net_usd += v_net_qty * ref_price
-                physical_net_usd += ph_net_qty * ref_price
-
-                # DISCREPANCY DETECTION
-                # 🚀 PROFESSOR'S PRECISION: Low as possible — $0.01 tolerance (CENT LEVEL)
-                if net_usd_diff > 0.01:
-                    # Report the mismatch for the whole symbol (Net basis)
-                    v_usd_net = v_net_qty * ref_price
-                    ph_usd_net = ph_net_qty * ref_price
-                    # 🚀 V2.1: Keep signed difference for accurate whitelisting
-                    signed_qty_diff = ph_net_qty - v_net_qty 
-                    mismatched_pairs.append((f"{p} NET", v_usd_net, ph_usd_net, net_usd_diff, v_net_qty, ph_net_qty, signed_qty_diff, ref_price))
-                else:
-                    # SYNCED AT NET LEVEL: 
-                    # We might still check if sides are 'fighting' (e.g. system has LONG+SHORT but exchange has NET)
-                    # but since they net out perfectly, we consider it Healthy.
-                    pass
-            
-            diff_net = abs(virtual_net_usd - physical_net_usd)
-            # (Mismatch and Order Health are displayed in the MASTER STATUS INDICATOR section below)
-            
-        except Exception as e:
-            st.warning(f"Could not calculate sync status: {e}")
-
-
-        
-        # --- Status Indicator & Order Health ---
-        try:
-            order_health_msg = ""
-            order_status_color = "green"
-            
-            # --- STATUS CONSISTENCY FIX ---
-            # A bot expects orders on the exchange if its current_step > 0.
-            # Scanning bots (current_step == 0) may have 0 or 1 (the Entry Limit).
-            active_bots = df_pos[df_pos['is_active'] == 1]
-            total_orders = len(market_orders)
-            
-            # --- REALITY SYNC: Per-Bot Order Validation ---
-            try:
-                # 🚀 TRUE PHYSICAL VERIFICATION:
-                # Count actual open orders directly from CCXT, ignoring the stale SQLite DB.
-                # Map physical order counts by matching API returned prefix strings.
-                physical_order_counts = {}
-                for o in market_orders:
-                    cid = str(o.get('clientOrderId') or '')
-                    if cid.startswith('CQB_'):
-                        try:
-                            # format: CQB_{bot_id}_...
-                            parts = cid.split('_')
-                            if len(parts) >= 2:
-                                bid_parsed = int(parts[1])
-                                physical_order_counts[bid_parsed] = physical_order_counts.get(bid_parsed, 0) + 1
-                        except: pass
-                
-                # Load pos_limit_hit flags for all bots in one query
+                # Fetch Physical Positions (df_physical)
                 try:
-                    from engine.database import get_connection as _gconn
-                    _conn = _gconn()
-                    _plimit_rows = _conn.execute("SELECT id, pos_limit_hit FROM bots").fetchall()
-                    _pos_limit_flags = {row[0]: bool(row[1]) for row in _plimit_rows}
-                except Exception:
-                    _pos_limit_flags = {}
+                    df_physical = pd.read_sql("SELECT pair, side, size, entry_price, datetime(last_checked, 'unixepoch', 'localtime') as updated FROM active_positions", conn_fresh)
+                except Exception as e:
+                    st.error(f"Failed to fetch physical positions: {e}")
+                    print(f"DEBUG UI ERROR: {e}")
+                    df_physical = pd.DataFrame()
+                
+                # Initialize metrics
+                hedge_amounts = {}
+                diff_net = 0.0
+                virtual_qty_by_pair = {}
+                physical_qty_by_pair = {}
+                pair_prices = {} # For converting qty back to USD for readability
+                virtual_net_by_norm = {}
 
-                # Check for in-trade bots missing real physics orders
-                bots_with_missing_orders = []
-                bots_with_partial_orders = []
-                bots_pos_limit = []  # Bots that hit exchange position cap — NOT a mismatch
-                for _, bot_row in active_bots.iterrows():
-                    bid = int(bot_row['id'])
-                    actual_physical = physical_order_counts.get(bid, 0)
-                    is_pos_capped = _pos_limit_flags.get(bid, False)
+                # Fetch Hedged Bots (All cycles since hedges can outlive TP)
+                query_h = """
+                    SELECT bo.bot_id, b.pair, b.direction, bo.order_type, bo.filled_amount
+                    FROM bot_orders bo
+                    JOIN bots b ON bo.bot_id = b.id
+                    JOIN trades t ON b.id = t.bot_id
+                    WHERE b.is_active = 1
+                      AND bo.order_type IN ('hedge', 'hedge_tp')
+                      AND bo.status NOT IN ('canceled', 'cancelled', 'rejected', 'failed', 'reset_cleared', 'auto_closed', 'placing')
+                      AND (bo.cycle_id = t.cycle_id OR (bo.cycle_id IS NULL AND t.cycle_id IS NULL))
+                      AND (t.wipe_wall_ts = 0 OR bo.created_at >= t.wipe_wall_ts)
+                """
+                df_h = pd.read_sql(query_h, conn_fresh)
+                
+                # Pre-calculate hedge_amounts for the Status Column
+                if not df_h.empty:
+                    for b_id in df_pos['id'].unique():
+                        # 🛡️ ARCHITECT'S FIX: Hedges only exist if the bot is actively in a trade (Step > 0)
+                        # or specifically marked as HEDGE_EXIT_PENDING. Step 0 bots are SCANNING.
+                        row_bot = df_pos[df_pos['id'] == b_id].iloc[0]
+                        # c_step = int(row_bot.get('current_step', 0) if pd.notna(row_bot.get('current_step')) else 0)
+                        # if c_step == 0 and "EXITING" not in str(row_bot.get('status','')).upper():
+                        #     hedge_amounts[b_id] = 0.0
+                        #     continue
+
+                        h_sum = df_h[(df_h['bot_id'] == b_id) & (df_h['order_type'] == 'hedge')]['filled_amount'].sum()
+                        hx_sum = df_h[(df_h['bot_id'] == b_id) & (df_h['order_type'] == 'hedge_tp')]['filled_amount'].sum()
+                        hedge_amounts[b_id] = max(0.0, h_sum - hx_sum)
+
+                # Fetch Hedged Bot IDs for heuristic missing-order detection
+                hedged_bot_ids = set(df_h[df_h['filled_amount'] > 1e-8]['bot_id'].unique())
+
+                # --- FUNDAMENTAL FIX: DATA-DRIVEN STATUS ---
+                # Derive 'display_status' from current_step and status strings
+                def derive_status(row):
+                    if not row['is_active']: return "⚪ STOPPED"
                     
-                    # SMART ORDER VALIDATION:
-                    # Parse config to know max_steps. If current_step < max_steps, we expect TWO orders (TP + Grid).
-                    # If current_step >= max_steps, we expect ONE order (TP).
-                    # If current_step == 0 (SCANNING), we expect AT MOST 1 order.
-                    try:
-                        cfg = json.loads(bot_row.get('config', '{}'))
-                        max_steps = int(cfg.get('max_steps', 10))
-                        c_step = int(bot_row.get('current_step', 0))
+                    b_status = str(row.get('bot_status', row.get('status', ''))).upper()
+                    if 'REQUIRE_MANUAL' in b_status: return "🚨 MANUAL GATE"
+                    if 'CARRY_PENDING' in b_status: return "⏳ CARRY/PENDING"
+                    if 'HEDGE_EXIT_PENDING' in b_status: return "🛡️ HEDGE EXITING"
+                    
+                    c_phase = str(row.get('cycle_phase', 'IDLE')).upper()
+                    c_step = int(row.get('current_step', 0) if pd.notna(row.get('current_step')) else 0)
+                    invested = float(row.get('total_invested', 0) or 0)
+                    h_amt = hedge_amounts.get(row['id'], 0)
+                    
+                    if c_phase == 'HEDGED' or h_amt > 1e-8:
+                        if "EXITING" in b_status:
+                            return f"🛡️ HEDGE EXIT PENDING ({h_amt:.4f})"
+                        return f"🛡️ HEDGED ({h_amt:.4f}) | Step {c_step}"
+                    
+                    if c_phase == 'ACTIVE' or invested > 1e-8:
+                        # Binance min-notional is 5 USD. Noticeably small positions are dust.
+                        if invested > 0 and invested <= 5.0: 
+                            return "🟡 DUST/PARTIAL"
+                        return f"🔴 IN TRADE | Step {c_step}"
+                    
+                    return "🟢 SCANNING"
+
+                # Apply fix to df_pos BEFORE rendering
+                df_pos['status'] = df_pos.apply(derive_status, axis=1)
+
+                # Group active IN TRADE bots to the top
+                df_pos['sort_priority'] = df_pos['status'].apply(lambda x: 1 if ("IN TRADE" in x or "HEDGED" in x) else (2 if "SCANNING" in x else 3))
+                df_pos.sort_values(by=['sort_priority', 'name'], ascending=[True, True], inplace=True)
+
+                # 1. Fetch ALL Active Bot Positions (O(1) approach)
+                # v2.5.5: Prefer open_qty accumulator over invested/avg derived qty.
+                query_v = """
+                    SELECT b.id, b.pair, b.direction, t.open_qty, t.total_invested, t.avg_entry_price
+                    FROM bots b
+                    JOIN trades t ON b.id = t.bot_id
+                    WHERE b.is_active = 1
+                """
+                df_v = pd.read_sql(query_v, conn_fresh)
+                
+                if not df_v.empty:
+                    for _, row in df_v.iterrows():
+                        invested   = float(row['total_invested'] or 0)
+                        avg_price  = float(row['avg_entry_price'] or 0)
+                        open_qty_v = float(row['open_qty'] or 0)
+                        pair_key   = _norm_universal(row['pair'])
+                        side_key   = str(row['direction']).upper()  # LONG or SHORT
+                        bot_id     = row['id']
                         
-                        if c_step == 0:
-                            expected_for_bot = min(1, actual_physical)
+                        # Derive raw qty
+                        if open_qty_v > 0:
+                            qty_abs = open_qty_v
+                            ref_price = avg_price if avg_price > 0 else 1.0
+                        elif invested > 0 and avg_price > 0:
+                            qty_abs = invested / avg_price
+                            ref_price = avg_price
                         else:
-                            expected_for_bot = 1 if c_step >= max_steps else 2
+                            qty_abs = 0
+                            ref_price = 1.0
+
+                        if pair_key not in pair_prices:
+                            pair_prices[pair_key] = ref_price
+
+                        # 🛡️ HEDGE-AWARE NETTING:
+                        # v2.5.9: 'open_qty' is already the net position (Entry - Hedge)
+                        effective_qty = qty_abs
                         
-                        # Only genuinely IN-TRADE bots can be "missing" baseline orders.
-                        # A bot with c_step > 0 but total_invested <= 0 is a zombie state (post-reset race condition)
-                        # — do NOT alarm on it, as it has no real position and no orders are expected.
-                        # Fix 4: also check total_invested > 0 to suppress false positives for zombie bots.
-                        bot_invested = float(bot_row.get('total_invested', 0) or 0)
-                        if actual_physical == 0 and c_step > 0 and bot_invested > 0:
-                            if is_pos_capped:
-                                # Bot hit exchange cap — holding position, waiting for TP.
-                                # This is EXPECTED behaviour — do not alarm.
-                                bots_pos_limit.append(f"{bot_row['name']} (0/{expected_for_bot})")
-                            else:
-                                bots_with_missing_orders.append(f"{bot_row['name']} (0/{expected_for_bot})")
-                        elif actual_physical < expected_for_bot and c_step > 0 and bot_invested > 0:
-                            if is_pos_capped:
-                                # Has TP but no grid — expected when pos cap hit
-                                bots_pos_limit.append(f"{bot_row['name']} ({actual_physical}/{expected_for_bot})")
-                            else:
-                                # Usually means TP placed but Grid is blocked (e.g. Max Position Limit Reached) -> Yellow
-                                bots_with_partial_orders.append(f"{bot_row['name']} ({actual_physical}/{expected_for_bot})")
+                        # 🚀 HEDGE-MODE: Group by (pair, side)
+                        composite_key = (pair_key, side_key)
+                        virtual_qty_by_pair[composite_key] = virtual_qty_by_pair.get(composite_key, 0.0) + effective_qty
+
+                # 2. Physical Positions (grouped by normalized pair + side)
+                if not df_physical.empty:
+                    for _, row in df_physical.iterrows():
+                        if pd.notna(row['size']) and pd.notna(row['entry_price']):
+                            qty = abs(float(row['size']))
+                            price = float(row['entry_price'])
+                            side = str(row['side']).upper().strip()
+                            side_key = 'LONG' if side in ('BUY', 'LONG') else 'SHORT'
+                            pair_key = _norm_universal(row['pair'])
+                            composite_key = (pair_key, side_key)
+                            if pair_key not in pair_prices:
+                                pair_prices[pair_key] = price
+                            physical_qty_by_pair[composite_key] = physical_qty_by_pair.get(composite_key, 0.0) + qty
+                
+                # 3. Symbol-Level NET comparison (One-Way Mode Awareness)
+                all_symbols = set([_norm_universal(p) for p in df_v['pair']]) | set([_norm_universal(p) for p in df_physical['pair']]) if not df_physical.empty else set([_norm_universal(p) for p in df_v['pair']])
+                virtual_net_usd = 0.0
+                physical_net_usd = 0.0
+                diff_net = 0.0
+                
+                # Pre-calculate virtual net quantities in memory (O(1) pass)
+                for (pk, sk), q in virtual_qty_by_pair.items():
+                    virtual_net_by_norm[pk] = virtual_net_by_norm.get(pk, 0.0) + (q if sk == 'LONG' else -q)
+
+                for p in sorted(all_symbols):
+                    v_net_qty = virtual_net_by_norm.get(p, 0.0)
+                    ph_net_qty = physical_qty_by_pair.get((p, 'LONG'), 0.0) - physical_qty_by_pair.get((p, 'SHORT'), 0.0)
+                    
+                    # 🛡️ ARCHITECT'S SHIELD: Apply manual whitelists to ignore personal trades
+                    whitelists = get_manual_whitelists(p)
+                    for w in whitelists:
+                        w_qty = float(w['qty'])
+                        ph_net_qty -= w_qty if w['side'] == 'LONG' else -w_qty
+                    
+                    ref_price = pair_prices.get(p, 1.0)
+                    net_qty_diff = abs(v_net_qty - ph_net_qty)
+                    net_usd_diff = net_qty_diff * ref_price
+                    
+                    # Global metrics update
+                    virtual_net_usd += v_net_qty * ref_price
+                    physical_net_usd += ph_net_qty * ref_price
+
+                    # DISCREPANCY DETECTION
+                    if net_usd_diff > 0.01:
+                        diff_net += net_usd_diff # Correctly accumulate total diff
+                        v_usd_net = v_net_qty * ref_price
+                        ph_usd_net = ph_net_qty * ref_price
+                        signed_qty_diff = ph_net_qty - v_net_qty 
+                        mismatched_pairs.append((f"{p} NET", v_usd_net, ph_usd_net, net_usd_diff, v_net_qty, ph_net_qty, signed_qty_diff, ref_price))
+                
+                # --- 🚀 UI UPGRADE: PROMINENT METRICS (Green/Red Part) 🚀 ---
+                m_col1, m_col2, m_col3 = st.columns(3)
+                with m_col1:
+                    st.metric("Net Exposure (Virtual)", f"${virtual_net_usd:,.2f}")
+                with m_col2:
+                    st.metric("Exchange Net (Physical)", f"${physical_net_usd:,.2f}", delta=f"{physical_net_usd-virtual_net_usd:,.2f}")
+                with m_col3:
+                    _status = "HEALTHY" if abs(virtual_net_usd - physical_net_usd) <= 0.01 else "MISMATCH"
+                    _color = "green" if _status == "HEALTHY" else "red"
+                    st.markdown(f"**System Status:** <span style='color:{_color}; font-weight:bold;'>{_status}</span>", unsafe_allow_html=True)
+                st.divider()
+
+                # --- Status Indicator & Order Health ---
+                try:
+                    order_health_msg = ""
+                    order_status_color = "green"
+                    
+                    # --- STATUS CONSISTENCY FIX ---
+                    active_bots = df_pos[df_pos['is_active'] == 1]
+                    total_orders = len(market_orders)
+                    
+                    # --- REALITY SYNC: Per-Bot Order Validation ---
+                    try:
+                        physical_order_counts = {}
+                        for o in market_orders:
+                            cid = str(o.get('clientOrderId') or '')
+                            if cid.startswith('CQB_'):
+                                try:
+                                    parts = cid.split('_')
+                                    if len(parts) >= 2:
+                                        bid_parsed = int(parts[1])
+                                        physical_order_counts[bid_parsed] = physical_order_counts.get(bid_parsed, 0) + 1
+                                except: pass
+                        
+                        # Load pos_limit_hit flags for all bots in one query
+                        try:
+                            from engine.database import get_connection as _gconn
+                            _conn = _gconn()
+                            _plimit_rows = _conn.execute("SELECT id, pos_limit_hit FROM bots").fetchall()
+                            _pos_limit_flags = {row[0]: bool(row[1]) for row in _plimit_rows}
+                        except Exception:
+                            _pos_limit_flags = {}
+
+                        # Check for in-trade bots missing real physics orders
+                        bots_with_missing_orders = []
+                        bots_with_partial_orders = []
+                        bots_pos_limit = []
+                        for _, row in active_bots.iterrows():
+                            bid = int(row['id'])
+                            c_step = int(row.get('current_step', 0))
+                            bot_invested = float(row.get('total_invested', 0) or 0)
+                            is_hedged = bid in hedged_bot_ids
+                            
+                            actual_physical = physical_order_counts.get(bid, 0)
+                            
+                            # 🛡️ PENDING/RESET GATE: Bots exiting or reset should NOT trigger alerts
+                            b_status_upper = str(row.get('status', '')).upper()
+                            c_phase = str(row.get('cycle_phase', 'IDLE')).upper()
+                            
+                            # Self-Healing Status derivation for alert gating
+                            is_scanning = (c_phase == 'IDLE' and bot_invested <= 1e-8 and not is_hedged)
+                            
+                            if "EXITING" in b_status_upper or is_scanning:
+                                continue
+
+                            if is_hedged:
+                                if actual_physical == 0: bots_with_missing_orders.append(f"{row['name']} (HEDGED)")
+                                continue
+
+                            if actual_physical == 0 and bot_invested > 1e-8:
+                                if _pos_limit_flags.get(bid, False): bots_pos_limit.append(row['name'])
+                                else: bots_with_missing_orders.append(row['name'])
+                            
+                            elif actual_physical < 2 and c_step > 0 and bot_invested > 0 and not is_hedged:
+                                try:
+                                    cfg = json.loads(row.get('config', '{}'))
+                                    max_steps = int(cfg.get('max_steps', 10))
+                                    if c_step < max_steps:
+                                        if _pos_limit_flags.get(bid, False): bots_pos_limit.append(row['name'])
+                                        else: bots_with_partial_orders.append(f"{row['name']} ({actual_physical}/2)")
+                                except: pass
+
+                        expected_total = sum(
+                            physical_order_counts.get(int(row['id']), 0) if int(row['id']) in hedged_bot_ids else
+                            (min(1, physical_order_counts.get(int(row['id']), 0)) 
+                            if int(row.get('current_step', 0)) == 0
+                            else (1 if int(row.get('current_step', 0)) >= int(json.loads(row.get('config', '{}')).get('max_steps', 10)) else 2))
+                            for _, row in active_bots.iterrows()
+                        )
                     except Exception:
-                        # Fallback heuristic
-                        if actual_physical == 0 and int(bot_row.get('current_step', 0)) > 0:
-                            bots_with_missing_orders.append(bot_row['name'])
-                
-                # Accurately compute expected total including scanning bots entry dynamics
-                # v2.3.5: Include residue bots (> $0.01) in "In Trade" count even if current_step=0
-                expected_total = sum(
-                    min(1, physical_order_counts.get(int(row['id']), 0)) 
-                    if int(row.get('current_step', 0)) == 0
-                    else (1 if int(row.get('current_step', 0)) >= int(json.loads(row.get('config', '{}')).get('max_steps', 10)) else 2) 
-                    for _, row in active_bots.iterrows()
-                )
-            except Exception as e:
-                expected_total = total_orders # Fallback
-                bots_with_missing_orders = []
-                bots_pos_limit = []
-            
-            if bots_with_missing_orders:
-                order_health_msg = f"⚠️ MISSING CRITICAL ORDERS: {', '.join(bots_with_missing_orders)} have 0 open limit orders!"
-                order_status_color = "red"
-            elif bots_with_partial_orders:
-                # 🚀 DIAGNOSTIC UPGRADE: Pull specific error from bot state if missing grids
-                error_reasons = []
-                for b_str in bots_with_partial_orders:
-                    # 🚀 ROBUST PARSING: Use rpartition to safely extract multi-word names from "Name (qty)"
-                    b_name = b_str.rpartition(' (')[0] if ' (' in b_str else b_str
-                    # Find first matching bot row safely
-                    b_row = active_bots[active_bots['name'] == b_name].iloc[0] if not active_bots[active_bots['name'] == b_name].empty else None
-                    if b_row is not None and b_row.get('error'):
-                        error_reasons.append(f"{b_name}: {b_row['error']}")
+                        expected_total = total_orders
+                        bots_with_missing_orders = []
+                        bots_pos_limit = []
+                    
+                    if bots_with_missing_orders:
+                        order_health_msg = f"⚠️ MISSING CRITICAL ORDERS: {', '.join(bots_with_missing_orders)} have 0 open limit orders!"
+                        order_status_color = "red"
+                    elif bots_with_partial_orders:
+                        error_reasons = []
+                        for b_str in bots_with_partial_orders:
+                            b_name = b_str.rpartition(' (')[0] if ' (' in b_str else b_str
+                            b_row = active_bots[active_bots['name'] == b_name].iloc[0] if not active_bots[active_bots['name'] == b_name].empty else None
+                            if b_row is not None and b_row.get('error'): error_reasons.append(f"{b_name}: {b_row['error']}")
+                            else: error_reasons.append(b_str)
+                        order_health_msg = f"⚠️ MISSING GRIDS (Check ATR/Params): {', '.join(error_reasons)}"
+                        order_status_color = "orange"
+                    elif bots_pos_limit:
+                        order_health_msg = f"🚫 POS LIMIT: {', '.join(bots_pos_limit)} at exchange max notional."
+                        order_status_color = "green"
+                    elif total_orders < expected_total:
+                        order_health_msg = f"⚠️ EXCHANGE LAG: Found {total_orders}, Expected {expected_total} (Syncing...)."
+                        order_status_color = "orange"
+                    elif total_orders > expected_total:
+                        order_health_msg = f"⚠️ STRAY ORDERS: Found {total_orders}, Expected only {expected_total}."
+                        order_status_color = "red"
                     else:
-                        error_reasons.append(b_str)
-                
-                order_health_msg = f"⚠️ MISSING GRIDS (Check ATR/Params): {', '.join(error_reasons)}"
-                order_status_color = "orange"
-                # Downgrade visually to yellow for bots experiencing partial grid errors
-                for pd_idx, bot_row in df_pos.iterrows():
-                    for name_str in bots_with_partial_orders:
-                        if bot_row['name'] in name_str and '🔴 IN TRADE' in str(bot_row['status']):
-                            df_pos.at[pd_idx, 'status'] = str(bot_row['status']).replace('🔴', '🟡')
-            elif bots_pos_limit:
-                # All missing grids are accounted for by the exchange position cap — this is healthy behaviour.
-                order_health_msg = f"🚫 POS LIMIT: {', '.join(bots_pos_limit)} at exchange max notional. Holding position, waiting for TP."
-                order_status_color = "green"  # Not an error — deliberate cap
-            elif total_orders < expected_total:
-                order_health_msg = f"⚠️ EXCHANGE LAG: Found {total_orders}, Expected {expected_total} (Syncing...)."
-                order_status_color = "orange" # Warning but not critical mismatch
-            elif total_orders > expected_total:
-                 order_health_msg = f"⚠️ STRAY ORDERS: Found {total_orders}, Expected only {expected_total}."
-                 order_status_color = "red"
-            else:
-                order_health_msg = f"✅ ORDERS SYNCED: {total_orders} active orders."
+                        order_health_msg = f"✅ ORDERS SYNCED: {total_orders} active orders."
 
-            # --- SYSTEM MISMATCH / RECOVERY SHORTCUT ---
-            has_mismatch = len(mismatched_pairs) > 0
-            if has_mismatch:
-                st.error("🚨 DATABASE DESYNC: Binance physical exchange positions drastically differ from the bots' internal ledgers.")
+                    if diff_net > 0.01:
+                        st.markdown(f"""
+                        <div style="background-color:rgba(255, 75, 75, 0.1); padding:10px; border-radius:5px; border:1px solid rgba(255, 75, 75, 0.2); margin-bottom:15px;">
+                            <span style="color:#ff4b4b; font-weight:bold;">⚠️ SYSTEM MISMATCH:</span> 
+                            The exchange is reporting <b>${physical_net_usd:,.2f}</b> net exposure, but the system believes it is <b>${virtual_net_usd:,.2f}</b>.
+                        </div>
+                        """, unsafe_allow_html=True)
+                    
+                    st.markdown(f"""
+                    <div style="display: flex; justify-content: space-between; align-items: center; background-color: #0e1117; padding: 15px; border-radius: 10px; border: 1px solid #30363d; margin-bottom: 20px;">
+                        <div>
+                            <div style="font-size: 0.8rem; color: #8b949e; margin-bottom: 4px;">ORDER HEALTH</div>
+                            <div style="font-size: 1.1rem; color: {order_status_color}; font-weight: bold;">{order_health_msg}</div>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
 
-            # Display Metrics
-            col1, col2 = st.columns(2)
-            with col1:
-                st.metric("Net Exposure (Virtual USD)", f"${virtual_net_usd:,.2f}")
-            with col2:
-                st.metric("Exchange Net (Physical USD)", f"${physical_net_usd:,.2f}", delta=f"{physical_net_usd-virtual_net_usd:,.2f}")
+                except Exception as e:
+                    st.error(f"Status Indicator Error: {e}")
 
-                # MASTER STATUS INDICATOR
-                
-                # --- STARTUP GRACE PERIOD AUDIT ---
-                # Delay RED status for 60s during startup to allow entry orders to fire.
+                try:
+                    with st.expander("🔍 Global Netting Diagnostics (v2.5.8)", expanded=False):
+                        st.write(f"**Reconciliation Mode:** Global Net (Hedge-Aware)")
+                        debug_data = []
+                        for p_dbg in sorted(all_symbols):
+                            v_dbg = virtual_net_by_norm.get(p_dbg, 0.0)
+                            ph_l_dbg = physical_qty_by_pair.get((p_dbg, 'LONG'), 0.0)
+                            ph_s_dbg = physical_qty_by_pair.get((p_dbg, 'SHORT'), 0.0)
+                            ph_net_dbg = ph_l_dbg - ph_s_dbg
+                            debug_data.append({
+                                "Symbol": p_dbg,
+                                "System Net": f"{v_dbg:+.4f}",
+                                "Exchange Net": f"{ph_net_dbg:+.4f}",
+                                "Diff Qty": f"{abs(v_dbg - ph_net_dbg):.4f}"
+                            })
+                        st.table(pd.DataFrame(debug_data))
+                except Exception:
+                    pass
+
+                has_mismatch = len(mismatched_pairs) > 0
+                if has_mismatch:
+                    st.error("🚨 DATABASE DESYNC: Binance physical exchange positions drastically differ from the bots' internal ledgers.")
+
                 is_startup_grace = False
                 if not df_pos.empty:
-                    # Check if any bot session is < 60s old
                     try:
                         newest_start = df_pos['basket_start_time'].max()
-                        if (time.time() - newest_start) < 60:
-                            is_startup_grace = True
+                        if (time.time() - newest_start) < 60: is_startup_grace = True
                     except: pass
 
-                status_color = "red"
                 if not has_mismatch and order_status_color == "green":
                     st.success(f"✅ **SYSTEM HEALTHY**: Contracts and orders are perfectly aligned. {order_health_msg}")
                 elif is_startup_grace and order_status_color == "red":
                     st.warning(f"🟡 **SYSTEM STARTUP**: Waiting for initial sync/orders (Grace Period)...")
-                    st.caption(f"Reason: {order_health_msg}")
                 else:
                     st.error(f"🚨 **SYSTEM MISMATCH DETECTED**")
                     if mismatched_pairs:
-                        # Don't show generic virtual_net_usd if it's just a position issue
                         for row_mp in mismatched_pairs:
-                            mp_pair, mp_virt, mp_phys, mp_diff = row_mp[0], row_mp[1], row_mp[2], row_mp[3]
-                            mp_vqty = row_mp[4] if len(row_mp) > 4 else None
-                            mp_pqty = row_mp[5] if len(row_mp) > 5 else None
-                            mp_dqty = row_mp[6] if len(row_mp) > 6 else None
-                            mp_price = row_mp[7] if len(row_mp) > 7 else None
-                            # Format qty display
-                            qty_str = ""
-                            if mp_vqty is not None and mp_pqty is not None:
-                                qty_str = f" | Qty: system={mp_vqty:+.4f} exchange={mp_pqty:+.4f} diff={mp_dqty:.4f}"
-                            # Check if any bot in this pair is at the exchange position cap.
-                            # If so, the difference is EXPECTED — not an error or a partial fill.
-                            _pair_root = mp_pair.split(' ')[0]  # e.g. 'BTC/USDC' from 'BTC/USDC NET'
-                            _pair_pos_capped = any(
-                                _pos_limit_flags.get(int(row['id']), False)
-                                for _, row in active_bots.iterrows()
-                                if str(row.get('pair', '')).startswith(_pair_root.split('/')[0])
-                            )
+                            mp_pair, mp_virt, mp_phys, mp_diff, mp_vqty, mp_pqty, mp_dqty, mp_price = row_mp
+                            qty_str = f" | Qty: system={mp_vqty:+.4f} exchange={mp_pqty:+.4f} diff={mp_dqty:.4f}"
+                            _pair_root = mp_pair.split(' ')[0]
+                            _pair_pos_capped = any(_pos_limit_flags.get(int(row['id']), False) for _, row in active_bots.iterrows() if str(row.get('pair', '')).startswith(_pair_root.split('/')[0]))
                             if _pair_pos_capped:
-                                # Truthful label — the exchange capped the position at this size
-                                st.info(f"   🚫 **{mp_pair}**: System ${mp_virt:,.2f} vs Exchange ${mp_phys:,.2f} (Diff: ${mp_diff:,.2f}){qty_str} — *POS LIMIT: Exchange capped. Holding position until TP.*")
+                                st.info(f"   🚫 **{mp_pair}**: System ${mp_virt:,.2f} vs Exchange ${mp_phys:,.2f} (Diff: ${mp_diff:,.2f}){qty_str} — *POS LIMIT*")
                             elif mp_diff > 0.01:
-                                # 🚨 CENT-LEVEL ALERT: Anything over $0.01 mismatch gets a Warning
                                 st.warning(f"   ⚠️ **{mp_pair}**: System ${mp_virt:,.2f} vs Exchange ${mp_phys:,.2f} (Diff: ${mp_diff:,.2f}){qty_str}")
-                            else:
-                                # USD difference is negligible (< $0.01) — show bullet for perfect sync
-                                st.write(f"   • **{mp_pair}**: System ${mp_virt:,.2f} vs Exchange ${mp_phys:,.2f} (Diff: ${mp_diff:,.2f}){qty_str} *(price basis only)*")
-
-                            # 🚀 ACTION BUTTONS 🔬
+                            
                             if abs(mp_dqty or 0) > 0.0001:
                                 _act_col1, _act_col2, _act_col3, _act_col4 = st.columns([1,1,1,1])
                                 with _act_col1:
-                                    if st.button("🕵️ Forensic Adopt", key=f"forensic_{mp_pair}", help="Deep 7-day scan for CQB_ order ID proofs"):
-                                        with st.spinner("Scanning 7-day history..."):
-                                            sr = StateReconciler()
-                                            res = sr.perform_forensic_reconstruction(_pair_root)
-                                            if sum(res.values()) > 0:
-                                                st.success(f"Forensic Success! Found {sum(res.values())} missing fills.")
-                                                time.sleep(1)
-                                                st.rerun()
-                                            else:
-                                                st.warning("No missing proof-based fills found.")
-
+                                    if st.button("🕵️ Forensic Adopt", key=f"forensic_{mp_pair}"):
+                                        from engine.reconciler import StateReconciler
+                                        sr = StateReconciler()
+                                        res = sr.perform_forensic_reconstruction(_pair_root)
+                                        if sum(res.values()) > 0: st.success("Forensic Success!"); time.sleep(1); st.rerun()
+                                        else: st.warning("No missing proof-based fills found.")
                                 with _act_col2:
                                     _side = 'LONG' if mp_dqty > 0 else 'SHORT'
-                                    if st.button("📝 Mark as Manual", key=f"manual_{mp_pair}", help=f"Whitelist {abs(mp_dqty):.4f} {_side} as personal trade"):
-                                        add_manual_whitelist(_pair_root, _side, abs(mp_dqty))
-                                        st.success(f"Whitelisted {abs(mp_dqty):.4f} {_side} for {_pair_root}")
-                                        time.sleep(1)
-                                        st.rerun()
-
+                                    if st.button("📝 Mark as Manual", key=f"manual_{mp_pair}"):
+                                        from ui.views.monitor import add_manual_whitelist
+                                        add_manual_whitelist(_pair_root, _side, abs(mp_dqty)); st.rerun()
                                 with _act_col3:
-                                    if st.button("💥 Market Close", key=f"mkt_close_{mp_pair}", help="FULL NEUTRALIZE: Flattens physical inventory AND wipes virtual ledger for this pair"):
-                                        try:
-                                            ex_mkt = get_exchange_instance('future')
-                                            
-                                            # 1. 🎯 FLATTEN PHYSICAL (Bring exchange to exactly 0)
-                                            if abs(mp_pqty) > 0.0001:
-                                                _flat_side = 'sell' if mp_pqty > 0 else 'buy'
-                                                ex_mkt.create_order(
-                                                    symbol=_pair_root, 
-                                                    type='market', 
-                                                    side=_flat_side, 
-                                                    amount=abs(mp_pqty), 
-                                                    params={'reduceOnly': True}
-                                                )
-                                                st.info(f"Physical Flatten sent: {_flat_side.upper()} {abs(mp_pqty):.4f} {_pair_root}")
+                                    if st.button("💥 Market Close", key=f"mkt_close_{mp_pair}"):
+                                        ex_mkt = get_exchange_instance('future')
+                                        if abs(mp_pqty) > 0.0001:
+                                            ex_mkt.create_order(_pair_root, 'market', 'sell' if mp_pqty > 0 else 'buy', abs(mp_pqty), params={'reduceOnly': True})
+                                        from engine.database import get_connection as _gconn_mkt
+                                        _conn_mkt = _gconn_mkt()
+                                        _involved_bots = [r[0] for r in _conn_mkt.execute("SELECT id FROM bots WHERE pair LIKE ?", (f"{_pair_root}%",)).fetchall()]
+                                        for _bid in _involved_bots:
+                                            _conn_mkt.execute("UPDATE bot_orders SET status='reset_cleared' WHERE bot_id=?", (_bid,))
+                                            _conn_mkt.execute("UPDATE trades SET total_invested=0, current_step=0 WHERE bot_id=?", (_bid,))
+                                        _conn_mkt.commit(); st.rerun()
 
-                                            # 2. 🧹 WIPE VIRTUAL (Force-SL all bots on this pair to 0)
-                                            from engine.database import get_connection as _gconn_mkt
-                                            _conn_mkt = _gconn_mkt()
-                                            _c_mkt = _conn_mkt.cursor()
-                                            _c_mkt.execute("SELECT id FROM bots WHERE pair LIKE ?", (f"{_pair_root}%",))
-                                            _involved_bots = [r[0] for r in _c_mkt.fetchall()]
-                                            
-                                            for _bid in _involved_bots:
-                                                try:
-                                                    ex_mkt.cancel_orders_by_bot_id(_bid, _pair_root)
-                                                except Exception as e_cancel:
-                                                    st.warning(f"Could not cancel limit orders for bot {_bid}: {e_cancel}")
-                                                    
-                                                # 3. 🧹 WIPE VIRTUAL (Force-SL all bots on this pair to 0)
-                                                # We must aggressively wipe the DB state so the "Entry Anchor" is freed.
-                                                # Marking all bot_orders as reset_cleared ensures they fall behind the mathematical Wipe Wall.
-                                                _c_mkt.execute("UPDATE bot_orders SET status='reset_cleared' WHERE bot_id=?", (_bid,))
-                                                _c_mkt.execute("""
-                                                    UPDATE trades SET 
-                                                        total_invested=0, avg_entry_price=0, current_step=0, 
-                                                        entry_confirmed=0, basket_start_time=0,
-                                                        open_qty=0, wipe_wall_ts=?
-                                                    WHERE bot_id=?
-                                                """, (int(time.time()), _bid))
-                                                _c_mkt.execute("UPDATE bots SET status='Scanning' WHERE id=?", (_bid,))
-
-                                            _conn_mkt.commit()
-                                            st.success(f"✅ Neutralized {_pair_root}: Physical closed, limits cancelled & {len(_involved_bots)} bots reset to Scanning.")
-                                            time.sleep(1)
-                                            st.rerun()
-                                        except Exception as _mkt_e:
-                                            st.error(f"Neutralize failed: {_mkt_e}")
-                                            
-                                with _act_col4:
-                                    st.caption("Deterministic Control")
-                    else:
-                        st.write(f"**Position State**: Perfect Quantity Match")
-                        
-                    if order_health_msg:
-                        st.write(f"**Order Health**: {order_health_msg}")
-
-                # --- ORPHAN PHYSICAL POSITIONS — Direct Market Close ────────
-                # These are exchange positions that the system has no bot record for.
-                # bot_id=0 in active_positions = unowned orphan.
-                # Shown here so they can be closed without needing Bot Manager Force SL
-                # (which only works when the bot is IN TRADE, not Scanning).
                 try:
-                    from engine.database import get_connection as _orphan_conn
-                    _oc = _orphan_conn()
-                    _orphan_rows = _oc.execute(
-                        "SELECT pair, side, size, entry_price FROM active_positions WHERE bot_id=0 ORDER BY pair, side"
-                    ).fetchall()
-                    _oc.close()
-                except Exception:
-                    _orphan_rows = []
-
+                    _orphan_rows = sqlite3.connect(db_path).execute("SELECT pair, side, size, entry_price FROM active_positions WHERE bot_id=0").fetchall()
+                except: _orphan_rows = []
                 if _orphan_rows:
-                    st.divider()
-                    st.markdown("### 🚨 Unowned Physical Positions (Orphans)")
-                    st.caption(
-                        "These positions exist on the exchange but have no owning bot in the system. "
-                        "They cannot be closed via Bot Manager (no bot = no Force SL). "
-                        "Use **Market Close** below to flatten each one directly."
-                    )
+                    st.divider(); st.markdown("### 🚨 Unowned Physical Positions (Orphans)")
                     for _or in _orphan_rows:
-                        _o_pair, _o_side, _o_size, _o_entry = _or[0], _or[1], float(_or[2] or 0), float(_or[3] or 0)
-                        _o_notional = _o_size * _o_entry
-                        _o_col1, _o_col2, _o_col3 = st.columns([3, 2, 1])
-                        with _o_col1:
-                            st.markdown(f"**{_o_pair}** `{_o_side}`  |  qty: `{_o_size:.4f}`  |  ~${_o_notional:,.2f}  |  entry: `{_o_entry:.4f}`")
-                        with _o_col2:
-                            st.caption("No owning bot — manual close required")
-                        with _o_col3:
-                            _close_key = f"orphan_close_{_o_pair}_{_o_side}"
-                            if st.button("🛑 Flatten Orphan (Market)", key=_close_key, type="primary"):
-                                try:
-                                    _ex_orp = get_exchange_instance('future')
-                                    _close_direction = 'sell' if _o_side.upper() == 'LONG' else 'buy'
-                                    # ONE-WAY MODE: account is ONE-WAY, NOT HEDGE MODE.
-                                    # NEVER send positionSide — that param is for hedge mode only and causes 400.
-                                    # side (sell/buy) + reduceOnly=True is the correct one-way close.
-                                    _ex_orp.create_order(
-                                        symbol=_o_pair,
-                                        type='market',
-                                        side=_close_direction,
-                                        amount=_o_size,
-                                        params={'reduceOnly': True}
-                                    )
-
-                                    st.success(f"✅ Market close sent: {_close_direction.upper()} {_o_size} {_o_pair}")
-                                    time.sleep(1)
+                        _o_pair, _o_side, _o_size, _o_entry = _or
+                        if st.button(f"🛑 Flatten {_o_pair} {_o_side} ({_o_size})"):
+                            try:
+                                get_exchange_instance('future').create_order(_o_pair, 'market', 'sell' if _o_side.upper() == 'LONG' else 'buy', _o_size, params={'reduceOnly': True})
+                                st.success(f"Position closed: {_o_pair}")
+                                time.sleep(1); st.rerun()
+                            except Exception as e_fl:
+                                if "reduceonly" in str(e_fl).lower():
+                                    st.error("ReduceOnly Rejected: Binance thinks you have no position. Force closing without ReduceOnly...")
+                                    get_exchange_instance('future').create_order(_o_pair, 'market', 'sell' if _o_side.upper() == 'LONG' else 'buy', _o_size)
                                     st.rerun()
-                                except Exception as _oe:
-                                    st.error(f"Close failed: {_oe}")
+                                else:
+                                    st.error(f"Flatten Error: {e_fl}")
 
-                # --- MANUAL LINK RECOVERY TOOL (Always available if mismatch exists) ---
                 if has_mismatch:
-                    st.divider()
-                    st.markdown("### 🧙‍♂️ Manual Link Recovery Tool")
-                    st.caption("Accurately restore bot links for manual trades or disconnected assets. These discrepancies are REAL measurements comparing the Database Virtual Contracts vs Binance's Physical Contracts.")
-                    
-                    # 1. Detect Rogue Positions from cached DB results (DO NOT call reconciler from UI)
-                    # The reconciler runs in the background engine. Calling it here causes:
-                    #  - Concurrent DB writes with the engine (phantom adoption generation)
-                    #  - Binance API rate-limit spikes (every page refresh = full exchange scan)
-                    #  - 'Could not calculate order health' exceptions on DB lock
-                    # Instead, read the last cached reconciliation results from the log.
-
+                    st.divider(); st.markdown("### 🧙‍♂️ Manual Link Recovery Tool")
                     try:
-                        from engine.database import get_connection as _gconn2
-                        _rc = _gconn2()
-                        _recon_rows = _rc.execute("""
-                            SELECT pair, action, details, created_at 
-                            FROM reconciliation_log 
-                            WHERE created_at > ? AND action IN ('UNAUTHORIZED_LOSS', 'MANUAL_INTERVENTION')
-                            ORDER BY created_at DESC LIMIT 10
-                        """, (int(__import__('time').time()) - 3600,)).fetchall()
+                        _rc = sqlite3.connect(db_path)
+                        # Check if table exists first
+                        _check = _rc.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='reconciliation_log'").fetchone()
+                        if not _check:
+                            _rc.execute("CREATE TABLE reconciliation_log (id INTEGER PRIMARY KEY AUTOINCREMENT, bot_id INTEGER, pair TEXT, action TEXT, details TEXT, created_at INTEGER)")
+                            _rc.commit()
+                        
+                        _recon_rows = _rc.execute("SELECT pair, details FROM reconciliation_log WHERE action IN ('UNAUTHORIZED_LOSS', 'MANUAL_INTERVENTION') ORDER BY created_at DESC LIMIT 10").fetchall()
                         _rc.close()
-                    except Exception:
+                    except Exception as e_db:
+                        st.warning(f"Database sync in progress: {e_db}")
                         _recon_rows = []
                     
-                    # Build rogue_results from DB cache only
-                    rogue_results = []
-                    for _rrow in _recon_rows:
-                        class _R:
-                            def __init__(self, pair, details):
-                                self.pair = pair
-                                self.details = details
-                                self.action_taken = ReconciliationAction.MANUAL_INTERVENTION_REQUIRED
-                                self.requires_manual_intervention = True
-                        rogue_results.append(_R(_rrow[0], _rrow[2]))
-                    
-                    # Fetch physical positions for the manual close tool (read-only, just positions — not reconcile)
-                    try:
-                        _ex_rogue = get_exchange_instance('future')
-                        _raw_positions = _ex_rogue.fetch_positions()
-                        all_positions = {}
-                        for p in (_raw_positions or []):
-                            if p.get('contracts', 0):
-                                _sym = p.get('symbol','')
-                                if _sym not in all_positions:
-                                    all_positions[_sym] = []
-                                class _P:
-                                    pass
-                                _pp = _P()
-                                _pp.symbol = _sym
-                                _pp.side = 'LONG' if float(p.get('contracts',0)) > 0 else 'SHORT'
-                                _pp.size = abs(float(p.get('contracts',0)))
-                                _pp.entry_price = float(p.get('entryPrice', 0) or 0)
-                                all_positions[_sym].append(_pp)
-                    except Exception:
-                        all_positions = {}
-
-                    # Pre-calculate active bots available for adoption
-                    # Derive candidates from df_pos which has 12+ columns
-                    candidates_df = df_pos[df_pos['status'].str.contains('SCANNING|IN TRADE', case=False, na=False)]
-                    scanning_bot_options = {f"{row['name']} (#{row['id']}) [{row['pair']}] - {row['status']}": row['id'] for _, row in candidates_df.iterrows()}
-
-                    if rogue_results:
-                        for idx, rogue in enumerate(rogue_results):
-                            with st.expander(f"🔴 Rogue Position: {rogue.pair} (Issue #{idx+1})", expanded=True):
-                                st.write(f"**Details:** {rogue.details}")
-                                st.info("Resolution Options: Adopt mathematically if this is a known bot gap, or market close to flatten the stray physical quantity.")
-                                
-                                res_col1, res_col2 = st.columns(2)
-                                
-                                with res_col1:
-                                    if scanning_bot_options:
-                                        st.markdown("**(Bypass) Force Direct Math Adoption:**")
-                                        selected_target_force = st.selectbox("Link to Bot without Proof:", list(scanning_bot_options.keys()), key=f"adopt_force_sel_{rogue.pair}_{idx}")
-                                        if st.button("🔗 Adopt (Force Synchronize)", key=f"adopt_force_btn_{rogue.pair}_{idx}", type="primary"):
-                                            pair_norm = _norm(rogue.pair)
-                                            pos_data = all_positions.get(pair_norm, [])
-                                            if pos_data:
-                                                total_size = sum(p.size for p in pos_data)
-                                                avg_entry = sum(p.size * p.entry_price for p in pos_data) / total_size if total_size > 0 else 0
-                                                side = pos_data[0].side
-                                                bot_id_ad = scanning_bot_options[selected_target_force]
-                                                
-                                                success, msg = import_position_from_exchange(bot_id_ad, rogue.pair, total_size, avg_entry, side)
-                                                if success:
-                                                    st.success(f"✅ Bot #{bot_id_ad} has aggressively adopted the mathematical gap!")
-                                                    time.sleep(1)
-                                                    st.rerun()
-                                                else:
-                                                    st.error(f"❌ Force Adoption Failed: {msg}")
-                                    else:
-                                        st.warning("No 'Scanning' bots available to adopt this position.")
-                                
-                                with res_col2:
-                                    st.markdown("**Terminate Physical Footprint:**")
-                                    if st.button("🛑 Market Close", key=f"close_btn_{rogue.pair}_{idx}"):
-                                        try:
-                                            ex = get_exchange_instance('future')
-                                            pair_norm = _norm(rogue.pair)
-                                            pos_data = all_positions.get(pair_norm, [])
-                                            if pos_data:
-                                                for p in pos_data:
-                                                    close_side = 'sell' if p.side.upper() == 'LONG' else 'buy'
-                                                    ex.create_order(p.symbol, 'market', close_side, p.size)
-                                                st.success(f"✅ Market close orders sent!")
-                                                if f"forensic_trades_{rogue.pair}_{idx}" in st.session_state: del st.session_state[f"forensic_trades_{rogue.pair}_{idx}"]
-                                                time.sleep(1)
-                                                st.rerun()
-                                        except Exception as e:
-                                            st.error(f"Failed to close: {e}")
-
-                                st.divider()
-                                st.caption("Advanced: Forensic Search (Link Specific Fills)")
-                                # Forensic Search
-                                if st.button(f"🔍 Scan Recent Fills ({rogue.pair})", key=f"forensic_btn_{rogue.pair}_{idx}"):
-                                     ex = get_exchange_instance('future')
-                                     trades = ex.fetch_my_trades(rogue.pair, limit=10)
-                                     if trades:
-                                         st.session_state[f"forensic_trades_{rogue.pair}_{idx}"] = trades
-                                     else:
-                                         st.warning("No recent fills found on exchange for this pair.")
-                                
-                                if f"forensic_trades_{rogue.pair}_{idx}" in st.session_state:
-                                     trades = st.session_state[f"forensic_trades_{rogue.pair}_{idx}"]
-                                     # Let user select a trade
-                                     trade_options = {
-                                         f"{t['side'].upper()} {t['amount']} @ {t['price']} (ID:{t['orderId']})": t 
-                                         for t in trades
-                                     }
-                                     selected_trade_label = st.selectbox("Select Evidence Fill:", list(trade_options.keys()), key=f"trade_sel_{rogue.pair}_{idx}")
-                                     selected_trade = trade_options[selected_trade_label]
-                                     st.info("Forensic Fill isolated. Contact developer to implement specific signature re-linking.")
-                    
-                    # 2. Stray Bot Order Recovery (DNA Link)
-                    # Orders with CQB_ prefix that are not matched to currently active bot IDs
-                    active_bot_ids = [str(b[0]) for (b) in active_bots_list]
-                    stray_orders = []
-                    unknown_orders = []
-                    
-                    for o in market_orders:
-                        cid = o.get('clientOrderId', '')
-                        if cid.startswith('CQB_'):
-                            # Check if it belongs to an active bot
-                            parts = cid.split('_')
-                            if len(parts) > 1 and parts[1] not in active_bot_ids:
-                                stray_orders.append(o)
-                        else:
-                            unknown_orders.append(o)
+                    active_bot_ids = [str(b[0]) for (b) in df_pos[['id']].values]
+                    stray_orders = [o for o in market_orders if str(o.get('clientOrderId','')).startswith('CQB_') and o.get('clientOrderId','').split('_')[1] not in active_bot_ids]
 
                     if stray_orders:
-                        with st.expander(f"🩹 {len(stray_orders)} Stray Bot Orders Detected", expanded=True):
-                            st.warning("These orders belong to the system (DNA match) but use unknown Bot IDs (e.g. from a previous run).")
-                            st.dataframe(pd.DataFrame(stray_orders)[['symbol', 'side', 'price', 'amount', 'clientOrderId']], width="stretch")
-                            
-                            # Adoption logic for stray orders
-                            st.info("You can adopt these orders to a new bot to resume management.")
-                            col_s1, col_s2 = st.columns(2)
-                            with col_s1:
-                                if scanning_bot_options:
-                                    selected_target = st.selectbox("Link Strays to Bot:", list(scanning_bot_options.keys()), key="stray_adopt_sel")
-                                    if st.button("🔗 Adopt Stray Orders", type="primary"):
-                                        # Logic to adopt - basically update the DB or just rely on the bot taking over the symbol
-                                        # For orders, we might need to update the client_order_id to the new bot's ID?
-                                        # Actually, if we link the POSITION, the bot will manage the orders if we fix its internal ID.
-                                        # For now, let's keep it simple: link them or cancel them.
-                                        st.info("Adoption would re-link these signatures. (Feature in progress or simply use 'Market Close' for safety).")
-                            with col_s2:
-                                if st.button("🗑️ Cancel All Stray Orders"):
-                                    try:
-                                        ex = get_exchange_instance('future')
-                                        for o in stray_orders:
-                                            ex.cancel_order(o['id'], o['symbol'])
-                                        st.success(f"✅ {len(stray_orders)} stray orders cancelled!")
-                                        time.sleep(1)
-                                        st.rerun()
-                                    except Exception as e:
-                                        st.error(f"Failed to cancel: {e}")
-
-                    if unknown_orders:
-                        with st.expander(f"⚠️ {len(unknown_orders)} Unknown Exchange Orders", expanded=False):
-                            st.caption("These orders have no system signature (Manual trades).")
-                            st.dataframe(pd.DataFrame(unknown_orders)[['symbol', 'side', 'price', 'amount']], width="stretch")
-                    
-                    if not rogue_results and not stray_orders and not unknown_orders:
-                        st.info("No rogue positions or stray orders detected. The system is in sync with the exchange DNA.")
-
-        except Exception as e:
-            st.warning(f"Could not calculate order health: {e}")
-
+                        st.info(f"Found {len(stray_orders)} stray orders.")
+        except Exception as e_global:
+            st.error(f"Global Monitor Error: {e_global}")
 
         st.divider()
 
@@ -1269,7 +997,7 @@ def render_monitor_view():
 
                         hedge_status = ""
                         if is_in_trade and cfg.get('UseStepHedge', False) and int(row.get('current_step', 0)) >= int(cfg.get('HedgeStartStep', 99)):
-                            hedge_status = " 🛡️ [HEDGED]"
+                            hedge_status = f" 🛡️ [HEDGED @ Step {cfg.get('HedgeStartStep')}]"
 
                         if is_in_trade:
                             res['Trigger'] = f"In Trade{ee_status}{hedge_status} ({desc_trigger})"
@@ -1292,20 +1020,31 @@ def render_monitor_view():
                                 price_val = float(o.get('price', 0.0) or 0.0)
                                 if 'TP' in cid:
                                     detailed.append('TP')
-                                    res['TP_Price'] = price_val
+                                    if 'HEDGETP' in cid:
+                                        res['Hedge_TP_Price'] = price_val
+                                        res['Hedge_TP_Qty'] = float(o.get('origQty', o.get('amount', 0.0)) or 0.0)
+                                        res['Hedge_TP_Side'] = o.get('side', '').upper()
+                                    else:
+                                        res['TP_Price'] = price_val
                                 elif 'GRID' in cid:
                                     detailed.append('GRID')
                                     res['Grid_Price'] = price_val
                                     res['Grid_Amount'] = float(o.get('origQty', o.get('amount', 0.0)) or 0.0)
                                 elif 'HEDGE' in cid:
-                                    detailed.append('HEDGE')
+                                    q = float(o.get('origQty', o.get('amount', 0.0)) or 0.0)
+                                    side = o.get('side', '').upper()
+                                    detailed.append(f"HEDGE: {side} {q} @ ${price_val:,.2f}")
                                     is_hedged = True
                                 elif 'ENTRY' in cid: detailed.append('ENTRY')
                                 else: detailed.append('LIMIT')
                             count_str = f"{len(my_orders)} " + (f"({', '.join(detailed)})" if detailed else "")
                             res['Orders'] = count_str
                             if is_hedged:
-                                res['Trigger'] = f"🛡️ HEDGED | {res['Trigger']}"
+                                hedge_info = [d for d in detailed if 'HEDGE' in d]
+                                if hedge_info:
+                                    res['Trigger'] = f"🛡️ HEDGED ({', '.join(hedge_info)}) | {res['Trigger']}"
+                                else:
+                                    res['Trigger'] = f"🛡️ HEDGED | {res['Trigger']}"
                         else:
                             res['Orders'] = "0"
 
@@ -1325,7 +1064,15 @@ def render_monitor_view():
                     if x_val < 10.0: return f"${x_val:.3f}"
                     return f"${x_val:,.2f}"
 
-                df_pos['Active TP'] = info_df['TP_Price'].apply(format_tp_price)
+                def derive_tp_display(row_info):
+                    h_price = row_info.get('Hedge_TP_Price', 0.0)
+                    if isinstance(h_price, (int, float)) and h_price > 0:
+                        side = row_info.get('Hedge_TP_Side', '')
+                        qty = row_info.get('Hedge_TP_Qty', 0.0)
+                        return f"🛡️ {side} {qty} @ {format_tp_price(h_price)}"
+                    return format_tp_price(row_info.get('TP_Price'))
+
+                df_pos['Active TP'] = info_df.apply(derive_tp_display, axis=1)
                 df_pos['Next Grid'] = info_df.apply(
                     lambda row: f"{row['Grid_Amount']} @ {format_tp_price(row['Grid_Price'])}" if (float(row.get('Grid_Price') or 0.0)) > 0 else "-",
                     axis=1

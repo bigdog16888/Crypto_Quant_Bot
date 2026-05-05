@@ -104,7 +104,13 @@ def flag_unmatched_positions(runner, snapshot: Dict[str, Any]):
 
         # Calculate Net Positions (LONG is positive, SHORT is negative)
         p_net = p_data['long'] - p_data['short']
-        v_net = v_data['long'] - v_data['short']
+        
+        # 🛡️ HEDGE-AWARE PARITY (v2.5.0):
+        # We must include the net filled hedge position in the system's virtual footprint.
+        # Otherwise, One-Way mode netting on the exchange will look like a "Ghost Position"
+        # mismatch if a bot side is perfectly hedged.
+        from engine.database import get_pair_virtual_net
+        v_net = get_pair_virtual_net(pair)
         
         diff_qty = abs(p_net - v_net)
         

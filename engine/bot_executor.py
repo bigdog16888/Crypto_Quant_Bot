@@ -243,13 +243,24 @@ class BotExecutor:
                 neighbors = _cur.fetchall()
                 opposite_virtual_qty = sum(q for d, q in neighbors if d.upper() != bot_dir)
 
+                # 🚀 HEDGE-AWARE UBE (v3.0.1)
+                # In One-Way mode, the physical position is NETTED.
+                # If a SHORT bot has a LONG hedge, the physical position will be higher (less negative).
+                # Example: Short 1.1 BTC + Hedge 1.5 BTC Long = Net 0.4 BTC Long.
+                # The "capacity" for the bot's SHORT 1.1 BTC is Net - Hedge = 0.4 - 1.5 = -1.1.
+                from engine.database import get_bot_hedge_qty
+                my_hedge_qty = get_bot_hedge_qty(bot_id)
+                
                 if phys_matching > 0:
-                    max_possible_qty = phys_matching + opposite_virtual_qty
+                    max_possible_qty = phys_matching + opposite_virtual_qty + my_hedge_qty
                 elif bot_virtual_open_qty > 0 and phys_matching == 0 and phys_opposite == 0:
                     max_possible_qty = bot_virtual_open_qty + opposite_virtual_qty
                     logger.debug(f"🔍 {name}: UBE: No physical row for {bot_dir} {norm_pair}. Using accumulator anchor ({bot_virtual_open_qty:.6f}).")
                 else:
-                    max_possible_qty = max(0.0, opposite_virtual_qty - phys_opposite)
+                    # In One-Way mode, if we are SHORT but physical is LONG (phys_opposite),
+                    # our "capacity" for SHORT is (Phys_Opposite_Long + My_Hedge_Long).
+                    # If My_Hedge_Long is 1.5 and Phys_Opposite_Long is 0.4, it means we have 1.1 SHORT underlying.
+                    max_possible_qty = max(0.0, opposite_virtual_qty + my_hedge_qty - phys_opposite)
 
                 # Only cap if virtual is genuinely more than 20% above physical capacity.
                 # This filters out snapshot lag (e.g. phys=0.015 vs virtual=0.016 due to stale row).
@@ -308,9 +319,19 @@ class BotExecutor:
             logger.warning(f"DUST {name}: Virtual TP notional ${notional:.2f} < min ${_min_notional:.2f} (qty={tp_qty}).")
             
             if _other_bots_count == 0:
-                # Sole bot fallback: Convert to a reduceOnly order which mathematically bypasses the min-notional gate.
-                ccxt_params = {'timeInForce': 'GTC', 'reduceOnly': True}
-                logger.info(f"✨ {name}: Sub-$5 limit detected. Sole-bot status confirmed. Switching to natively bypassed reduceOnly TP.")
+                # 🚀 PAIR-PARITY CHECK [v2.5.0]
+                # In One-Way mode, if the physical net is already 0 (due to a hedge or wipe),
+                # a reduceOnly TP will fail. We must verify physical existence before using the bypass.
+                # Use local vars from UBE check above.
+                phys_net_signed = phys_matching - phys_opposite
+                
+                if abs(phys_net_signed) >= (tp_qty * 0.99):
+                    # Sole bot fallback: Convert to a reduceOnly order which mathematically bypasses the min-notional gate.
+                    ccxt_params = {'timeInForce': 'GTC', 'reduceOnly': True}
+                    logger.info(f"✨ {name}: Sub-$5 limit detected. Sole-bot + Physical match. Using bypassed reduceOnly TP.")
+                else:
+                    logger.warning(f"🛑 {name}: Sub-$5 limit detected but physical net is {phys_net_signed:.4f}. Cannot use reduceOnly. Yielding to DUST_CHASER.")
+                    return 'DUST_CHASER', tp_qty
             else:
                 # Multi-bot setups cannot use reduceOnly, meaning Binance will strictly reject the sub-$5 limit order.
                 # Since we forbid synthetic price-nudging (Strict Proof-Only), this dust cannot be closed profitably.
@@ -1461,6 +1482,26 @@ class BotExecutor:
                             except Exception as e_fetch:
                                 logger.warning(f"⚠️ {name}: Could not fetch open orders before reset: {e_fetch}")
                             
+                            # 🛡️ HEDGE-AWARE EXIT (v2.5.9):
+                            # If an active hedge exists, we do NOT reset yet.
+                            # Instead, we move to HEDGE_EXIT_PENDING and wait for the BE TP to fill.
+                            try:
+                                from engine.database import get_connection, update_bot_status
+                                with get_connection() as conn:
+                                    cur = conn.cursor()
+                                    cur.execute("SELECT SUM(filled_amount) FROM bot_orders WHERE bot_id=? AND order_type='hedge' AND status IN ('filled', 'closed', 'hedge_exited')", (bot_id,))
+                                    h_filled = cur.fetchone()[0] or 0.0
+                                    cur.execute("SELECT SUM(filled_amount) FROM bot_orders WHERE bot_id=? AND order_type='hedge_tp' AND status IN ('filled', 'closed')", (bot_id,))
+                                    hx_filled = cur.fetchone()[0] or 0.0
+                                    
+                                    if (h_filled - hx_filled) > 1e-8:
+                                        logger.info(f"🛡️ {name}: Main TP filled. ACTIVE HEDGE DETECTED ({h_filled-hx_filled:.4f}). Transitioning to HEDGE_EXIT_PENDING.")
+                                        update_bot_status(bot_id, cycle_phase='HEDGE_EXIT_PENDING')
+                                        return # Cycle NOT finished yet
+                            except Exception as e_h:
+                                logger.error(f"⚠️ {name}: Error checking hedge status during TP: {e_h}")
+
+                            # Standard reset for bots without hedges
                             reset_bot_after_tp(bot_id, actual_exit, direction=direction)
                         else:
                             logger.debug(f"⏭️ {name}: TP order {tp_order_id} is filled, but bot state is already zeroed (handled by WS). Skipping redundant reset.")
@@ -1494,8 +1535,75 @@ class BotExecutor:
             # Do NOT force reset here, because the physical position is still open!
             # maintain_orders will place the TP order automatically on the next cycle.
 
+    def _market_close_all_hedges(self, bot_id: int, name: str, pair: str, exchange: ExchangeInterface) -> None:
+        """
+        Hard-closes any active hedge positions on the exchange when a bot hits TP or exits.
+        This prevents 'unowned' inventory from lingering after a bot cycle reset.
+        """
+        try:
+            from engine.database import get_connection, update_order_status, save_bot_order, get_bot_status
+            conn = get_connection()
+            cur = conn.cursor()
+            
+            # 1. Sum up all FILLED hedges that haven't been cleared yet
+            cur.execute("""
+                SELECT SUM(filled_amount), position_side 
+                FROM bot_orders 
+                WHERE bot_id = ? AND order_type = 'hedge' AND status = 'filled'
+                GROUP BY position_side
+            """, (bot_id,))
+            rows = cur.fetchall()
+            
+            if not rows:
+                return
+
+            bot_status = get_bot_status(bot_id)
+            cycle_id = bot_status.get('cycle_id', 0)
+
+            for filled_qty, hedge_side in rows:
+                if not filled_qty or filled_qty <= 0:
+                    continue
+                
+                # 2. Cancel any pending HEDGETP orders first
+                try:
+                    all_open = exchange.fetch_open_orders(pair)
+                    for o in all_open:
+                        cid = str(o.get('clientOrderId', ''))
+                        if cid.startswith(f"CQB_{bot_id}_HEDGETP"):
+                            logger.info(f"🧹 {name}: Cancelling HEDGETP {o['id']} before market close.")
+                            exchange.cancel_order(o['id'], pair)
+                            update_order_status(o['id'], 'cancelled', bot_id=bot_id)
+                except Exception as e_c:
+                    logger.warning(f"⚠️ {name}: Failed to purge HEDGETP before close: {e_c}")
+
+                # 3. Market close the hedge position
+                exit_side = 'buy' if str(hedge_side).lower() == 'sell' else 'sell'
+                logger.warning(f"🛡️ {name}: MARKET CLOSING HEDGE {hedge_side.upper()} {filled_qty} {pair} (Exit Side: {exit_side.upper()})")
+                
+                try:
+                    # Use a reduceOnly market order if possible
+                    params = {'reduceOnly': True}
+                    order = exchange.create_order(pair, 'market', exit_side, filled_qty, params=params)
+                    
+                    # Record the exit in the ledger to balance the net
+                    save_bot_order(
+                        bot_id=bot_id,
+                        step=99, # Special step for exit
+                        order_type='hedge_tp',
+                        exchange_order_id=order.get('id', f"MKT_H_EXIT_{int(time.time())}"),
+                        price=float(order.get('average', 0) or order.get('price', 0)),
+                        amount=filled_qty,
+                        status='filled',
+                        client_order_id=f"CQB_{bot_id}_H_EXIT_{int(time.time())}",
+                        notes=f"Mandatory Market Hedge Close on TP/Exit"
+                    )
+                except Exception as e_close:
+                    logger.error(f"❌ {name}: FAILED TO MARKET CLOSE HEDGE: {e_close}")
+        except Exception as e_global:
+            logger.error(f"❌ {name}: Critical error in _market_close_all_hedges: {e_global}")
+
     def _manage_hedge_exit(self, bot_id: int, name: str, pair: str, direction: str, 
-                           bot_open_orders: List[dict], exchange: ExchangeInterface) -> None:
+                           bot_open_orders: List[dict], exchange: ExchangeInterface, bot_status: Dict[str, Any]) -> None:
         """
         Manages the exit of a filled hedge position at BE price.
         """
@@ -1508,25 +1616,29 @@ class BotExecutor:
             
             # C. Retirement Logic: If the last HEDGETP filled, retire the hedge orders BEFORE generating new ones
             cur.execute(
-                "SELECT status FROM bot_orders WHERE bot_id=? AND order_type='hedge_tp' ORDER BY id DESC LIMIT 1",
-                (bot_id,)
+                "SELECT status FROM bot_orders WHERE bot_id=? AND order_type='hedge_tp' AND (cycle_id=? OR cycle_id IS NULL) ORDER BY id DESC LIMIT 1",
+                (bot_id, bot_status.get('cycle_id', 0))
             )
             last_tp = cur.fetchone()
             if last_tp and last_tp[0] in ('filled', 'closed'):
-                logger.info(f"🛡️ {name}: Hedge TP confirmed filled. Retiring hedge positions.")
+                logger.info(f"🛡️ {name}: Hedge TP confirmed filled. Cycle Complete. Resetting bot.")
                 cur.execute(
                     "UPDATE bot_orders SET status='hedge_exited', updated_at=? "\
                     "WHERE bot_id=? AND order_type='hedge' AND status='filled'",
                     (int(time.time()), bot_id)
                 )
                 conn.commit()
+                
+                # 🚀 FINAL RESET: Now that BOTH main TP and Hedge TP are filled, the cycle is DONE.
+                from engine.database import reset_bot_after_tp
+                reset_bot_after_tp(bot_id, 0.0, direction=direction, action_label='HEDGE_COMPLETE', notes="Hedge BE Exit Complete")
                 pass # conn.close() disabled for singleton safety
                 return
 
             cur.execute(
-                "SELECT SUM(amount * price) / SUM(amount), SUM(amount), position_side FROM bot_orders "
-                "WHERE bot_id=? AND order_type='hedge' AND status='filled' GROUP BY position_side",
-                (bot_id,)
+                "SELECT SUM(filled_amount * price) / SUM(filled_amount), SUM(filled_amount), position_side FROM bot_orders "
+                "WHERE bot_id=? AND order_type='hedge' AND status IN ('filled', 'closed', 'hedge_exited') AND (cycle_id=? OR cycle_id IS NULL) GROUP BY position_side",
+                (bot_id, bot_status.get('cycle_id', 0))
             )
             res = cur.fetchone()
             pass # conn.close() disabled for singleton safety
@@ -1561,7 +1673,11 @@ class BotExecutor:
             if not existing_h_tp:
                 logger.warning(f"🛡️ {name}: Placing Hedge BE Exit (Limit Post-Only) {exit_side.upper()} {hedge_qty} @ {be_price:.4f}")
                 
-                cycle_id = bot_status.get('cycle_id', 0)
+                # Fetch cycle_id if missing (singleton executor might not have it in the arg list)
+                cur.execute("SELECT cycle_id FROM trades WHERE bot_id=?", (bot_id,))
+                row = cur.fetchone()
+                cycle_id = row[0] if row else 0
+                
                 cid = self._generate_deterministic_id(bot_id, 'HEDGETP', cycle_id, 0)
                 params = {'timeInForce': 'GTX', 'postOnly': True, 'newClientOrderId': cid}
                 
@@ -1727,12 +1843,47 @@ class BotExecutor:
         existing_entry_orders = [o for o in bot_open_orders if '_ENTRY_' in o.get('clientOrderId', '')]
 
         # CASE 1: CARRY_PENDING GUARD -> SUSPEND MAINTENANCE
-        # A bot in CARRY_PENDING state has TP'd but left a remainder dust position.
-        # It is waiting for the background Reconciler to adopt the remainder into the ledger.
-        # Do NOT treat it as "SCANNING" (which would purge orders) and do NOT place TP/Grid.
         if bot_status.get('cycle_phase') == 'CARRY_PENDING':
              logger.info(f"⏳ [CARRY-PENDING] {name}: Ledger awaiting background carry adoption. Suspending maintenance.")
              return None
+
+        # 🚀 CASE 1.5: HEDGE / HEDGE_EXIT_PENDING (v3.0.1)
+        # Main TP has filled, but we are waiting for the Hedge BE TP to fill,
+        # OR the bot is currently in HEDGED mode and needs its BE TP placed.
+        if bot_status.get('cycle_phase') in ('HEDGED', 'HEDGE_EXIT_PENDING'):
+            logger.info(f"🛡️ {name}: {bot_status.get('cycle_phase')} - Managing hedge breakeven exit.")
+            self._manage_hedge_exit(bot_id, name, pair, direction, bot_open_orders, exchange, bot_status)
+            
+            # If we are strictly in HEDGE_EXIT_PENDING, we block further grid/tp placement.
+            # If we are in HEDGED, we allow grid/tp placement to continue (Martingale can still work).
+            if bot_status.get('cycle_phase') == 'HEDGE_EXIT_PENDING':
+                # Check if it's finished
+                try:
+                    from engine.database import get_connection
+                    conn = get_connection()
+                    cur = conn.cursor()
+                    # Sum of all confirmed ACTIVE hedge fills
+                    cur.execute("""
+                        SELECT 
+                            SUM(CASE WHEN order_type LIKE 'hedge%' AND order_type NOT LIKE '%tp%' THEN amount ELSE 0 END),
+                            SUM(CASE WHEN order_type LIKE 'hedge%tp%' OR order_type LIKE 'hedgetp%' THEN amount ELSE 0 END)
+                        FROM bot_orders 
+                        WHERE bot_id=? 
+                          AND status NOT IN ('auto_closed', 'reset_cleared', 'canceled', 'rejected')
+                    """, (bot_id,))
+                    h_row = cur.fetchone()
+                    h_filled = float(h_row[0] or 0.0)
+                    hx_filled = float(h_row[1] or 0.0)
+                    
+                    if (h_filled - hx_filled) <= 1e-8:
+                        logger.warning(f"✅ {name}: Hedge TP confirmed filled. Completing cycle reset.")
+                        from engine.database import reset_bot_after_tp
+                        # Use last known price or current price
+                        reset_bot_after_tp(bot_id, current_price, direction=direction, action_label='HEDGE_TP_COMPLETE', notes="Full cycle complete (Main TP + Hedge BE TP)")
+                    return None
+                except Exception as e_check:
+                    logger.error(f"⚠️ {name}: Error checking hedge completion: {e_check}")
+                    return None
 
         # CASE 2: IN TRADE -> NO ENTRY ORDERS ALLOWED
         if bot_status['total_invested'] > 0 and existing_entry_orders:
@@ -1802,20 +1953,12 @@ class BotExecutor:
                         update_order_status(ho['id'], 'cancelled', bot_id=bot_id)
                     except: pass
             
-            # 🚀 NEW: Call centralized hedge exit manager
+            # 🚀 NEW: Call centralized hedge exit manager (redundancy for residue)
             self._manage_hedge_exit(bot_id, name, pair, direction, bot_open_orders, exchange)
 
-            # 🛡️ STEP-0 EARLY RETURN (Fix 3 — Infinite Cancellation Loop Prevention)
-            # The bot is SCANNING: no position is open, total_invested ≤ 10, step == 0.
-            # All dangling ghost orders above have been purged. We MUST return NOW.
-            # Without this return, the function falls through to TP/Grid placement code
-            # and immediately creates new orders, which the next cycle will detect and purge —
-            # an infinite cancel-and-recreate loop that floods Binance with cancellations.
-            logger.debug(
-                f"✅ {name}: Step-0 / scanning state — all ghost orders purged. "
-                f"Returning early (no TP/Grid placement for scanning bots)."
-            )
-            return None
+            # 🛡️ FIX: DO NOT RETURN NONE HERE.
+            # If the bot was promoted, we want to CONTINUE and place its TP/Grid orders.
+            # Only truly empty bots (invested <= 0.01) returned early above.
 
         # 🚀 STEP-SYNC FIX (Deterministic ID Parsing)
         # ID Format: CQB_{bot_id}_{prefix}_{cycle_id}_{step}
@@ -1824,20 +1967,21 @@ class BotExecutor:
         expected_tp_step = current_step
         expected_grid_step = current_step + 1
 
-        def get_step_from_cid(cid: str, prefix: str) -> int:
-            """Extracts the step integer from a CQB clientOrderId. Returns -1 if invalid."""
+        def get_cycle_step_from_cid(cid: str, prefix: str) -> Tuple[int, int]:
+            """Extracts (cycle_id, step) from a CQB clientOrderId. Returns (-1, -1) if invalid."""
             try:
                 # CQB_100_GRID_0_3 -> split by _GRID_ -> "0_3"
                 parts = cid.split(f"_{prefix}_")
                 if len(parts) > 1:
                     # The remainder is "{cycle_id}_{step}" maybe with "_R" retry suffix
                     remainder = parts[1].split('_')
-                    # remainder[0] is cycle_id, remainder[1] is step
                     if len(remainder) >= 2:
-                        # strip any alpha suffixes like R or F before int conversion, though they append with _, so split drops it
-                        return int(remainder[1].replace('R','').replace('F',''))
+                        # strip any alpha suffixes like R or F
+                        cycle_id = int(remainder[0])
+                        step_num = int(remainder[1].replace('R','').replace('F',''))
+                        return cycle_id, step_num
             except: pass
-            return -1
+            return -1, -1
 
         stored_tp_id = str(bot_status.get('tp_order_id', '') or '')
         
@@ -1845,32 +1989,32 @@ class BotExecutor:
         valid_grid_orders = []
         stale_orders = []
 
+        current_cycle = int(bot_status.get('cycle_id', 0))
         for o in tp_orders:
             cid = o.get('clientOrderId', '')
-            step_num = get_step_from_cid(cid, 'TP')
-            if step_num == expected_tp_step or (stored_tp_id and o.get('id', '') == stored_tp_id):
+            cycle_num, step_num = get_cycle_step_from_cid(cid, 'TP')
+            # Order is valid ONLY if it matches the current cycle AND (matches expected step OR matches stored TP ID)
+            if cycle_num == current_cycle and (step_num == expected_tp_step or (stored_tp_id and o.get('id', '') == stored_tp_id)):
                 valid_tp_orders.append(o)
-            elif step_num != -1 and step_num < expected_tp_step:
-                stale_orders.append(o)
-            elif step_num == -1: # Fallback for malformed or manual orders
+            else:
                 stale_orders.append(o)
 
         for o in grid_orders:
             cid = o.get('clientOrderId', '')
-            step_num = get_step_from_cid(cid, 'GRID')
-            if step_num == expected_grid_step:
+            cycle_num, step_num = get_cycle_step_from_cid(cid, 'GRID')
+            if cycle_num == current_cycle and step_num == expected_grid_step:
                 valid_grid_orders.append(o)
-            elif step_num != -1 and step_num < expected_grid_step:
-                stale_orders.append(o)
-            elif step_num == -1:
+            else:
                 stale_orders.append(o)
                 
         for o in dust_orders:
             cid = o.get('clientOrderId', '')
-            step_num = get_step_from_cid(cid, 'DUST')
-            if step_num != -1 and step_num < current_step:
+            cycle_num, step_num = get_cycle_step_from_cid(cid, 'DUST')
+            if cycle_num == current_cycle and step_num < current_step:
+                # Keep it if it's current cycle but old step? 
+                # Actually DUST chaser is usually for the whole bot, so step_num < current_step is a good heuristic.
                 stale_orders.append(o)
-            elif step_num == -1:
+            elif cycle_num != current_cycle:
                 stale_orders.append(o)
                 
         if stale_orders:
@@ -1897,7 +2041,8 @@ class BotExecutor:
         if len(grid_orders) > 1:
             logger.warning(f"⚠️ {name}: Found {len(grid_orders)} total GRID orders. Restricting to strict 1 max...")
             # Sort to prefer the matching step, otherwise just keep newest
-            grid_orders.sort(key=lambda x: 1 if get_step_from_cid(x.get('clientOrderId', ''), 'GRID') == expected_grid_step else 0, reverse=True)
+            # Sort to prefer the matching step, otherwise just keep newest
+            grid_orders.sort(key=lambda x: 1 if get_cycle_step_from_cid(x.get('clientOrderId', ''), 'GRID')[1] == expected_grid_step else 0, reverse=True)
             for o in grid_orders[1:]:
                 try: 
                     exchange.cancel_order(o['id'], pair)
@@ -1998,26 +2143,6 @@ class BotExecutor:
                                 logger.debug(f"🧹 {name}: Force-marked TP {local_tp_id} as filled in DB to prevent CARRY bugs.")
                             except Exception as e_uos:
                                 logger.warning(f"⚠️ {name}: Failed to mark TP {local_tp_id} as filled: {e_uos}")
-                            
-                            # 🚀 FUNDAMENTAL FIX: purge all remaining open orders before cycle reset
-                            try:
-                                all_open = exchange.fetch_open_orders(pair)
-                                bot_tag = f"CQB_{bot_id}_"
-                                for o in all_open:
-                                    cid = o.get('clientOrderId', '')
-                                    oid = o.get('id')
-                                    if not cid.startswith(bot_tag):
-                                        continue
-                                    if str(oid) == str(local_tp_id):
-                                        continue
-                                    logger.info(f"🧹 {name}: Purging orphan-risk order {oid} ({cid}) before cycle reset.")
-                                    try:
-                                        exchange.cancel_order(oid, pair)
-                                        update_order_status(oid, 'cancelled', bot_id=bot_id)
-                                    except Exception as e_c:
-                                        logger.warning(f"⚠️ {name}: Could not cancel {oid}: {e_c}")
-                            except Exception as e_f:
-                                logger.warning(f"⚠️ {name}: fetch_open_orders before reset failed: {e_f}")
                             
                             # v2.0: Register in cascade registry — runner will do atomic cancel+reset
                             from engine.ledger import register_tp_cascade, credit_fill as _cf_tp
@@ -2338,16 +2463,16 @@ class BotExecutor:
              # Risk is managed by circuit breaker and per-bot position limits.
              try:
                  phys_positions = market_snapshot.get('positions', []) if market_snapshot else []
-                 phys_net_signed = 0.0  # signed: positive=LONG, negative=SHORT
+                 phys_long = 0.0
+                 phys_short = 0.0
                  for p in phys_positions:
                      if normalize_symbol(p.get('symbol', '')) == normalize_symbol(pair):
-                         # 🚀 ONE-WAY MODE FIX: Binance One-Way always returns side='both'.
-                         # The ONLY reliable signal is the SIGN of contracts:
-                         #   positive → net LONG position, negative → net SHORT position
-                         raw_contracts = float(p.get('contracts', 0) or 0)
-                         if raw_contracts != 0:
-                             phys_net_signed = raw_contracts
-
+                        size = abs(float(p.get('contracts', 0) or 0))
+                        pos_amount = float(p.get('contracts', 0) or 0)
+                        if pos_amount < 0: phys_short += size
+                        elif pos_amount > 0: phys_long += size
+                 phys_net_qty = phys_long - phys_short
+                
                  virtual_qty = (float(bot_status.get('total_invested', 0) or 0) /
                                 float(bot_status.get('avg_entry_price', 1) or 1))
 
@@ -2856,11 +2981,14 @@ class BotExecutor:
             )
             open_row = cur.fetchone()
             
-            # Sum of all FILLED hedge amounts for this bot
-            cur.execute(
-                "SELECT SUM(amount) FROM bot_orders WHERE bot_id=? AND order_type='hedge' AND status='filled'",
-                (bot_id,)
-            )
+            # Sum of all confirmed ACTIVE hedge fills for this bot
+            cur.execute("""
+                SELECT SUM(CASE WHEN order_type LIKE 'hedge%' AND order_type NOT LIKE '%tp%' THEN amount ELSE -amount END)
+                FROM bot_orders 
+                WHERE bot_id=? 
+                  AND (order_type LIKE 'hedge%' OR order_type LIKE 'hedgetp%')
+                  AND status NOT IN ('auto_closed', 'reset_cleared', 'canceled', 'rejected')
+            """, (bot_id,))
             filled_qty = cur.fetchone()[0] or 0.0
             pass # conn.close() disabled for singleton safety
 
@@ -2949,19 +3077,17 @@ class BotExecutor:
             except Exception:
                 _other_bots_hedge = 1  # conservative: assume multi-bot
 
-            if _other_bots_hedge == 0:
-                # Sole bot on pair: use reduceOnly (closes perfectly, zero margin)
-                params = {'timeInForce': 'GTC', 'reduceOnly': True, 'newClientOrderId': cid}
-                logger.info(f"🛡️ {name}: Sole bot on {pair} — hedge entry with reduceOnly (no margin needed).")
-            else:
-                # Multi-bot: use postOnly+GTX (may fail on margin cap — fallback below)
-                params = {'timeInForce': 'GTX', 'postOnly': True, 'newClientOrderId': cid}
-                logger.info(f"🛡️ {name}: Multi-bot on {pair} ({_other_bots_hedge} others) — hedge entry postOnly+GTX.")
+            # 🛡️ HEDGE ENTRY ORDER FLAG LOGIC [v2.5.0]
+            # In One-Way mode, never use reduceOnly for hedges. Hedges must be regular 
+            # orders to ensure they can cross the zero-bound (e.g. if the physical 
+            # position was already zeroed or opposite due to other bots/manual trades).
+            params = {'timeInForce': 'GTX', 'postOnly': True, 'newClientOrderId': cid}
+            logger.info(f"🛡️ {name}: Placing hedge entry (postOnly+GTX) for global net safety.")
 
             order = None
             try:
                 order = self._place_gtx_order_with_retry(
-                    exchange, pair, hedge_side, lock_qty, lock_price_r, params,
+                    exchange, pair, hedge_side, delta_qty, lock_price_r, params,
                     label=f"HEDGE-{name}"
                 )
             except Exception as e_hedge:
@@ -2972,10 +3098,11 @@ class BotExecutor:
                     "exceed maximum position", "position limit",
                 ]
                 _is_margin_cap = any(s in err_msg.lower() for s in _MARGIN_SIGNALS)
+                _is_reduce_only_rejection = "reduceonly" in err_msg.lower() and "rejected" in err_msg.lower()
+                
                 if _is_margin_cap and params.get('postOnly'):
                     # Multi-bot + margin cap: hedge entry also blocked.
                     # The hedge entry REDUCES the existing position — fall back to reduceOnly.
-                    # Risk same as TP fallback: partial cancel if net position shrinks first.
                     logger.warning(
                         f"🛡️ {name}: postOnly hedge entry blocked by margin cap. "
                         f"Falling back to reduceOnly GTC."
@@ -2987,7 +3114,7 @@ class BotExecutor:
                             'timeInForce': 'GTC',
                         }
                         order = exchange.create_order(
-                            pair, 'limit', hedge_side, lock_qty, lock_price_r,
+                            pair, 'limit', hedge_side, delta_qty, lock_price_r,
                             params=ro_params
                         )
                         if order:
@@ -3007,21 +3134,18 @@ class BotExecutor:
             logger.info(f"✅ [HEDGE-LOCK] Bot {name}: Hedge order placed. ID={exchange_order_id}")
 
             # 5. Record in bot_orders
-            conn = get_connection()
-            cur = conn.cursor()
-            cur.execute("""
-                INSERT INTO bot_orders (bot_id, step, order_type, order_id, price, amount, status, created_at, client_order_id, notes)
-                VALUES (?, ?, 'hedge', ?, ?, ?, 'open', ?, ?, ?)
-            """, (bot_id, trigger_step, exchange_order_id, lock_price_r, lock_qty,
-                  int(time.time()), cid, f"Hedge lock at step {trigger_step}"))
-            conn.commit()
-            pass # conn.close() disabled for singleton safety
+            save_bot_order(
+                bot_id, 'hedge', exchange_order_id, lock_price_r, delta_qty, 
+                trigger_step, order.get('status', 'open'), 
+                client_order_id=cid, notes=f"Hedge lock at step {trigger_step}",
+                cycle_id=cycle_id
+            )
 
             # 6. Log to trade_history
             from engine.database import log_trade
-            log_trade(bot_id, 'HEDGE_OPEN', pair, lock_price_r, lock_qty,
-                      lock_price_r * lock_qty, exchange_order_id, trigger_step,
-                      f'{direction} bot hedged at step {trigger_step} via {hedge_side.upper()} @ {lock_price_r}', 0)
+            log_trade(bot_id, 'HEDGE_OPEN', pair, lock_price_r, delta_qty,
+                      lock_price_r * delta_qty, exchange_order_id, trigger_step,
+                      f'{direction} bot hedged {delta_qty} at step {trigger_step} via {hedge_side.upper()} @ {lock_price_r}', 0)
 
             return order
 

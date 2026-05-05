@@ -317,23 +317,18 @@ class StateReconciler:
         #    went offline BEFORE the WebSocket fill event arrived. This means filled_amount=0 in DB even
         #    though Binance fully executed the entry order.
         #
-        # SCOPE CONSTRAINT: We intentionally restrict 'new' scanning to ENTRY orders only.
-        # TP and grid orders legitimately sit as status='new', filled_amount=0 while open on the book.
-        # Scanning them would process live active orders as "stale unresolved" — causing false resets.
-        # Only entry fills that happened while offline can cause the virtual/physical gaps we target here.
+        # 🚀 DNA-GUARD v3.0: FULL-SPECTRUM ID RESOLUTION
+        # We resolve ALL unresolved orders (placing, new, open) across ALL types.
+        # This ensures the ledger is 100% accurate before parity checks run.
         _place_conn = get_connection()
         _place_cur = _place_conn.cursor()
         _place_cur.execute("""
             SELECT bo.id, bo.bot_id, b.pair, bo.order_type, bo.client_order_id,
                    bo.price, bo.amount, bo.step, bo.cycle_id
             FROM bot_orders bo JOIN bots b ON bo.bot_id=b.id
-            WHERE (
-                bo.status = 'placing'                                      -- Window A: crashed mid-atomicity
-                OR (bo.status = 'new' AND bo.order_type = 'entry')        -- Window B: entry filled offline
-            )
-              AND bo.filled_amount = 0
-              AND bo.created_at < ?
-        """, (int(time.time()) - 30,))
+            WHERE (bo.status IN ('placing', 'new', 'open'))
+              AND bo.filled_amount < bo.amount
+        """)
         placing_rows = _place_cur.fetchall()
 
         if placing_rows:
@@ -362,11 +357,24 @@ class StateReconciler:
                     if exch_order:
                         o_status = (exch_order.get('status') or '').lower()
                         o_id = exch_order.get('id')
+                        o_filled = float(exch_order.get('filled', exch_order.get('filled_amount', 0.0)))
+                        o_price = float(exch_order.get('average', exch_order.get('price', price)))
+                        if o_price <= 0: o_price = price # fallback
+
                         if o_status in ('filled', 'closed', 'open', 'new', 'partially_filled'):
-                            new_status = 'open' if o_status in ('open','new','partially_filled') else o_status
-                            _place_cur.execute("UPDATE bot_orders SET order_id=?, status=?, updated_at=? WHERE id=?",
-                                               (o_id, new_status, int(time.time()), db_id))
-                            logger.info(f"✅ [PRE-COMMIT-RESOLVE] Bot {bot_id} {otype} cid={cid} → found on exchange as {o_status} (id={o_id}). Restored to '{new_status}'.")
+                            new_status = 'open' if o_status in ('open','new','partially_filled','partiallyfilled') else o_status
+                            _place_cur.execute("""
+                                UPDATE bot_orders 
+                                SET order_id=?, status=?, filled_amount=?, price=?, updated_at=? 
+                                WHERE id=?
+                            """, (o_id, new_status, o_filled, o_price, int(time.time()), db_id))
+                            logger.info(f"✅ [PRE-COMMIT-RESOLVE] Bot {bot_id} {otype} cid={cid} → found on exchange as {o_status} (id={o_id}, filled={o_filled}). Restored.")
+                            
+                            # 🚀 ATOMIC SYNC: If it's filled/closed, trigger ledger sync immediately
+                            if new_status in ('filled', 'closed'):
+                                from .ledger import credit_fill, seal_trade_state
+                                credit_fill(bot_id=bot_id, order_id=o_id, cumulative_qty=o_filled, avg_price=o_price, order_type=otype, is_cumulative=True)
+                                seal_trade_state(bot_id)
                         else:
                             _place_cur.execute("UPDATE bot_orders SET status='failed', updated_at=? WHERE id=?",
                                                (int(time.time()), db_id))
@@ -419,7 +427,7 @@ class StateReconciler:
                 FROM bots b
                 LEFT JOIN trades t ON b.id=t.bot_id
                 LEFT JOIN bot_orders bo ON b.id=bo.bot_id AND bo.filled_amount>0
-                    AND (bo.cycle_id=t.cycle_id OR bo.cycle_id IS NULL)
+                    AND (bo.cycle_id=t.cycle_id OR bo.cycle_id IS NULL OR t.current_step=0)
                     AND bo.status NOT IN ('reset_cleared','auto_closed','failed','placing')
                 WHERE b.is_active=1
                 GROUP BY b.id
@@ -1032,7 +1040,7 @@ class StateReconciler:
         
         # 🚀 ROOT CAUSE FIX: Recompute exact mathematical truth from bot_orders and SET (overwrite)
         # the trades table. We NO LONGER ADD to total_invested, preventing double-counts.
-        true_cost, true_avg, true_qty, true_step = recompute_invested_from_orders(bot_id)
+        true_cost, true_avg, true_qty, true_step, h_qty = recompute_invested_from_orders(bot_id)
         if true_step < new_step: true_step = new_step
         set_trade_from_ledger(bot_id, true_cost, true_avg, true_step)
         
@@ -1051,7 +1059,7 @@ class StateReconciler:
 
         # 🚀 ROOT CAUSE FIX: Force Step 1 alignment for physical entries, replacing relative ADDs
         # with an absolute SET from the true ledger. Prevents WebSocket double-counting.
-        true_cost, true_avg, true_qty, true_step = recompute_invested_from_orders(bot_id)
+        true_cost, true_avg, true_qty, true_step, h_qty = recompute_invested_from_orders(bot_id)
         if true_step < 1: true_step = 1
         set_trade_from_ledger(bot_id, true_cost, true_avg, true_step)
         
@@ -1352,10 +1360,28 @@ class StateReconciler:
             )
 
 
+
+            # --- v2.5.0 GLOBAL NETTING MASTER GUARD ---
+            # Before auditing individual bots, check if the entire pair is in parity.
+            # In One-Way mode, bot-level discrepancies are often just netting artifacts.
+            # If the Global Net (Bots + Hedges) matches Exchange Net, skip aggressive wipes.
+            from .database import get_pair_virtual_net
+            global_system_net = get_pair_virtual_net(pair_normalized)
+            
+            # Signed physical net (positive=LONG, negative=SHORT)
+            physical_long = sum(p.size for p in pair_positions if p.side == 'LONG')
+            physical_short = sum(p.size for p in pair_positions if p.side == 'SHORT')
+            global_physical_net = physical_long - physical_short
+            
+            global_diff = abs(global_system_net - global_physical_net)
+            if global_diff < 0.0001:
+                logger.info(f"🛡️ [GLOBAL-NET-OK] {pair_normalized}: System Net {global_system_net:.6f} matches Exchange {global_physical_net:.6f}. Individual bot audits will bypass aggressive wipes.")
+                global_net_ok = True
+            else:
+                logger.warning(f"⚠️ [GLOBAL-NET-MISMATCH] {pair_normalized}: System {global_system_net:.6f} vs Exchange {global_physical_net:.6f} (Diff={global_diff:.6f}). Auditing bots...")
+                global_net_ok = False
+
             # 🚀 Case A: Impossible Bot Mass Detection (Vanished or Ghost Bots)
-            # A bot is mathematically a "Ghost" if it independently claims to hold MORE units
-            # than the entire gross sum existing on the exchange (plus any virtual opposing bots in one-way mode).
-            # This occurs if a user manually closes the position or if it was liquidated/ADL'd.
             for b in bots:
                 # v2.3.4: Ghost detection must see residues in Scanning bots.
                 bot_qty = bot_qtys.get(b.bot_id, 0.0)
@@ -1388,7 +1414,7 @@ class StateReconciler:
                             END
                         ), 0.0)
                         FROM bot_orders
-                        WHERE bot_id = ? AND status IN ('filled', 'closed')
+                        WHERE bot_id = ? AND status IN ('filled', 'closed', 'hedge_exited', 'reset_cleared', 'auto_closed')
                     """, (b.bot_id,)).fetchone()[0]
                     
                     # 🚀 UNIVERSAL BOUND EQUATION (Hedge & One-Way Compatible)
@@ -1424,6 +1450,10 @@ class StateReconciler:
                     
                     # Exact precision enforced.
                     if bot_qty > (max_possible_qty + 0.0001):
+                        if global_net_ok:
+                             logger.info(f"🛡️ [BYPASS-WIPE] {b.name}: Individual ghost detected ({bot_qty:.6f} > {max_possible_qty:.6f}), but Global Net is BALANCED. Bypassing wipe — this is a netting artifact.")
+                             continue
+
                         logger.critical(f"👻 SYSTEM MISMATCH on {pair}: Bot {b.name} claims {bot_qty:.6f} QTY, but Math Capacity is only {max_possible_qty:.6f} QTY.")
                         
                         proof = self._find_proof_of_exit(b)
@@ -2444,6 +2474,17 @@ class StateReconciler:
                     if flatten_executed or not ex_heal:
                         # Success or Offline: Zero out all local ledger tracks for this direction
                         for b in suspects:
+                            # 🛡️ HEDGE-PROTECTION GATE (v3.0.5)
+                            # We check the absolute ground truth in the trades table. 
+                            # If a bot has a recorded hedge_qty > 0, it is actively in a hedge cycle.
+                            # EXCEPTION: If we have just successfully flattened the pair (flatten_executed=True), 
+                            # we MUST proceed with the wipe to clear the now-orphaned hedge residue.
+                            from engine.database import get_bot_status
+                            b_status = get_bot_status(b.bot_id)
+                            if not flatten_executed and b_status and (float(b_status.get('hedge_qty', 0)) > 1e-8 or "HEDGE" in str(b_status.get('cycle_phase', '')).upper()):
+                                logger.warning(f"🛡️ [WIPE-ABORT] Bot {b.name} (ID {b.bot_id}) has ACTIVE HEDGE ({b_status.get('hedge_qty')}). Skipping wipe to protect hedge-exit math.")
+                                continue
+
                             logger.info(f"💣 [WIPE] Zero-clearing memory for Bot {b.name} (ID {b.bot_id}) after market flatten.")
                             self._execute_accounting_adjustment(b, 0.0, 0.0, "Ultimate Flatten Protocol: Zero-Parity Reset")
                             safe_wipe_bot(
@@ -2699,212 +2740,22 @@ class StateReconciler:
     def _execute_accounting_adjustment(self, bot: BotState, phys_notional: float, phys_qty: float, reason: str):
         """
         🚀 PHYSICAL ADOPTION:
-        When the reconciler has mathematically proven a physical position exists on the exchange
-        that differs from the DB ledger, write the delta as an adoption row and resync memory.
-        
-        This is NOT a synthetic injection — it is called only after the reconciler has verified
-        the physical position exists on the exchange (via fetch_positions snapshot).
-        
-        Safety: only acts when phys_qty is non-zero. Zero-out calls go through safe_wipe_bot.
+        Proof-Only v3.0: Synthetic adoptions are DISABLED.
+        This function now only supports Zero-Parity Resets (phys_qty=0.0).
+        For all other mismatches, it reports a proof violation.
         """
-        # FIX #1 [V2.4.1]: Import get_connection at the TOP of the function to prevent
-        # Python UnboundLocalError. If imported only at line ~2751, Python treats
-        # get_connection as a local variable for the ENTIRE function scope, causing
-        # the earlier call in the hedge-proof-check block to crash with:
-        # "local variable 'get_connection' referenced before assignment"
-        from .database import get_connection, log_reconciliation, recompute_invested_from_orders
+        from .database import get_connection, log_reconciliation
         try:
-            # The signed physical quantity: positive=LONG, negative=SHORT
-            # The bot's virtual qty is always stored positive (magnitude only), direction is on the bot.
-            virt_qty = (bot.total_invested / bot.avg_entry_price) if bot.avg_entry_price > 0 else 0.0
+            if abs(phys_qty) > 1e-9:
+                logger.error(f"❌ [PROOF-VIOLATION] {bot.name}: Physical mismatch (Phys={phys_qty:.6f}) detected but NO synthetic adoption is allowed. Intervention required.")
+                return False
 
-            phys_mag = abs(phys_qty)
-            delta_qty = phys_mag - virt_qty
-
-            logger.info(
-                f"⚖️ [ACCOUNTING-ADJUSTMENT] {bot.name}: "
-                f"Physical={phys_mag:.6f} vs Virtual={virt_qty:.6f}. Reason: {reason}"
-            )
-
-            # Ignore dust gaps < 0.0001
-            if abs(delta_qty) < 0.0001:
-                logger.info(f"  ✅ [RECON] Gap is negligible (<0.0001 units). No action needed.")
-                return True
-
-            # 🛡️ PRE-ADOPTION HEDGE PROOF CHECK (Proof-Only Consensus):
-            # Before writing ANY adoption, verify this gap is not the exchange netting effect
-            # of an outstanding hedge. A LONG bot's filled hedge (SELL) reduces the pooled
-            # LONG position on the exchange. If the reconciler then sees virtual=X but physical<X,
-            # it may try to adoption_reduce — but the deficit is just the hedge being open.
-            # Adopting would incorrectly shrink the bot's virtual ledger to match a hedged-net position.
-            try:
-                _hconn_pre = get_connection()
-                _hcur_pre = _hconn_pre.cursor()
-                _hrow_pre = _hcur_pre.execute("""
-                    SELECT
-                        COALESCE(SUM(CASE WHEN order_type='hedge'    THEN filled_amount ELSE 0 END), 0),
-                        COALESCE(SUM(CASE WHEN order_type='hedge_tp' THEN filled_amount ELSE 0 END), 0)
-                    FROM bot_orders
-                    WHERE bot_id=? AND status IN ('filled','closed','hedge_exited')
-                      AND order_type IN ('hedge','hedge_tp')
-                """, (bot.bot_id,)).fetchone()
-                if _hrow_pre:
-                    _outstanding_hedge = float(_hrow_pre[0]) - float(_hrow_pre[1])
-                    if _outstanding_hedge > 1e-6:
-                        # If the gap is within epsilon of the outstanding hedge, it is NOT orphaned
-                        # inventory — it is the hedge net effect. Block the adoption.
-                        if abs(abs(delta_qty) - _outstanding_hedge) < 0.001:
-                            logger.warning(
-                                f"🛡️ [HEDGE-PROOF-BLOCK] {bot.name}: Adoption blocked. "
-                                f"Gap={delta_qty:+.6f} is fully explained by outstanding hedge SHORT={_outstanding_hedge:.6f}. "
-                                f"The gap is a hedge netting artifact, NOT orphaned inventory. "
-                                f"hedge_tp must fire first to close the SHORT position."
-                            )
-                            return True  # Not an error — gap is hedge-explained
-                        elif _outstanding_hedge > 0.001:
-                            logger.warning(
-                                f"⚠️ [HEDGE-PARTIAL] {bot.name}: Gap={delta_qty:+.6f} but "
-                                f"outstanding hedge={_outstanding_hedge:.6f}. Gap may be partially hedge-explained. "
-                                f"Proceeding with adoption of residual={abs(delta_qty)-_outstanding_hedge:.6f}."
-                            )
-            except Exception as _hpe:
-                logger.warning(f"[HEDGE-PROOF-CHECK] Could not verify hedge for {bot.name}: {_hpe}")
-
-            # 🚨 ARCHITECTURAL FIX: Restored Proof-Based Physical Ledger Sync
-            # Instead of forcing a panic SL which causes API failures and ghost bots,
-            # we write the verified delta as an adoption row into the bot's track record.
-            # NOTE: get_connection is imported at the top of this function (Fix #1 V2.4.1)
-            conn = get_connection()
-            cursor = conn.cursor()
-            
-            # 🚀 ROOT CAUSE FIX [V1.6.9]: Resolve Cycle Mismatch
-            # We MUST use the cycle_id from the 'trades' table as the definitive active cycle.
-            # Using 'bot_orders' causes adoptions to be stamped with stale historical cycles (e.g. cycle 4 
-            # while bot is already at cycle 7), making them invisible to the current recomputation.
-            c_row = cursor.execute("SELECT cycle_id FROM trades WHERE bot_id=?", (bot.bot_id,)).fetchone()
-            cycle_id = c_row[0] if c_row and c_row[0] else 1
-            b_pair = bot.pair
-            
-            # Derive current pricing to apply to the adoption mass
-            implied_price = abs(phys_notional / phys_qty) if abs(phys_qty) > 0 else bot.avg_entry_price
-            if implied_price <= 0: implied_price = bot.avg_entry_price # Fallback
-            if implied_price <= 0: implied_price = 1.0 # Last resort fallback
-            
-            action_type = "adoption_add" if delta_qty > 0 else "adoption_reduce"
-            adj_mag = abs(delta_qty)
-
-            # 🚀 V2.3.0 LEDGER-ONLY ARCHITECTURE (Atomic Credit/Seal)
-            # We insert an 'open' bot_orders row and process it through the core engine's
-            # fill and sealing logic, ensuring the `open_qty` accumulator tracks it perfectly.
-            sync_ts = int(time.time())
-            client_order_id = f"CQB_{bot.bot_id}_ADOPT_{cycle_id}_{sync_ts}"
-            order_id = f"LEDGER_SYNC_{bot.bot_id}_{sync_ts}"
-
-            # Insert as 'open' with filled_amount=0 so `credit_fill` handles the delta
-            cursor.execute("""
-                INSERT INTO bot_orders
-                (bot_id, cycle_id, order_type, price, amount, filled_amount, status, created_at, updated_at, notes, client_order_id, order_id)
-                VALUES (?, ?, ?, ?, ?, 0.0, 'open', ?, ?, ?, ?, ?)
-            """, (bot.bot_id, cycle_id, action_type, implied_price, adj_mag, sync_ts, sync_ts, reason, client_order_id, order_id))
-            conn.commit()
-
-            from .ledger import credit_fill, seal_trade_state
-            
-            # Atomic Pipeline
-            try:
-                # 1. Credit the fill (updates accumulator)
-                credit_fill(
-                    bot_id=bot.bot_id, 
-                    order_id=client_order_id,
-                    cumulative_qty=adj_mag, 
-                    avg_price=implied_price,
-                    order_type=action_type, 
-                    is_cumulative=True
-                )
-                
-                # 2. Seal the state (propagates accumulator to trades)
-                seal_trade_state(bot.bot_id)
-                logger.info(f"⚡ [ATOMIC-ADOPTION] {bot.name}: Successfully settled ledger transfer of {adj_mag:.6f} units.")
-
-                # 3. CARRY_PENDING DEADLOCK FIX:
-                # The ledger seal only promotes CARRY_PENDING→ACTIVE if total_invested >= $5.
-                # For small carries (e.g. $2.54 SOL), this threshold is never met and the bot
-                # stays suspended forever with 0 open orders.
-                # After a physically-verified adoption, we MUST promote to ACTIVE unconditionally
-                # so the bot resumes placing its TP and grids.
-                phase_row = cursor.execute(
-                    "SELECT cycle_phase FROM trades WHERE bot_id=?", (bot.bot_id,)
-                ).fetchone()
-                if phase_row and phase_row[0] == 'CARRY_PENDING':
-                    cursor.execute(
-                        "UPDATE trades SET cycle_phase='ACTIVE' WHERE bot_id=?", (bot.bot_id,)
-                    )
-                    conn.commit()
-                    logger.info(
-                        f"🔓 [CARRY-PENDING-UNLOCK] {bot.name}: Promoted CARRY_PENDING→ACTIVE "
-                        f"after physical adoption ({adj_mag:.6f} units). Bot will resume order maintenance."
-                    )
-
-                # 4. ADOPTION STEP-CAP: Prevent martingale snowball on inherited positions.
-                # base_size is stored in USD. Max USD capacity = base_size * SUM(grid_mult^i).
-                # If total_invested (USD) after adoption > bot's max USD capacity, pin to max_steps
-                # so the engine places ONLY a TP order — no additional grids on the orphaned mass.
-                if action_type == 'adoption_add':
-                    import json as _json
-                    try:
-                        cfg_row = cursor.execute(
-                            "SELECT config, base_size FROM bots WHERE id=?", (bot.bot_id,)
-                        ).fetchone()
-                        if cfg_row:
-                            cfg             = _json.loads(cfg_row[0]) if cfg_row[0] else {}
-                            max_steps       = int(cfg.get('max_steps', 8))
-                            grid_mult       = float(cfg.get('GridMultiplier', 1.1))
-                            base_size_usd   = float(cfg_row[1] or cfg.get('base_size', 0.0))
-                            if base_size_usd > 0:
-                                # Max USD capacity: geometric series sum
-                                max_capacity_usd = sum(
-                                    base_size_usd * (grid_mult ** i) for i in range(max_steps)
-                                )
-                                t_row = cursor.execute(
-                                    "SELECT total_invested FROM trades WHERE bot_id=?", (bot.bot_id,)
-                                ).fetchone()
-                                current_invested_usd = float(t_row[0]) if t_row else 0.0
-                                if current_invested_usd > max_capacity_usd * 0.9:
-                                    cursor.execute(
-                                        "UPDATE trades SET current_step=? WHERE bot_id=?",
-                                        (max_steps, bot.bot_id)
-                                    )
-                                    conn.commit()
-                                    logger.warning(
-                                        f"🛑 [ADOPTION-STEP-CAP] {bot.name}: Adopted ${current_invested_usd:.2f} "
-                                        f"exceeds bot max=${max_capacity_usd:.2f} (base_usd=${base_size_usd}, max_steps={max_steps}). "
-                                        f"Pinned current_step={max_steps} — bot will ONLY place TP, no new grids."
-                                    )
-                    except Exception as e_cap:
-                        logger.warning(f"[ADOPTION-STEP-CAP] Could not apply step cap for {bot.name}: {e_cap}")
-
-            except Exception as e:
-                logger.error(f"❌ [ATOMIC-ADOPTION] Failed to settle adoption transfer for {bot.name}: {e}")
-
-            # Also attempt the recompute-based sync as a secondary check
-            from .database import sync_trades_from_orders
-            synced = sync_trades_from_orders(bot.bot_id)
-
-            # Recompute for logging (may still show garbage for cycle-contaminated bots)
-            true_inv, true_avg, true_qty, true_step = recompute_invested_from_orders(bot.bot_id)
-
-            log_reconciliation(
-                bot_id=bot.bot_id,
-                pair=b_pair,
-                action="PHYSICAL_ADOPTION",
-                details=f"Adopted {delta_qty:+.6f} units to heal gap. Sync={synced}. Imprinted={abs(phys_notional):.2f}. Reason: {reason}"
-            )
-
-            logger.info(f"✅ [ACCOUNTING-ADJUSTMENT] {bot.name} successfully healed. Imprinted ${abs(phys_notional):.2f} via {action_type}.")
+            # If we are here and phys_qty=0, it's a legitimate zero-parity wipe.
+            logger.info(f"💣 [WIPE-EXECUTE] {bot.name}: Executing zero-parity reset. Reason: {reason}")
             return True
 
         except Exception as e:
-            logger.error(f"[RECON-FLATTEN] Failed to trigger flatten for bot {bot.name}: {e}", exc_info=True)
+            logger.error(f"[RECON-WIPE] Failed for bot {bot.name}: {e}", exc_info=True)
             return False
 
 
@@ -3125,7 +2976,7 @@ class StateReconciler:
                 
                 from engine.database import recompute_invested_from_orders
                 
-                true_cost, true_avg_price, true_qty, true_step = recompute_invested_from_orders(b_id)
+                true_cost, true_avg_price, true_qty, true_step, hedge_qty = recompute_invested_from_orders(b_id)
                 true_inv = true_cost
                 avg_entry = true_avg_price
                 ledger_qty = true_qty
@@ -3165,7 +3016,7 @@ class StateReconciler:
                                     f"🔧 [DNA-ALIGN] Bot {b_id} ({b_name}): IDLE + zero ledger + zero physical. Force-resetting phantom memory."
                                 )
                                 # 🚀 ARCHITECTURAL GATE (v2.3.7): Use safe_wipe_bot
-                                safe_wipe_bot(b_id, pair_normalized, "LONG" if "LONG" in b_name.upper() else "SHORT", "DNA_ALIGN_IDLE", force=True)
+                                safe_wipe_bot(b_id, pair_normalized, "LONG" if "LONG" in b_name.upper() else "SHORT", "DNA_ALIGN_IDLE")
                             else:
                                 logger.warning(
                                     f"⚠️ [DNA-HOLD] Bot {b_id} ({b_name}): entry_confirmed=1, "
@@ -3174,7 +3025,7 @@ class StateReconciler:
                         else:
                             logger.warning(f"🔧 [DNA-ALIGN] Bot {b_id} ({b_name}): Ledger empty, entry not confirmed. Resetting.")
                             # 🚀 ARCHITECTURAL GATE (v2.3.7): Use safe_wipe_bot
-                            safe_wipe_bot(b_id, pair_normalized, "LONG" if "LONG" in b_name.upper() else "SHORT", "DNA_ALIGN_RESET", force=True)
+                            safe_wipe_bot(b_id, pair_normalized, "LONG" if "LONG" in b_name.upper() else "SHORT", "DNA_ALIGN_RESET")
                     else:
                         cursor.execute("UPDATE trades SET total_invested=?, avg_entry_price=? WHERE bot_id=?", (true_inv, avg_entry, b_id))
             conn.commit()
@@ -3371,7 +3222,7 @@ class StateReconciler:
                     conn.commit()
                     
                     from engine.database import recompute_invested_from_orders, sync_trades_from_orders
-                    _, _, true_qty, _ = recompute_invested_from_orders(bot_id)
+                    _, _, true_qty, _, h_qty = recompute_invested_from_orders(bot_id)
 
                     bot_hedge_qty = cursor.execute("""
                         SELECT COALESCE(SUM(
@@ -3392,9 +3243,8 @@ class StateReconciler:
                     total_net_proved_qty += (bot_net_qty if bot_dir == 'LONG' else -bot_net_qty)
 
                     # 🔬 HISTORICAL NET: also compute the cross-cycle cumulative sum
-                    # for use in PASS 3. Physical positions are cumulative across ALL cycles,
-                    # not just the current one. reset_cleared fills represent real trades that
-                    # happened in prior cycles and still affect the exchange position until closed.
+                    # for use in PASS 3. # 🚀 DNA-GUARD v3.0: Immediate Forensic Resolution
+                    # We no longer use grace periods. If a mismatch exists, we solve it via ID proof.
                     hist_opened = cursor.execute("""
                         SELECT COALESCE(SUM(filled_amount), 0.0)
                         FROM bot_orders
@@ -3512,7 +3362,7 @@ class StateReconciler:
                             total_net_proved_qty_v2 = 0.0
                             for bot_info_v2 in bots_on_ticker:
                                 from engine.database import recompute_invested_from_orders as _rif
-                                _, _, heal_qty, _ = _rif(bot_info_v2['bot_id'])
+                                _, _, heal_qty, _, _ = _rif(bot_info_v2['bot_id'])
                                 total_net_proved_qty_v2 += (heal_qty if bot_info_v2['direction'] == 'LONG' else -heal_qty)
 
                             if abs(total_net_proved_qty_v2 - net_phys_qty) <= max(abs(net_phys_qty)*0.02, 0.01):
@@ -3523,7 +3373,7 @@ class StateReconciler:
                                     f"Promoting bots to IN TRADE."
                                 )
                                 for b_info in bots_on_ticker:
-                                    _, _, b_qty, _ = _rif(b_info['bot_id'])
+                                    _, _, b_qty, _, _ = _rif(b_info['bot_id'])
                                     if b_qty > 0:
                                         cursor.execute(
                                             "UPDATE bots SET status='IN TRADE' WHERE id=? AND status IN ('Scanning','🟢 SCANNING','REQUIRE_MANUAL_PROOF')",
@@ -3533,24 +3383,36 @@ class StateReconciler:
                                         sync_trades_from_orders(b_info['bot_id'])
                                 conn.commit()
                             else:
-                                # Escalate to manual intervention if forensic scan cannot logically explain the gap
+                                # 🚀 ROOT CAUSE FIX: Isolate REQUIRE_MANUAL_PROOF to specific bots
+                                # Only freeze the bot(s) whose individual proved qty doesn't match their allocation.
+                                # Bots whose own proved fills ARE consistent with their share of the physical should NOT be frozen.
                                 for b_info in bots_on_ticker:
-                                    cursor.execute("UPDATE bots SET status='REQUIRE_MANUAL_PROOF' WHERE id=?", (b_info['bot_id'],))
+                                    from engine.database import recompute_invested_from_orders as _rif
+                                    _, _, b_qty, _, h_qty = _rif(b_info['bot_id'])
+                                    if b_qty <= 0 and abs(h_qty) <= 1e-8 and b_info.get('total_invested', 0) > 0:
+                                        # This specific bot has a proven gap — freeze only this one
+                                        logger.warning(f"🚨 [PROOF-FAILED] Bot {b_info['bot_id']} ({b_info['name']}) has proven gap. Freezing.")
+                                        cursor.execute("UPDATE bots SET status='REQUIRE_MANUAL_PROOF' WHERE id=?", (b_info['bot_id'],))
                                 conn.commit()
                                 logger.critical(
                                     f"🚨 [PROOF-FAILED] Ticker {symbol} NET Mismatch PERSISTS after forensic scan: "
                                     f"Physical {net_phys_qty:.6f} vs Proved-Net {total_net_proved_qty_v2:.6f}. "
-                                    f"All bots on this ticker moved to REQUIRE_MANUAL_PROOF."
+                                    f"Problematic bots moved to REQUIRE_MANUAL_PROOF."
                                 )
                         except Exception as _heal_err:
                             logger.error(f"[AUTONOMOUS-HEAL] Forensic scan failed for {symbol}: {_heal_err}")
+                            # 🚀 ROOT CAUSE FIX: Isolate REQUIRE_MANUAL_PROOF to specific bots
                             for b_info in bots_on_ticker:
-                                cursor.execute("UPDATE bots SET status='REQUIRE_MANUAL_PROOF' WHERE id=?", (b_info['bot_id'],))
+                                from engine.database import recompute_invested_from_orders as _rif
+                                _, _, b_qty, _, h_qty = _rif(b_info['bot_id'])
+                                if b_qty <= 0 and abs(h_qty) <= 1e-8 and b_info.get('total_invested', 0) > 0:
+                                    logger.warning(f"🚨 [PROOF-FAILED] Bot {b_info['bot_id']} ({b_info['name']}) has proven gap. Freezing.")
+                                    cursor.execute("UPDATE bots SET status='REQUIRE_MANUAL_PROOF' WHERE id=?", (b_info['bot_id'],))
                             conn.commit()
                             logger.critical(
                                 f"🚨 [PROOF-FAILED] Ticker {symbol} NET Mismatch: "
                                 f"Physical {net_phys_qty:.6f} vs Proved-Net {total_net_proved_qty:.6f}. "
-                                f"All bots on this ticker moved to REQUIRE_MANUAL_PROOF."
+                                f"Problematic bots moved to REQUIRE_MANUAL_PROOF."
                             )
                         # ─────────────────────────────────────────────────────────────────────
 
