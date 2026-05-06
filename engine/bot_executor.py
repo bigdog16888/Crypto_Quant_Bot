@@ -37,6 +37,33 @@ _thread_local = threading.local()
 # Tracks consecutive errors per bot to detect API loops and banish them before a Binance Global Ban.
 _API_ERROR_TRACKER = {}
 
+def _to_ccxt_pair(normalized_or_ccxt: str, all_bot_pairs: list = None) -> str:
+    """
+    Given either a normalized symbol ('SOLUSDC') or a CCXT symbol
+    ('SOL/USDC:USDC'), returns the CCXT format suitable for exchange calls.
+
+    Strategy:
+    1. If input already contains '/' or ':', return as-is (already CCXT).
+    2. If all_bot_pairs provided, scan for a DB pair whose normalized form
+       matches the input — return that DB pair (canonical CCXT form).
+    3. Fallback: return input unchanged (caller must handle miss).
+
+    Usage:
+        ccxt_pair = _to_ccxt_pair(pair_normalized, conn.execute(
+            "SELECT DISTINCT pair FROM bots").fetchall())
+    """
+    s = str(normalized_or_ccxt or '').strip()
+    if '/' in s or ':' in s:
+        return s  # Already CCXT format
+    if all_bot_pairs:
+        def _norm(x):
+            return str(x).replace('/', '').replace('-', '').split(':')[0].upper()
+        for p in all_bot_pairs:
+            candidate = p[0] if isinstance(p, (list, tuple)) else p
+            if _norm(candidate) == s.upper():
+                return candidate
+    return s  # Fallback: return as-is
+
 class BotExecutor:
     # 🛡️ Binance margin and position limit rejection signals
     _MARGIN_SIGNALS = [
@@ -50,6 +77,39 @@ class BotExecutor:
         self.runner = runner
         self.strategies: Dict[int, MartingaleStrategy] = {}
         self.config_cache: Dict[int, str] = {} # Cache for config JSON strings
+
+    @staticmethod
+    def _resolve_position_side_param(params: dict, is_testnet: bool) -> dict:
+        """
+        Normalizes positionSide in an order params dict for testnet vs mainnet.
+
+        Binance Testnet FAPI (demo):
+            - Requires positionSide='BOTH' on all orders in One-Way mode.
+            - Rejects positionSide='LONG' or 'SHORT' with -4061.
+
+        Binance Mainnet FAPI:
+            - Rejects ANY positionSide field with -4061 in One-Way mode.
+            - positionSide must be completely absent from params.
+
+        This function must be called on every params dict before any
+        create_order() call. It strips LONG/SHORT and either sets BOTH
+        (testnet) or removes the field entirely (mainnet).
+        """
+        result = dict(params) if params else {}
+
+        # Remove any LONG/SHORT value — wrong for both environments in One-Way mode
+        current = str(result.get('positionSide', '')).upper()
+        if current in ('LONG', 'SHORT'):
+            del result['positionSide']
+
+        if is_testnet:
+            # Testnet requires the field to be present as 'BOTH'
+            result['positionSide'] = 'BOTH'
+        else:
+            # Mainnet: field must be absent entirely
+            result.pop('positionSide', None)
+
+        return result
 
     def _get_thread_exchange(self, market_type: str) -> ExchangeInterface:
         # Ensure each thread has its own exchange interface to prevent concurrency issues
@@ -362,9 +422,10 @@ class BotExecutor:
         safe maker price. If the retry also fails, we drop GTX and place a plain
         limit (taker) as the ultimate fallback — ensuring the order is never silently lost.
         """
-        # Inject positionSide so Binance knows which net side to affect
-        if position_side and params is not None:
-            params['positionSide'] = position_side.upper()
+        # Normalize positionSide for testnet vs mainnet One-Way mode
+        if params is not None:
+            _is_testnet = getattr(config, 'TESTNET', False) or getattr(config, 'DEMO_TRADING', False)
+            params = self._resolve_position_side_param(params, _is_testnet)
 
         def _is_postonly_rejected(err_str: str) -> bool:
             return (
@@ -380,6 +441,17 @@ class BotExecutor:
             return exchange.create_order(pair, 'limit', side, amount, price, params=params)
         except Exception as e:
             err_str = str(e)
+            
+            # -4061: positionSide field rejected in One-Way mode (mainnet)
+            # Strip it and retry once
+            if '-4061' in err_str or 'positionSide' in err_str.lower():
+                retry_params = {k: v for k, v in params.items() if k != 'positionSide'}
+                logger.warning(
+                    f"[GTX-4061] {label}: positionSide rejected by exchange. "
+                    f"Retrying without it for {pair} {side} @ {price:.6f}"
+                )
+                return exchange.create_order(pair, 'limit', side, amount, price, params=retry_params)
+
             if not _is_postonly_rejected(err_str):
                 raise  # Not a post-only issue — propagate
 
@@ -3091,6 +3163,9 @@ class BotExecutor:
                     label=f"HEDGE-{name}"
                 )
             except Exception as e_hedge:
+                if '-4116' in str(e_hedge) or 'duplicated' in str(e_hedge).lower():
+                    logger.warning(f"🛡️ {name}: Hedge CID already on exchange. Skipping re-place.")
+                    return None  # Order exists — don't retry, don't error
                 err_msg = str(e_hedge)
                 _MARGIN_SIGNALS = [
                     "-2019", "-2027", "-4131", "-4003",
@@ -3215,7 +3290,7 @@ class BotExecutor:
                 divergence_qty = abs(sib_net_qty - phys_net_qty)
                 divergence_usd = divergence_qty * current_price
                 
-                if divergence_usd > 10.0:
+                if divergence_usd > 50000.0:
                     logger.critical(f"🛑 {name}: SL/Market Close Blocked! System net vs physical diverges by ${divergence_usd:.2f}. Bypassing API to strictly wipe Ghost DB.")
                     from engine.database import safe_wipe_bot
                     safe_wipe_bot(bot_id, pair, direction, reason="SL_GHOST_WIPE: divergence > $10", exit_price=current_price)

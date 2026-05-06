@@ -158,166 +158,123 @@ def render_monitor_view():
         except Exception as e:
             st.error(f"Heatmap Error: {e}")
 
-    # --- Command Center (Health Dashboard) ---
-    try:
-        conn = get_connection()
-        cur = conn.cursor()
-        
-        # 1. Active Bots
-        cur.execute("SELECT COUNT(*) FROM bots WHERE is_active = 1")
-        active_count = cur.fetchone()[0]
-        
-        # 2. Total Invested (Exposure) from DB
-        cur.execute("SELECT SUM(total_invested) FROM trades WHERE total_invested > 0")
-        total_invested_res = cur.fetchone()
-        total_invested_db = total_invested_res[0] if total_invested_res[0] else 0.0
-        
-        # 3. Calculate Global PnL (Requires live prices)
-        cur.execute("SELECT t.total_invested, t.avg_entry_price, b.pair, b.direction FROM trades t JOIN bots b ON t.bot_id = b.id WHERE t.total_invested > 0 AND b.is_active = 1")
-        active_trades = cur.fetchall()
-        
-        global_pnl_usd = 0.0
-        
-        # Fetch prices for active trades
-        active_symbols = list(set([t[2] for t in active_trades]))
-        price_map = {}
-        if active_symbols:
-            try:
-                ex_global = get_exchange_instance(market_type=global_config.MARKET_TYPE)
-                for sym in active_symbols:
-                    # Use get_last_price which is standardized in ExchangeInterface
-                    price = ex_global.get_last_price(sym)
-                    if price:
-                        price_map[sym] = float(price)
-            except Exception:
-                pass
-        
-        for trade in active_trades:
-            inv, entry, pair, direction = trade
-            curr = price_map.get(pair, 0.0)
-            
-            # --- 🛡️ PnL EXPLOSION SAFEGUARD ---
-            # If entry price is abnormally low (e.g. 0.0001 for BTC/XAU), it's likely corrupted data
-            # Changed floor to 0.0001 to support cheap altcoins like XRP and SUI
-            if curr > 0 and entry > 0.0001: 
-                if direction == 'LONG':
-                    pnl = (curr - entry) / entry * inv
-                else:
-                    pnl = (entry - curr) / entry * inv
-                global_pnl_usd += pnl
-            elif entry > 0:
-                # Log or warn about suspected corruption in console
-                print(f"⚠️ SUSPECTED DATA CORRUPTION: Bot on {pair} has avg_entry={entry}. Skipping PnL calculation.")
+    # --- Auto-Refresh Toggle (Default ON) ---
+    auto_refresh = st.toggle("⚡ Auto-Refresh (15s) [ASync]", value=True, key="auto_refresh_toggle")
+    
+    # Detect if the Reconciler / Forensic Wizard is actively in use.
+    wizard_active = any(bool(st.session_state[k]) for k in st.session_state if k.startswith(("forensic_trades_", "adopt_force_sel_", "trade_sel_")))
 
-        # 4. Fetch Multi-Asset Balances (Spot + Futures)
-        futures_balance = 0.0
-        spot_balance = 0.0
-        total_equity = 0.0
-        assets_breakdown = []
-
-        # --- A. Fetch Futures Balance ---
+    # --- Fragment: Header Metrics (Command Center) ---
+    @st.fragment(run_every=30 if auto_refresh and not wizard_active else None)
+    def _header_metrics_fragment():
+        # --- Command Center (Health Dashboard) ---
         try:
-            fut_data = fetch_balance_cached('future')
-            if fut_data:
-                if 'total' in fut_data:
+            conn = get_connection()
+            cur = conn.cursor()
+            
+            # 1. Active Bots
+            cur.execute("SELECT COUNT(*) FROM bots WHERE is_active = 1")
+            active_count = cur.fetchone()[0]
+            
+            # 2. Total Invested (Exposure) from DB
+            cur.execute("SELECT SUM(total_invested) FROM trades WHERE total_invested > 0")
+            total_invested_res = cur.fetchone()
+            total_invested_db = total_invested_res[0] if total_invested_res[0] else 0.0
+            
+            # 3. Calculate Global PnL (Requires live prices)
+            cur.execute("SELECT t.total_invested, t.avg_entry_price, b.pair, b.direction FROM trades t JOIN bots b ON t.bot_id = b.id WHERE t.total_invested > 0 AND b.is_active = 1")
+            active_trades = cur.fetchall()
+            
+            global_pnl_usd = 0.0
+            
+            # Fetch prices for active trades
+            active_symbols = list(set([t[2] for t in active_trades]))
+            price_map = {}
+            if active_symbols:
+                try:
+                    ex_global = get_exchange_instance(market_type=global_config.MARKET_TYPE)
+                    for sym in active_symbols:
+                        price = ex_global.get_last_price(sym)
+                        if price:
+                            price_map[sym] = float(price)
+                except Exception: pass
+            
+            for trade in active_trades:
+                inv, entry, pair, direction = trade
+                curr = price_map.get(pair, 0.0)
+                if curr > 0 and entry > 0.0001: 
+                    if direction == 'LONG': pnl = (curr - entry) / entry * inv
+                    else: pnl = (entry - curr) / entry * inv
+                    global_pnl_usd += pnl
+
+            # 4. Fetch Multi-Asset Balances (Spot + Futures)
+            futures_balance = 0.0
+            spot_balance = 0.0
+            total_equity = 0.0
+            assets_breakdown = []
+
+            # --- A. Futures Balance ---
+            try:
+                fut_data = fetch_balance_cached('future')
+                if fut_data and 'total' in fut_data:
                     for asset, amount in fut_data['total'].items():
                         if amount and amount > 0:
-                            u_pnl = 0.0
                             assets_breakdown.append({
-                                'Type': 'Futures',
-                                'Asset': asset,
-                                'Balance': amount,
-                                'Unrealized PnL': u_pnl,
-                                'Equity': amount + u_pnl
+                                'Type': 'Futures', 'Asset': asset, 'Balance': amount,
+                                'Unrealized PnL': 0.0, 'Equity': amount
                             })
-                            if asset in ['USDT', 'USDC', 'USD', 'BUSD']:
-                                futures_balance += amount
-        except Exception as e: 
-            print(f"Error fetching futures balance: {e}")
+                            if asset in ['USDT', 'USDC', 'USD', 'BUSD']: futures_balance += amount
+            except Exception: pass
 
-        # --- B. Fetch Spot Balance ---
-        try:
-            cur.execute("SELECT config FROM bots WHERE is_active = 1")
-            active_configs = cur.fetchall()
+            # --- B. Spot Balance ---
+            try:
+                cur.execute("SELECT config FROM bots WHERE is_active = 1")
+                active_configs = cur.fetchall()
+                needs_spot = False
+                for cfg in active_configs:
+                    try:
+                        c_dict = json.loads(cfg[0]) if cfg[0] else {}
+                        if c_dict.get('market_type') == 'spot':
+                            needs_spot = True; break
+                    except: pass
+                
+                if needs_spot and global_config.MARKET_TYPE != 'future':
+                    spot_data = fetch_balance_cached('spot')
+                    if spot_data and 'total' in spot_data:
+                        for asset, amount in spot_data['total'].items():
+                            if amount > 0:
+                                val = amount if asset in ['USDT', 'USDC', 'DAI', 'BUSD'] else 0.0
+                                if val > 0: spot_balance += val
+                                assets_breakdown.append({
+                                    'Type': 'Spot', 'Asset': asset, 'Balance': amount,
+                                    'Unrealized PnL': 0.0, 'Equity': val
+                                })
+            except Exception: pass
+
+            total_equity = futures_balance + spot_balance + global_pnl_usd 
             
-            needs_spot = False
-            for cfg in active_configs:
-                try:
-                    c_dict = json.loads(cfg[0]) if cfg[0] else {}
-                    if c_dict.get('market_type') == 'spot':
-                        needs_spot = True
-                        break
-                except: pass
+            # Display Metrics Grid
+            m1, m2, m3, m4 = st.columns(4)
+            with m1: st.metric("Total Equity", f"${total_equity:,.2f}")
+            with m2: st.metric("Futures Balance", f"${futures_balance:,.2f}")
+            with m3: st.metric("Active PnL", f"${global_pnl_usd:,.2f}")
+            with m4: st.metric("Active Exposure", f"${total_invested_db:,.2f}")
+
+            if assets_breakdown:
+                with st.expander("💰 Detailed Asset Breakdown"):
+                    st.table(pd.DataFrame(assets_breakdown))
+            st.divider()
             
-            if needs_spot and global_config.MARKET_TYPE != 'future':
-                spot_data = fetch_balance_cached('spot')
-                if spot_data and 'total' in spot_data:
-                    for asset, amount in spot_data['total'].items():
-                        if amount > 0:
-                            val = amount if asset in ['USDT', 'USDC', 'DAI', 'BUSD'] else 0.0
-                            if val > 0: spot_balance += val
-                            assets_breakdown.append({
-                                'Type': 'Spot', 'Asset': asset, 'Balance': amount,
-                                'Unrealized PnL': 0.0, 'Equity': val
-                            })
-        except Exception: pass
+            # --- System Status Ribbon ---
+            cur.execute("SELECT action, symbol, price FROM trade_history ORDER BY id DESC LIMIT 1")
+            last_h = cur.fetchone()
+            last_act_str = f"{last_h[0]}: {last_h[1]} @ {last_h[2]:,.2f}" if last_h else "NO RECENT ACTIVITY"
+            st.info(f"CORE ENGINE: ONLINE | ACTIVE BOTS: {active_count} | LAST ACTION: {last_act_str}")
+        except Exception as e:
+            st.error(f"Dashboard Load Error: {e}")
 
-        total_equity = futures_balance + spot_balance + global_pnl_usd 
-        # conn.close() 
-    except Exception as e:
-        st.error(f"Dashboard Load Error: {e}")
-        active_count = 0
-        total_invested_db = 0.0
-        global_pnl_usd = 0.0
-        futures_balance = 0.0
-        spot_balance = 0.0
-        total_equity = 0.0
-        assets_breakdown = []
-
-    # Display Metrics Grid
-    m1, m2, m3, m4 = st.columns(4)
-    with m1:
-        st.metric("Total Equity", f"${total_equity:,.2f}")
-    with m2:
-        st.metric("Futures Balance", f"${futures_balance:,.2f}")
-    with m3:
-        color = "normal" if global_pnl_usd >= 0 else "inverse"
-        st.metric("Active PnL", f"${global_pnl_usd:,.2f}")
-    with m4:
-        st.metric("Active Exposure", f"${total_invested_db:,.2f}")
-
-    if assets_breakdown:
-        with st.expander("💰 Detailed Asset Breakdown"):
-            st.table(pd.DataFrame(assets_breakdown))
-
-    st.divider()
-    
-    # --- 1. System Status Ribbon ---
-    try:
-        conn_h = get_connection()
-        cur_h = conn_h.cursor()
-        cur_h.execute("SELECT COUNT(*) FROM bots WHERE is_active = 1")
-        act_count = cur_h.fetchone()[0]
-        cur_h.execute("SELECT action, symbol, price FROM trade_history ORDER BY id DESC LIMIT 1")
-        last_h = cur_h.fetchone()
-        
-        # Fundamental Health Check Logic
-        # 1. Active Bots vs Orders
-        # Expectation: Each IN_TRADE bot should have 2 orders (TP + Grid) if fully active
-        cur_h.execute("SELECT id, status FROM bots WHERE is_active = 1")
-        active_bots_data = cur_h.fetchall()
-        bots_in_trade = [b for b in active_bots_data if 'IN TRADE' in b[1] or 'Pending' in b[1] or 'HEDGED' in b[1]]
-        expected_orders_min = len(bots_in_trade) * 2
-        
-        # We need actual open orders count (fetched below, but we need it here for ribbon)
-        # We'll use a quick cached fetch or previous logic. 
-        # For the ribbon, we might just use the visual indicator below.
-        
-        # conn_h.close()
-        
-        last_act_str = f"{last_h[0]}: {last_h[1]} @ {last_h[2]:,.2f}" if last_h else "NO RECENT ACTIVITY"
-        st.info(f"CORE ENGINE: ONLINE | ACTIVE BOTS: {act_count} | LAST ACTION: {last_act_str}")
-    except: pass
+    # Invoke Header Fragment
+    _header_metrics_fragment()
 
 
     # --- Control Bar ---
@@ -364,15 +321,6 @@ def render_monitor_view():
         if st.button("🔄 Refresh Now", use_container_width=True):
             st.cache_data.clear()
             st.rerun()
-
-    # Auto-Refresh Toggle (Default ON) - Capture state here, execute later
-    auto_refresh = st.toggle("⚡ Auto-Refresh (15s) [ASync]", value=True, key="auto_refresh_toggle")
-
-    # Detect if the Reconciler / Forensic Wizard is actively in use.
-    # Suppressing auto-refresh while the wizard is open prevents the page
-    # from reloading mid-operation and wiping the user's in-progress state.
-    # We must check if the values are actually truthy, as Streamlit leaves stale keys behind.
-    wizard_active = any(bool(st.session_state[k]) for k in st.session_state if k.startswith(("forensic_trades_", "adopt_force_sel_", "trade_sel_")))
 
     # --- Data Fetching (Parallel) ---
     with st.spinner("Fetching market data..."):
@@ -1417,39 +1365,14 @@ def render_monitor_view():
         except Exception as e:
             st.error(f"Error loading trade history: {e}")
 
-    # --- Auto-Refresh (Legacy full-page fallback) ---
-    # NOTE: The main bot metrics section is now a @st.fragment that self-refreshes
-    # every 15 seconds. The legacy st_autorefresh below is kept for the header
-    # metrics at the top of the page (equity, balance, PnL) which are NOT
-    # wrapped in a fragment and require a full-page rerun to update.
-    # --- Native Auto-Refresh (Replacement for failing st_autorefresh) ---
+    # --- Auto-Refresh ---
+    # The header and bot grid now refresh via native @st.fragment decorators.
     if auto_refresh and not wizard_active:
-        from datetime import datetime
-        
-        # 🚀 NATIVE REFRESH ENGINE:
-        # We use a simple JS-less trigger for Windows compatibility.
-        # If the custom component fails to load, this serves as a robust fallback.
-        refresh_interval = 30 # seconds
-        
-        if "last_manual_refresh" not in st.session_state:
-            st.session_state.last_manual_refresh = time.time()
-            
-        # We still try the component if it works, but we wrap it in a try-except
-        # and provide a fallback "Next refresh" countdown.
-        try:
-            import streamlit_autorefresh
-            refresh_count = streamlit_autorefresh.st_autorefresh(interval=refresh_interval * 1000, limit=None, key="monitor_autorefresh")
-        except Exception:
-            # Fallback UI if component is totally missing
-            st.info(f"🔄 Component bypass: Manual refresh required or wait for next fragment update.")
-            refresh_count = 0
-
-        st.caption(f"⏱️ Header updated: {datetime.now().strftime('%H:%M:%S')} | Bot grid auto-refreshes every 15s via fragment.")
+        st.caption(f"⏱️ Header/Grid auto-refreshing via native fragments. Last page load: {time.strftime('%H:%M:%S')}")
     elif wizard_active:
         st.warning(
-            "⏸ **Auto-Refresh Paused** \u2014 Reconciler wizard is active. "
-            "Refreshing now would wipe your in-progress recovery work. "
-            "Complete or dismiss the wizard to resume automatic updates."
+            "⏸ **Auto-Refresh Paused** — Reconciler wizard is active. "
+            "Refreshing now would wipe your in-progress recovery work."
         )
     else:
         st.caption("ℹ️ Tip: Auto-Refresh is OFF. Toggle it above for real-time updates.")

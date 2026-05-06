@@ -188,15 +188,17 @@ def credit_fill(
         # touching open_qty. The row is preserved for audit trail.
         #
         # This guard fires on ALL fill paths: WS live, history-orphan, REST deferred.
-        _ENTRY_TYPES = ('entry', 'grid', 'adoption_add', 'adoption')
-        _EXIT_TYPES  = ('tp', 'close', 'sl', 'dust_close', 'adoption_reduce')
+        _ENTRY_TYPES = ('entry', 'grid', 'adoption_add', 'adoption',
+                        'forensic_adoption_add')
+        _EXIT_TYPES  = ('tp', 'close', 'sl', 'dust_close', 'adoption_reduce',
+                        'forensic_adoption_reduce')
 
         if order_type in _ENTRY_TYPES and row_step is not None and row_cycle is not None and order_amount > 0:
             try:
                 already_credited = conn.execute(
                     "SELECT COALESCE(SUM(filled_amount), 0.0) FROM bot_orders "
                     "WHERE bot_id = ? AND step = ? AND cycle_id = ? "
-                    "AND order_type IN ('entry','grid','adoption_add','adoption') "
+                    "AND order_type IN ('entry','grid','adoption_add','adoption','forensic_adoption_add') "
                     "AND filled_amount > 0 "
                     "AND status NOT IN ('reset_cleared','auto_closed','cancelled','canceled','failed','rejected') "
                     "AND id != ?",
@@ -365,18 +367,16 @@ def seal_trade_state(bot_id: int) -> Dict[str, Any]:
             if accumulator_qty > 0:
                 drift = abs(accumulator_qty - qty)
                 drift_pct = drift / accumulator_qty if accumulator_qty > 0 else 0
-                if drift_pct > 0.20:
+                if drift_pct > 0.05:
                     # ── LARGE-DRIFT SELF-HEAL [v2.3.2] ─────────────────────────
-                    # >20% gap is structurally impossible under normal operation.
-                    # A past adoption_reduce or TP fill likely failed to update
-                    # open_qty, leaving a stale value that would cause the NEXT
-                    # TP replacement to size for too many contracts (oversell).
-                    # Recompute (SUM of actual fills from bot_orders) is the ground
-                    # truth — self-heal open_qty in DB and use the correct value.
+                    # 🚀 FIX 4 (v3.0.7): Tightened threshold from 20% to 5%
+                    # If drift is above 5%, the recompute (which is based on 
+                    # individual confirmed fill rows) is considered more reliable
+                    # than the trades.open_qty accumulator cache.
                     logger.warning(
                         f"[QTY-DRIFT-HEAL] Bot {bot_id}: accumulator={accumulator_qty:.8f} "
-                        f"vs recomputed={qty:.8f} (drift={drift_pct:.2%} > 20%). "
-                        f"Recompute wins — self-healing open_qty in DB."
+                        f"vs recomputed={qty:.8f} (drift={drift_pct:.2%} > 5%). "
+                        f"Overwriting accumulator with recomputed truth."
                     )
                     conn.execute(
                         "UPDATE trades SET open_qty=? WHERE bot_id=?",
@@ -384,7 +384,7 @@ def seal_trade_state(bot_id: int) -> Dict[str, Any]:
                     )
                     conn.commit()
                     # qty already holds the correct recomputed value — do not override
-                elif drift_pct > 0.001:  # 0.1%–20%: minor drift → accumulator wins
+                elif drift_pct > 0.001:  # 0.1%–5%: minor drift → accumulator wins
                     logger.warning(
                         f"[QTY-DRIFT] Bot {bot_id}: accumulator={accumulator_qty:.8f} "
                         f"vs recomputed={qty:.8f} (drift={drift_pct:.2%}). "
@@ -408,21 +408,44 @@ def seal_trade_state(bot_id: int) -> Dict[str, Any]:
 
         # Read previous qty to detect if we just entered (for basket_start_time)
         prev_row = conn.execute(
-            "SELECT total_invested, avg_entry_price FROM trades WHERE bot_id = ?",
+            "SELECT total_invested, avg_entry_price, basket_start_time, current_step FROM trades WHERE bot_id = ?",
             (bot_id,)
         ).fetchone()
 
         if prev_row:
-            prev_invested, prev_avg = float(prev_row[0] or 0), float(prev_row[1] or 1)
+            prev_invested = float(prev_row[0] or 0)
+            prev_avg = float(prev_row[1] or 1)
+            prev_basket_ts = int(prev_row[2] or 0)
+            prev_step = int(prev_row[3] or 0)
             prev_qty = prev_invested / prev_avg if prev_avg > 0 else 0
         else:
             prev_qty = 0.0
+            prev_basket_ts = 0
+            prev_step = 0
 
-        # EE timer reset: update basket_start_time only if qty meaningfully increased
-        # (new grid fill added to position). 1% threshold avoids noise from rounding.
         basket_time_update = None
+
+        # PRIMARY: qty increased meaningfully → new fill, update timer
         if qty > prev_qty * 1.01 and qty > 1e-8:
             basket_time_update = int(time.time())
+
+        # SAFETY NET: qty > 0 but basket_start_time is from a previous cycle
+        # (i.e. prev_step was 0 meaning we just came out of a reset, but basket_start_time
+        #  was not zeroed by the reset path — it holds the TP reset timestamp).
+        # Detect: basket_start_time exists but prev_invested was 0 (post-reset state).
+        # In this case, always anchor to now regardless of qty movement.
+        elif qty > 1e-8 and prev_step == 0 and prev_basket_ts > 0 and prev_invested <= 0.01:
+            basket_time_update = int(time.time())
+            logger.info(
+                f"[SEAL] Bot {bot_id}: basket_start_time reset — "
+                f"prev_step=0 + prev_invested=0 indicates stale TP-reset timestamp. "
+                f"Anchoring to now (qty={qty:.6f})."
+            )
+
+        # EXPLICIT ZERO: if position is flat, zero the basket_start_time so next
+        # cycle starts clean. This prevents the stale timestamp from ever persisting.
+        if qty <= 1e-8:
+            basket_time_update = 0
 
         # Invariant: a bot with physical position (qty > 0) must have step >= 1.
         # step=0 is the Scanning state. If recompute returned 0 (e.g. adoption rows
@@ -439,11 +462,17 @@ def seal_trade_state(bot_id: int) -> Dict[str, Any]:
                 total_invested   = ?,
                 avg_entry_price  = ?,
                 current_step     = ?,
-                entry_confirmed  = CASE WHEN ? > 0.01 THEN 1 ELSE 0 END,
-                basket_start_time = COALESCE(?, basket_start_time),
-                cycle_phase      = CASE WHEN cycle_phase = 'CARRY_PENDING' AND ? >= 0.10 THEN 'ACTIVE' ELSE cycle_phase END
+                entry_confirmed  = CASE WHEN ? > 0.01 OR abs(?) > 1e-8 THEN 1 ELSE 0 END,
+                basket_start_time = CASE 
+                    WHEN ? IS NOT NULL THEN ?
+                    ELSE basket_start_time 
+                END,
+                cycle_phase      = CASE 
+                    WHEN cycle_phase = 'CARRY_PENDING' AND ? >= 0.10 THEN 'ACTIVE' 
+                    ELSE cycle_phase 
+                END
             WHERE bot_id = ?
-        """, (cost, avg, step, cost, basket_time_update, cost, bot_id))
+        """, (cost, avg, step, cost, h_qty, basket_time_update, basket_time_update, cost, bot_id))
 
 
         # Derive and update bot status

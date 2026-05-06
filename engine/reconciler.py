@@ -18,19 +18,50 @@ from config.settings import config
 
 logger = logging.getLogger("StateReconciliation")
 
-# 🧬 Helper for internal symbol normalization
+ENGINE_START_TIME = int(time.time())
+
+# 🧬 Helpers for internal symbol normalization and Testnet/Mainnet positionSide
 def _nsym(pair: str) -> str:
     """Normalize exchange symbols to match internal bot ticker format."""
     if not pair: return ""
     return pair.split(':')[0].replace('/', '').upper()
 
-# 🕐 SESSION GUARD: Record the exact moment this engine session started.
-# Used in two ways:
-#   1. Guard against re-ingesting stale fills from Binance's 48h history after restart.
-#   2. Detect whether a bot's basket_start_time was set as a restart-fallback
-#      (i.e., set within 10min of ENGINE_START_TIME) vs. a genuine trade-start time.
-#      If it's a fallback, the DNA-GUARD is bypassed so current-cycle fills are not blocked.
-ENGINE_START_TIME = int(time.time())
+def _safe_order_params(params: dict, is_testnet: bool = False) -> dict:
+    """
+    Strips or normalizes positionSide for One-Way mode compatibility.
+    Testnet requires positionSide='BOTH'. Mainnet rejects positionSide entirely.
+    Call this on every params dict before create_order() in the reconciler.
+    """
+    result = dict(params) if params else {}
+    current = str(result.get('positionSide', '')).upper()
+    if current in ('LONG', 'SHORT', ''):
+        result.pop('positionSide', None)
+    if is_testnet:
+        result['positionSide'] = 'BOTH'
+    return result
+
+def _to_ccxt_pair(normalized_or_ccxt: str, all_bot_pairs: list = None) -> str:
+    """
+    Given either a normalized symbol ('SOLUSDC') or a CCXT symbol
+    ('SOL/USDC:USDC'), returns the CCXT format suitable for exchange calls.
+
+    Strategy:
+    1. If input already contains '/' or ':', return as-is (already CCXT).
+    2. If all_bot_pairs provided, scan for a DB pair whose normalized form
+       matches the input — return that DB pair (canonical CCXT form).
+    3. Fallback: return input unchanged (caller must handle miss).
+    """
+    s = str(normalized_or_ccxt or '').strip()
+    if '/' in s or ':' in s:
+        return s  # Already CCXT format
+    if all_bot_pairs:
+        def _norm(x):
+            return str(x).replace('/', '').replace('-', '').split(':')[0].upper()
+        for p in all_bot_pairs:
+            candidate = p[0] if isinstance(p, (list, tuple)) else p
+            if _norm(candidate) == s.upper():
+                return candidate
+    return s  # Fallback: return as-is
 
 
 class ReconciliationAction(Enum):
@@ -230,9 +261,12 @@ class StateReconciler:
                 logger.debug(f"⏳ [FILL-SCAN] Skipping targeted {pair_filter} scan (3m cooldown, {int(180 - (current_time - last_pair_scan))}s left).")
                 return stats
             setattr(StateReconciler, _pair_key, current_time)
-            logger.info(f"🔎 [FILL-SCAN] Targeted pair scan triggered for {pair_filter} (bypassing global cooldown).") 
+            logger.info(f"🔎 [FILL-SCAN] Targeted pair scan triggered for {pair_filter} (bypassing global cooldown).")
         
         # 🔑 PREFLIGHT: Sync DB positions to exchange before looking at any single fill
+        from engine.database import get_connection as _gc
+        _all_pairs = [r[0] for r in _gc().execute("SELECT DISTINCT pair FROM bots").fetchall()]
+        
         # This prevents fragmented/slow fills from corrupting a position that already matches
         try:
             ex_fut = self.exchanges.get('future')
@@ -361,24 +395,25 @@ class StateReconciler:
                         o_price = float(exch_order.get('average', exch_order.get('price', price)))
                         if o_price <= 0: o_price = price # fallback
 
-                        if o_status in ('filled', 'closed', 'open', 'new', 'partially_filled'):
-                            new_status = 'open' if o_status in ('open','new','partially_filled','partiallyfilled') else o_status
+                        if o_status in ('filled', 'closed', 'open', 'new', 'partially_filled') or o_filled > 1e-8:
+                            # 🚀 Fix 5: If there is a fill (even if status=canceled/expired), it's valid.
+                            new_status = 'open' if o_status in ('open','new','partially_filled','partiallyfilled') else 'filled'
                             _place_cur.execute("""
                                 UPDATE bot_orders 
                                 SET order_id=?, status=?, filled_amount=?, price=?, updated_at=? 
                                 WHERE id=?
                             """, (o_id, new_status, o_filled, o_price, int(time.time()), db_id))
-                            logger.info(f"✅ [PRE-COMMIT-RESOLVE] Bot {bot_id} {otype} cid={cid} → found on exchange as {o_status} (id={o_id}, filled={o_filled}). Restored.")
+                            logger.info(f"✅ [PRE-COMMIT-RESOLVE] Bot {bot_id} {otype} cid={cid} → found as {o_status} (id={o_id}, filled={o_filled}). Restored.")
                             
-                            # 🚀 ATOMIC SYNC: If it's filled/closed, trigger ledger sync immediately
-                            if new_status in ('filled', 'closed'):
+                            # 🚀 ATOMIC SYNC: If it's filled/closed (or canceled with fill), trigger ledger sync
+                            if new_status == 'filled' or o_filled > 1e-8:
                                 from .ledger import credit_fill, seal_trade_state
                                 credit_fill(bot_id=bot_id, order_id=o_id, cumulative_qty=o_filled, avg_price=o_price, order_type=otype, is_cumulative=True)
                                 seal_trade_state(bot_id)
                         else:
                             _place_cur.execute("UPDATE bot_orders SET status='failed', updated_at=? WHERE id=?",
                                                (int(time.time()), db_id))
-                            logger.info(f"🗑️ [PRE-COMMIT-RESOLVE] Bot {bot_id} {otype} cid={cid} → {o_status}. Marked failed.")
+                            logger.info(f"🗑️ [PRE-COMMIT-RESOLVE] Bot {bot_id} {otype} cid={cid} → {o_status} (no fill). Marked failed.")
                     else:
                         # Never reached the exchange — delete the intent row
                         _place_cur.execute("DELETE FROM bot_orders WHERE id=?", (db_id,))
@@ -494,7 +529,8 @@ class StateReconciler:
                         hist = []
                         current_since = since_fallback
                         for _ in range(10):  # Fetch up to 10 pages to span long offline weekends
-                            page = ex.fetch_closed_orders(gap_pair, since=current_since, limit=1000)
+                            _ccxt_pair = _to_ccxt_pair(gap_pair, _all_pairs)
+                            page = ex.fetch_closed_orders(_ccxt_pair, since=current_since, limit=1000)
                             if not page: break
                             hist.extend(page)
                             last_ts = max((o.get('timestamp') or 0) for o in page)
@@ -617,7 +653,7 @@ class StateReconciler:
                                 pass 
                             else:
                                 raw_otype = parts[2].upper() if len(parts)>2 else 'GRID'
-                                otype_r = raw_otype if raw_otype in ('ENTRY','GRID','TP','HEDGETP') else 'GRID'
+                                otype_r = raw_otype if raw_otype in ('ENTRY','GRID','TP','HEDGETP','HEDGE','DUST') else 'GRID'
 
                             _oi_cur.execute(
                                 "SELECT COALESCE(cycle_id,1), basket_start_time, "
@@ -756,12 +792,13 @@ class StateReconciler:
                 if not ex:
                     continue
                 try:
-                    history = ex.fetch_closed_orders(pair, limit=100) # Only recent to prevent ghost-collision spam
+                    _ccxt_pair = _to_ccxt_pair(pair, _all_pairs)
+                    history = ex.fetch_closed_orders(_ccxt_pair, limit=100) # Only recent to prevent ghost-collision spam
                     if not isinstance(history, list):
                         history = []
                     # Also fetch open orders for partial fill recovery
                     try:
-                        open_orders = ex.fetch_open_orders(pair)
+                        open_orders = ex.fetch_open_orders(_ccxt_pair)
                         if isinstance(open_orders, list):
                             history.extend(open_orders)
                     except Exception as eo_e:
@@ -1076,6 +1113,9 @@ class StateReconciler:
         Ask each bot: "You say you are in trade. Do your orders exist on the exchange?"
         If not -> Zombie -> Reset.
         """
+        from engine.database import get_connection as _gc
+        _all_pairs = [r[0] for r in _gc().execute("SELECT DISTINCT pair FROM bots").fetchall()]
+        
         results = []
         
         for bot in bot_states:
@@ -1165,7 +1205,8 @@ class StateReconciler:
                         try:
                             ex_heal = self.exchanges.get('future')
                             if ex_heal:
-                                ex_heal.cancel_order(o.order_id, pair_normalized)
+                                _ccxt_pair = _to_ccxt_pair(pair_normalized, _all_pairs)
+                                ex_heal.cancel_order(o.order_id, _ccxt_pair)
                         except Exception as e:
                             logger.error(f"Failed to cancel orphan order {o.order_id}: {e}")
                     
@@ -1188,7 +1229,6 @@ class StateReconciler:
         try:
             ex = self.exchanges.get('future') or (list(self.exchanges.values())[0] if self.exchanges else None)
             if not ex: return 5.0, 0.0
-            
             market = ex.exchange.market(pair)
             min_notional = float(market.get('limits', {}).get('cost', {}).get('min', 5.0) or 5.0)
             min_qty = float(market.get('limits', {}).get('amount', {}).get('min', 0.0) or 0.0)
@@ -1202,6 +1242,11 @@ class StateReconciler:
         Calculates Net Virtual Position and compares with Net Physical Position.
         If significant deviation exists, identifies 'Ghost' bots and resets them using SYSTEM_FIX.
         """
+        from engine.database import get_connection as _gc
+        from engine import config as _cfg
+        _is_testnet = getattr(_cfg, 'TESTNET', False) or getattr(_cfg, 'DEMO_TRADING', False)
+        _all_pairs = [r[0] for r in _gc().execute("SELECT DISTINCT pair FROM bots").fetchall()]
+        
         results = []
         
         # Group bots by pair (normalized)
@@ -1714,7 +1759,7 @@ class StateReconciler:
                                 logger.info(f"🧹 [DUST-CHASER] Executing PHYSICAL MARKET {exit_side.upper()} order for {abs(physical_net_qty):.6f} {b.pair}.")
                                 ex.create_order(
                                     symbol=b.pair, type='market', side=exit_side, amount=abs(physical_net_qty),
-                                    params={'reduceOnly': True, 'positionSide': pos_side}
+                                    params=_safe_order_params({'reduceOnly': True}, _is_testnet)
                                 )
                                 logger.info(f"✅ [DUST-CHASER] Physical exchange clearance successful for {b.pair}.")
                                 # Reset physical values so subsequent bots see it as flat
@@ -2276,12 +2321,13 @@ class StateReconciler:
                             _closed = False
                             if _ex_heal:
                                 try:
+                                    _ccxt_pair = _to_ccxt_pair(pair_normalized, _all_pairs)
                                     _ex_heal.create_order(
-                                        symbol=pair_normalized,
+                                        symbol=_ccxt_pair,
                                         type='market',
                                         side=_close_side,
                                         amount=_side_residual,
-                                        params={'reduceOnly': True, 'positionSide': _orphan_side}
+                                        params=_safe_order_params({'reduceOnly': True}, _is_testnet)
                                     )
                                     logger.info(
                                         f"✅ [RESIDUAL-ORPHAN-CLOSE] {pair_normalized}: "
@@ -2290,10 +2336,14 @@ class StateReconciler:
                                     )
                                     _closed = True
                                 except Exception as _roe:
-                                    logger.error(
-                                        f"❌ [RESIDUAL-ORPHAN-CLOSE] {pair_normalized}: "
-                                        f"Failed to close orphaned {_orphan_side}: {_roe}"
-                                    )
+                                    if '-4061' in str(_roe) or 'positionside' in str(_roe).lower():
+                                        # Retry without positionSide if rejected
+                                        try:
+                                            _ex_heal.create_order(symbol=_ccxt_pair, type='market', side=_close_side, amount=_side_residual, params={'reduceOnly': True})
+                                            _closed = True
+                                        except Exception: pass
+                                    if not _closed:
+                                        logger.error(f"❌ [RESIDUAL-ORPHAN-CLOSE] {pair_normalized}: Failed: {_roe}")
 
                             results.append(ReconciliationResult(
                                 bot_id=0, bot_name=f"ORPHAN-{_orphan_side}",
@@ -2366,13 +2416,14 @@ class StateReconciler:
                     
                     # Fetch current price for notional threshold check
                     ex_heal = self.exchanges.get('future') or (list(self.exchanges.values())[0] if self.exchanges else None)
-                    current_price = ex_heal.get_last_price(pair_normalized) if ex_heal else 0.0
+                    _ccxt_pair = _to_ccxt_pair(pair_normalized, _all_pairs)
+                    current_price = ex_heal.get_last_price(_ccxt_pair) if ex_heal else 0.0
                     if current_price <= 0:
                         current_price = suspects[0].avg_entry_price if suspects else 0.0
 
                     gap_notional = abs(gap_qty_signed * current_price)
                     
-                    if (gap_notional < min_notional * 1.05 or abs(gap_qty_signed) < min_qty) and is_sole:
+                    if gap_notional < min_notional * 1.05 or abs(gap_qty_signed) < min_qty:
                         # 🧹 DUST CHASER PATH: Sole-bot residue detected.
                         logger.warning(f"🧹 [DUST-CHASER] {pair_normalized}: Orphan residue ${gap_notional:.2f} (<min) on sole-bot. Auto-flattening parity.")
                         
@@ -2381,9 +2432,10 @@ class StateReconciler:
                             heal_pos_side = error_side  # 'LONG' or 'SHORT'
                             try:
                                 # reduceOnly bypasses min_notional for sole bots (Closing Only)
+                                _ccxt_pair = _to_ccxt_pair(pair_normalized, _all_pairs)
                                 ex_heal.create_order(
-                                    symbol=pair_normalized, type='market', side=heal_side, amount=abs(gap_qty_signed),
-                                    params={'reduceOnly': True, 'positionSide': heal_pos_side}
+                                    symbol=_ccxt_pair, type='market', side=heal_side, amount=abs(gap_qty_signed),
+                                    params=_safe_order_params({'reduceOnly': True}, _is_testnet)
                                 )
                                 logger.info(f"✅ [DUST-CHASER] Physical {heal_side.upper()} executed. Zeroing ledger.")
                                 
@@ -2395,6 +2447,28 @@ class StateReconciler:
                             except Exception as _heale:
                                 logger.error(f"❌ [DUST-CHASER] Flatten failed: {_heale}")
 
+                    # 🚀 Fix 2: Directional Guard [v3.0.7]
+                    # If physical position direction contradicts the suspect bots' direction,
+                    # DO NOT autonomously flatten. The state is too ambiguous.
+                    # e.g. error_side is LONG but physical position is SHORT.
+                    if (error_side == 'LONG' and adjusted_phys_qty < -0.0001) or \
+                       (error_side == 'SHORT' and adjusted_phys_qty > 0.0001):
+                        logger.critical(
+                            f"🚨 [DIRECTIONAL-MISMATCH] {pair_normalized}: Physical position ({adjusted_phys_qty:.6f}) "
+                            f"contradicts suspect bots' direction ({error_side}). Blocking autonomous flatten."
+                        )
+                        for b in suspects:
+                            cursor.execute("UPDATE bots SET status='REQUIRE_MANUAL_PROOF' WHERE id=?", (b.bot_id,))
+                        conn.commit()
+                        
+                        results.append(ReconciliationResult(
+                            bot_id=0, bot_name=pair_normalized, pair=pair_normalized,
+                            action_taken=ReconciliationAction.REQUIRE_MANUAL,
+                            details=f"Directional Mismatch: Physical {adjusted_phys_qty:.6f} vs Bot {error_side}. Manual proof required.",
+                            requires_manual_intervention=True
+                        ))
+                        continue
+
                     # 4. 🚀 AGGRESSIVE MARKET FLATTEN PROTOCOL [V2.0]
                     # If forensic proof failed, we no longer block healing.
                     # We execute a direct Market Close to restore FACT-ONLY PARITY.
@@ -2402,23 +2476,38 @@ class StateReconciler:
                     
                     flatten_executed = False
                     if ex_heal:
-                        if phys_qty_abs < QTY_EPSILON:
-                            # The exchange has NO physical footprint for this error side.
-                            # The gap is purely virtual. No exchange order is needed.
-                            logger.info(f"✅ [MARKET-FLATTEN] {pair_normalized}: Physical footprint is 0.0. Skipping exchange order.")
+                        # === DIRECTION REALITY CHECK ===
+                        # Verify physical still exists in the error direction before placing order.
+                        phys_is_long  = physical_net_qty > QTY_EPSILON
+                        phys_is_short = physical_net_qty < -QTY_EPSILON
+
+                        if error_side == 'LONG' and not phys_is_long:
+                            logger.warning(f"[FLATTEN-SKIP] {pair_normalized}: error_side=LONG but physical is {'SHORT' if phys_is_short else 'FLAT'}. Self-healed.")
+                            flatten_executed = True
+                        elif error_side == 'SHORT' and not phys_is_short:
+                            logger.warning(f"[FLATTEN-SKIP] {pair_normalized}: error_side=SHORT but physical is {'LONG' if phys_is_long else 'FLAT'}. Self-healed.")
+                            flatten_executed = True
+                        elif phys_qty_abs < QTY_EPSILON:
+                            logger.info(f"✅ [MARKET-FLATTEN] {pair_normalized}: Physical footprint is 0.0. Skipping.")
                             flatten_executed = True
                         else:
                             flatten_side = 'sell' if error_side == 'LONG' else 'buy'
                             try:
-                                # Execute MARKET close on the TRUE physical capacity available for this side
+                                _ccxt_pair = _to_ccxt_pair(pair_normalized, _all_pairs)
                                 ex_heal.create_order(
-                                    symbol=pair_normalized, type='market', side=flatten_side, amount=phys_qty_abs,
-                                    params={'reduceOnly': True}
+                                    symbol=_ccxt_pair, type='market', side=flatten_side, amount=phys_qty_abs,
+                                    params=_safe_order_params({'reduceOnly': True}, _is_testnet)
                                 )
                                 logger.info(f"✅ [MARKET-FLATTEN] Physical {flatten_side.upper()} order executed for {phys_qty_abs:.6f} {pair_normalized}.")
                                 flatten_executed = True
                             except Exception as _fe:
-                                logger.error(f"❌ [MARKET-FLATTEN] Physical execution failed for {pair_normalized}: {_fe}")
+                                if '-4061' in str(_fe) or 'positionside' in str(_fe).lower():
+                                    try:
+                                        ex_heal.create_order(symbol=_ccxt_pair, type='market', side=flatten_side, amount=phys_qty_abs, params={'reduceOnly': True})
+                                        flatten_executed = True
+                                    except Exception: pass
+                                if not flatten_executed:
+                                    logger.error(f"❌ [MARKET-FLATTEN] Physical execution failed for {pair_normalized}: {_fe}")
                                 # 🚀 RACE-CONDITION GUARD [V1.7.2]:
                                 # -2022 ReduceOnly rejected has two causes in one-way mode:
                                 # (a) Position flipped direction since snapshot → gap naturally resolved.
@@ -2428,7 +2517,8 @@ class StateReconciler:
                                 if '-2022' in str(_fe) or 'reduceonly' in str(_fe).lower() or 'reduce_only' in str(_fe).lower():
                                     try:
                                         fresh_positions = ex_heal.fetch_positions() or []
-                                        fresh_orders   = ex_heal.fetch_open_orders(pair_normalized) or []
+                                        _ccxt_pair = _to_ccxt_pair(pair_normalized, _all_pairs)
+                                        fresh_orders   = ex_heal.fetch_open_orders(_ccxt_pair) or []
                                         fresh_signed_qty = sum(
                                             float(p.get('contracts', 0))
                                             for p in fresh_positions
@@ -2993,15 +3083,42 @@ class StateReconciler:
                         b_dir_row = cursor.fetchone()
                         phys_qty = 0.0
                         if b_dir_row:
-                            phys_snap = cursor.execute("SELECT ABS(size) FROM active_positions WHERE pair=? AND side=?", (norm_pair, 'LONG' if b_dir_row[0].upper() == 'LONG' else 'SHORT')).fetchone()
+                            phys_snap = cursor.execute(
+                                "SELECT ABS(size) FROM active_positions WHERE pair=? AND side=?",
+                                (norm_pair, 'LONG' if b_dir_row[0].upper() == 'LONG' else 'SHORT')
+                            ).fetchone()
                             phys_qty = float(phys_snap[0]) if phys_snap and phys_snap[0] else 0.0
 
-                        if phys_qty > 0.0:
-                            # 🛡️ REALITY-LOCK: We have a physical position but no ledger proof.
-                            # DO NOT WIPE the internal state. This is either an orphan manual trade 
-                            # or a fragmented cycle that needs adoption.
-                            logger.warning(f"⚠️ [DNA-PROTECT] Bot {b_id} ({b_name}): Ledger empty, but exchange has {phys_qty:.4f}. Preserving state for adoption.")
-                            continue # Skip the wipe logic below
+                        # v3.0.5: If snapshot says 0 but DB shows invested cost, the snapshot is
+                        # stale. Do a live exchange fetch before trusting the cached table.
+                        # active_positions refreshes every 60 cycles (~5 min); a fresh fill
+                        # will not be there yet. This is the last guard before an irreversible wipe.
+                        if phys_qty < 0.0001 and db_inv > 0.01:
+                            try:
+                                _ex = list(self.exchanges.values())[0] if self.exchanges else None
+                                if _ex:
+                                    _bot_dir = b_dir_row[0].upper() if b_dir_row else 'LONG'
+                                    for _lp in (_ex.fetch_positions() or []):
+                                        _lsym = _lp.get('symbol', '').replace('/', '').split(':')[0].upper()
+                                        _lside = str(_lp.get('side', '')).upper()
+                                        _lqty = float(_lp.get('contracts') or 0)
+                                        if _lsym == norm_pair and _lside == _bot_dir and abs(_lqty) > 0.0001:
+                                            phys_qty = abs(_lqty)
+                                            logger.info(
+                                                f"[DNA-LIVE-CHECK] Bot {b_id} ({b_name}): "
+                                                f"Snapshot stale (0), live exchange shows {phys_qty:.6f}. "
+                                                f"Preserving state."
+                                            )
+                                            break
+                            except Exception as _live_err:
+                                logger.warning(f"[DNA-ALIGN] Live fetch failed for {b_name}: {_live_err}")
+
+                        if phys_qty > 0.0001:
+                            logger.warning(
+                                f"[DNA-PROTECT] Bot {b_id} ({b_name}): Ledger empty but exchange "
+                                f"shows {phys_qty:.6f} units (snapshot or live). Preserving state."
+                            )
+                            continue  # Skip wipe logic below
                         
                         elif entry_confirmed:
                             # 🚀 FIX 2: IDLE ghost detection — if cycle_phase=IDLE and no physical
@@ -3015,17 +3132,45 @@ class StateReconciler:
                                 logger.warning(
                                     f"🔧 [DNA-ALIGN] Bot {b_id} ({b_name}): IDLE + zero ledger + zero physical. Force-resetting phantom memory."
                                 )
+                                # Fetch bot direction for safe_wipe_bot
+                                _dir_row = cursor.execute("SELECT direction FROM bots WHERE id=?", (b_id,)).fetchone()
+                                _bot_direction = str(_dir_row[0]).upper() if _dir_row and _dir_row[0] else "LONG"
+                                
                                 # 🚀 ARCHITECTURAL GATE (v2.3.7): Use safe_wipe_bot
-                                safe_wipe_bot(b_id, pair_normalized, "LONG" if "LONG" in b_name.upper() else "SHORT", "DNA_ALIGN_IDLE")
+                                safe_wipe_bot(b_id, norm_pair, _bot_direction, "DNA_ALIGN_IDLE")
                             else:
                                 logger.warning(
                                     f"⚠️ [DNA-HOLD] Bot {b_id} ({b_name}): entry_confirmed=1, "
                                     f"phase={cycle_phase}, ledger qty=0 but not IDLE. Holding."
                                 )
                         else:
-                            logger.warning(f"🔧 [DNA-ALIGN] Bot {b_id} ({b_name}): Ledger empty, entry not confirmed. Resetting.")
-                            # 🚀 ARCHITECTURAL GATE (v2.3.7): Use safe_wipe_bot
-                            safe_wipe_bot(b_id, pair_normalized, "LONG" if "LONG" in b_name.upper() else "SHORT", "DNA_ALIGN_RESET")
+                            # v3.0.5: Recency guard. If any fill landed in the last 5 min,
+                            # the bot just entered and the ledger is still being sealed by the
+                            # async DB worker. Deferring until the next alignment cycle (15 min)
+                            # guarantees a fully-committed ledger before any wipe decision.
+                            _recent_cutoff = int(time.time()) - 300
+                            _recent_fills = cursor.execute(
+                                "SELECT COUNT(*) FROM bot_orders WHERE bot_id=? "
+                                "AND filled_amount > 0 AND (filled_at >= ? OR updated_at >= ?)",
+                                (b_id, _recent_cutoff, _recent_cutoff)
+                            ).fetchone()[0] or 0
+
+                            if _recent_fills > 0:
+                                logger.warning(
+                                    f"[DNA-ALIGN-GRACE] Bot {b_id} ({b_name}): "
+                                    f"{_recent_fills} fill(s) in last 5 min — ledger still settling. "
+                                    f"Deferring wipe to next cycle."
+                                )
+                            else:
+                                logger.warning(
+                                    f"[DNA-ALIGN] Bot {b_id} ({b_name}): Ledger empty, "
+                                    f"entry_confirmed=0, no recent fills. Resetting."
+                                )
+                                _dir_row = cursor.execute(
+                                    "SELECT direction FROM bots WHERE id=?", (b_id,)
+                                ).fetchone()
+                                _bot_direction = str(_dir_row[0]).upper() if _dir_row and _dir_row[0] else "LONG"
+                                safe_wipe_bot(b_id, norm_pair, _bot_direction, "DNA_ALIGN_RESET")
                     else:
                         cursor.execute("UPDATE trades SET total_invested=?, avg_entry_price=? WHERE bot_id=?", (true_inv, avg_entry, b_id))
             conn.commit()

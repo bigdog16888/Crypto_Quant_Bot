@@ -1,5 +1,5 @@
 # Crypto Quant Bot — AI Agent Codebase Guide
-**Version: 2.0.0 | Last Updated: 2026-04-22**
+**Version: 3.0.6 | Last Updated: 2026-05-06**
 
 > **READ THIS FIRST** before touching any code. This is the single authoritative guide.
 > It supersedes `UNIFIED_BOT_DOCUMENTATION.md` and all older session notes.
@@ -68,6 +68,14 @@ Crypto_Quant_Bot/
 ├── engine.log                 ← Rotating log (10MB, 5 backups)
 └── restart_runner.bat         ← Kills + restarts the engine process
 ```
+
+---
+
+## 🎨 UI Architecture — Native Fragments
+The dashboard (`monitor.py`) utilizes **native Streamlit Fragments** (`@st.fragment`) for auto-refresh.
+- **Header Metrics**: Refreshes every 30s (Equity, Balance, PnL).
+- **Bot Grid**: Refreshes every 15s (Steps, Invested, Status).
+- **Rule**: Avoid external refresh components (like `st_autorefresh`) as they fail in restricted network environments. Native fragments are the absolute standard.
 
 ---
 
@@ -247,6 +255,12 @@ In One-Way mode, residues on the opposite side of the physical net cannot be clo
 2. **Phase Gate**: Only bots in `Scanning` status or `cycle_phase = 'IDLE'` are eligible. This ensures active trading bots are never wiped.
 3. **Action**: The trapped residue is neutralized via `safe_wipe_bot(reason='CONSOLIDATION')`.
 4. **Healing**: The Reconciler detects the resulting gap and executes an **Adoption-Reduce** on the primary (physical-side) bot.
+
+### 3.17. Hedge Integrity & Gross-Exposure Gating
+To protect fully hedged bots (net quantity = 0 but gross invested > 0), the system uses **Gross-Exposure Gating** for all state transitions:
+- **`seal_trade_state`**: Status is only flipped to `Scanning` if `total_invested` (gross) is effectively zero.
+- **`entry_confirmed`**: Remains `1` if any proven fill exists for the current cycle, regardless of whether it was later offset by a hedge.
+- **`sync_trades_from_orders`**: If a bot is fully hedged, the logic preserves the `HEDGED` phase and `entry_confirmed=1` status, ensuring the bot doesn't "DNA-WIPE" while physically active.
 
 ---
 

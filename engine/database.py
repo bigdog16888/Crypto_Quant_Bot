@@ -916,7 +916,7 @@ def validate_trade_data(bot_id, step, invested, avg_price):
         
     return True
 
-def update_martingale_step(bot_id, step, total_invested, avg_price, tp_price):
+def update_martingale_step(bot_id, step, total_invested, avg_price, tp_price, fill_ts: int = 0):
     """Updates or inserts the trade state for a specific bot (UPSERT logic)."""
     
     # --- FUNDAMENTAL FIX: PRE-WRITE VALIDATION ---
@@ -941,6 +941,7 @@ def update_martingale_step(bot_id, step, total_invested, avg_price, tp_price):
             
             # UPDATE existing record
             # 🚀 EE-RESET: Update basket_start_time on EVERY grid fill to restart EE decay timer.
+            basket_ts = fill_ts if fill_ts > 0 else int(time.time())
             cursor.execute("""
                 UPDATE trades
                 SET current_step = ?, 
@@ -951,7 +952,7 @@ def update_martingale_step(bot_id, step, total_invested, avg_price, tp_price):
                     position_side = ?,
                     basket_start_time = ?
                 WHERE bot_id = ? AND (current_step <= ? OR ? = 0)
-            """, (step, total_invested, avg_price, tp_price, position_side, int(time.time()), bot_id, step, step))
+            """, (step, total_invested, avg_price, tp_price, position_side, basket_ts, bot_id, step, step))
             logger.debug(f"✅ Updated trade state for bot {bot_id}: step={step}, invested={total_invested}, avg_price={avg_price} (EE Timer Reset)")
         else:
             # Look up bot direction for position_side
@@ -960,7 +961,7 @@ def update_martingale_step(bot_id, step, total_invested, avg_price, tp_price):
             position_side = str(bot_dir_row[0]).upper() if bot_dir_row else 'LONG'
             
             # INSERT new record
-            now_ts = int(time.time())
+            now_ts = fill_ts if fill_ts > 0 else int(time.time())
             cursor.execute("""
                 INSERT INTO trades (bot_id, current_step, total_invested, avg_entry_price, target_tp_price, entry_confirmed, basket_start_time, cycle_start_time, position_side)
                 VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
@@ -1134,13 +1135,16 @@ def _reset_bot_after_tp_internal(cursor, bot_id, exit_price, direction=None, act
     # This is the authoritative cycle boundary for all future fill attribution.
     new_cycle_start_time = exit_fill_ts if exit_fill_ts > 0 else int(time.time())
 
+    # 🚀 ARCHITECTURAL FIX (v3.0.7): Increment cycle_id FIRST.
+    cursor.execute("UPDATE trades SET cycle_id = ? WHERE bot_id = ?", (new_cycle, bot_id))
+
     cursor.execute(
         "UPDATE trades SET current_step = 0, total_invested = 0, avg_entry_price = 0, "
-        "target_tp_price = 0, last_exit_price = ?, last_exit_time = ?, basket_start_time = ?, "
+        "target_tp_price = 0, last_exit_price = ?, last_exit_time = ?, basket_start_time = 0, "
         "entry_confirmed = 0, entry_order_id = NULL, tp_order_id = NULL, "
         "bot_position_id = NULL, close_type = ?, cycle_id = ?, cycle_phase = ?, "
         "open_qty = 0, hedge_qty = 0, wipe_wall_ts = ?, cycle_start_time = ? WHERE bot_id = ?",
-        (exit_price, int(time.time()), int(time.time()), action_label, new_cycle, new_cycle_phase,
+        (exit_price, int(time.time()), action_label, new_cycle, new_cycle_phase,
          int(time.time()), new_cycle_start_time, bot_id)
     )
     logger.info(
@@ -2669,6 +2673,10 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None) -> tuple:
             return 0.0, 0.0, 0.0, 0, 0.0
 
         target_cycle = row_trade[0]
+        if target_cycle is None:
+            logger.warning(f"[RECOMPUTE] Bot {bot_id}: cycle_id is NULL. Returning zero to prevent phantom accumulation.")
+            return 0.0, 0.0, 0.0, 0, 0.0
+            
         wall_ts = int(row_trade[2] or 0)
         bot_side = row_trade[3] or 'LONG'
 
@@ -2779,18 +2787,18 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None) -> tuple:
               AND filled_amount > 0
               AND price > 0
               AND status NOT IN ('open', 'new', 'placing', 'failed', 'auto_closed', 'reset_cleared')
-        """, (bot_id, cycle_id)).fetchone()
+        """, (bot_id, target_cycle)).fetchone()
 
         if carry_price_row and carry_price_row[0] and float(carry_price_row[0]) > 0:
             carry_avg_price = float(carry_price_row[0])
-            carry_cost = carry_qty * carry_avg_price
+            carry_cost = carry_qty_val * carry_avg_price
             logger.info(
-                f"[RECOMPUTE-CARRY] Bot {bot_id} cycle {cycle_id}: "
-                f"CARRY qty={carry_qty:.8f} @ avg={carry_avg_price:.4f} "
+                f"[RECOMPUTE-CARRY] Bot {bot_id} cycle {target_cycle}: "
+                f"CARRY qty={carry_qty_val:.8f} @ avg={carry_avg_price:.4f} "
                 f"(from bot_orders CARRY fills). total_invested={carry_cost:.4f}"
             )
-            carry_step = _calculate_formula_step(bot_id, carry_cost, 1, cursor, cycle_id)
-            return carry_cost, carry_avg_price, carry_qty, carry_step, hedge_qty
+            carry_step = _calculate_formula_step(bot_id, carry_cost, 1, cursor, target_cycle)
+            return carry_cost, carry_avg_price, carry_qty_val, carry_step, hedge_qty
 
         # ── SOURCE 2: active_positions snapshot (available after prime_startup_snapshot) ──
         snap_row = cursor.execute(
@@ -2799,14 +2807,14 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None) -> tuple:
         ).fetchone()
         if snap_row and float(snap_row[0] or 0) > 0:
             carry_avg_price = float(snap_row[0])
-            carry_cost = carry_qty * carry_avg_price
+            carry_cost = carry_qty_val * carry_avg_price
             logger.info(
-                f"[RECOMPUTE-CARRY] Bot {bot_id} cycle {cycle_id}: "
-                f"CARRY qty={carry_qty:.8f} @ entry_price={carry_avg_price:.4f} "
+                f"[RECOMPUTE-CARRY] Bot {bot_id} cycle {target_cycle}: "
+                f"CARRY qty={carry_qty_val:.8f} @ entry_price={carry_avg_price:.4f} "
                 f"(from active_positions). total_invested={carry_cost:.4f}"
             )
-            carry_step = _calculate_formula_step(bot_id, carry_cost, 1, cursor, cycle_id)
-            return carry_cost, carry_avg_price, carry_qty, carry_step, hedge_qty
+            carry_step = _calculate_formula_step(bot_id, carry_cost, 1, cursor, target_cycle)
+            return carry_cost, carry_avg_price, carry_qty_val, carry_step, hedge_qty
 
         # ── SOURCE 3: Last resort — cached avg from trades row ──
         cached_avg = cursor.execute(
@@ -2814,16 +2822,16 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None) -> tuple:
         ).fetchone()
         if cached_avg and float(cached_avg[0] or 0) > 0:
             carry_avg_price = float(cached_avg[0])
-            carry_cost = carry_qty * carry_avg_price
+            carry_cost = carry_qty_val * carry_avg_price
             logger.warning(
                 f"[RECOMPUTE-CARRY] Bot {bot_id}: CARRY fallback to trades.avg_entry_price={carry_avg_price:.4f} "
-                f"(no CARRY fills or active_positions). qty={carry_qty:.8f}, cost={carry_cost:.4f}"
+                f"(no CARRY fills or active_positions). qty={carry_qty_val:.8f}, cost={carry_cost:.4f}"
             )
-            carry_step = _calculate_formula_step(bot_id, carry_cost, 1, cursor, cycle_id)
-            return carry_cost, carry_avg_price, carry_qty, carry_step, hedge_qty
+            carry_step = _calculate_formula_step(bot_id, carry_cost, 1, cursor, target_cycle)
+            return carry_cost, carry_avg_price, carry_qty_val, carry_step, hedge_qty
 
         logger.warning(
-            f"[RECOMPUTE-CARRY] Bot {bot_id}: CARRY qty={carry_qty:.8f} — "
+            f"[RECOMPUTE-CARRY] Bot {bot_id}: CARRY qty={carry_qty_val:.8f} — "
             f"no CARRY fills, no active_positions, no cached avg. Cannot price position."
         )
         return 0.0, 0.0, 0.0, 0, hedge_qty
@@ -3290,8 +3298,7 @@ def get_pair_virtual_net(pair):
     """
     try:
         # DEBUG: Trace calls from UI
-        with open("scratch/net_debug.log", "a") as f:
-            f.write(f"{time.ctime()} - get_pair_virtual_net('{pair}') called\n")
+        logger.debug(f"[NET-VIRTUAL] get_pair_virtual_net('{pair}') called")
         
         conn = get_connection()
         cursor = conn.cursor()

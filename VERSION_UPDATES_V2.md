@@ -1,5 +1,50 @@
 # VERSION UPDATES V2
 
+## v3.0.6 — XAUUSDT Parity & UI Fragment Stability (2026-05-06)
+
+### 🚀 XAUUSDT Ledger Reconciliation
+- **Root Cause**: Identified that `reconciler.py` misclassified `HEDGE` fills as `GRID` orders due to an incomplete `otype_r` whitelist. This caused systemic ledger inflation for hedged bots.
+- **Fix**: Updated `reconstruct_offline_fills` to correctly whitelist `HEDGE` and `DUST` order types.
+- **Result**: Absolute parity achieved for XAUUSDT (System 0.00 | Exchange 0.00).
+
+### 🛠️ UI Stability (Native Fragments)
+- **Problem**: The third-party `streamlit_autorefresh` component was failing to load assets in restricted environments, causing dashboard crashes.
+- **Fix**: Replaced all external refresh logic with **Native Streamlit Fragments** (`@st.fragment`).
+- **Optimization**: Isolated the Header Metrics (30s) and Bot Strategy Grid (15s) into independent refresh zones, reducing total page reruns.
+
+### 🛡️ Bot Executor Hardening
+- **Duplicate Guard**: Added a Binance `-4116` (duplicate order) exception handler in `execute_hedge_lock` to prevent infinite retry loops.
+- **Emergency Bypass**: Increased the `divergence_usd` threshold for emergency market closes to $50,000, allowing manual intervention even during significant ledger drift.
+
+## v3.0.5 — Shutdown Integrity + SYSTEM_WIPE False-Positive Fix (2026-05-05)
+
+### Bug #1 — Shutdown DB flush race (runner.py)
+- Root cause: WS thread continued receiving fills after `runner.running = False`, and `stop_db_worker(timeout=10s)` could not drain them all before process exit. On restart, DB showed stale `total_invested` against a closed exchange position.
+- Fix A: `_graceful_shutdown` now stops the WS stream immediately before setting `running = False`, so no new fills enter the queue after shutdown signal.
+- Fix B: Shutdown sequence extended — `stop_db_worker` timeout raised from 10s to 15s, followed by `seal_all_active_bots()` which re-derives all bot states from committed `bot_orders` fills. DB is self-consistent at exit regardless of queue.
+
+### Bug #2 — `_align_memory_to_ledger` false SYSTEM_WIPE (runner.py + reconciler.py)
+- Root cause: `cycle_count % 30` at 5s/cycle = 2.5 min, not 15 min as commented. Running 6x faster than intended caused alignment to fire before async seal commits.
+- Fix A: Changed `% 30` → `% 180` (exactly 15 min at 5s/cycle). (runner.py)
+- Fix B: Added live `fetch_positions()` fallback when `active_positions` snapshot shows 0 but `db_inv > 0`. Stale snapshot no longer causes false wipes. (reconciler.py)
+- Fix C: Added 5-min recency guard before `DNA_ALIGN_RESET`. Any bot with fills in the last 5 min is deferred — the async seal is still settling. (reconciler.py)
+
+## v3.0.4 — Stability & Runtime Hardening (2026-05-05)
+- **Fix #1 (`database.py`)**: Resolved `NameError: carry_qty` by switching to `carry_qty_val`. Corrected `CARRY SOURCE 1` to use `target_cycle` instead of shadowing `cycle_id`.
+- **Fix #2 (`reconciler.py`)**: Resolved `NameError: pair_normalized` in `_align_memory_to_ledger`. Implemented a robust database lookup for bot direction instead of brittle guessing.
+- **Fix #3 (`runner.py`)**: Removed redundant `self.cycle_count += 1` at the end of `run_cycle()`. Periodic tasks (every 60 cycles) will now fire at the correct intervals.
+- **Fix #4 (`bot_executor.py`)**: Moved Hammer Shield (`_API_ERROR_TRACKER`) reset to the top of the loop.
+- **Fix #5 & #6 (`ledger.py`)**: Added forensic adoption types to `credit_fill` and hardened `entry_confirmed` for net-zero hedged bots.
+
+
+## v3.0.3 — Ledger Hedge Integrity & Graceful Shutdown (2026-05-05)
+- **Hedge Oscillation Fix**: Overhauled `ledger.py` (`seal_trade_state`) to gate "In Trade" status and `entry_confirmed` on **gross invested cost** rather than net quantity. This prevents fully hedged bots (net qty=0) from erroneously resetting to "Scanning" mode.
+- **Graceful Shutdown**: Hardened `runner.py` with `SIGTERM`/`SIGINT` handlers and a mandatory `stop_db_worker()` flush. This ensures 100% of fills in the async queue are committed before the process exits, eliminating the root cause of `SYSTEM_WIPE` on restart.
+- **Serialized Startup Reconciliation**: Refactored `startup_sync` into a rigid, sequential gate (Prime Snapshot → Recover Fills → Recompute Trades → Verify Parity). Removed the premature `run_cycle()` call to prevent order placement before the ledger is proven.
+- **Hedge-Aware Pass 3**: Updated the Reconciler's net verification to be hedge-aware, preventing false-positive `REQUIRE_MANUAL_PROOF` freezes for bots with net-zero positions but active hedges.
+- **Retroactive Fill Guard**: Implemented immediate ledger sealing in `bot_executor.py` following order placement. This eliminates the race condition where a fast fill could arrive before the database row was fully committed.
+- **Granular Forensic Isolation**: Changed the Reconciler to freeze bots individually during proof gaps, ensuring that a single bot's mismatch no longer deadlocks every other bot on the same ticker.
+
 ## v2.5.3 — Cross-Cycle Hedge Parity & Phantom Purge (2026-04-30)
 - **Architectural Adjustment**: Removed `cycle_id` filtering on `hedge` order evaluation in both UI and Reconciler Pass 3. Because hedges mathematically survive basic TP cycles, they must be globally offset against the physical inventory.
 - **Ghost Hedge Fix**: Modified `database.py` (`_reset_bot_after_tp_internal`) to properly sweep `order_type='hedge'` during destructive wipes (`SYSTEM_WIPE`, `MANUAL_CLOSE`, `RESET_STRUCTURAL_GHOST`). Previously, a hardcoded exclusion preserved old hedges forever, generating permanent math corruption when they were unmasked by the cycle-id removal.

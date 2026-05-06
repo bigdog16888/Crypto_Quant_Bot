@@ -767,10 +767,11 @@ class BotRunner:
             except Exception as _pof_err:
                 logger.warning(f"Periodic offline fill scan failed (non-fatal): {_pof_err}")
 
-        # 🔧 PERIODIC LEDGER ALIGNMENT (every 30 cycles ≈ every 15 min)
-        # 🚀 ROOT CAUSE FIX: _align_memory_to_ledger() compares trades table against bot_orders ledger
-        # and corrects any drift. Without this, ledger gaps accumulate silently forever.
-        if self.cycle_count % 30 == 0 and self._reconciler:
+        # 🔧 PERIODIC LEDGER ALIGNMENT (every 180 cycles = exactly 15 min at 5s/cycle)
+        # WARNING: Do NOT reduce this below 120. _align_memory_to_ledger reads active_positions
+        # (refreshed at cycle%60=5min) and relies on seal_trade_state having committed.
+        # Running this faster than the snapshot refresh rate causes false SYSTEM_WIPEs.
+        if self.cycle_count % 180 == 0 and self._reconciler:
             try:
                 logger.info(f"[PERIODIC] Running memory-to-ledger alignment (cycle {self.cycle_count})...")
                 self._reconciler._align_memory_to_ledger()
@@ -1282,7 +1283,6 @@ class BotRunner:
         # Runs every ~60 cycles (~5 minutes at 5s intervals)
         # Catches any state desyncs that slipped through Layers 1 and 2
         # ============================================================
-        self.cycle_count += 1
         if self.cycle_count % 60 == 0 and self._reconciler:
             try:
                 # 🏗️ PHASE 4: Use persistent self._reconciler — no new instantiation.
@@ -1420,6 +1420,13 @@ if __name__ == "__main__":
     # 🚀 ROOT CAUSE FIX: Graceful Signal Handling
     def _graceful_shutdown(signum, frame):
         logger.info(f"Signal {signum} received. Initiating graceful shutdown...")
+        # Step 1: Stop WS stream immediately — no new fills can enter the queue.
+        try:
+            from engine.ws_event_handlers import stop_ws_stream
+            stop_ws_stream()
+            logger.info("✅ [SHUTDOWN] WS stream stopped.")
+        except Exception as _ws_err:
+            logger.warning(f"[SHUTDOWN] Could not stop WS stream: {_ws_err}")
         runner.running = False  # Triggers the main loop exit
 
     signal.signal(signal.SIGTERM, _graceful_shutdown)
@@ -1531,13 +1538,24 @@ if __name__ == "__main__":
     # === METRICS SERVER STOP ===
     metrics_server.stop()
     
-    # 🚀 ROOT CAUSE FIX: Drain async DB write queue before exit
+    # Step 2: Drain async DB write queue — all queued fills must be committed.
     try:
         from engine.ws_event_handlers import stop_db_worker
         logger.info("Flushing async DB write queue before exit...")
-        stop_db_worker(timeout=10.0)
+        stop_db_worker(timeout=15.0)  # Extended from 10s to 15s
         logger.info("✅ DB write queue flushed.")
     except Exception as e:
         logger.error(f"Failed to flush DB write queue: {e}")
+
+    # Step 3: Seal all active bot states from the confirmed DB ledger.
+    # This re-derives total_invested, avg_entry, open_qty from bot_orders fills,
+    # ensuring the DB is self-consistent even if an in-flight WS fill was lost.
+    # On next restart, recompute_invested_from_orders will agree with trades table.
+    try:
+        from engine.ledger import seal_all_active_bots
+        corrected = seal_all_active_bots()
+        logger.info(f"✅ [SHUTDOWN-SEAL] Sealed {corrected} active bot state(s) from confirmed fills.")
+    except Exception as e:
+        logger.error(f"[SHUTDOWN-SEAL] Failed to seal bot states on exit: {e}")
 
     lock.release()
