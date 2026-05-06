@@ -1,4 +1,26 @@
-# VERSION UPDATES V2
+# VERSION UPDATES V3
+
+## v3.0.9 — Fragment Sync Hardening (2026-05-06)
+
+### 🚀 UI Monitoring Verification
+- **Visual Proof**: Added **Grid Sync** timestamp to the Bot Positions fragment. Users can now see real-time independent refresh confirmation for both the Header (30s) and the Grid (15s).
+- **Architecture**: Clarified the distinction between **Full Page Reruns** (static) and **Fragment Syncs** (dynamic) in the dashboard footer to resolve user confusion regarding auto-refresh behavior.
+- **Stability**: Confirmed `stray_orders` scoping fix and parity logic integrity.
+
+## v3.0.8 — UI Refresh & Ledger Finalization (2026-05-06)
+
+### 🚀 UI Monitoring Evolution
+- **Fix**: Refactored `@st.fragment` logic in `monitor.py` to fetch data internally. This resolved the "Static UI" bug where dashboard metrics remained frozen despite the auto-refresh timer running.
+- **Visual Proof**: Added "Sync" timestamps (Header Sync / Grid Sync) within fragments to provide verifiable proof of background refresh activity.
+- **Independency**: The Header (30s) and Bot Grid (15s) now independently sync with both the local database and the exchange, ensuring real-time accuracy for active orders and PnL.
+
+### 🏥 Ledger Parity & Stability
+- **Fix**: Finalized `ledger.py` with `'hedge'` and `'hedge_tp'` exit types. This corrected the 1.65 qty phantom drift observed on XAU/USDT by ensuring hedge fills correctly decrement `trades.open_qty`.
+- **Audit**: Conducted a global forensic audit across all 13 active bots. Confirmed 100% parity between `bot_orders` (Ground Truth) and the physical exchange inventory.
+
+### 🧹 Workspace Cleanup
+- **Purge**: Removed obsolete `scratch/` scripts and legacy database backups.
+- **Hygiene**: Consolidated documentation and bumped system version to **v3.0.8** for final production backup.
 
 ## v3.0.6 — XAUUSDT Parity & UI Fragment Stability (2026-05-06)
 

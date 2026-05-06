@@ -191,7 +191,7 @@ def credit_fill(
         _ENTRY_TYPES = ('entry', 'grid', 'adoption_add', 'adoption',
                         'forensic_adoption_add')
         _EXIT_TYPES  = ('tp', 'close', 'sl', 'dust_close', 'adoption_reduce',
-                        'forensic_adoption_reduce')
+                        'forensic_adoption_reduce', 'hedge', 'hedge_tp')
 
         if order_type in _ENTRY_TYPES and row_step is not None and row_cycle is not None and order_amount > 0:
             try:

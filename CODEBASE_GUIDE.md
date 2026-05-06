@@ -1,5 +1,5 @@
 # Crypto Quant Bot — AI Agent Codebase Guide
-**Version: 3.0.6 | Last Updated: 2026-05-06**
+**Version: 3.0.9 | Last Updated: 2026-05-06**
 
 > **READ THIS FIRST** before touching any code. This is the single authoritative guide.
 > It supersedes `UNIFIED_BOT_DOCUMENTATION.md` and all older session notes.

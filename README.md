@@ -1,17 +1,17 @@
-# 🤖 Crypto Quant Bot (v2.4.2)
+# 🤖 Crypto Quant Bot (v3.0.9)
 
 A professional-grade, multi-bot algorithmic trading system designed for **Binance Futures (USDT/USDC)**. It features a robust **Virtual Position Manager** that allows multiple bots to trade the same pair independently (e.g., Hedging Long/Short) without conflict.
 
 ## 🌟 Key Features
 
 *   **Virtual Position System:** Each bot tracks its own position logic (`trades` table) while the engine reconciles with the exchange.
-*   **Fully Autonomous Reconciliation (v2.4.2):** Achieved strict zero-drift ledger stability. The engine relies on cryptographic proof-of-fill (Deterministic ID mapping) and handles complex One-Way mode netting and Hedge-aware ledger recovery.
+*   **Fully Autonomous Reconciliation (v3.0.9):** Achieved absolute ledger parity (0.00 drift). The engine relies on cryptographic proof-of-fill (Deterministic ID mapping) and handles complex One-Way mode netting and Hedge-aware ledger recovery.
 *   **Ghost-Proof Order Management:** Advanced string-parsing logic for `clientOrderId` eliminates infinite cancel/recreate loops and stale order "ghosting."
 *   **Drift-Aware Consensus:** Pair-consensus logic accounts for sibling virtual positions on the same pair, preventing false-positive drift alerts in One-Way accounts.
 *   **Atomic State Integrity:** Consolidates snapshots into `BEGIN IMMEDIATE` transaction blocks with fail-safe recovery for TP and Grid placements.
 *   **High-Precision Arithmetic:** All calculations use cent-level ($0.01) precision guards, eliminating floating-point noise across all assets.
 *   **Async DB Write Queue:** WebSocket fill events are dispatched to a non-blocking background SQLite worker, keeping the CCXT listener lag-free.
-*   **Fragment UI Refresh:** Bot grid panel uses `@st.fragment` for isolated 15-second updates — zero full-page flickering.
+*   **Dynamic Fragment UI Refresh:** Dashboard utilizes independent `@st.fragment` zones for Header (30s) and Bot Grid (15s) with live data-sync timestamps — zero full-page flickering.
 *   **SocketLock Singleton:** OS-enforced process protection (TCP port 19888) to prevent duplicate runners.
 *   **Real-Time UI:** Streamlit dashboard with ghosting-loop fixes, **Auto-Refresh**, Live Charts, Parallel Data Fetching, and Portfolio Heatmaps.
 *   **One-Way & Hedge Mode Support:** Fully compatible with Binance's One-Way and Hedge modes.

@@ -3293,7 +3293,7 @@ class BotExecutor:
                 if divergence_usd > 50000.0:
                     logger.critical(f"🛑 {name}: SL/Market Close Blocked! System net vs physical diverges by ${divergence_usd:.2f}. Bypassing API to strictly wipe Ghost DB.")
                     from engine.database import safe_wipe_bot
-                    safe_wipe_bot(bot_id, pair, direction, reason="SL_GHOST_WIPE: divergence > $10", exit_price=current_price)
+                    safe_wipe_bot(bot_id, pair, direction, reason="SL_GHOST_WIPE: divergence > $50000", exit_price=current_price)
                     return
 
                 if actual_size > 0:
