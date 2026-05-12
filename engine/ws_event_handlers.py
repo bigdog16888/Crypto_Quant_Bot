@@ -182,20 +182,31 @@ def handle_order_update(event: Dict):
         
         logger.debug(f"📬 WS Processing {order_type} for Bot {bot_id} (Status: {status})")
 
-        # 🕒 HISTORICAL EVENT GUARD: Reject events that occurred before engine startup
-        # CCXT watch_orders() frequently emits recent historical bounds on initial connection.
-        # The StateReconciler already handles these silently. Emitting them here causes double-processing
-        # and triggers false "Entry Filled" notification popups for offline activity.
+        # 🕒 HISTORICAL EVENT GUARD: Reject genuinely old events from before engine startup.
+        # CCXT watch_orders() replays recent history on connect. reconstruct_offline_fills()
+        # already handles fills > 30 minutes old at startup. But fills that arrived DURING
+        # the startup sequence (after order placement, before WS connected) fall into a gap:
+        # too recent for reconstruct_offline_fills to have caught, but timestamped before
+        # ENGINE_START_TIME, so the old 5s guard silently dropped them.
+        #
+        # FIX: Only discard fills older than 30 minutes before startup. Anything in the
+        # last 30 minutes passes through — credit_fill() is idempotent so double-crediting
+        # is safe (MAX-fill protection prevents quantity inflation).
+        HISTORICAL_GUARD_MS = 30 * 60 * 1000  # 30 minutes in milliseconds
         event_timestamp = event.get('timestamp')
         if event_timestamp:
             try:
                 from engine.reconciler import ENGINE_START_TIME
-                # Provide a 5-second buffer for connection drift
-                if event_timestamp < (ENGINE_START_TIME * 1000) - 5000:
-                    logger.debug(f"⏭️ WS Ignoring historical order {order_id} (Timestamp: {event_timestamp}) since it predates Engine Start.")
+                if event_timestamp < (ENGINE_START_TIME * 1000) - HISTORICAL_GUARD_MS:
+                    logger.debug(
+                        f"⏭️ WS Ignoring genuinely historical order {order_id} "
+                        f"(fill_ts={event_timestamp}, engine_start={ENGINE_START_TIME * 1000}, "
+                        f"gap>{HISTORICAL_GUARD_MS}ms). reconstruct_offline_fills handles these."
+                    )
                     return
             except ImportError:
                 pass
+
         
         # FUNDAMENTAL SAFETY CHECK: Is Bot Active?
         # If we process a fill for an inactive bot, we might trigger new orders (Grid/TP)

@@ -857,7 +857,7 @@ class StateReconciler:
                     if len(parts) < 4: continue
                     
                     bot_id = int(parts[1])
-                    otype = parts[2] # ENTRY, GRID, TP
+                    otype = parts[2].lower() # ENTRY, GRID, TP
                     step = int(parts[3])
                     
                     current_state = bot_states.get(bot_id, {})
@@ -971,7 +971,7 @@ class StateReconciler:
                         """, (bot_id, step, otype.lower(), order['id'], fill_price, fill_qty, fill_qty,
                               int(order.get('timestamp', time.time()*1000)/1000), int(time.time()), cid, 'Reconstructed from History', _bot_cycle))
 
-                    if otype == 'TP':
+                    if otype == 'tp':
                         if fill_price <= 0:
                             logger.warning(f"⚠️ Skipping OFFLINE_TP for Bot {bot_id}: fill_price={fill_price} is invalid.")
                             continue
@@ -992,7 +992,7 @@ class StateReconciler:
                             logger.info(f"📋 OFFLINE TP Partial: Bot {bot_id} sold {unaccounted_qty:.6f} @ {fill_price}. DB natively tracking partial closure.")
                             stats['tp_fills'] += 1
                         
-                    elif otype == 'GRID':
+                    elif otype == 'grid':
                         if step >= curr_step:
                             cursor.execute(
                                 "SELECT COUNT(*) FROM bot_orders WHERE order_id=? AND status IN ('filled','closed')",
@@ -1015,7 +1015,7 @@ class StateReconciler:
                             bot_states[bot_id]['total_invested'] = new_inv
                             bot_states[bot_id]['avg_entry'] = new_avg
                             
-                    elif otype == 'ENTRY':
+                    elif otype == 'entry':
                         if curr_step == 0:
                             if unaccounted_qty > 1e-8:
                                 logger.info(f"✅ Re-playing OFFLINE_ENTRY for Bot {bot_id} for {unaccounted_qty:.6f} unaccounted qty.")
@@ -1027,12 +1027,20 @@ class StateReconciler:
                                 old_inv = bot_states[bot_id].get('total_invested', 0)
                                 bot_states[bot_id]['total_invested'] = old_inv + (fill_price * unaccounted_qty)
 
-                    elif otype == 'HEDGETP':
+                    elif otype == 'hedgetp':
                         logger.info(f"🛡️ ✅ [OFFLINE-HEDGETP] Re-playing HEDGETP for Bot {bot_id}")
+                        self._handle_offline_tp_fill(bot_id, bot_name, fill_price, fill_symbol)
                         stats['tp_fills'] += 1
 
-                    elif otype == 'HEDGE':
-                        logger.info(f"🛡️ ✅ [OFFLINE-HEDGE] Re-playing HEDGE for Bot {bot_id}")
+                    elif otype == 'hedge':
+                        logger.info(f"🛡️ ✅ [OFFLINE-HEDGE] Re-playing HEDGE for Bot {bot_id} (Reducing side)")
+                        # HEDGE reduces exposure. We sync it to the ledger which handles directionality.
+                        from engine.database import log_trade
+                        log_trade(bot_id, 'OFFLINE_HEDGE', fill_symbol, fill_price, unaccounted_qty, 0.0, f"HEDGE_REDUCE")
+                        # Sync ledger truth
+                        from .ledger import credit_fill, seal_trade_state
+                        credit_fill(bot_id=bot_id, order_id=order['id'], cumulative_qty=fill_qty, avg_price=fill_price, order_type='hedge')
+                        seal_trade_state(bot_id)
                         stats['grid_fills'] += 1
                         
                 except Exception as e:
@@ -3294,6 +3302,49 @@ class StateReconciler:
                 bots_on_ticker = sym_group.get(symbol, [])
                 if not bots_on_ticker: continue
 
+                # ── [v3.1.4] IDEMPOTENCY GUARD ─────────────────────────────────────
+                # If ALL bots on this ticker are already REQUIRE_MANUAL_PROOF, skip.
+                # The forensic scan already ran and failed. Re-running every reconciler
+                # cycle is expensive and changes nothing. Human must intervene first.
+                all_proof_required = all(
+                    cursor.execute("SELECT status FROM bots WHERE id=?", (b['bot_id'],)).fetchone()[0] == 'REQUIRE_MANUAL_PROOF'
+                    for b in bots_on_ticker
+                )
+                if all_proof_required:
+                    logger.debug(f"[ADOPT-SKIP] {symbol}: All bots already REQUIRE_MANUAL_PROOF. Skipping scan.")
+                    continue
+                # ────────────────────────────────────────────────────────────────────
+
+                # ── [v3.1.4] WIPE-WALL GATE ────────────────────────────────────────
+                # If physical position predates the earliest wipe_wall_ts on this ticker,
+                # it's a pre-session orphan. The system intentionally doesn't track it.
+                # Don't try to reconcile pre-session positions against current-cycle accounting.
+                if abs(net_phys_qty) > 1e-8:
+                    min_wipe_wall = min(
+                        (int(cursor.execute("SELECT wipe_wall_ts FROM trades WHERE bot_id=?", (b['bot_id'],)).fetchone()[0] or 0))
+                        for b in bots_on_ticker
+                    )
+                    if min_wipe_wall > 0:
+                        # Check if the physical position has any fills after the wipe wall
+                        try:
+                            recent_fills = ex.fetch_my_trades(symbol, limit=50) or []
+                            post_wall_cqb = any(
+                                str(f.get('clientOrderId', '')).startswith('CQB_') and
+                                int((f.get('timestamp') or 0) // 1000) >= min_wipe_wall
+                                for f in recent_fills
+                            )
+                            if not post_wall_cqb:
+                                logger.warning(
+                                    f"[WIPE-WALL-GATE] {symbol}: Physical position {net_phys_qty:.4f} "
+                                    f"has no post-wall CQB fills (wall={min_wipe_wall}). "
+                                    f"Pre-session orphan — skipping reconciliation. "
+                                    f"Monitor will show mismatch until position is manually closed."
+                                )
+                                continue
+                        except Exception as _wg_err:
+                            logger.debug(f"[WIPE-WALL-GATE] {symbol}: Fill check failed (non-blocking): {_wg_err}")
+                # ────────────────────────────────────────────────────────────────────
+
                 # 🚀 NET-SUM PROOF CALCULATION:
                 # We must verify if (Net_Ledger_Sum) == (Net_Physical_Total)
                 total_net_proved_qty = 0.0
@@ -3419,7 +3470,19 @@ class StateReconciler:
                 # Tier 2: If current-cycle mismatches, check HISTORICAL net (all cycles).
                 #         Physical positions are cumulative — they include prior cycles' fills
                 #         that were marked reset_cleared after cycle turnovers.
-                if abs(total_net_proved_qty - net_phys_qty) > max(abs(net_phys_qty)*0.02, 0.01):
+                
+                # Fetch a dynamic reference price to scale the threshold properly (preventing $80 BTC mismatches from being ignored)
+                ref_price = 1.0
+                try:
+                    _p_row = conn.execute("SELECT AVG(cached_avg_price) FROM trades t JOIN bots b ON b.id=t.bot_id WHERE b.pair=? AND cached_avg_price > 0", (symbol,)).fetchone()
+                    if _p_row and _p_row[0]: ref_price = float(_p_row[0])
+                except: pass
+
+                diff_qty = abs(total_net_proved_qty - net_phys_qty)
+                diff_usd = diff_qty * ref_price
+
+                # Dynamic USD tolerance: 2% or $0.05 minimum (aligns with UI monitor mismatch triggers)
+                if diff_usd > max(abs(net_phys_qty * ref_price) * 0.02, 0.05):
 
                     # ── RECENT-FILL GRACE PERIOD [v2.5] ──────────────────────────────────
                     # After a WS fill event fires, the DB commit from seal_trade_state runs
@@ -3528,22 +3591,33 @@ class StateReconciler:
                                         sync_trades_from_orders(b_info['bot_id'])
                                 conn.commit()
                             else:
-                                # 🚀 ROOT CAUSE FIX: Isolate REQUIRE_MANUAL_PROOF to specific bots
-                                # Only freeze the bot(s) whose individual proved qty doesn't match their allocation.
-                                # Bots whose own proved fills ARE consistent with their share of the physical should NOT be frozen.
-                                for b_info in bots_on_ticker:
-                                    from engine.database import recompute_invested_from_orders as _rif
-                                    _, _, b_qty, _, h_qty = _rif(b_info['bot_id'])
-                                    if b_qty <= 0 and abs(h_qty) <= 1e-8 and b_info.get('total_invested', 0) > 0:
-                                        # This specific bot has a proven gap — freeze only this one
-                                        logger.warning(f"🚨 [PROOF-FAILED] Bot {b_info['bot_id']} ({b_info['name']}) has proven gap. Freezing.")
-                                        cursor.execute("UPDATE bots SET status='REQUIRE_MANUAL_PROOF' WHERE id=?", (b_info['bot_id'],))
-                                conn.commit()
-                                logger.critical(
-                                    f"🚨 [PROOF-FAILED] Ticker {symbol} NET Mismatch PERSISTS after forensic scan: "
-                                    f"Physical {net_phys_qty:.6f} vs Proved-Net {total_net_proved_qty_v2:.6f}. "
-                                    f"Problematic bots moved to REQUIRE_MANUAL_PROOF."
+                                # ════════════════════════════════════════════════════════════
+                                # [v3.1.4] BIDIRECTIONAL FORENSIC ADOPTION DISABLED
+                                # ════════════════════════════════════════════════════════════
+                                # REASON: The adoption was self-reinforcing and catastrophically
+                                # broken. Each forensic_adoption_add record (CQB_ADOPT_ ID) gets
+                                # counted as a POSITIVE FILL by get_pair_virtual_net() on the
+                                # next reconciler cycle. This makes the apparent mismatch DOUBLE,
+                                # triggering another adoption twice as large — ad infinitum.
+                                # Observed: 1063 → 2126 → 4253 → ... → 8,711,372 → 17M XRP
+                                #
+                                # CORRECT BEHAVIOR: Persistent unexplained mismatches must
+                                # escalate to REQUIRE_MANUAL_PROOF for human review.
+                                # ════════════════════════════════════════════════════════════
+                                logger.error(
+                                    f"🚨 [PROOF-FAILED] Ticker {symbol}: Persistent mismatch "
+                                    f"cannot be resolved by forensic scan. "
+                                    f"System={total_net_proved_qty_v2:.6f} vs Physical={net_phys_qty:.6f}. "
+                                    f"Diff={abs(total_net_proved_qty_v2 - net_phys_qty):.6f}. "
+                                    f"Setting REQUIRE_MANUAL_PROOF — check Monitor → Global Netting → {symbol}."
                                 )
+                                for b_info in bots_on_ticker:
+                                    cursor.execute(
+                                        "UPDATE bots SET status='REQUIRE_MANUAL_PROOF' WHERE id=? "
+                                        "AND status NOT IN ('Scanning', 'stopped')",
+                                        (b_info['bot_id'],)
+                                    )
+                                conn.commit()
                         except Exception as _heal_err:
                             logger.error(f"[AUTONOMOUS-HEAL] Forensic scan failed for {symbol}: {_heal_err}")
                             # 🚀 ROOT CAUSE FIX: Isolate REQUIRE_MANUAL_PROOF to specific bots

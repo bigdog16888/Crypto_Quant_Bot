@@ -167,14 +167,20 @@ def render_monitor_view():
     # --- PERFORMANCE: SHARED DATA LOADER ---
     def _fetch_fresh_monitor_data():
         """Fetches the latest bot and physical state from DB + Exchange for fragments."""
+        m_orders = []
+        exchange_error = None
         try:
             db_path = global_config.PATHS['DB_FILE']
             with sqlite3.connect(db_path, timeout=10) as conn_fresh:
-                # 1. Fetch Bot Strategies
+                # 1. Fetch Bot Strategies (Explicit Aliases for mapping safety)
                 query_all = """
-                    SELECT b.id, b.name, b.pair, b.direction, b.strategy_type, b.config, t.current_step, 
-                           t.total_invested, t.avg_entry_price, t.target_tp_price, b.is_active, b.status, 
-                           b.error, t.basket_start_time, t.cycle_start_time, t.cycle_phase, t.open_qty
+                    SELECT b.id AS id, b.name AS name, b.pair AS pair, b.direction AS direction, 
+                           b.strategy_type AS strategy_type, b.config AS config, t.current_step AS current_step, 
+                           t.total_invested AS total_invested, t.avg_entry_price AS avg_entry_price, 
+                           t.target_tp_price AS target_tp_price, b.is_active AS is_active, b.status AS status, 
+                           b.error AS error, t.basket_start_time AS basket_start_time, 
+                           t.cycle_start_time AS cycle_start_time, t.cycle_phase AS cycle_phase, 
+                           t.open_qty AS open_qty
                     FROM bots b
                     LEFT JOIN trades t ON b.id = t.bot_id
                     WHERE b.is_active = 1
@@ -183,19 +189,18 @@ def render_monitor_view():
                 
                 # 2. Fetch Physical Positions
                 try:
-                    df_ph = pd.read_sql("SELECT pair, side, size, entry_price, datetime(last_checked, 'unixepoch', 'localtime') as updated FROM active_positions", conn_fresh)
+                    df_ph = pd.read_sql("SELECT pair, side, size, entry_price, last_checked FROM active_positions", conn_fresh)
                 except:
                     df_ph = pd.DataFrame()
                 
-                # 3. Fetch Market Orders (Live from Exchange for fragment accuracy)
-                m_orders = []
+                # 3. Fetch Market Orders (Live from Exchange)
                 try:
                     ex = get_exchange_instance(global_config.MARKET_TYPE)
                     m_orders = ex.fetch_open_orders(None)
-                except Exception:
-                    pass # Fallback to empty if exchange is unreachable
+                except Exception as e:
+                    exchange_error = f"Exchange Order Sync Error: {e}"
                 
-                # 4. Fetch Hedge Orders (Hedge-Aware Accounting)
+                # 4. Fetch Hedge Orders
                 query_h = """
                     SELECT bo.bot_id, bo.order_type, bo.filled_amount, bo.status, bo.created_at
                     FROM bot_orders bo
@@ -206,10 +211,10 @@ def render_monitor_view():
                 """
                 df_h = pd.read_sql(query_h, conn_fresh)
                 
-                return df_p, df_ph, m_orders, df_h
+                return df_p, df_ph, m_orders, df_h, exchange_error
         except Exception as e:
             print(f"Fragment Data Fetch Error: {e}")
-            return pd.DataFrame(), pd.DataFrame(), [], pd.DataFrame()
+            return pd.DataFrame(), pd.DataFrame(), [], pd.DataFrame(), str(e)
 
     # --- Fragment: Header Metrics (Command Center) ---
     @st.fragment(run_every=30 if auto_refresh and not wizard_active else None)
@@ -314,11 +319,17 @@ def render_monitor_view():
                     st.table(pd.DataFrame(assets_breakdown))
             st.divider()
             
+            # 5. Adoptions Count (Forensic Audit)
+            cur.execute("SELECT COUNT(*) FROM reconciliation_logs WHERE action LIKE '%ADOPTION%' AND timestamp > ?", (int(time.time()) - 86400,))
+            adoptions_today = cur.fetchone()[0]
+
             # --- System Status Ribbon ---
             cur.execute("SELECT action, symbol, price FROM trade_history ORDER BY id DESC LIMIT 1")
             last_h = cur.fetchone()
             last_act_str = f"{last_h[0]}: {last_h[1]} @ {last_h[2]:,.2f}" if last_h else "NO RECENT ACTIVITY"
-            st.info(f"CORE ENGINE: ONLINE | ACTIVE BOTS: {active_count} | LAST ACTION: {last_act_str}")
+            
+            # Integrated Status Ribbon
+            st.info(f"⚡ CORE: ONLINE | ACTIVE: {active_count} | ADOPTIONS (24h): {adoptions_today} | LAST: {last_act_str}")
         except Exception as e:
             st.error(f"Dashboard Load Error: {e}")
 
@@ -406,483 +417,25 @@ def render_monitor_view():
     tab_overview, tab_charts, tab_history = st.tabs(["📊 Overview", "📈 Live Charts", "📝 Orders & History"])
 
     with tab_overview:
-        # --- Prepare Data ---
-        df_pos = pd.DataFrame()
-        df_physical = pd.DataFrame()
-        virtual_net_usd = 0.0
-        virtual_gross_usd = 0.0
-        physical_net_usd = 0.0
-        virtual_by_pair = {}
-        physical_by_pair = {}
-        mismatched_pairs = []
-        
-        # --- Mismatch Alert Logic (v2.5.5) ---
-        # 🛡️ ARCHITECT'S DOCTRINE: Universal Parity & Ghost Exclusion
-        # We calculate the global virtual net for every pair by summing active bot positions 
-        # and subtracting active (un-reset) hedges.
-        
-        # --- Mismatch Alert Logic ---
-        try:
-            # FUNDAMENTAL FIX: Use a fresh connection to bypass thread-local staleness in Streamlit
-            db_path = global_config.PATHS['DB_FILE']
-            with sqlite3.connect(db_path, timeout=10) as conn_fresh:
-            
-                # Fetch Bot Strategies (df_pos)
-                query_all = """
-                    SELECT b.id, b.name, b.pair, b.direction, b.strategy_type, b.config, t.current_step, t.total_invested, t.avg_entry_price, t.target_tp_price, b.is_active, b.status, b.error, t.basket_start_time, t.cycle_start_time, t.cycle_phase
-                    FROM bots b
-                    LEFT JOIN trades t ON b.id = t.bot_id
-                    WHERE b.is_active = 1
-                """
-                df_pos = pd.read_sql(query_all, conn_fresh)
-                
-                # Fetch Physical Positions (df_physical)
-                try:
-                    df_physical = pd.read_sql("SELECT pair, side, size, entry_price, datetime(last_checked, 'unixepoch', 'localtime') as updated FROM active_positions", conn_fresh)
-                except Exception as e:
-                    st.error(f"Failed to fetch physical positions: {e}")
-                    print(f"DEBUG UI ERROR: {e}")
-                    df_physical = pd.DataFrame()
-                
-                # Initialize metrics
-                hedge_amounts = {}
-                diff_net = 0.0
-                virtual_qty_by_pair = {}
-                physical_qty_by_pair = {}
-                pair_prices = {} # For converting qty back to USD for readability
-                virtual_net_by_norm = {}
+        # --- FRAGMENTED OVERVIEW (v3.1.2) ---
 
-                # Fetch Hedged Bots (All cycles since hedges can outlive TP)
-                query_h = """
-                    SELECT bo.bot_id, b.pair, b.direction, bo.order_type, bo.filled_amount
-                    FROM bot_orders bo
-                    JOIN bots b ON bo.bot_id = b.id
-                    JOIN trades t ON b.id = t.bot_id
-                    WHERE b.is_active = 1
-                      AND bo.order_type IN ('hedge', 'hedge_tp')
-                      AND bo.status NOT IN ('canceled', 'cancelled', 'rejected', 'failed', 'reset_cleared', 'auto_closed', 'placing')
-                      AND (bo.cycle_id = t.cycle_id OR (bo.cycle_id IS NULL AND t.cycle_id IS NULL))
-                      AND (t.wipe_wall_ts = 0 OR bo.created_at >= t.wipe_wall_ts)
-                """
-                df_h = pd.read_sql(query_h, conn_fresh)
-                
-                # Pre-calculate hedge_amounts for the Status Column
-                if not df_h.empty:
-                    for b_id in df_pos['id'].unique():
-                        # 🛡️ ARCHITECT'S FIX: Hedges only exist if the bot is actively in a trade (Step > 0)
-                        # or specifically marked as HEDGE_EXIT_PENDING. Step 0 bots are SCANNING.
-                        row_bot = df_pos[df_pos['id'] == b_id].iloc[0]
-                        # c_step = int(row_bot.get('current_step', 0) if pd.notna(row_bot.get('current_step')) else 0)
-                        # if c_step == 0 and "EXITING" not in str(row_bot.get('status','')).upper():
-                        #     hedge_amounts[b_id] = 0.0
-                        #     continue
-
-                        h_sum = df_h[(df_h['bot_id'] == b_id) & (df_h['order_type'] == 'hedge')]['filled_amount'].sum()
-                        hx_sum = df_h[(df_h['bot_id'] == b_id) & (df_h['order_type'] == 'hedge_tp')]['filled_amount'].sum()
-                        hedge_amounts[b_id] = max(0.0, h_sum - hx_sum)
-
-                # Fetch Hedged Bot IDs for heuristic missing-order detection
-                hedged_bot_ids = set(df_h[df_h['filled_amount'] > 1e-8]['bot_id'].unique())
-
-                # --- FUNDAMENTAL FIX: DATA-DRIVEN STATUS ---
-                # Derive 'display_status' from current_step and status strings
-                def derive_status(row):
-                    if not row['is_active']: return "⚪ STOPPED"
-                    
-                    b_status = str(row.get('bot_status', row.get('status', ''))).upper()
-                    if 'REQUIRE_MANUAL' in b_status: return "🚨 MANUAL GATE"
-                    if 'CARRY_PENDING' in b_status: return "⏳ CARRY/PENDING"
-                    if 'HEDGE_EXIT_PENDING' in b_status: return "🛡️ HEDGE EXITING"
-                    
-                    c_phase = str(row.get('cycle_phase', 'IDLE')).upper()
-                    c_step = int(row.get('current_step', 0) if pd.notna(row.get('current_step')) else 0)
-                    invested = float(row.get('total_invested', 0) or 0)
-                    h_amt = hedge_amounts.get(row['id'], 0)
-                    
-                    if c_phase == 'HEDGED' or h_amt > 1e-8:
-                        if "EXITING" in b_status:
-                            return f"🛡️ HEDGE EXIT PENDING ({h_amt:.4f})"
-                        return f"🛡️ HEDGED ({h_amt:.4f}) | Step {c_step}"
-                    
-                    if c_phase == 'ACTIVE' or invested > 1e-8:
-                        # Binance min-notional is 5 USD. Noticeably small positions are dust.
-                        if invested > 0 and invested <= 5.0: 
-                            return "🟡 DUST/PARTIAL"
-                        return f"🔴 IN TRADE | Step {c_step}"
-                    
-                    return "🟢 SCANNING"
-
-                # Apply fix to df_pos BEFORE rendering
-                df_pos['status'] = df_pos.apply(derive_status, axis=1)
-
-                # Group active IN TRADE bots to the top
-                df_pos['sort_priority'] = df_pos['status'].apply(lambda x: 1 if ("IN TRADE" in x or "HEDGED" in x) else (2 if "SCANNING" in x else 3))
-                df_pos.sort_values(by=['sort_priority', 'name'], ascending=[True, True], inplace=True)
-
-                # 1. Fetch ALL Active Bot Positions (O(1) approach)
-                # v2.5.5: Prefer open_qty accumulator over invested/avg derived qty.
-                query_v = """
-                    SELECT b.id, b.pair, b.direction, t.open_qty, t.total_invested, t.avg_entry_price
-                    FROM bots b
-                    JOIN trades t ON b.id = t.bot_id
-                    WHERE b.is_active = 1
-                """
-                df_v = pd.read_sql(query_v, conn_fresh)
-                
-                if not df_v.empty:
-                    for _, row in df_v.iterrows():
-                        invested   = float(row['total_invested'] or 0)
-                        avg_price  = float(row['avg_entry_price'] or 0)
-                        open_qty_v = float(row['open_qty'] or 0)
-                        pair_key   = _norm_universal(row['pair'])
-                        side_key   = str(row['direction']).upper()  # LONG or SHORT
-                        bot_id     = row['id']
-                        
-                        # Derive raw qty
-                        if open_qty_v > 0:
-                            qty_abs = open_qty_v
-                            ref_price = avg_price if avg_price > 0 else 1.0
-                        elif invested > 0 and avg_price > 0:
-                            qty_abs = invested / avg_price
-                            ref_price = avg_price
-                        else:
-                            qty_abs = 0
-                            ref_price = 1.0
-
-                        if pair_key not in pair_prices:
-                            pair_prices[pair_key] = ref_price
-
-                        # 🛡️ HEDGE-AWARE NETTING:
-                        # v2.5.9: 'open_qty' is already the net position (Entry - Hedge)
-                        effective_qty = qty_abs
-                        
-                        # 🚀 HEDGE-MODE: Group by (pair, side)
-                        composite_key = (pair_key, side_key)
-                        virtual_qty_by_pair[composite_key] = virtual_qty_by_pair.get(composite_key, 0.0) + effective_qty
-
-                # 2. Physical Positions (grouped by normalized pair + side)
-                if not df_physical.empty:
-                    for _, row in df_physical.iterrows():
-                        if pd.notna(row['size']) and pd.notna(row['entry_price']):
-                            qty = abs(float(row['size']))
-                            price = float(row['entry_price'])
-                            side = str(row['side']).upper().strip()
-                            side_key = 'LONG' if side in ('BUY', 'LONG') else 'SHORT'
-                            pair_key = _norm_universal(row['pair'])
-                            composite_key = (pair_key, side_key)
-                            if pair_key not in pair_prices:
-                                pair_prices[pair_key] = price
-                            physical_qty_by_pair[composite_key] = physical_qty_by_pair.get(composite_key, 0.0) + qty
-                
-                # 3. Symbol-Level NET comparison (One-Way Mode Awareness)
-                all_symbols = set([_norm_universal(p) for p in df_v['pair']]) | set([_norm_universal(p) for p in df_physical['pair']]) if not df_physical.empty else set([_norm_universal(p) for p in df_v['pair']])
-                virtual_net_usd = 0.0
-                physical_net_usd = 0.0
-                diff_net = 0.0
-                
-                # Pre-calculate virtual net quantities in memory (O(1) pass)
-                for (pk, sk), q in virtual_qty_by_pair.items():
-                    virtual_net_by_norm[pk] = virtual_net_by_norm.get(pk, 0.0) + (q if sk == 'LONG' else -q)
-
-                for p in sorted(all_symbols):
-                    v_net_qty = virtual_net_by_norm.get(p, 0.0)
-                    ph_net_qty = physical_qty_by_pair.get((p, 'LONG'), 0.0) - physical_qty_by_pair.get((p, 'SHORT'), 0.0)
-                    
-                    # 🛡️ ARCHITECT'S SHIELD: Apply manual whitelists to ignore personal trades
-                    whitelists = get_manual_whitelists(p)
-                    for w in whitelists:
-                        w_qty = float(w['qty'])
-                        ph_net_qty -= w_qty if w['side'] == 'LONG' else -w_qty
-                    
-                    ref_price = pair_prices.get(p, 1.0)
-                    net_qty_diff = abs(v_net_qty - ph_net_qty)
-                    net_usd_diff = net_qty_diff * ref_price
-                    
-                    # Global metrics update
-                    virtual_net_usd += v_net_qty * ref_price
-                    physical_net_usd += ph_net_qty * ref_price
-
-                    # DISCREPANCY DETECTION
-                    if net_usd_diff > 0.01:
-                        diff_net += net_usd_diff # Correctly accumulate total diff
-                        v_usd_net = v_net_qty * ref_price
-                        ph_usd_net = ph_net_qty * ref_price
-                        signed_qty_diff = ph_net_qty - v_net_qty 
-                        mismatched_pairs.append((f"{p} NET", v_usd_net, ph_usd_net, net_usd_diff, v_net_qty, ph_net_qty, signed_qty_diff, ref_price))
-                
-                # --- 🚀 UI UPGRADE: PROMINENT METRICS (Green/Red Part) 🚀 ---
-                m_col1, m_col2, m_col3 = st.columns(3)
-                with m_col1:
-                    st.metric("Net Exposure (Virtual)", f"${virtual_net_usd:,.2f}")
-                with m_col2:
-                    st.metric("Exchange Net (Physical)", f"${physical_net_usd:,.2f}", delta=f"{physical_net_usd-virtual_net_usd:,.2f}")
-                with m_col3:
-                    _status = "HEALTHY" if abs(virtual_net_usd - physical_net_usd) <= 0.01 else "MISMATCH"
-                    _color = "green" if _status == "HEALTHY" else "red"
-                    st.markdown(f"**System Status:** <span style='color:{_color}; font-weight:bold;'>{_status}</span>", unsafe_allow_html=True)
-                st.divider()
-
-                # --- Status Indicator & Order Health ---
-                try:
-                    order_health_msg = ""
-                    order_status_color = "green"
-                    
-                    # --- STATUS CONSISTENCY FIX ---
-                    active_bots = df_pos[df_pos['is_active'] == 1]
-                    total_orders = len(market_orders)
-                    
-                    # --- REALITY SYNC: Per-Bot Order Validation ---
-                    try:
-                        physical_order_counts = {}
-                        for o in market_orders:
-                            cid = str(o.get('clientOrderId') or '')
-                            if cid.startswith('CQB_'):
-                                try:
-                                    parts = cid.split('_')
-                                    if len(parts) >= 2:
-                                        bid_parsed = int(parts[1])
-                                        physical_order_counts[bid_parsed] = physical_order_counts.get(bid_parsed, 0) + 1
-                                except: pass
-                        
-                        # Load pos_limit_hit flags for all bots in one query
-                        try:
-                            from engine.database import get_connection as _gconn
-                            _conn = _gconn()
-                            _plimit_rows = _conn.execute("SELECT id, pos_limit_hit FROM bots").fetchall()
-                            _pos_limit_flags = {row[0]: bool(row[1]) for row in _plimit_rows}
-                        except Exception:
-                            _pos_limit_flags = {}
-
-                        # Check for in-trade bots missing real physics orders
-                        bots_with_missing_orders = []
-                        bots_with_partial_orders = []
-                        bots_pos_limit = []
-                        for _, row in active_bots.iterrows():
-                            bid = int(row['id'])
-                            c_step = int(row.get('current_step', 0))
-                            bot_invested = float(row.get('total_invested', 0) or 0)
-                            is_hedged = bid in hedged_bot_ids
-                            
-                            actual_physical = physical_order_counts.get(bid, 0)
-                            
-                            # 🛡️ PENDING/RESET GATE: Bots exiting or reset should NOT trigger alerts
-                            b_status_upper = str(row.get('status', '')).upper()
-                            c_phase = str(row.get('cycle_phase', 'IDLE')).upper()
-                            
-                            # Self-Healing Status derivation for alert gating
-                            is_scanning = (c_phase == 'IDLE' and bot_invested <= 1e-8 and not is_hedged)
-                            
-                            if "EXITING" in b_status_upper or is_scanning:
-                                continue
-
-                            if is_hedged:
-                                if actual_physical == 0: bots_with_missing_orders.append(f"{row['name']} (HEDGED)")
-                                continue
-
-                            if actual_physical == 0 and bot_invested > 1e-8:
-                                if _pos_limit_flags.get(bid, False): bots_pos_limit.append(row['name'])
-                                else: bots_with_missing_orders.append(row['name'])
-                            
-                            elif actual_physical < 2 and c_step > 0 and bot_invested > 0 and not is_hedged:
-                                try:
-                                    cfg = json.loads(row.get('config', '{}'))
-                                    max_steps = int(cfg.get('max_steps', 10))
-                                    if c_step < max_steps:
-                                        if _pos_limit_flags.get(bid, False): bots_pos_limit.append(row['name'])
-                                        else: bots_with_partial_orders.append(f"{row['name']} ({actual_physical}/2)")
-                                except: pass
-
-                        expected_total = sum(
-                            physical_order_counts.get(int(row['id']), 0) if int(row['id']) in hedged_bot_ids else
-                            (min(1, physical_order_counts.get(int(row['id']), 0)) 
-                            if int(row.get('current_step', 0)) == 0
-                            else (1 if int(row.get('current_step', 0)) >= int(json.loads(row.get('config', '{}')).get('max_steps', 10)) else 2))
-                            for _, row in active_bots.iterrows()
-                        )
-                    except Exception:
-                        expected_total = total_orders
-                        bots_with_missing_orders = []
-                        bots_pos_limit = []
-                    
-                    if bots_with_missing_orders:
-                        order_health_msg = f"⚠️ MISSING CRITICAL ORDERS: {', '.join(bots_with_missing_orders)} have 0 open limit orders!"
-                        order_status_color = "red"
-                    elif bots_with_partial_orders:
-                        error_reasons = []
-                        for b_str in bots_with_partial_orders:
-                            b_name = b_str.rpartition(' (')[0] if ' (' in b_str else b_str
-                            b_row = active_bots[active_bots['name'] == b_name].iloc[0] if not active_bots[active_bots['name'] == b_name].empty else None
-                            if b_row is not None and b_row.get('error'): error_reasons.append(f"{b_name}: {b_row['error']}")
-                            else: error_reasons.append(b_str)
-                        order_health_msg = f"⚠️ MISSING GRIDS (Check ATR/Params): {', '.join(error_reasons)}"
-                        order_status_color = "orange"
-                    elif bots_pos_limit:
-                        order_health_msg = f"🚫 POS LIMIT: {', '.join(bots_pos_limit)} at exchange max notional."
-                        order_status_color = "green"
-                    elif total_orders < expected_total:
-                        order_health_msg = f"⚠️ EXCHANGE LAG: Found {total_orders}, Expected {expected_total} (Syncing...)."
-                        order_status_color = "orange"
-                    elif total_orders > expected_total:
-                        order_health_msg = f"⚠️ STRAY ORDERS: Found {total_orders}, Expected only {expected_total}."
-                        order_status_color = "red"
-                    else:
-                        order_health_msg = f"✅ ORDERS SYNCED: {total_orders} active orders."
-
-                    if diff_net > 0.01:
-                        st.markdown(f"""
-                        <div style="background-color:rgba(255, 75, 75, 0.1); padding:10px; border-radius:5px; border:1px solid rgba(255, 75, 75, 0.2); margin-bottom:15px;">
-                            <span style="color:#ff4b4b; font-weight:bold;">⚠️ SYSTEM MISMATCH:</span> 
-                            The exchange is reporting <b>${physical_net_usd:,.2f}</b> net exposure, but the system believes it is <b>${virtual_net_usd:,.2f}</b>.
-                        </div>
-                        """, unsafe_allow_html=True)
-                    
-                    st.markdown(f"""
-                    <div style="display: flex; justify-content: space-between; align-items: center; background-color: #0e1117; padding: 15px; border-radius: 10px; border: 1px solid #30363d; margin-bottom: 20px;">
-                        <div>
-                            <div style="font-size: 0.8rem; color: #8b949e; margin-bottom: 4px;">ORDER HEALTH</div>
-                            <div style="font-size: 1.1rem; color: {order_status_color}; font-weight: bold;">{order_health_msg}</div>
-                        </div>
-                    </div>
-                    """, unsafe_allow_html=True)
-
-                except Exception as e:
-                    st.error(f"Status Indicator Error: {e}")
-
-                try:
-                    with st.expander("🔍 Global Netting Diagnostics (v2.5.8)", expanded=False):
-                        st.write(f"**Reconciliation Mode:** Global Net (Hedge-Aware)")
-                        debug_data = []
-                        for p_dbg in sorted(all_symbols):
-                            v_dbg = virtual_net_by_norm.get(p_dbg, 0.0)
-                            ph_l_dbg = physical_qty_by_pair.get((p_dbg, 'LONG'), 0.0)
-                            ph_s_dbg = physical_qty_by_pair.get((p_dbg, 'SHORT'), 0.0)
-                            ph_net_dbg = ph_l_dbg - ph_s_dbg
-                            debug_data.append({
-                                "Symbol": p_dbg,
-                                "System Net": f"{v_dbg:+.4f}",
-                                "Exchange Net": f"{ph_net_dbg:+.4f}",
-                                "Diff Qty": f"{abs(v_dbg - ph_net_dbg):.4f}"
-                            })
-                        st.table(pd.DataFrame(debug_data))
-                except Exception:
-                    pass
-
-                has_mismatch = len(mismatched_pairs) > 0
-                if has_mismatch:
-                    st.error("🚨 DATABASE DESYNC: Binance physical exchange positions drastically differ from the bots' internal ledgers.")
-
-                is_startup_grace = False
-                if not df_pos.empty:
-                    try:
-                        newest_start = df_pos['basket_start_time'].max()
-                        if (time.time() - newest_start) < 60: is_startup_grace = True
-                    except: pass
-
-                if not has_mismatch and order_status_color == "green":
-                    st.success(f"✅ **SYSTEM HEALTHY**: Contracts and orders are perfectly aligned. {order_health_msg}")
-                elif is_startup_grace and order_status_color == "red":
-                    st.warning(f"🟡 **SYSTEM STARTUP**: Waiting for initial sync/orders (Grace Period)...")
-                else:
-                    st.error(f"🚨 **SYSTEM MISMATCH DETECTED**")
-                    if mismatched_pairs:
-                        for row_mp in mismatched_pairs:
-                            mp_pair, mp_virt, mp_phys, mp_diff, mp_vqty, mp_pqty, mp_dqty, mp_price = row_mp
-                            qty_str = f" | Qty: system={mp_vqty:+.4f} exchange={mp_pqty:+.4f} diff={mp_dqty:.4f}"
-                            _pair_root = mp_pair.split(' ')[0]
-                            _pair_pos_capped = any(_pos_limit_flags.get(int(row['id']), False) for _, row in active_bots.iterrows() if str(row.get('pair', '')).startswith(_pair_root.split('/')[0]))
-                            if _pair_pos_capped:
-                                st.info(f"   🚫 **{mp_pair}**: System ${mp_virt:,.2f} vs Exchange ${mp_phys:,.2f} (Diff: ${mp_diff:,.2f}){qty_str} — *POS LIMIT*")
-                            elif mp_diff > 0.01:
-                                st.warning(f"   ⚠️ **{mp_pair}**: System ${mp_virt:,.2f} vs Exchange ${mp_phys:,.2f} (Diff: ${mp_diff:,.2f}){qty_str}")
-                            
-                            if abs(mp_dqty or 0) > 0.0001:
-                                _act_col1, _act_col2, _act_col3, _act_col4 = st.columns([1,1,1,1])
-                                with _act_col1:
-                                    if st.button("🕵️ Forensic Adopt", key=f"forensic_{mp_pair}"):
-                                        from engine.reconciler import StateReconciler
-                                        sr = StateReconciler()
-                                        res = sr.perform_forensic_reconstruction(_pair_root)
-                                        if sum(res.values()) > 0: st.success("Forensic Success!"); time.sleep(1); st.rerun()
-                                        else: st.warning("No missing proof-based fills found.")
-                                with _act_col2:
-                                    _side = 'LONG' if mp_dqty > 0 else 'SHORT'
-                                    if st.button("📝 Mark as Manual", key=f"manual_{mp_pair}"):
-                                        from ui.views.monitor import add_manual_whitelist
-                                        add_manual_whitelist(_pair_root, _side, abs(mp_dqty)); st.rerun()
-                                with _act_col3:
-                                    if st.button("💥 Market Close", key=f"mkt_close_{mp_pair}"):
-                                        ex_mkt = get_exchange_instance('future')
-                                        if abs(mp_pqty) > 0.0001:
-                                            ex_mkt.create_order(_pair_root, 'market', 'sell' if mp_pqty > 0 else 'buy', abs(mp_pqty), params={'reduceOnly': True})
-                                        from engine.database import get_connection as _gconn_mkt
-                                        _conn_mkt = _gconn_mkt()
-                                        _involved_bots = [r[0] for r in _conn_mkt.execute("SELECT id FROM bots WHERE pair LIKE ?", (f"{_pair_root}%",)).fetchall()]
-                                        for _bid in _involved_bots:
-                                            _conn_mkt.execute("UPDATE bot_orders SET status='reset_cleared' WHERE bot_id=?", (_bid,))
-                                            _conn_mkt.execute("UPDATE trades SET total_invested=0, current_step=0 WHERE bot_id=?", (_bid,))
-                                        _conn_mkt.commit(); st.rerun()
-
-                try:
-                    _orphan_rows = sqlite3.connect(db_path).execute("SELECT pair, side, size, entry_price FROM active_positions WHERE bot_id=0").fetchall()
-                except: _orphan_rows = []
-                if _orphan_rows:
-                    st.divider(); st.markdown("### 🚨 Unowned Physical Positions (Orphans)")
-                    for _or in _orphan_rows:
-                        _o_pair, _o_side, _o_size, _o_entry = _or
-                        if st.button(f"🛑 Flatten {_o_pair} {_o_side} ({_o_size})"):
-                            try:
-                                get_exchange_instance('future').create_order(_o_pair, 'market', 'sell' if _o_side.upper() == 'LONG' else 'buy', _o_size, params={'reduceOnly': True})
-                                st.success(f"Position closed: {_o_pair}")
-                                time.sleep(1); st.rerun()
-                            except Exception as e_fl:
-                                if "reduceonly" in str(e_fl).lower():
-                                    st.error("ReduceOnly Rejected: Binance thinks you have no position. Force closing without ReduceOnly...")
-                                    get_exchange_instance('future').create_order(_o_pair, 'market', 'sell' if _o_side.upper() == 'LONG' else 'buy', _o_size)
-                                    st.rerun()
-                                else:
-                                    st.error(f"Flatten Error: {e_fl}")
-
-                if has_mismatch:
-                    st.divider(); st.markdown("### 🧙‍♂️ Manual Link Recovery Tool")
-                    try:
-                        _rc = sqlite3.connect(db_path)
-                        # Check if table exists first
-                        _check = _rc.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='reconciliation_log'").fetchone()
-                        if not _check:
-                            _rc.execute("CREATE TABLE reconciliation_log (id INTEGER PRIMARY KEY AUTOINCREMENT, bot_id INTEGER, pair TEXT, action TEXT, details TEXT, created_at INTEGER)")
-                            _rc.commit()
-                        
-                        _recon_rows = _rc.execute("SELECT pair, details FROM reconciliation_log WHERE action IN ('UNAUTHORIZED_LOSS', 'MANUAL_INTERVENTION') ORDER BY created_at DESC LIMIT 10").fetchall()
-                        _rc.close()
-                    except Exception as e_db:
-                        st.warning(f"Database sync in progress: {e_db}")
-                        _recon_rows = []
-                    
-                    active_bot_ids = [str(b[0]) for (b) in df_pos[['id']].values]
-                    stray_orders = [o for o in market_orders if str(o.get('clientOrderId','')).startswith('CQB_') and o.get('clientOrderId','').split('_')[1] not in active_bot_ids]
-                    if stray_orders:
-                        st.info(f"Found {len(stray_orders)} stray orders.")
-        except Exception as e_global:
-            st.error(f"Global Monitor Error: {e_global}")
-        st.divider()
-
-        # -------------------------------------------------------------------------
-        # ⚡ FRAGMENT: Exchange Reality + Bot Strategies
         # Decorated with @st.fragment so this section refreshes independently
         # without triggering a full-page rerun.
         # -------------------------------------------------------------------------
         @st.fragment(run_every=15 if auto_refresh and not wizard_active else None)
         def _bot_positions_fragment():
             # 🚀 SINGLE SOURCE OF TRUTH FETCH
-            df_pos_f, df_physical_f, market_orders_f, df_h_f = _fetch_fresh_monitor_data()
+            df_pos_f, df_physical_f, market_orders_f, df_h_f, ex_err = _fetch_fresh_monitor_data()
             st.caption(f"  ⚡ Grid Sync: {time.strftime('%H:%M:%S')}")
+            
+            if ex_err:
+                st.warning(f"⚠️ {ex_err}")
             
             # --- Mismatch Alert Logic (v3.0.9) ---
             # Integrated directly into fragment for real-time parity tracking
             try:
                 # Initialize metrics
                 hedge_amounts = {}
-                virtual_qty_by_pair = {}
                 physical_qty_by_pair = {}
                 pair_prices = {} 
                 virtual_net_by_norm = {}
@@ -904,30 +457,60 @@ def render_monitor_view():
                     if 'REQUIRE_MANUAL' in b_status: return "🚨 MANUAL GATE"
                     if 'CARRY_PENDING' in b_status: return "⏳ CARRY/PENDING"
                     if 'HEDGE_EXIT_PENDING' in b_status: return "🛡️ HEDGE EXITING"
+                    
                     c_phase = str(row.get('cycle_phase', 'IDLE')).upper()
                     c_step = int(row.get('current_step', 0) if pd.notna(row.get('current_step')) else 0)
                     invested = float(row.get('total_invested', 0) or 0)
                     h_amt = hedge_amounts.get(row['id'], 0)
+                    
                     if c_phase == 'HEDGED' or h_amt > 1e-8:
                         if "EXITING" in b_status: return f"🛡️ HEDGE EXIT PENDING ({h_amt:.4f})"
                         return f"🛡️ HEDGED ({h_amt:.4f}) | Step {c_step}"
-                    if c_phase == 'ACTIVE' or invested > 1e-8:
+                    
+                    # Consistent threshold for 'In Trade'
+                    if c_phase == 'ACTIVE' or invested > 0.01:
                         if invested > 0 and invested <= 5.0: return "🟡 DUST/PARTIAL"
                         return f"🔴 IN TRADE | Step {c_step}"
+                    
                     return "🟢 SCANNING"
 
                 df_pos_f['status'] = df_pos_f.apply(derive_status, axis=1)
                 df_pos_f['sort_priority'] = df_pos_f['status'].apply(lambda x: 1 if ("IN TRADE" in x or "HEDGED" in x) else (2 if "SCANNING" in x else 3))
                 df_pos_f.sort_values(by=['sort_priority', 'name'], ascending=[True, True], inplace=True)
 
-                # Calculate Netting Parity
-                for _, row in df_pos_f.iterrows():
-                    inv, avg, o_qty = float(row['total_invested'] or 0), float(row['avg_entry_price'] or 0), float(row['open_qty'] or 0)
-                    p_key, s_key = _norm_universal(row['pair']), str(row['direction']).upper()
-                    qty_abs = o_qty if o_qty > 0 else (inv / avg if inv > 0 and avg > 0 else 0)
-                    if p_key not in pair_prices: pair_prices[p_key] = avg if avg > 0 else 1.0
-                    virtual_qty_by_pair[(p_key, s_key)] = virtual_qty_by_pair.get((p_key, s_key), 0.0) + qty_abs
+                # ═══════════════════════════════════════════════════════════════════════
+                # [v3.1.4] GLOBAL NETTING — SINGLE SOURCE OF TRUTH FIX
+                # ═══════════════════════════════════════════════════════════════════════
+                # BEFORE (broken): Built virtual_qty_by_pair from trades.open_qty +
+                # inline hedge arithmetic. trades.open_qty is a cached snapshot that is
+                # NOT updated synchronously when hedges fill, causing false-positive
+                # mismatches (e.g. XRP: System=-743 vs Exchange=0 when hedge filled).
+                #
+                # AFTER (correct): Use get_pair_virtual_net(pair) — the authoritative
+                # proof-only computation from actual bot_orders fills. It already handles
+                # entries, exits, partial-cancel-fills, hedges, hedge_tp, wipe_wall, and
+                # cycle_id boundaries. One function → one source of truth → no false alarms.
+                # ═══════════════════════════════════════════════════════════════════════
+                from engine.database import get_pair_virtual_net as _get_virtual_net
 
+                # Build unique pair map: normalized_key → canonical DB pair string
+                unique_db_pairs = {}  # p_key → canonical pair (e.g. 'XRP/USDC:USDC')
+                for _, row in df_pos_f.iterrows():
+                    p_key = _norm_universal(row['pair'])
+                    if p_key not in unique_db_pairs:
+                        unique_db_pairs[p_key] = row['pair']
+                    avg = float(row.get('avg_entry_price') or 0)
+                    if avg > 0 and p_key not in pair_prices:
+                        pair_prices[p_key] = avg
+
+                # Populate virtual_net_by_norm from authoritative source
+                for p_key, canonical_pair in unique_db_pairs.items():
+                    try:
+                        virtual_net_by_norm[p_key] = _get_virtual_net(canonical_pair)
+                    except Exception as _vne:
+                        virtual_net_by_norm[p_key] = 0.0
+
+                # Build physical_qty_by_pair from exchange position snapshot (unchanged)
                 if not df_physical_f.empty:
                     for _, row in df_physical_f.iterrows():
                         if pd.notna(row['size']) and pd.notna(row['entry_price']):
@@ -936,11 +519,27 @@ def render_monitor_view():
                             if p_key not in pair_prices: pair_prices[p_key] = price
                             physical_qty_by_pair[(p_key, s_key)] = physical_qty_by_pair.get((p_key, s_key), 0.0) + qty
 
-                all_symbols = set([_norm_universal(p) for p in df_pos_f['pair']]) | set([_norm_universal(p) for p in df_physical_f['pair']]) if not df_physical_f.empty else set([_norm_universal(p) for p in df_pos_f['pair']])
+                # 🔥 HEATMAP: Enrich pair_prices with LIVE ticker prices
+                # Overwrite stale avg_entry_price with real mark prices for accurate distance %
+                try:
+                    ex_live = get_exchange_instance(global_config.MARKET_TYPE)
+                    for p_key, canonical_pair in unique_db_pairs.items():
+                        try:
+                            live_px = ex_live.get_last_price(canonical_pair)
+                            if live_px and float(live_px) > 0:
+                                pair_prices[p_key] = float(live_px)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+                # Union of all known symbols (virtual + physical)
+                all_symbols = set(unique_db_pairs.keys())
+                if not df_physical_f.empty:
+                    all_symbols |= set(_norm_universal(p) for p in df_physical_f['pair'])
+
                 virtual_net_usd = 0.0
                 physical_net_usd = 0.0
-                for (pk, sk), q in virtual_qty_by_pair.items():
-                    virtual_net_by_norm[pk] = virtual_net_by_norm.get(pk, 0.0) + (q if sk == 'LONG' else -q)
 
                 for p in sorted(all_symbols):
                     v_net_qty = virtual_net_by_norm.get(p, 0.0)
@@ -986,11 +585,24 @@ def render_monitor_view():
                 for _, row in df_pos_f.iterrows():
                     bid, bot_inv, c_step = int(row['id']), float(row['total_invested'] or 0), int(row.get('current_step', 0))
                     actual_ph = physical_order_counts.get(bid, 0)
-                    if "EXITING" in str(row.get('status','')).upper() or ("SCANNING" in str(row.get('status','')).upper() and bot_inv <= 1e-8): continue
+                    
+                    # Skip bots that are legitimately idle or finishing
+                    if "EXITING" in str(row.get('status','')).upper() or ("SCANNING" in str(row.get('status','')).upper() and bot_inv <= 0.01):
+                        continue
+                        
                     if bid in hedged_bot_ids:
                         if actual_ph == 0: bots_with_missing_orders.append(f"{row['name']} (HEDGED)")
-                    elif actual_ph == 0 and bot_inv > 1e-8: bots_with_missing_orders.append(row['name'])
-                    elif actual_ph < 2 and c_step > 0 and bot_inv > 5.0: bots_with_partial_orders.append(f"{row['name']} ({actual_ph}/2)")
+                    else:
+                        # Stricter health: Step 1+ bots should generally have 2 orders (TP + Grid)
+                        cycle_phase = str(row.get('cycle_phase', 'IDLE')).upper()
+                        # We flag as MISSING CRITICAL if they have 0 orders but are in trade
+                        if actual_ph == 0 and bot_inv > 5.0 and cycle_phase != 'CARRY_PENDING':
+                            bots_with_missing_orders.append(row['name'])
+                        elif actual_ph == 0 and cycle_phase == 'CARRY_PENDING':
+                            pass # Engine is intentionally holding without orders
+                        # We flag as MISSING GRIDS if they have only 1 order but are mid-cycle (Step 1+)
+                        elif actual_ph < 2 and c_step >= 1 and bot_inv > 5.0:
+                            bots_with_partial_orders.append(f"{row['name']} ({actual_ph}/2)")
 
                 if bots_with_missing_orders:
                     order_health_msg, order_status_color = f"⚠️ MISSING CRITICAL ORDERS: {', '.join(bots_with_missing_orders)}!", "red"
@@ -999,14 +611,24 @@ def render_monitor_view():
                 else:
                     order_health_msg = f"✅ ORDERS SYNCED: {len(market_orders_f)} active orders."
 
-                st.markdown(f"""
-                <div style="display: flex; justify-content: space-between; align-items: center; background-color: #0e1117; padding: 15px; border-radius: 10px; border: 1px solid #30363d; margin-bottom: 20px;">
-                    <div>
-                        <div style="font-size: 0.8rem; color: #8b949e; margin-bottom: 4px;">ORDER HEALTH (Auto-Updating)</div>
-                        <div style="font-size: 1.1rem; color: {order_status_color}; font-weight: bold;">{order_health_msg}</div>
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
+                st.caption(f"  🩺 Order Health: :{order_status_color}[{order_health_msg}]")
+
+                # --- Global Netting Diagnostics (Restored to Fragment) ---
+                try:
+                    with st.expander("🔍 Global Netting Diagnostics", expanded=False):
+                        st.write("**Reconciliation Mode:** Global Net (Hedge-Aware)")
+                        debug_data = []
+                        for p_dbg in sorted(all_symbols):
+                            v_dbg = virtual_net_by_norm.get(p_dbg, 0.0)
+                            ph_l_dbg = physical_qty_by_pair.get((p_dbg, 'LONG'), 0.0)
+                            ph_s_dbg = physical_qty_by_pair.get((p_dbg, 'SHORT'), 0.0)
+                            ph_net_dbg = ph_l_dbg - ph_s_dbg
+                            debug_data.append({
+                                "Symbol": p_dbg, "System Net": f"{v_dbg:+.4f}",
+                                "Exchange Net": f"{ph_net_dbg:+.4f}", "Diff Qty": f"{abs(v_dbg - ph_net_dbg):.4f}"
+                            })
+                        st.table(pd.DataFrame(debug_data))
+                except: pass
 
                 if mismatched_pairs:
                     st.error("🚨 SYSTEM MISMATCH DETECTED")
@@ -1015,75 +637,214 @@ def render_monitor_view():
                         st.warning(f"   ⚠️ **{mp_pair}**: System ${mp_virt:,.2f} vs Exchange ${mp_phys:,.2f} (Diff: ${mp_diff:,.2f}) | Qty: sys={mp_vqty:+.4f} ex={mp_pqty:+.4f} diff={mp_dqty:.4f}")
                         _act_c1, _act_c2, _act_c3 = st.columns(3)
                         with _act_c1:
-                            if st.button("🕵️ Forensic Adopt", key=f"f_{mp_pair}_{time.time()}"):
+                            if st.button("🕵️ Forensic Adopt", key=f"f_{mp_pair}"):
                                 from engine.reconciler import StateReconciler
                                 StateReconciler().perform_forensic_reconstruction(mp_pair.split(' ')[0]); st.rerun()
                         with _act_c2:
-                            if st.button("📝 Manual", key=f"m_{mp_pair}_{time.time()}"):
+                            if st.button("📝 Manual", key=f"m_{mp_pair}"):
                                 add_manual_whitelist(mp_pair.split(' ')[0], 'LONG' if mp_dqty > 0 else 'SHORT', abs(mp_dqty)); st.rerun()
                         with _act_c3:
-                            if st.button("💥 Close", key=f"c_{mp_pair}_{time.time()}"):
+                            if st.button("💥 Close", key=f"c_{mp_pair}"):
                                 ex_m = get_exchange_instance('future')
-                                if abs(mp_pqty) > 0.0001: ex_m.create_order(mp_pair.split(' ')[0], 'market', 'sell' if mp_pqty > 0 else 'buy', abs(mp_pqty), params={'reduceOnly': True})
+                                # Only send a market order if the exchange actually holds a position
+                                if abs(mp_pqty) > 0.0001:
+                                    try:
+                                        ex_m.create_order(mp_pair.split(' ')[0], 'market', 'sell' if mp_pqty > 0 else 'buy', abs(mp_pqty), params={'reduceOnly': True})
+                                    except Exception as _close_ex_err:
+                                        st.warning(f"Exchange close order failed (may already be flat): {_close_ex_err}")
+                                # Zero ALL affected bots with a proper reset (not raw SQL)
+                                from engine.database import reset_bot_after_tp as _rbt
                                 conn_m = sqlite3.connect(global_config.PATHS['DB_FILE'])
                                 bids = [r[0] for r in conn_m.execute("SELECT id FROM bots WHERE pair LIKE ?", (f"{mp_pair.split(' ')[0]}%",)).fetchall()]
+                                conn_m.close()
                                 for b in bids:
-                                    conn_m.execute("UPDATE bot_orders SET status='reset_cleared' WHERE bot_id=?", (b,))
-                                    conn_m.execute("UPDATE trades SET total_invested=0, current_step=0 WHERE bot_id=?", (b,))
-                                conn_m.commit(); conn_m.close(); st.rerun()
+                                    try:
+                                        _rbt(b, exit_price=0.0, action_label='MANUAL_CLOSE',
+                                             notes=f"UI Close: exchange={mp_pqty:+.4f}, virtual={mp_vqty:+.4f}")
+                                    except Exception as _rbt_err:
+                                        st.warning(f"Reset bot {b} failed: {_rbt_err}")
+                                st.rerun()
 
                 # --- Position Details & Grids ---
                 st.subheader("🤖 Active Bot Positions")
                 
-                # Extract Trigger Info & Active Orders
+                # Extract Trigger Info, Active Orders, and EE/Profit Metrics
                 def extract_info(row):
-                    res = {'Trigger': 'N/A', 'Orders': '0', 'TP_Price': 0.0, 'Grid_Price': 0.0, 'Grid_Amount': 0.0}
+                    res = {
+                        'Trigger': 'N/A', 'Orders': '0', 'TP_Price': 0.0, 
+                        'Grid_Price': 0.0, 'Grid_Amount': 0.0, 
+                        'Expected_Profit': 0.0, 'EE_Status': '-', 'Basket_Age': '-', 'Cycle_Age': '-',
+                        'TP_Price_Str': '-', 'Grid_Price_Str': '-',
+                        'Action_Age': '-', 'Trade_Age': '-'
+                    }
+                    def _clean(val):
+                        if pd.isna(val) or val is None: return 0.0
+                        try: return float(val)
+                        except: return 0.0
                     try:
-                        cfg = json.loads(row.get('config', '{}') or '{}')
+                        cfg_raw = row.get('config')
+                        cfg = json.loads(cfg_raw if cfg_raw else '{}')
+                        # Fetch current market price
+                        pair_key = _norm_universal(row.get('pair', ''))
+                        current_price = _clean(pair_prices.get(pair_key, 0.0))
+                        
+                        # 1. Trigger Description
                         triggers = []
                         m_p = int(cfg.get('mode_price', 0) or 0)
                         t_p = float(cfg.get('price_threshold', 0) or 0)
-                        if m_p == 1: triggers.append(f"Price > ${t_p:,.2f}")
-                        elif m_p == 2: triggers.append(f"Price < ${t_p:,.2f}")
+                        if m_p == 1: 
+                            dist_str = f" ({((current_price - t_p)/t_p*100):.1f}%)" if current_price > 0 and t_p > 0 else ""
+                            triggers.append(f"Price > ${t_p:,.2f}{dist_str}")
+                        elif m_p == 2: 
+                            dist_str = f" ({((current_price - t_p)/t_p*100):.1f}%)" if current_price > 0 and t_p > 0 else ""
+                            triggers.append(f"Price < ${t_p:,.2f}{dist_str}")
                         if cfg.get('mode_rsi'): triggers.append(f"RSI({cfg.get('rsi_level')})")
                         desc_trigger = " + ".join(triggers) if triggers else "N/A"
-                        inv = float(row.get('total_invested', 0) or 0)
-                        is_in_trade = inv > 0
+                        
+                        inv = _clean(row.get('total_invested'))
+                        is_in_trade = inv > 0.01 or str(row.get('cycle_phase', '')).upper() == 'ACTIVE'
                         res['Trigger'] = f"In Trade ({desc_trigger})" if is_in_trade else desc_trigger
                         
+                        # 2. Order Tracking
                         bot_id = int(row['id'])
                         my_orders = [o for o in market_orders_f if str(o.get('clientOrderId') or '').startswith(f"CQB_{bot_id}_")]
                         if my_orders:
                             detailed = []
                             for o in my_orders:
-                                cid = o.get('clientOrderId', '')
-                                price_val = float(o.get('price', 0.0) or 0.0)
+                                cid = str(o.get('clientOrderId', ''))
+                                price_val = _clean(o.get('price'))
                                 if 'TP' in cid:
-                                    detailed.append('TP'); res['TP_Price'] = price_val
+                                    detailed.append('TP')
+                                    res['TP_Price'] = price_val
                                 elif 'GRID' in cid:
-                                    detailed.append('GRID'); res['Grid_Price'] = price_val; res['Grid_Amount'] = float(o.get('amount', 0))
+                                    detailed.append('GRID')
+                                    # If multiple grids, show the one closest to current price
+                                    if res['Grid_Price'] == 0:
+                                        res['Grid_Price'] = price_val
+                                        res['Grid_Amount'] = _clean(o.get('amount'))
+                                elif 'ENTRY' in cid: detailed.append('ENTRY')
                                 elif 'HEDGE' in cid: detailed.append('HEDGE')
-                            res['Orders'] = f"{len(my_orders)} ({', '.join(detailed)})"
-                    except: pass
+                            res['Orders'] = f"{len(my_orders)} ({', '.join(detailed[:5])}{'...' if len(detailed)>5 else ''})"
+                            
+                        # Enrich TP and Grid with distance
+                        if res['TP_Price'] > 0 and current_price > 0:
+                            dist = (current_price - res['TP_Price']) / res['TP_Price'] * 100
+                            res['TP_Price_Str'] = f"${res['TP_Price']:,.2f} ({dist:+.1f}%)"
+                        else:
+                            res['TP_Price_Str'] = f"${res['TP_Price']:,.2f}" if res['TP_Price'] > 0 else "-"
+                            
+                        if res['Grid_Price'] > 0 and current_price > 0:
+                            dist = (current_price - res['Grid_Price']) / res['Grid_Price'] * 100
+                            res['Grid_Price_Str'] = f"{res['Grid_Amount']:.4f} @ ${res['Grid_Price']:,.2f} ({dist:+.1f}%)"
+                        else:
+                            res['Grid_Price_Str'] = f"{res['Grid_Amount']:.4f} @ ${res['Grid_Price']:,.2f}" if res['Grid_Price'] > 0 else "-"
+                        
+                        # 3. Expected Profit
+                        o_qty = _clean(row.get('open_qty'))
+                        tp_p = _clean(res['TP_Price'] or row.get('target_tp_price'))
+                        avg_p = _clean(row.get('avg_entry_price'))
+                        if o_qty > 1e-8 and tp_p > 1e-8 and avg_p > 1e-8:
+                            side = str(row.get('direction', 'LONG')).upper()
+                            if side == 'SHORT': res['Expected_Profit'] = (avg_p - tp_p) * o_qty
+                            else: res['Expected_Profit'] = (tp_p - avg_p) * o_qty
+                        
+                        # 4. Early Exit (EE) Status
+                        b_start = _clean(row.get('basket_start_time'))
+                        if is_in_trade and cfg.get('UseEarlyExit') and b_start > 0:
+                            ee_start_h = _clean(cfg.get('EEStartHours'))
+                            elapsed_h = (time.time() - b_start) / 3600
+                            if elapsed_h > ee_start_h:
+                                decay_mins = _clean(cfg.get('DecayIntervalMins', 15))
+                                decay_pct = _clean(cfg.get('DecayPercentPerInterval', 10))
+                                intervals = (elapsed_h - ee_start_h) * 60 / decay_mins
+                                total_decay = min(100.0, intervals * decay_pct)
+                                if total_decay >= 100.0:
+                                    res['EE_Status'] = f"ACTIVE (100%) 🔴"
+                                else:
+                                    # Show intervals remaining until 100%
+                                    intervals_to_full = (100.0 - total_decay) / decay_pct
+                                    mins_to_full = intervals_to_full * decay_mins
+                                    h_to_full = mins_to_full / 60
+                                    if h_to_full < 1.0:
+                                        time_to_full = f"{mins_to_full:.0f}m"
+                                    else:
+                                        time_to_full = f"{h_to_full:.1f}h"
+                                    res['EE_Status'] = f"ACTIVE ({total_decay:.0f}%) → 100% in {time_to_full}"
+                            else:
+                                # Show time remaining until EE activates
+                                wait_h = ee_start_h - elapsed_h
+                                if wait_h < 1.0:
+                                    res['EE_Status'] = f"Wait {wait_h*60:.0f}m"
+                                else:
+                                    res['EE_Status'] = f"Wait {wait_h:.1f}h"
+                        
+                        # 5. Pos Age (Position Age = basket_start_time = when entry filled)
+                        b_start = _clean(row.get('basket_start_time'))
+                        if is_in_trade and b_start > 0:
+                            b_age_h = (time.time() - b_start) / 3600
+                            if b_age_h < 1.0: res['Action_Age'] = f"{b_age_h*60:.0f}m"
+                            elif b_age_h < 24.0: res['Action_Age'] = f"{b_age_h:.1f}h"
+                            else: res['Action_Age'] = f"{b_age_h/24:.1f}d"
+                        
+                        # 6. Cycle Age (cycle_start_time = when the cycle began = last TP exit)
+                        c_start = _clean(row.get('cycle_start_time'))
+                        if is_in_trade and c_start > 0:
+                            c_age_h = (time.time() - c_start) / 3600
+                            if c_age_h < 1.0: res['Trade_Age'] = f"{c_age_h*60:.0f}m"
+                            else: res['Trade_Age'] = f"{c_age_h:.1f}h"
+
+                    except Exception as e:
+                        print(f"Error extracting info for bot {row.get('id')}: {e}")
                     return res
 
                 info_df = df_pos_f.apply(extract_info, axis=1, result_type='expand')
                 df_pos_f['Trigger Condition'] = info_df['Trigger']
                 df_pos_f['Active Orders'] = info_df['Orders']
-                df_pos_f['Active TP'] = info_df['TP_Price'].apply(lambda x: f"${x:,.2f}" if x > 0 else "-")
-                df_pos_f['Next Grid'] = info_df.apply(lambda r: f"{r['Grid_Amount']} @ ${r['Grid_Price']:,.2f}" if r['Grid_Price'] > 0 else "-", axis=1)
+                df_pos_f['Active TP'] = info_df['TP_Price_Str']
+                df_pos_f['Next Grid'] = info_df['Grid_Price_Str']
+                
+                # Visual Profit Feedback
+                def format_profit(row):
+                    x = row['Expected_Profit']
+                    status = str(row.get('status', '')).upper()
+                    if 'SCANNING' in status or abs(x) < 0.001:
+                        return "-"
+                    return f"${x:,.2f}"
 
-                st.dataframe(df_pos_f[['name', 'pair', 'direction', 'status', 'Active TP', 'Next Grid', 'Active Orders', 'total_invested']], width="stretch")
+                df_pos_f['Expected Profit'] = info_df.apply(format_profit, axis=1)
+                df_pos_f['EE Status'] = info_df['EE_Status']
+                df_pos_f['Pos Age'] = info_df['Action_Age']   # basket_start_time: when this entry filled
+                df_pos_f['Cycle Age'] = info_df['Trade_Age']  # cycle_start_time: when the cycle started (last TP)
+                df_pos_f['Total Invested'] = df_pos_f['total_invested'].apply(lambda x: f"${x:,.2f}" if x > 0.01 else "-")
+
+                st.dataframe(
+                    df_pos_f[['name', 'pair', 'direction', 'status', 'Trigger Condition', 'Total Invested', 'Pos Age', 'Expected Profit', 'EE Status', 'Cycle Age', 'Active TP', 'Next Grid', 'Active Orders']], 
+                    width="stretch",
+                    hide_index=True
+                )
 
                 # Manual Link Recovery Section
                 active_bot_ids = [str(b_id) for b_id in df_pos_f['id'].values]
                 stray_orders = [o for o in market_orders_f if str(o.get('clientOrderId','')).startswith('CQB_') and o.get('clientOrderId','').split('_')[1] not in active_bot_ids]
+                
+                # --- Orphan Position Detection (Restored to Fragment) ---
+                try:
+                    _orphan_rows = sqlite3.connect(global_config.PATHS['DB_FILE']).execute("SELECT pair, side, size, entry_price FROM active_positions WHERE bot_id=0").fetchall()
+                    if _orphan_rows:
+                        st.error("🚨 Unowned Physical Positions (Orphans) Found!")
+                        for i, _or in enumerate(_orphan_rows):
+                            _o_pair, _o_side, _o_size, _o_entry = _or
+                            if st.button(f"💥 Flatten {_o_pair} {_o_side} ({_o_size})", key=f"flat_{_o_pair}_{i}"):
+                                get_exchange_instance('future').create_order(_o_pair, 'market', 'sell' if _o_side.upper() == 'LONG' else 'buy', _o_size, params={'reduceOnly': True})
+                                st.rerun()
+                except: pass
+
                 if stray_orders:
                     with st.expander(f"🧙‍♂️ Manual Link Recovery Tool ({len(stray_orders)} Strays)", expanded=False):
                         st.info("Found orders on exchange belonging to bots that are no longer active.")
-                        for o in stray_orders:
+                        for i, o in enumerate(stray_orders):
                             st.write(f"• {o.get('symbol')} {o.get('side')} {o.get('amount')} @ {o.get('price')} (ID: {o.get('clientOrderId')})")
-                            if st.button(f"Cancel {o.get('id')}", key=f"cancel_{o.get('id')}"):
+                            if st.button(f"Cancel {o.get('id')}", key=f"cancel_{o.get('id')}_{i}"):
                                 get_exchange_instance('future').cancel_order(o.get('id'), o.get('symbol')); st.rerun()
 
             except Exception as e_frag:
@@ -1249,10 +1010,9 @@ def render_monitor_view():
         except Exception as e:
             st.error(f"Error loading trade history: {e}")
 
-    # --- Auto-Refresh ---
     # The header and bot grid now refresh via native @st.fragment decorators.
     if auto_refresh and not wizard_active:
-        st.caption(f"ℹ️ Header/Grid auto-refreshing via native fragments. Last Full Page Reload: {time.strftime('%H:%M:%S')}")
+        st.caption(f"ℹ️ Fragments auto-updating every 15-30s. [Page Base Time: {time.strftime('%H:%M:%S')}]")
     elif wizard_active:
         st.warning(
             "⏸ **Auto-Refresh Paused** — Reconciler wizard is active. "

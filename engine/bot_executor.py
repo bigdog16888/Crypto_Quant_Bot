@@ -77,6 +77,11 @@ class BotExecutor:
         self.runner = runner
         self.strategies: Dict[int, MartingaleStrategy] = {}
         self.config_cache: Dict[int, str] = {} # Cache for config JSON strings
+        # 🛡️ [v3.1.3] HEDGE DEBOUNCE: In-memory per-bot last-placement timestamps.
+        # Even if the WS cache check misses (e.g. during WS reconnect), this prevents
+        # rapid-fire hedge placements within the cooldown window.
+        self._hedge_cooldown_ts: Dict[int, float] = {}  # bot_id -> last hedge placement time
+        self._HEDGE_COOLDOWN_SECS = 60  # Minimum seconds between hedge placements per bot
 
     @staticmethod
     def _resolve_position_side_param(params: dict, is_testnet: bool) -> dict:
@@ -1008,6 +1013,8 @@ class BotExecutor:
                                                     CASE 
                                                         WHEN order_type IN ('entry', 'grid', 'adoption_add', 'adoption') THEN filled_amount
                                                         WHEN order_type IN ('adoption_reduce', 'tp', 'close', 'dust_close', 'sl') THEN -filled_amount
+                                                        WHEN order_type LIKE 'hedge%' AND order_type NOT LIKE '%tp%' THEN -filled_amount
+                                                        WHEN order_type LIKE 'hedge%tp%' OR order_type LIKE 'hedgetp%' THEN filled_amount
                                                         ELSE 0.0
                                                     END
                                                 ), 0.0) 
@@ -1024,6 +1031,8 @@ class BotExecutor:
                                                     CASE 
                                                         WHEN order_type IN ('entry', 'grid', 'adoption_add', 'adoption') THEN filled_amount
                                                         WHEN order_type IN ('adoption_reduce', 'tp', 'close', 'dust_close', 'sl') THEN -filled_amount
+                                                        WHEN order_type LIKE 'hedge%' AND order_type NOT LIKE '%tp%' THEN -filled_amount
+                                                        WHEN order_type LIKE 'hedge%tp%' OR order_type LIKE 'hedgetp%' THEN filled_amount
                                                         ELSE 0.0
                                                     END
                                                 ), 0.0) 
@@ -1574,7 +1583,72 @@ class BotExecutor:
                                 logger.error(f"⚠️ {name}: Error checking hedge status during TP: {e_h}")
 
                             # Standard reset for bots without hedges
+                            prior_open_qty = float(bot_status.get('open_qty') or bot_status.get('total_invested', 0) / max(float(bot_status.get('avg_entry_price', 1)), 0.001))
                             reset_bot_after_tp(bot_id, actual_exit, direction=direction)
+
+                            # ════════════════════════════════════════════════════════════
+                            # [v3.1.4] POST-TP DUST SWEEP
+                            # ════════════════════════════════════════════════════════════
+                            # Root cause of SOL -0.11 orphan: a grid order fills in the
+                            # timing gap between TP placement and TP execution. The TP was
+                            # sized for the position at placement time, so the extra grid
+                            # units are left behind as untracked dust after bot reset.
+                            #
+                            # Fix: after reset, verify the exchange position is truly zero.
+                            # If residual dust exists below threshold, auto-close it.
+                            # Threshold: < 5% of prior position OR < $20 USD value.
+                            # ════════════════════════════════════════════════════════════
+                            try:
+                                time.sleep(1.5)  # Allow exchange 1.5s to settle post-fill
+                                _phys_positions = exchange.fetch_positions([pair])
+                                _dust_qty = 0.0
+                                _dust_side = None
+                                for _pos in (_phys_positions or []):
+                                    _pos_size = abs(float(_pos.get('contracts', 0) or _pos.get('amount', 0) or _pos.get('size', 0) or 0))
+                                    _pos_side = str(_pos.get('side', '')).lower()
+                                    if _pos_size > 1e-8:
+                                        _dust_qty = _pos_size
+                                        _dust_side = 'sell' if _pos_side == 'long' else 'buy'  # Closing side
+                                
+                                if _dust_qty > 1e-8:
+                                    _dust_usd = _dust_qty * actual_exit
+                                    _dust_pct = (_dust_qty / max(prior_open_qty, 1e-8)) * 100
+                                    _dust_threshold_usd = 20.0
+                                    _dust_threshold_pct = 5.0
+
+                                    if _dust_usd <= _dust_threshold_usd or _dust_pct <= _dust_threshold_pct:
+                                        logger.warning(
+                                            f"🧹 [DUST-SWEEP] {name}: Post-TP residual {_dust_qty:.6f} {pair.split('/')[0]} "
+                                            f"(${_dust_usd:.2f}, {_dust_pct:.1f}% of prior). Auto-closing as dust."
+                                        )
+                                        try:
+                                            _dust_prec = exchange.get_symbol_precision(pair) or {}
+                                            _strat = self._get_strategy_instance(bot_id, bot_config)
+                                            _dust_qty_r = _strat._round_qty(_dust_qty)
+                                            _dust_cid = self._generate_deterministic_id(bot_id, 'DUST', bot_status.get('cycle_id', 0), 0)
+                                            _dust_params = {'newClientOrderId': _dust_cid, 'reduceOnly': True}
+                                            _dust_order = exchange.create_order(pair, 'market', _dust_side, _dust_qty_r, params=_dust_params)
+                                            if _dust_order:
+                                                _dust_oid = str(_dust_order.get('id', 'DUST_CLOSE'))
+                                                save_bot_order(
+                                                    bot_id, 'dust_close', _dust_oid, actual_exit, _dust_qty_r,
+                                                    0, 'filled', client_order_id=_dust_cid,
+                                                    notes=f'Post-TP dust sweep: {_dust_qty_r} {pair} @ market',
+                                                    cycle_id=bot_status.get('cycle_id', 0)
+                                                )
+                                                logger.info(f"✅ [DUST-SWEEP] {name}: Dust closed {_dust_qty_r} {pair}. OID={_dust_oid}")
+                                        except Exception as _e_dust_close:
+                                            logger.error(f"❌ [DUST-SWEEP] {name}: Dust close failed: {_e_dust_close}. Residual {_dust_qty} on exchange — manual action required.")
+                                    else:
+                                        logger.error(
+                                            f"🚨 [DUST-SWEEP] {name}: Post-TP LARGE residual {_dust_qty:.6f} {pair.split('/')[0]} "
+                                            f"(${_dust_usd:.2f}, {_dust_pct:.1f}% of prior). ABOVE threshold — MANUAL ACTION REQUIRED. "
+                                            f"Check Monitor → Global Netting → {pair}."
+                                        )
+                                else:
+                                    logger.debug(f"✅ [DUST-SWEEP] {name}: Post-TP position verified zero for {pair}.")
+                            except Exception as _e_dust:
+                                logger.debug(f"[DUST-SWEEP] {name}: Post-TP position check skipped (non-fatal): {_e_dust}")
                         else:
                             logger.debug(f"⏭️ {name}: TP order {tp_order_id} is filled, but bot state is already zeroed (handled by WS). Skipping redundant reset.")
                     elif status in ['canceled', 'rejected'] or (status == 'closed' and filled == 0):
@@ -1701,6 +1775,13 @@ class BotExecutor:
                 )
                 conn.commit()
                 
+                # 🚀 CLEAR ORPHANS: Cancel all open exchange orders for this bot before resetting the cycle
+                try:
+                    logger.info(f"🧹 {name}: Cancelling open exchange orders before Hedge Complete reset...")
+                    exchange.cancel_orders_by_bot_id(bot_id, pair)
+                except Exception as e_cancel:
+                    logger.error(f"❌ {name}: Failed to cancel exchange orders during hedge reset: {e_cancel}")
+
                 # 🚀 FINAL RESET: Now that BOTH main TP and Hedge TP are filled, the cycle is DONE.
                 from engine.database import reset_bot_after_tp
                 reset_bot_after_tp(bot_id, 0.0, direction=direction, action_label='HEDGE_COMPLETE', notes="Hedge BE Exit Complete")
@@ -1949,6 +2030,14 @@ class BotExecutor:
                     
                     if (h_filled - hx_filled) <= 1e-8:
                         logger.warning(f"✅ {name}: Hedge TP confirmed filled. Completing cycle reset.")
+                        
+                        # 🚀 CLEAR ORPHANS: Cancel all open exchange orders for this bot before resetting the cycle
+                        try:
+                            logger.info(f"🧹 {name}: Cancelling open exchange orders before HEDGE_TP_COMPLETE reset...")
+                            exchange.cancel_orders_by_bot_id(bot_id, pair)
+                        except Exception as e_cancel:
+                            logger.error(f"❌ {name}: Failed to cancel exchange orders during hedge tp reset: {e_cancel}")
+
                         from engine.database import reset_bot_after_tp
                         # Use last known price or current price
                         reset_bot_after_tp(bot_id, current_price, direction=direction, action_label='HEDGE_TP_COMPLETE', notes="Full cycle complete (Main TP + Hedge BE TP)")
@@ -3042,6 +3131,18 @@ class BotExecutor:
         """
         try:
             from engine.database import get_connection
+
+            # 🛡️ [v3.1.3] LAYER 0: TIME-BASED DEBOUNCE (fastest check, no I/O)
+            # Guards against rapid-fire calls from maintain_orders even when WS cache misses.
+            _now = time.time()
+            _last_placed = self._hedge_cooldown_ts.get(bot_id, 0)
+            _secs_since = _now - _last_placed
+            if _secs_since < self._HEDGE_COOLDOWN_SECS:
+                logger.debug(
+                    f"🛡️ [HEDGE-DEBOUNCE] {name}: Skipping hedge — last placed {_secs_since:.0f}s ago "
+                    f"(cooldown={self._HEDGE_COOLDOWN_SECS}s). Pair={pair}"
+                )
+                return None
             
             # 1. Fetch Current Hedge State (Open Orders and Filled Positions)
             conn = get_connection()
@@ -3052,6 +3153,27 @@ class BotExecutor:
                 (bot_id,)
             )
             open_row = cur.fetchone()
+            
+            # 🛡️ [v3.1.1 DUPLICATE-HEDGE GUARD]: Cross-check WS cache in addition to DB.
+            # The DB state can lag during cancel/replace races: the cancel event arrives after
+            # maintain_orders already sees the order as 'open' in DB and places another.
+            # Checking the live WS cache closes this race window entirely.
+            try:
+                from engine.websocket_handler import get_ws_cache
+                _ws_cache = get_ws_cache()
+                _live_hedge_orders = [
+                    o for o in _ws_cache.get_open_orders(pair)
+                    if 'HEDGE' in str(o.get('clientOrderId', '')).upper()
+                    and str(o.get('clientOrderId', '')).startswith(f'CQB_{bot_id}_')
+                ]
+                if _live_hedge_orders:
+                    logger.info(
+                        f"🛡️ [HEDGE-GUARD] {name}: {len(_live_hedge_orders)} live hedge order(s) "
+                        f"already exist in WS cache for {pair}. Skipping new placement."
+                    )
+                    return None
+            except Exception as _wsc_err:
+                logger.debug(f"🛡️ [HEDGE-GUARD] WS cache check failed (non-fatal, continuing): {_wsc_err}")
             
             # Sum of all confirmed ACTIVE hedge fills for this bot
             cur.execute("""
@@ -3208,6 +3330,9 @@ class BotExecutor:
             exchange_order_id = str(order['id'])
             logger.info(f"✅ [HEDGE-LOCK] Bot {name}: Hedge order placed. ID={exchange_order_id}")
 
+            # 🛡️ [v3.1.3] Record cooldown timestamp — blocks any re-placement for 60s
+            self._hedge_cooldown_ts[bot_id] = time.time()
+
             # 5. Record in bot_orders
             save_bot_order(
                 bot_id, 'hedge', exchange_order_id, lock_price_r, delta_qty, 
@@ -3310,6 +3435,11 @@ class BotExecutor:
                     if order:
                         from engine.database import reset_bot_after_tp
                         log_trade(bot_id, 'STOP_LOSS_EXIT', pair, current_price, actual_size, current_price * actual_size, f'SL_MARKET_{bot_id}', bot_status['current_step'], "SL Market Exit", (current_price - bot_status['avg_entry_price']) * actual_size)
+                        try:
+                            logger.info(f"🧹 {name}: Cancelling open exchange orders before STOP_LOSS_EXIT reset...")
+                            exchange.cancel_orders_by_bot_id(bot_id, pair)
+                        except Exception as e_cancel:
+                            logger.error(f"❌ {name}: Failed to cancel exchange orders during SL reset: {e_cancel}")
                         reset_bot_after_tp(bot_id, current_price, direction=direction, action_label='STOP_LOSS_EXIT')
                         logger.info(f"✅ {name}: Market order placed to close SL for {pair} (ID: {order['id']})")
                 else:

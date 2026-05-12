@@ -254,21 +254,22 @@ def credit_fill(
         # Maintain trades.open_qty as an explicit running total of confirmed fills.
         # delta = net NEW qty credited this call (cumulative_qty - prior existing_fill).
         delta = cumulative_qty - existing_fill  # always > 0 (guarded above by MAX check)
+        _otype_lower = str(order_type).lower()
         try:
-            if order_type in _ENTRY_TYPES:
+            if _otype_lower in _ENTRY_TYPES:
                 conn.execute(
                     "UPDATE trades SET open_qty = ROUND(COALESCE(open_qty, 0) + ?, 8) "
                     "WHERE bot_id = ?",
                     (delta, bot_id)
                 )
-                logger.debug(f"[OPEN-QTY] Bot {bot_id}: +{delta:.8f} (entry) delta")
-            elif order_type in _EXIT_TYPES:
+                logger.debug(f"[OPEN-QTY] Bot {bot_id}: +{delta:.8f} ({_otype_lower}) delta")
+            elif _otype_lower in _EXIT_TYPES:
                 conn.execute(
                     "UPDATE trades SET open_qty = MAX(0, ROUND(COALESCE(open_qty, 0) - ?, 8)) "
                     "WHERE bot_id = ?",
                     (delta, bot_id)
                 )
-                logger.debug(f"[OPEN-QTY] Bot {bot_id}: -{delta:.8f} (exit) delta")
+                logger.debug(f"[OPEN-QTY] Bot {bot_id}: -{delta:.8f} ({_otype_lower}) delta")
         except Exception as _oq_err:
             # Non-fatal: open_qty will be backfilled by check_and_fix_integrity on next startup
             logger.warning(f"[OPEN-QTY] Bot {bot_id}: accumulator update failed: {_oq_err}")

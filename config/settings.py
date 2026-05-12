@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 class Config:
-    VERSION = "3.0.3"  # Hedge-Aware Reconciliation + Unpacking Fix
+    VERSION = "3.1.4"  # Single-Source Netting + Post-TP Dust Sweep
     ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
     def __init__(self):

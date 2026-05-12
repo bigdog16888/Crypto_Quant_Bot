@@ -1051,6 +1051,9 @@ def _reset_bot_after_tp_internal(cursor, bot_id, exit_price, direction=None, act
     # Use cursor-based internal log to avoid nested transactions
     _log_trade_internal(cursor, bot_id, action_label, pair, exit_price, total_invested / avg_entry_price if avg_entry_price > 0 else 0, total_invested, step=current_step, pnl=pnl, notes=notes, position_side=final_direction)
     
+    # 🚀 ROOT CAUSE FIX C: Freeze time.time() to prevent wipe_wall_ts race conditions!
+    now_ts = int(time.time())
+
     cursor.execute("SELECT cycle_id FROM trades WHERE bot_id = ?", (bot_id,))
     cycle_row = cursor.fetchone()
     old_cycle = int(cycle_row[0]) if cycle_row and cycle_row[0] else 1
@@ -1067,13 +1070,13 @@ def _reset_bot_after_tp_internal(cursor, bot_id, exit_price, direction=None, act
     # Snap sub-epsilon dust to zero to prevent ghost carry-over
     old_net_qty = max(0.0, float(raw_net) if abs(float(raw_net)) > 1e-8 else 0.0)
 
-    cursor.execute("UPDATE bot_orders SET status = 'auto_closed', updated_at = ? WHERE bot_id = ? AND status IN ('open', 'new')", (int(time.time()), bot_id))
+    cursor.execute("UPDATE bot_orders SET status = 'auto_closed', updated_at = ? WHERE bot_id = ? AND status IN ('open', 'new')", (now_ts, bot_id))
     
     excluded_carry_labels = ['RESET_VANISHED_POSITION', 'RESET_STRUCTURAL_GHOST', 'RESET_PHANTOM_ENTRY', 'SYSTEM_WIPE', 'MANUAL_CLOSE', 'STOP_LOSS_EXIT']
     if action_label in excluded_carry_labels:
-        cursor.execute("UPDATE bot_orders SET status = 'reset_cleared', updated_at = ? WHERE bot_id = ? AND status NOT IN ('auto_closed', 'reset_cleared')", (int(time.time()), bot_id))
+        cursor.execute("UPDATE bot_orders SET status = 'reset_cleared', updated_at = ? WHERE bot_id = ? AND status NOT IN ('auto_closed', 'reset_cleared')", (now_ts, bot_id))
     else:
-        cursor.execute("UPDATE bot_orders SET status = 'reset_cleared', updated_at = ? WHERE bot_id = ? AND status NOT IN ('auto_closed', 'reset_cleared')", (int(time.time()), bot_id))
+        cursor.execute("UPDATE bot_orders SET status = 'reset_cleared', updated_at = ? WHERE bot_id = ? AND status NOT IN ('auto_closed', 'reset_cleared')", (now_ts, bot_id))
 
     # 🚀 ROOT CAUSE FIX B: Clamp carry-over qty against exchange physical reality.
     # Previously, old_net_qty was pure arithmetic from bot_orders (entry fills - TP fills).
@@ -1110,20 +1113,22 @@ def _reset_bot_after_tp_internal(cursor, bot_id, exit_price, direction=None, act
     # Only carry over residiual quantity if it represents significant monetary value (>$1.00).
     # This prevents the "Impossible Loop" where tiny rounding errors block 
     # the bot from returning to 'Scanning' mode.
-    residue_notional = abs(old_net_qty) * (exit_price if exit_price > 0 else 1.0)
+    # Fallback to avg_entry_price if exit_price is 0 to ensure non-zero carry price.
+    carry_price = exit_price if exit_price > 0 else (avg_entry_price if avg_entry_price > 0 else 1.0)
+    residue_notional = abs(old_net_qty) * carry_price
     
     if abs(old_net_qty) > 0.0001 and residue_notional > 1.0 and action_label not in excluded_carry_labels:
         logger.info(f"🌉 [CARRY-OVER] Bot {bot_id}: Carrying over {old_net_qty:.4f} {pair} units into Cycle {new_cycle}.")
         carry_otype = 'entry'
-        carry_cid = f"CQB_{bot_id}_CARRY_{int(time.time() * 1000)}"
+        carry_cid = f"CQB_{bot_id}_CARRY_{int(time.time() * 1000)}" # Keep unique ID suffix separate from now_ts logic
         cursor.execute("""
             INSERT INTO bot_orders (
                 bot_id, step, order_type, order_id, price, amount, filled_amount,
                 status, created_at, updated_at, client_order_id, notes, cycle_id
             ) VALUES (?, ?, ?, ?, ?, ?, ?, 'reset_cleared', ?, ?, ?, ?, ?)
         """, (
-            bot_id, 0, carry_otype, carry_cid, exit_price, abs(old_net_qty), abs(old_net_qty),
-            int(time.time()), int(time.time()), carry_cid,
+            bot_id, 0, carry_otype, carry_cid, carry_price, abs(old_net_qty), abs(old_net_qty),
+            now_ts, now_ts, carry_cid,
             f"Cross-cycle carry over of prior partial fills ({old_net_qty:.4f} units)",
             new_cycle
         ))
@@ -1133,7 +1138,7 @@ def _reset_bot_after_tp_internal(cursor, bot_id, exit_price, direction=None, act
     # Determine cycle_start_time for the new cycle:
     # Use the actual exchange fill timestamp if provided; fall back to now.
     # This is the authoritative cycle boundary for all future fill attribution.
-    new_cycle_start_time = exit_fill_ts if exit_fill_ts > 0 else int(time.time())
+    new_cycle_start_time = exit_fill_ts if exit_fill_ts > 0 else now_ts
 
     # 🚀 ARCHITECTURAL FIX (v3.0.7): Increment cycle_id FIRST.
     cursor.execute("UPDATE trades SET cycle_id = ? WHERE bot_id = ?", (new_cycle, bot_id))
@@ -1144,8 +1149,8 @@ def _reset_bot_after_tp_internal(cursor, bot_id, exit_price, direction=None, act
         "entry_confirmed = 0, entry_order_id = NULL, tp_order_id = NULL, "
         "bot_position_id = NULL, close_type = ?, cycle_id = ?, cycle_phase = ?, "
         "open_qty = 0, hedge_qty = 0, wipe_wall_ts = ?, cycle_start_time = ? WHERE bot_id = ?",
-        (exit_price, int(time.time()), action_label, new_cycle, new_cycle_phase,
-         int(time.time()), new_cycle_start_time, bot_id)
+        (exit_price, now_ts, action_label, new_cycle, new_cycle_phase,
+         now_ts, new_cycle_start_time, bot_id)
     )
     logger.info(
         f"🕐 [CYCLE-START] Bot {bot_id}: New cycle {new_cycle} anchored at "
@@ -2685,21 +2690,21 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None) -> tuple:
             SELECT 
                 ROUND(COALESCE(SUM(
                     CASE WHEN bo.cycle_id = ? AND bo.status NOT IN ('auto_closed', 'reset_cleared') AND (? = 0 OR bo.created_at >= ?)
-                         AND bo.order_type IN ('entry', 'grid', 'adoption_add', 'adoption', 'forensic_adoption_add') 
+                         AND bo.order_type IN ('entry', 'grid', 'adoption_add', 'adoption') 
                     THEN (bo.filled_amount * bo.price) ELSE 0.0 END
                 ), 0.0), 8) AS bought_cost,
                 
                 ROUND(COALESCE(SUM(
                     CASE 
                         WHEN bo.cycle_id = ? AND bo.status NOT IN ('auto_closed', 'reset_cleared') AND (? = 0 OR bo.created_at >= ?)
-                             AND bo.order_type IN ('entry', 'grid', 'adoption', 'adoption_add', 'forensic_adoption_add', 'carry') 
+                             AND bo.order_type IN ('entry', 'grid', 'adoption', 'adoption_add', 'carry') 
                         THEN bo.filled_amount ELSE 0.0 END
                 ), 0.0), 8) AS bought_qty,
                 
                 COALESCE(SUM(
                     CASE 
                         WHEN bo.cycle_id = ? AND bo.status NOT IN ('auto_closed', 'reset_cleared') AND (? = 0 OR bo.created_at >= ?)
-                             AND bo.order_type IN ('adoption_reduce', 'tp', 'close', 'dust_close', 'sl', 'virtual_netting', 'forensic_adoption_reduce') 
+                             AND bo.order_type IN ('adoption_reduce', 'tp', 'close', 'dust_close', 'sl', 'virtual_netting') 
                         THEN bo.filled_amount ELSE 0.0 END
                 ), 0.0) AS sold_qty,
                 
@@ -2718,7 +2723,14 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None) -> tuple:
             FROM bot_orders bo
             WHERE bo.bot_id = ?
               AND (bo.position_side = ? OR bo.position_side IS NULL OR bo.position_side = 'BOTH' OR bo.position_side = '')
-              AND bo.status IN ('filled', 'closed', 'auto_closed', 'hedge_exited')
+              -- 🚀 [v3.1.1 PARTIAL-CANCEL FIX]: Include 'cancelled' orders that have actual fills.
+              -- An order can be: placed → partially/fully filled → then cancelled (e.g. ATR grid resize).
+              -- Excluding ALL cancelled orders causes chronic open_qty undercount matching exchange.
+              -- Rule: include if status is a confirmed-fill state OR if status=cancelled but filled_amount>0.
+              AND (
+                  bo.status IN ('filled', 'closed', 'auto_closed', 'hedge_exited')
+                  OR (bo.status IN ('canceled', 'cancelled') AND bo.filled_amount > 0)
+              )
               AND bo.filled_amount > 0
         """, (
             target_cycle, wall_ts, wall_ts, # bought_cost
@@ -3318,7 +3330,7 @@ def get_pair_virtual_net(pair):
             for dbp in all_db_pairs:
                 if _local_norm(dbp) == pair:
                     actual_pair = dbp
-                    logger.info(f"🛡️ Resolved normalized pair '{pair}' to database pair '{actual_pair}'")
+                    logger.debug(f"🛡️ Resolved normalized pair '{pair}' to database pair '{actual_pair}'")
                     break
         
         pair = actual_pair
@@ -3331,22 +3343,29 @@ def get_pair_virtual_net(pair):
             SELECT 
                 ROUND(SUM(CASE 
                     -- Standard directional positions (Cycle-Locked or Orphaned-NULL)
+                    -- 🚀 [v3.1.1 PARTIAL-CANCEL FIX]: Include 'cancelled' orders with actual fills.
+                    -- An ATR grid resize cancels the old order but it may have been partially/fully filled.
+                    -- These real fills are on the exchange and must be counted in the virtual net.
                     WHEN (o.cycle_id = t.cycle_id OR (o.cycle_id IS NULL AND t.cycle_id IS NULL)) 
-                         AND o.status NOT IN ('auto_closed', 'reset_cleared', 'canceled', 'cancelled', 'rejected', 'failed')
+                         AND NOT (o.status IN ('auto_closed', 'reset_cleared', 'rejected', 'failed'))
+                         AND NOT (o.status IN ('canceled', 'cancelled') AND o.filled_amount = 0)
                          AND (t.wipe_wall_ts = 0 OR o.created_at >= t.wipe_wall_ts)
-                         AND o.order_type IN ('entry', 'grid', 'adoption', 'adoption_add', 'forensic_adoption_add', 'carry') THEN (CASE WHEN b.direction = 'LONG' THEN o.filled_amount ELSE -o.filled_amount END)
+                         AND o.order_type IN ('entry', 'grid', 'adoption', 'adoption_add', 'carry') THEN (CASE WHEN b.direction = 'LONG' THEN o.filled_amount ELSE -o.filled_amount END)
                     WHEN (o.cycle_id = t.cycle_id OR (o.cycle_id IS NULL AND t.cycle_id IS NULL))
-                         AND o.status NOT IN ('auto_closed', 'reset_cleared', 'canceled', 'cancelled', 'rejected', 'failed')
+                         AND NOT (o.status IN ('auto_closed', 'reset_cleared', 'rejected', 'failed'))
+                         AND NOT (o.status IN ('canceled', 'cancelled') AND o.filled_amount = 0)
                          AND (t.wipe_wall_ts = 0 OR o.created_at >= t.wipe_wall_ts)
-                         AND o.order_type IN ('tp', 'close', 'sl', 'dust_close', 'adoption_reduce', 'forensic_adoption_reduce', 'virtual_netting') THEN (CASE WHEN b.direction = 'LONG' THEN -o.filled_amount ELSE o.filled_amount END)
+                         AND o.order_type IN ('tp', 'close', 'sl', 'dust_close', 'adoption_reduce', 'virtual_netting') THEN (CASE WHEN b.direction = 'LONG' THEN -o.filled_amount ELSE o.filled_amount END)
                     
                     -- Internal Hedges (Sum ACTIVE fills for the current cycle)
                     WHEN (o.cycle_id = t.cycle_id OR (o.cycle_id IS NULL AND t.cycle_id IS NULL))
-                         AND o.status NOT IN ('auto_closed', 'reset_cleared', 'canceled', 'cancelled', 'rejected', 'failed')
+                         AND NOT (o.status IN ('auto_closed', 'reset_cleared', 'rejected', 'failed'))
+                         AND NOT (o.status IN ('canceled', 'cancelled') AND o.filled_amount = 0)
                          AND (t.wipe_wall_ts = 0 OR o.created_at >= t.wipe_wall_ts)
                          AND o.order_type LIKE 'hedge%' AND o.order_type NOT LIKE '%tp%' THEN (CASE WHEN b.direction = 'LONG' THEN -o.filled_amount ELSE o.filled_amount END)
                     WHEN (o.cycle_id = t.cycle_id OR (o.cycle_id IS NULL AND t.cycle_id IS NULL))
-                         AND o.status NOT IN ('auto_closed', 'reset_cleared', 'canceled', 'cancelled', 'rejected', 'failed')
+                         AND NOT (o.status IN ('auto_closed', 'reset_cleared', 'rejected', 'failed'))
+                         AND NOT (o.status IN ('canceled', 'cancelled') AND o.filled_amount = 0)
                          AND (t.wipe_wall_ts = 0 OR o.created_at >= t.wipe_wall_ts)
                          AND (o.order_type LIKE 'hedge%tp%' OR o.order_type LIKE 'hedgetp%') THEN (CASE WHEN b.direction = 'LONG' THEN o.filled_amount ELSE -o.filled_amount END)
                     
@@ -3465,14 +3484,15 @@ def update_order_fill(order_id, filled_qty, bot_id=None):
         try: conn.rollback()
         except: pass
 
-def save_bot_order(bot_id, order_type, exchange_order_id, price, amount, step, status='open', client_order_id=None, notes=None, position_side=None):
+def save_bot_order(bot_id, order_type, exchange_order_id, price, amount, step, status='open', client_order_id=None, notes=None, position_side=None, cycle_id=None):
     conn = get_connection()
     cursor = conn.cursor()
     try:
         # Resolve current cycle_id and bot direction
-        cursor.execute("SELECT COALESCE(cycle_id, 1) FROM trades WHERE bot_id=?", (bot_id,))
-        c_row = cursor.fetchone()
-        cycle_id = c_row[0] if c_row else 1
+        if cycle_id is None:
+            cursor.execute("SELECT COALESCE(cycle_id, 1) FROM trades WHERE bot_id=?", (bot_id,))
+            c_row = cursor.fetchone()
+            cycle_id = c_row[0] if c_row else 1
         
         cursor.execute("SELECT direction FROM bots WHERE id=?", (bot_id,))
         b_row = cursor.fetchone()

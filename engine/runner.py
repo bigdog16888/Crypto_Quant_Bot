@@ -544,13 +544,88 @@ class BotRunner:
             # 🚀 [v2.4.1] FINAL GATE: FULL RECONCILIATION.
             # Runs the complete resolve_net_mismatch logic to identify and clear
             # wrong-side residues (ghosts) immediately on startup.
+            #
+            # 🛡️ [v3.1.0 WS-WARMUP FIX]: WebSocket connects asynchronously. If reconcile_all()
+            # fires before the WS cache is populated, PRE-COMMIT-RESOLVE reads an empty order cache
+            # and marks ALL live exchange orders as 'failed'. maintain_orders then sees 0 orders
+            # for bots that have active positions and panics. The 8s wait is negligible at startup
+            # but eliminates this entire class of post-restart false alarms.
             try:
                 if self._reconciler:
+                    WS_WARMUP_SECONDS = 8
+                    logger.info(f"⏳ [STARTUP-RECON] Waiting {WS_WARMUP_SECONDS}s for WS cache to warm up before reconcile_all...")
+                    time.sleep(WS_WARMUP_SECONDS)
+                    
+                    # One final position snapshot refresh after warmup — ensures active_positions
+                    # is current before reconcile_all makes any state decisions.
+                    try:
+                        for _mt, _ex in self.exchanges.items():
+                            try:
+                                _fresh_snap = _ex.fetch_positions()
+                                if _fresh_snap is not None:
+                                    from engine.database import update_active_positions_snapshot
+                                    update_active_positions_snapshot(_fresh_snap)
+                                    logger.info(f"✅ [STARTUP-RECON] Post-warmup position snapshot refreshed ({len(_fresh_snap)} positions).")
+                                    break
+                            except Exception as _pe2:
+                                logger.warning(f"⚠️ [STARTUP-RECON] Post-warmup snapshot failed for {_mt}: {_pe2}")
+                    except Exception as _snap2_err:
+                        logger.warning(f"⚠️ [STARTUP-RECON] Post-warmup snapshot error (non-fatal): {_snap2_err}")
+                    
                     logger.info("🛡️ [STARTUP-RECON] Executing full reconciliation pass...")
                     self._reconciler.reconcile_all()
                     logger.info("✅ [STARTUP-RECON] Full reconciliation complete.")
             except Exception as _recon_err:
                 logger.error(f"❌ [STARTUP-RECON] Full reconciliation failed: {_recon_err}")
+
+            # ═══════════════════════════════════════════════════════════════════════
+            # 🔍 COLD TRUTH DIAGNOSTIC — LOG ONLY, NO DESTRUCTIVE ACTIONS.
+            # ═══════════════════════════════════════════════════════════════════════
+            # IMPORTANT: A previous version of this block auto-reset bots when
+            # exchange showed 0 physical. This was WRONG — it used a single-point-in-
+            # time fetch_positions() snapshot with NO CQB DNA proof. A bot with a
+            # live WS_ENTRY_FILL could appear as exchange=0 if the snapshot settled
+            # slightly after the fill, causing a legitimate position to be wiped.
+            #
+            # This block now ONLY logs discrepancies for human review.
+            # The correct fix for a stale virtual ledger is:
+            #   Bot Manager → Reset Bot (manual, intentional, proof-reviewed).
+            # ═══════════════════════════════════════════════════════════════════════
+            try:
+                from engine.database import get_connection as _ct_get_conn
+                _cold_conn = _ct_get_conn()
+                _cold_phys = {}
+                for _mt, _ex in self.exchanges.items():
+                    try:
+                        for _p in (_ex.fetch_positions() or []):
+                            _sym = str(_p.get('symbol', '')).replace('/', '').replace(':', '').upper()
+                            _cold_phys[_sym] = abs(float(_p.get('contracts', 0) or 0))
+                        break
+                    except Exception as _cp_err:
+                        logger.warning(f"⚠️ [COLD-DIAG] Could not fetch positions: {_cp_err}")
+
+                _cold_bots = _cold_conn.execute("""
+                    SELECT b.id, b.name, b.pair, t.total_invested, t.wipe_wall_ts, t.cycle_phase
+                    FROM bots b JOIN trades t ON b.id = t.bot_id
+                    WHERE b.is_active = 1 AND t.total_invested > 0
+                """).fetchall()
+
+                _now = int(time.time())
+                for _cbot_id, _cbot_name, _cpair, _c_invested, _c_wall, _c_phase in _cold_bots:
+                    if str(_c_phase or '').upper() in ('CARRY_PENDING', 'HEDGED', 'HEDGE_EXIT_PENDING'):
+                        continue
+                    _norm = str(_cpair).split(':')[0].replace('/', '').upper()
+                    _phys_qty = _cold_phys.get(_norm, 0.0)
+                    if _phys_qty < 0.0001:
+                        _wall_age = _now - int(_c_wall or 0)
+                        logger.warning(
+                            f"🔍 [COLD-DIAG] Bot {_cbot_name} ({_cpair}): "
+                            f"virtual=${_c_invested:.2f} but exchange shows 0 physical "
+                            f"(wipe_wall age={_wall_age}s). "
+                            f"ACTION REQUIRED: Manual reset via Bot Manager if this persists."
+                        )
+            except Exception as _ct_err:
+                logger.warning(f"⚠️ [COLD-DIAG] Cold truth diagnostic failed (non-fatal): {_ct_err}")
 
             # 3. Scan Positions (Adoption is verified in run_cycle via snapshot logic)
             # We explicitly run one cycle of 'update_active_positions_snapshot' to map reality to DB

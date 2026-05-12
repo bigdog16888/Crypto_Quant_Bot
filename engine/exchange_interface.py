@@ -27,14 +27,37 @@ class ExchangeInterface:
     _hybrid_mode_logged = False
     _position_mode_hedge = None # None=Unknown, True=Hedge, False=One-Way
     _position_mode_lock = threading.Lock()
-
+    _time_offset = None
 
     def __init__(self, market_type='future'):
         self.logger = logging.getLogger(f"ExchangeInterface.{market_type}")
         self.market_type = normalize_market_type(market_type)
+        self._sync_time_offset()
         self.exchange = self._create_exchange_instance()
         self._ensure_markets()
         self._detect_position_mode()
+
+    def _sync_time_offset(self):
+        """Fetches the server time to calculate the offset for raw requests."""
+        if ExchangeInterface._time_offset is not None:
+            return
+        try:
+            url = 'https://demo-fapi.binance.com/fapi/v1/time' if (config.TESTNET or config.DEMO_TRADING) else 'https://fapi.binance.com/fapi/v1/time'
+            res = requests.get(url, timeout=5)
+            if res.status_code == 200:
+                server_time = res.json()['serverTime']
+                local_time = int(time.time() * 1000)
+                ExchangeInterface._time_offset = server_time - local_time
+                self.logger.info(f"🕒 Time offset synced: {ExchangeInterface._time_offset}ms")
+        except Exception as e:
+            self.logger.warning(f"Failed to sync time offset: {e}")
+            ExchangeInterface._time_offset = 0
+
+    def _get_adjusted_timestamp(self) -> int:
+        if ExchangeInterface._time_offset is None:
+            self._sync_time_offset()
+        offset = ExchangeInterface._time_offset if ExchangeInterface._time_offset else 0
+        return int(time.time() * 1000) + offset
 
     @classmethod
     def _get_anon_exchange(cls):
@@ -153,7 +176,7 @@ class ExchangeInterface:
         """
         base_url = "https://demo-fapi.binance.com"
         query_dict = params.copy() if params else {}
-        query_dict['timestamp'] = int(time.time() * 1000)
+        query_dict['timestamp'] = self._get_adjusted_timestamp()
         query_dict['recvWindow'] = 60000 # Max allowed by Binance to tolerate time drift
         
         # --- FUNDAMENTAL FIX: DETERMINISTIC SIGNING ---
