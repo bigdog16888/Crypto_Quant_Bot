@@ -3601,23 +3601,93 @@ class StateReconciler:
                                 # triggering another adoption twice as large — ad infinitum.
                                 # Observed: 1063 → 2126 → 4253 → ... → 8,711,372 → 17M XRP
                                 #
-                                # CORRECT BEHAVIOR: Persistent unexplained mismatches must
-                                # escalate to REQUIRE_MANUAL_PROOF for human review.
+                                # CORRECT BEHAVIOR:
+                                #   (A) If the residual gap is sub-threshold (dust-level), write a
+                                #       'drift_note' audit record (filled_amount=0 — permanently
+                                #       invisible to get_pair_virtual_net()) and treat it as resolved.
+                                #   (B) If the gap is material, escalate to REQUIRE_MANUAL_PROOF.
+                                #
+                                # ⛔ CRITICAL — 'drift_note' MUST stay out of BOTH lists in §3.9:
+                                #   Entries: 'entry','grid','adoption','adoption_add','carry'
+                                #   Exits:   'tp','close','sl','dust_close','adoption_reduce','virtual_netting'
+                                # Any type from those lists counts toward ledger math on next cycle.
+                                # 'drift_note' falls through to ELSE 0 in the SQL — zero ledger impact.
                                 # ════════════════════════════════════════════════════════════
-                                logger.error(
-                                    f"🚨 [PROOF-FAILED] Ticker {symbol}: Persistent mismatch "
-                                    f"cannot be resolved by forensic scan. "
-                                    f"System={total_net_proved_qty_v2:.6f} vs Physical={net_phys_qty:.6f}. "
-                                    f"Diff={abs(total_net_proved_qty_v2 - net_phys_qty):.6f}. "
-                                    f"Setting REQUIRE_MANUAL_PROOF — check Monitor → Global Netting → {symbol}."
-                                )
-                                for b_info in bots_on_ticker:
-                                    cursor.execute(
-                                        "UPDATE bots SET status='REQUIRE_MANUAL_PROOF' WHERE id=? "
-                                        "AND status NOT IN ('Scanning', 'stopped')",
-                                        (b_info['bot_id'],)
+
+                                residual_qty = abs(total_net_proved_qty_v2 - net_phys_qty)
+                                residual_usd = residual_qty * ref_price
+
+                                # ── [v3.1.4] FRACTIONAL DRIFT SWEEPER ──────────────────────
+                                # Thresholds: gap must be BOTH < $5 USD AND < 0.5 units.
+                                # These are deliberately conservative — any larger gap must have
+                                # human eyes on it.  The note record carries full diagnostics so
+                                # a future audit can reconstruct exactly what was swept.
+                                _DRIFT_MAX_USD   = 5.0    # $5 maximum auto-sweep
+                                _DRIFT_MAX_UNITS = 0.5    # 0.5 units maximum auto-sweep
+
+                                if residual_usd <= _DRIFT_MAX_USD and residual_qty <= _DRIFT_MAX_UNITS:
+                                    logger.info(
+                                        f"🧹 [DRIFT-SWEEP] Ticker {symbol}: Residual gap "
+                                        f"({residual_qty:.6f} units / ${residual_usd:.4f}) is within "
+                                        f"dust threshold (≤{_DRIFT_MAX_UNITS}u / ≤${_DRIFT_MAX_USD}). "
+                                        f"Writing drift_note audit record (filled_amount=0, "
+                                        f"invisible to ledger math) and skipping REQUIRE_MANUAL_PROOF."
                                     )
-                                conn.commit()
+                                    # Write ONE audit row per affected bot.
+                                    # filled_amount=0 → passes the `AND o.filled_amount > 0`
+                                    # guard in get_pair_virtual_net() → contributes exactly 0.
+                                    _drift_ts = int(time.time())
+                                    for b_info in bots_on_ticker:
+                                        _note_cid = (
+                                            f"CQB_{b_info['bot_id']}_DRIFT_"
+                                            f"{symbol.replace('/','').replace(':','')}_{_drift_ts}"
+                                        )
+                                        try:
+                                            cursor.execute(
+                                                """INSERT OR IGNORE INTO bot_orders
+                                                   (bot_id, order_id, client_order_id,
+                                                    order_type, price, amount, filled_amount,
+                                                    status, step, cycle_id, created_at,
+                                                    position_side, notes)
+                                                   VALUES (?,?,?,'drift_note',?,?,0,'audit',
+                                                           0,?,?,?,?)""",
+                                                (
+                                                    b_info['bot_id'],
+                                                    f"DRIFT_{b_info['bot_id']}_{_drift_ts}",
+                                                    _note_cid,
+                                                    ref_price,
+                                                    residual_qty,
+                                                    b_info.get('cycle_id'),
+                                                    _drift_ts,
+                                                    b_info.get('direction', 'LONG'),
+                                                    (
+                                                        f"AutoSweep: proved={total_net_proved_qty_v2:.6f} "
+                                                        f"phys={net_phys_qty:.6f} "
+                                                        f"gap={residual_qty:.6f}u "
+                                                        f"(${residual_usd:.4f})"
+                                                    )
+                                                )
+                                            )
+                                        except Exception as _dn_err:
+                                            logger.debug(f"[DRIFT-SWEEP] drift_note insert warn: {_dn_err}")
+                                    conn.commit()
+
+                                else:
+                                    # Gap is material — human review required.
+                                    logger.error(
+                                        f"🚨 [PROOF-FAILED] Ticker {symbol}: Persistent mismatch "
+                                        f"cannot be resolved by forensic scan. "
+                                        f"System={total_net_proved_qty_v2:.6f} vs Physical={net_phys_qty:.6f}. "
+                                        f"Diff={residual_qty:.6f} units / ${residual_usd:.2f}. "
+                                        f"Setting REQUIRE_MANUAL_PROOF — check Monitor → Global Netting → {symbol}."
+                                    )
+                                    for b_info in bots_on_ticker:
+                                        cursor.execute(
+                                            "UPDATE bots SET status='REQUIRE_MANUAL_PROOF' WHERE id=? "
+                                            "AND status NOT IN ('Scanning', 'stopped')",
+                                            (b_info['bot_id'],)
+                                        )
+                                    conn.commit()
                         except Exception as _heal_err:
                             logger.error(f"[AUTONOMOUS-HEAL] Forensic scan failed for {symbol}: {_heal_err}")
                             # 🚀 ROOT CAUSE FIX: Isolate REQUIRE_MANUAL_PROOF to specific bots

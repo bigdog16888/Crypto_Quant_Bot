@@ -449,6 +449,18 @@ def render_monitor_view():
                         hedge_amounts[b_id] = max(0.0, h_sum - hx_sum)
 
                 hedged_bot_ids = set(df_h_f[df_h_f['filled_amount'] > 1e-8]['bot_id'].unique())
+                
+                # Pre-calculate physical order counts for health checks
+                physical_order_counts = {}
+                for o in market_orders_f:
+                    cid = str(o.get('clientOrderId') or '')
+                    if cid.startswith('CQB_'):
+                        try:
+                            parts = cid.split('_')
+                            if len(parts) >= 2:
+                                bid_parsed = int(parts[1])
+                                physical_order_counts[bid_parsed] = physical_order_counts.get(bid_parsed, 0) + 1
+                        except: pass
 
                 # Apply Display Status Mapping
                 def derive_status(row):
@@ -475,6 +487,18 @@ def render_monitor_view():
                     return "🟢 SCANNING"
 
                 df_pos_f['status'] = df_pos_f.apply(derive_status, axis=1)
+                df_pos_f['Active Orders'] = df_pos_f['id'].apply(lambda x: physical_order_counts.get(int(x), 0))
+                
+                # Highlight missing orders per-row
+                def highlight_health(row):
+                    bid, inv = int(row['id']), float(row['total_invested'] or 0)
+                    ord_count = physical_order_counts.get(bid, 0)
+                    status = str(row['status'])
+                    if "IN TRADE" in status and ord_count == 0 and "CARRY" not in str(row.get('cycle_phase','')):
+                        return f"⚠️ {status}"
+                    return status
+                
+                df_pos_f['status'] = df_pos_f.apply(highlight_health, axis=1)
                 df_pos_f['sort_priority'] = df_pos_f['status'].apply(lambda x: 1 if ("IN TRADE" in x or "HEDGED" in x) else (2 if "SCANNING" in x else 3))
                 df_pos_f.sort_values(by=['sort_priority', 'name'], ascending=[True, True], inplace=True)
 
@@ -569,16 +593,6 @@ def render_monitor_view():
                 # Order Health Alerts
                 order_health_msg = ""
                 order_status_color = "green"
-                physical_order_counts = {}
-                for o in market_orders_f:
-                    cid = str(o.get('clientOrderId') or '')
-                    if cid.startswith('CQB_'):
-                        try:
-                            parts = cid.split('_')
-                            if len(parts) >= 2:
-                                bid_parsed = int(parts[1])
-                                physical_order_counts[bid_parsed] = physical_order_counts.get(bid_parsed, 0) + 1
-                        except: pass
 
                 bots_with_missing_orders = []
                 bots_with_partial_orders = []
@@ -596,12 +610,12 @@ def render_monitor_view():
                         # Stricter health: Step 1+ bots should generally have 2 orders (TP + Grid)
                         cycle_phase = str(row.get('cycle_phase', 'IDLE')).upper()
                         # We flag as MISSING CRITICAL if they have 0 orders but are in trade
-                        if actual_ph == 0 and bot_inv > 5.0 and cycle_phase != 'CARRY_PENDING':
+                        if actual_ph == 0 and bot_inv > 0.01 and cycle_phase != 'CARRY_PENDING':
                             bots_with_missing_orders.append(row['name'])
                         elif actual_ph == 0 and cycle_phase == 'CARRY_PENDING':
                             pass # Engine is intentionally holding without orders
                         # We flag as MISSING GRIDS if they have only 1 order but are mid-cycle (Step 1+)
-                        elif actual_ph < 2 and c_step >= 1 and bot_inv > 5.0:
+                        elif actual_ph < 2 and c_step >= 1 and bot_inv > 0.01:
                             bots_with_partial_orders.append(f"{row['name']} ({actual_ph}/2)")
 
                 if bots_with_missing_orders:
@@ -639,36 +653,52 @@ def render_monitor_view():
                         with _act_c1:
                             if st.button("🕵️ Forensic Adopt", key=f"f_{mp_pair}"):
                                 from engine.reconciler import StateReconciler
-                                StateReconciler().perform_forensic_reconstruction(mp_pair.split(' ')[0]); st.rerun()
+                                _p_clean = mp_pair.split(' ')[0]
+                                clear_manual_whitelists_for_pair(_p_clean)
+                                StateReconciler().perform_forensic_reconstruction(_p_clean); st.rerun()
                         with _act_c2:
                             if st.button("📝 Manual", key=f"m_{mp_pair}"):
                                 add_manual_whitelist(mp_pair.split(' ')[0], 'LONG' if mp_dqty > 0 else 'SHORT', abs(mp_dqty)); st.rerun()
                         with _act_c3:
                             if st.button("💥 Close", key=f"c_{mp_pair}"):
+                                _p_clean = mp_pair.split(' ')[0]
                                 ex_m = get_exchange_instance('future')
-                                # Only send a market order if the exchange actually holds a position
+                                # 1. Clear any manual overrides first
+                                clear_manual_whitelists_for_pair(_p_clean)
+                                
+                                # 2. Attempt to flatten exchange
                                 if abs(mp_pqty) > 0.0001:
                                     try:
-                                        ex_m.create_order(mp_pair.split(' ')[0], 'market', 'sell' if mp_pqty > 0 else 'buy', abs(mp_pqty), params={'reduceOnly': True})
+                                        # Use standard close which handles reduceOnly internally or fails safely
+                                        ex_m.close_position(_p_clean)
+                                        st.success(f"Exchange closed {_p_clean}")
                                     except Exception as _close_ex_err:
-                                        st.warning(f"Exchange close order failed (may already be flat): {_close_ex_err}")
-                                # Zero ALL affected bots with a proper reset (not raw SQL)
+                                        err_m = str(_close_ex_err).lower()
+                                        if "reduceonly" in err_m or "400" in err_m or "not found" in err_m:
+                                            st.warning(f"Exchange close skipped/failed (Pos might be 0): {err_m[:50]}...")
+                                        else:
+                                            st.error(f"Exchange close failed: {_close_ex_err}")
+
+                                # 3. Zero ALL affected bots with a proper reset
                                 from engine.database import reset_bot_after_tp as _rbt
-                                conn_m = sqlite3.connect(global_config.PATHS['DB_FILE'])
-                                bids = [r[0] for r in conn_m.execute("SELECT id FROM bots WHERE pair LIKE ?", (f"{mp_pair.split(' ')[0]}%",)).fetchall()]
-                                conn_m.close()
-                                for b in bids:
-                                    try:
+                                try:
+                                    conn_m = sqlite3.connect(global_config.PATHS['DB_FILE'])
+                                    all_b = conn_m.execute("SELECT id, pair FROM bots WHERE is_active=1").fetchall()
+                                    conn_m.close()
+                                    target_bids = [b[0] for b in all_b if _norm_universal(b[1]) == _norm_universal(_p_clean)]
+                                    for b in target_bids:
                                         _rbt(b, exit_price=0.0, action_label='MANUAL_CLOSE',
                                              notes=f"UI Close: exchange={mp_pqty:+.4f}, virtual={mp_vqty:+.4f}")
-                                    except Exception as _rbt_err:
-                                        st.warning(f"Reset bot {b} failed: {_rbt_err}")
+                                    st.success(f"Reset {len(target_bids)} bots.")
+                                except Exception as _rbt_err:
+                                    st.warning(f"Reset failed: {_rbt_err}")
                                 st.rerun()
 
                 # --- Position Details & Grids ---
                 st.subheader("🤖 Active Bot Positions")
                 
                 # Extract Trigger Info, Active Orders, and EE/Profit Metrics
+                indicator_cache_f = {} # Per-fragment local cache
                 def extract_info(row):
                     res = {
                         'Trigger': 'N/A', 'Orders': '0', 'TP_Price': 0.0, 
@@ -688,22 +718,113 @@ def render_monitor_view():
                         pair_key = _norm_universal(row.get('pair', ''))
                         current_price = _clean(pair_prices.get(pair_key, 0.0))
                         
-                        # 1. Trigger Description
+                        # Helper for Indicators (Cached per fragment run)
+                        def get_indicator_val(p, tf, itype, period=14):
+                            cache_key = (p, tf, itype, period)
+                            if cache_key in indicator_cache_f: return indicator_cache_f[cache_key]
+                            try:
+                                ex_obj = get_exchange_instance(global_config.MARKET_TYPE)
+                                ohlcv = ex_obj.fetch_ohlcv(p, timeframe=tf, limit=max(100, period*2))
+                                if not ohlcv: return None
+                                df = pd.DataFrame(ohlcv, columns=['t','o','h','l','c','v'])
+                                from engine import indicators
+                                if itype == 'RSI': val = float(indicators.rsi(df['c'], period).iloc[-1])
+                                elif itype == 'CCI': val = float(indicators.cci(df['h'], df['l'], df['c'], period).iloc[-1])
+                                else: val = None
+                                indicator_cache_f[cache_key] = val
+                                return val
+                            except: return None
+
+                        # 1. Trigger Description (Entry Conditions)
                         triggers = []
                         m_p = int(cfg.get('mode_price', 0) or 0)
                         t_p = float(cfg.get('price_threshold', 0) or 0)
+                        
+                        dist_pct = 0.0
+                        if current_price > 0 and t_p > 0:
+                            dist_pct = abs(current_price - t_p) / t_p * 100
+                            
+                        # Proximity Labels for Price Entry
+                        entry_label = ""
+                        if dist_pct < 0.5: entry_label = "🟢 [IN RANGE]"
+                        elif dist_pct < 2.0: entry_label = "🟡 [SOON]"
+                        else: entry_label = "⚪ [FAR]"
+
                         if m_p == 1: 
                             dist_str = f" ({((current_price - t_p)/t_p*100):.1f}%)" if current_price > 0 and t_p > 0 else ""
-                            triggers.append(f"Price > ${t_p:,.2f}{dist_str}")
+                            triggers.append(f"{entry_label} Price > ${t_p:,.2f}{dist_str}")
                         elif m_p == 2: 
                             dist_str = f" ({((current_price - t_p)/t_p*100):.1f}%)" if current_price > 0 and t_p > 0 else ""
-                            triggers.append(f"Price < ${t_p:,.2f}{dist_str}")
-                        if cfg.get('mode_rsi'): triggers.append(f"RSI({cfg.get('rsi_level')})")
-                        desc_trigger = " + ".join(triggers) if triggers else "N/A"
+                            triggers.append(f"{entry_label} Price < ${t_p:,.2f}{dist_str}")
+                            
+                        if cfg.get('mode_rsi'): 
+                            target_rsi = float(cfg.get('rsi_level', 0))
+                            tf_rsi = cfg.get('rsi_tf', '15m')
+                            curr_rsi = get_indicator_val(row.get('pair'), tf_rsi, 'RSI')
+                            if curr_rsi is not None:
+                                dist_rsi = abs(curr_rsi - target_rsi)
+                                label = "🟢 [IN RANGE]" if dist_rsi < 2 else ("🟡 [SOON]" if dist_rsi < 8 else "⚪ [FAR]")
+                                triggers.append(f"{label} RSI({target_rsi}): {curr_rsi:.1f}")
+                            else:
+                                triggers.append(f"RSI({target_rsi})")
+
+                        if cfg.get('mode_cci'): 
+                            target_cci = float(cfg.get('cci_level', 0))
+                            tf_cci = cfg.get('cci_tf', '5m')
+                            curr_cci = get_indicator_val(row.get('pair'), tf_cci, 'CCI')
+                            if curr_cci is not None:
+                                dist_cci = abs(curr_cci - target_cci)
+                                label = "🟢 [IN RANGE]" if dist_cci < 15 else ("🟡 [SOON]" if dist_cci < 40 else "⚪ [FAR]")
+                                triggers.append(f"{label} CCI({target_cci}): {curr_cci:.1f}")
+                            else:
+                                triggers.append(f"CCI({target_cci})")
+
+                        if cfg.get('mode_stoch'): 
+                            tf_stoch = cfg.get('stoch_tf', '15m')
+                            # Note: stochastic returns (%K, %D). We'll use %K.
+                            try:
+                                ex_obj = get_exchange_instance(global_config.MARKET_TYPE)
+                                ohlcv = ex_obj.fetch_ohlcv(row.get('pair'), timeframe=tf_stoch, limit=60)
+                                if ohlcv:
+                                    df = pd.DataFrame(ohlcv, columns=['t','o','h','l','c','v'])
+                                    from engine import indicators
+                                    k, d = indicators.stochastic(df['h'], df['l'], df['c'])
+                                    curr_k = float(k.iloc[-1])
+                                    label = "🟢 [IN RANGE]" if (curr_k < 20 or curr_k > 80) else "⚪ [FAR]"
+                                    triggers.append(f"{label} Stoch: {curr_k:.1f}")
+                            except:
+                                triggers.append(f"Stoch({tf_stoch})")
+
+                        if cfg.get('mode_boll'): 
+                            tf_boll = cfg.get('boll_tf', '15m')
+                            try:
+                                ex_obj = get_exchange_instance(global_config.MARKET_TYPE)
+                                ohlcv = ex_obj.fetch_ohlcv(row.get('pair'), timeframe=tf_boll, limit=60)
+                                if ohlcv:
+                                    df = pd.DataFrame(ohlcv, columns=['t','o','h','l','c','v'])
+                                    from engine import indicators
+                                    u, m, l = indicators.bollinger_bands(df['c'])
+                                    curr_p = float(df['c'].iloc[-1])
+                                    curr_u = float(u.iloc[-1])
+                                    curr_l = float(l.iloc[-1])
+                                    dist_u = abs(curr_p - curr_u) / curr_u * 100
+                                    dist_l = abs(curr_p - curr_l) / curr_l * 100
+                                    label = "🟢 [IN RANGE]" if (dist_u < 0.2 or dist_l < 0.2) else ("🟡 [SOON]" if (dist_u < 1.0 or dist_l < 1.0) else "⚪ [FAR]")
+                                    triggers.append(f"{label} Bollinger")
+                            except:
+                                triggers.append(f"Bollinger")
+                        
+                        desc_trigger = " + ".join(triggers) if triggers else "Trend/Dynamic"
                         
                         inv = _clean(row.get('total_invested'))
                         is_in_trade = inv > 0.01 or str(row.get('cycle_phase', '')).upper() == 'ACTIVE'
-                        res['Trigger'] = f"In Trade ({desc_trigger})" if is_in_trade else desc_trigger
+                        
+                        # 🎯 HEATMAP REFACTOR: If In Trade, show TP/Grid distance as primary status
+                        if is_in_trade:
+                            # We'll calculate this after fetching orders below, so for now just placeholder
+                            res['Trigger'] = desc_trigger
+                        else:
+                            res['Trigger'] = desc_trigger
                         
                         # 2. Order Tracking
                         bot_id = int(row['id'])
@@ -738,6 +859,19 @@ def render_monitor_view():
                             res['Grid_Price_Str'] = f"{res['Grid_Amount']:.4f} @ ${res['Grid_Price']:,.2f} ({dist:+.1f}%)"
                         else:
                             res['Grid_Price_Str'] = f"{res['Grid_Amount']:.4f} @ ${res['Grid_Price']:,.2f}" if res['Grid_Price'] > 0 else "-"
+                        
+                        # 🎯 HEATMAP ENRICHMENT (Final Step): 
+                        if is_in_trade:
+                            if res['TP_Price'] > 0:
+                                dist = abs(current_price - res['TP_Price']) / res['TP_Price'] * 100
+                                label = "🟢 [READY]" if dist < 0.2 else ("🟡 [NEAR]" if dist < 1.0 else "⚪ [DISTANCE]")
+                                res['Trigger'] = f"{label} TP Proximity: {dist:.1f}%"
+                            elif res['Grid_Price'] > 0:
+                                dist = abs(current_price - res['Grid_Price']) / res['Grid_Price'] * 100
+                                label = "🟡 [NEAR]" if dist < 1.0 else "⚪ [DISTANCE]"
+                                res['Trigger'] = f"{label} Grid Proximity: {dist:.1f}%"
+                            else:
+                                res['Trigger'] = f"⚠️ NO ORDERS (Adopted?)"
                         
                         # 3. Expected Profit
                         o_qty = _clean(row.get('open_qty'))

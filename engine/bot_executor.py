@@ -1179,12 +1179,41 @@ class BotExecutor:
         # Get strategy from cache - FIXED: Use bot_config instead of bot_status for params
         strategy = self._get_strategy_instance(bot_id, bot_config)
 
-        # 🚀 CARRY_PENDING GUARD
-        # Do NOT place new entry orders if we are waiting for a dust/carry position
-        # to be adopted by the background Reconciler process.
+        # 🚀 CARRY_PENDING GUARD [v3.1.4 — self-healing]
+        # Do NOT place new entry orders while waiting for the carry to fill.
+        # HOWEVER: if the carry bot_orders row is ALREADY filled, the reconciler
+        # already credited it — call seal_trade_state() to promote CARRY_PENDING
+        # to ACTIVE right now, then fall through to normal execution.
         if bot_status.get('cycle_phase') == 'CARRY_PENDING':
-             logger.info(f"⏳ [CARRY-PENDING] {name}: Awaiting carry adoption from Reconciler. Suspending ENTRY order placement.")
-             return None
+            try:
+                from engine.database import get_connection as _gc_cp
+                from engine.ledger import seal_trade_state as _seal_cp
+                _conn_cp = _gc_cp()
+                _carry_filled = _conn_cp.execute(
+                    "SELECT COUNT(*) FROM bot_orders "
+                    "WHERE bot_id=? AND order_type IN ('entry','carry') "
+                    "AND status='filled' AND filled_amount>0",
+                    (bot_id,)
+                ).fetchone()[0]
+                if _carry_filled:
+                    logger.info(
+                        f"🔄 [CARRY-PROMOTE] {name}: carry entry already filled ({_carry_filled} row(s)). "
+                        f"Promoting CARRY_PENDING → ACTIVE via seal_trade_state."
+                    )
+                    _seal_cp(bot_id)
+                    # Re-read bot_status so the rest of this function sees ACTIVE phase
+                    from engine.database import get_bot_status as _gbs_cp
+                    bot_status = _gbs_cp(bot_id)
+                    # Fall through — continue with normal entry / maintain logic
+                else:
+                    logger.info(
+                        f"⏳ [CARRY-PENDING] {name}: carry entry not yet filled. "
+                        f"Suspending ENTRY order placement."
+                    )
+                    return None
+            except Exception as _cp_err:
+                logger.warning(f"[CARRY-PENDING] {name}: self-heal check failed ({_cp_err}). Suspending as precaution.")
+                return None
 
         # 🚀 MISSING ENTRY LOGIC RESTORED 🚀
         # If we are NOT in a trade (total_invested == 0) and NO entry order exists, PLACE IT.
@@ -1995,10 +2024,36 @@ class BotExecutor:
         # 🚀 STRICT SEQUENCING & STATE ENFORCEMENT
         existing_entry_orders = [o for o in bot_open_orders if '_ENTRY_' in o.get('clientOrderId', '')]
 
-        # CASE 1: CARRY_PENDING GUARD -> SUSPEND MAINTENANCE
+        # CASE 1: CARRY_PENDING GUARD [v3.1.4 — self-healing]
+        # Suspend maintenance while waiting for the carry fill — but if the carry
+        # bot_orders row is already 'filled', promote CARRY_PENDING → ACTIVE via
+        # seal_trade_state() and fall through to normal TP/grid maintenance.
         if bot_status.get('cycle_phase') == 'CARRY_PENDING':
-             logger.info(f"⏳ [CARRY-PENDING] {name}: Ledger awaiting background carry adoption. Suspending maintenance.")
-             return None
+            try:
+                from engine.database import get_connection as _gc_m
+                from engine.ledger import seal_trade_state as _seal_m
+                _conn_m = _gc_m()
+                _carry_filled_m = _conn_m.execute(
+                    "SELECT COUNT(*) FROM bot_orders "
+                    "WHERE bot_id=? AND order_type IN ('entry','carry') "
+                    "AND status='filled' AND filled_amount>0",
+                    (bot_id,)
+                ).fetchone()[0]
+                if _carry_filled_m:
+                    logger.info(
+                        f"🔄 [CARRY-PROMOTE] {name}: carry entry already filled ({_carry_filled_m} row(s)) "
+                        f"in maintain_orders. Promoting CARRY_PENDING → ACTIVE."
+                    )
+                    _seal_m(bot_id)
+                    from engine.database import get_bot_status as _gbs_m
+                    bot_status = _gbs_m(bot_id)
+                    # Fall through into normal TP/grid maintenance
+                else:
+                    logger.info(f"⏳ [CARRY-PENDING] {name}: Ledger awaiting background carry adoption. Suspending maintenance.")
+                    return None
+            except Exception as _m_cp_err:
+                logger.warning(f"[CARRY-PENDING] {name}: self-heal check failed ({_m_cp_err}). Suspending as precaution.")
+                return None
 
         # 🚀 CASE 1.5: HEDGE / HEDGE_EXIT_PENDING (v3.0.1)
         # Main TP has filled, but we are waiting for the Hedge BE TP to fill,

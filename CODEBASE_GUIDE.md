@@ -1,5 +1,5 @@
 # Crypto Quant Bot — AI Agent Codebase Guide
-**Version: 3.0.9 | Last Updated: 2026-05-06**
+**Version: 3.1.4 | Last Updated: 2026-05-12**
 
 > **READ THIS FIRST** before touching any code. This is the single authoritative guide.
 > It supersedes `UNIFIED_BOT_DOCUMENTATION.md` and all older session notes.
@@ -199,9 +199,16 @@ Transitions:
 
 ### 3.9. Ledger Mathematics — Canonical Form
 All position calculations MUST use:
-- **Entries** (add to position): `order_type IN ('entry', 'grid', 'adoption_add', 'adoption')`
-- **Exits** (subtract from position): `order_type IN ('tp', 'close', 'exit', 'adoption_reduce', 'dust_close', 'sl')`
+- **Entries** (add to position): `order_type IN ('entry', 'grid', 'adoption_add', 'adoption', 'carry')`
+- **Exits** (subtract from position): `order_type IN ('tp', 'close', 'exit', 'adoption_reduce', 'dust_close', 'sl', 'virtual_netting')`
+- **Audit-only** (zero ledger impact): `order_type = 'drift_note'`
+
 Any deviation creates ghost balances or zero-out errors.
+
+> **RULE — `drift_note` is the ONLY safe audit record type** (added v3.1.4).  
+> `get_pair_virtual_net()` only counts rows where `filled_amount > 0` AND `order_type` matches an Entry or Exit above.  
+> `drift_note` rows are always written with `filled_amount = 0`, so they fall through to `ELSE 0` in the accounting SQL.  
+> **NEVER use `adoption`, `adoption_add`, or any Entry/Exit type for reconciliation notes** — they will be counted as real fills on the next cycle and cause runaway ledger inflation (the XRP 1 063 → 17 M explosion, observed May 2026).
 
 ### 3.10. `position_side` Filter Must Be NULL-Tolerant
 ```sql
@@ -262,6 +269,27 @@ To protect fully hedged bots (net quantity = 0 but gross invested > 0), the syst
 - **`entry_confirmed`**: Remains `1` if any proven fill exists for the current cycle, regardless of whether it was later offset by a hedge.
 - **`sync_trades_from_orders`**: If a bot is fully hedged, the logic preserves the `HEDGED` phase and `entry_confirmed=1` status, ensuring the bot doesn't "DNA-WIPE" while physically active.
 
+### 3.18. Fractional Drift Sweeper — `drift_note` Protocol (v3.1.4)
+
+When the autonomous 48 h forensic fill scan (AUTONOMOUS-HEAL) still cannot close the gap between the system ledger and the physical exchange position, the engine applies a two-tier outcome:
+
+| Residual gap | Action |
+|---|---|
+| `qty ≤ 0.5 units` **AND** `USD ≤ $5.00` | Write a `drift_note` row (`filled_amount=0`) per bot as an audit trail. Bots stay in their current status. |
+| Any gap exceeding either threshold | Set all bots on that ticker to `REQUIRE_MANUAL_PROOF` for human review. |
+
+**Why the thresholds?**  
+0.5 units catches rounding dust on high-price assets (0.5 BTC would be ~$30 k and would fail the $5 USD check). $5 catches dust on cheap tokens without letting material gaps slip through.
+
+**Audit trail structure (`bot_orders` row):**
+```
+order_type    = 'drift_note'   ← safe — NOT in any Entry/Exit set
+filled_amount = 0              ← passes the `AND filled_amount > 0` guard → zero impact
+status        = 'audit'        ← will never be processed as a live order
+client_order_id = CQB_{bot_id}_DRIFT_{symbol}_{ts}
+notes         = full diagnostic string for future audits
+```
+
 ---
 
 ## 4. Reconciler Architecture
@@ -311,6 +339,9 @@ To protect fully hedged bots (net quantity = 0 but gross invested > 0), the syst
 | `trades.tp_order_id` stuck as `PLACING_CQB_...` forever | Pre-commit pattern writes placeholder to `trades` but `update_bot_order_exchange_id` only updated `bot_orders`, leaving the stalemate evictor querying a non-existent exchange ID | Fixed in v1.8.2: `update_bot_order_exchange_id` now back-fills `trades` table; `get_bot_order_ids` strips `PLACING_` and self-heals from `bot_orders` |
 | `[SYNC-DRIFT]` fires every cycle replacing a valid TP | Drift-check re-computed `db_tp` via `_compute_effective_tp(avg_entry_price)` each cycle. If `avg_entry_price` shifted (grid fill), the re-computed base TP differed from the placed TP → false drift even when no EE interval elapsed | Fixed in v1.8.4: drift-check reads `bot_orders.price` (what was physically placed on Binance) and compares it to the live exchange TP. EE interval change is detected separately via `new_ee_tp != placed_tp`. Tolerance reduced from 2% (patch) to 0.1% (tick-size rounding only) |
 | `python-dotenv could not parse` on startup (lines 17-51) | A test exercised the UI "Apply Settings" path with a mocked `st.text_input()` that returned a `MagicMock` object. `set_key()` wrote `MagicMock repr` verbatim to `.env`. The `<` character in the repr is illegal in dotenv format | Fixed in v1.8.4: `ui/app.py` validates inputs before writing (len≥10, printable ASCII, no `<`). `.env` now has stub `BINANCE_API_KEY=` so `set_key()` updates in-place, never appends |
+| Virtual net explodes to millions (XRP 1k→17M) | Forensic adoption wrote `adoption_add` rows which `get_pair_virtual_net()` counted as real fills, doubling the gap each cycle and triggering a new adoption record | Fixed in v3.1.0: Bidirectional forensic adoption disabled. v3.1.4 adds fractional drift sweeper using `drift_note` (invisible to ledger math) for sub-$5 / sub-0.5u residuals |
+| Monitor `Trigger` column shows `N/A` for all scanning bots | `extract_info` computed price-threshold proximity only; RSI/CCI branches existed but returned the raw level string without live value | Fixed in v3.1.2: `get_indicator_val()` fetches live OHLCV and computes RSI/CCI/Stoch in-fragment with a local cache; proximity label (`🟢 IN RANGE / 🟡 SOON / ⚪ FAR`) attached to every trigger type |
+| `💥 Close` on mismatch row returns Binance 400 ReduceOnly error, bot stays stuck | `create_order(reduceOnly=True)` rejected because position already flat; error aborted the bot-state reset | Fixed in v3.1.3: `Close` now catches `reduceOnly`/`400`/`not found` errors, issues a warning toast, and **always** proceeds to `reset_bot_after_tp` so bot returns to IDLE even when exchange is already flat |
 
 ---
 
@@ -335,6 +366,56 @@ After restart, watch for:
 ---
 
 ## 7. Version History (Change Log)
+
+### v3.1.4 — 2026-05-12
+**Fractional Drift Sweeper + `drift_note` Protocol + CODEBASE_GUIDE refresh.**
+
+**reconciler.py**:
+- `resolve_net_mismatch` / PASS 3 final block: replaced the binary "forensic scan failed → REQUIRE_MANUAL_PROOF" escalation with a two-tier outcome. Residual gaps ≤ 0.5 units AND ≤ $5 USD are now auto-resolved by writing a `drift_note` audit row (`filled_amount=0`, type not in any Entry/Exit set → zero ledger impact). Larger gaps still escalate to `REQUIRE_MANUAL_PROOF`.
+- `drift_note` rows carry full diagnostics in the `notes` column (proved qty, physical qty, gap, price) for future auditing.
+
+**CODEBASE_GUIDE.md**:
+- Version bumped 3.0.9 → 3.1.4.
+- §3.9: Added `drift_note` as the safe audit-only type; added `carry` and `virtual_netting` to complete the Entry/Exit sets.
+- §3.18: New section — Fractional Drift Sweeper protocol, thresholds, and `bot_orders` record structure.
+- §5: Added three new failure patterns (runaway adoption inflation, N/A trigger proximity, ReduceOnly Close stuck).
+- §7: Full v3.1.x changelog added below.
+
+### v3.1.3 — 2026-05-12
+**Robust Mismatch Recovery `Close` button + Stoch/Bollinger proximity labels.**
+
+**monitor.py**:
+- Mismatch section `💥 Close` button: rewritten to call `ex.close_position()` instead of raw `create_order(reduceOnly=True)`. Error handler now explicitly catches `reduceonly` / `400` / `not found` strings and issues a `st.warning` toast instead of aborting. **Bot state is always reset** (`reset_bot_after_tp` + manual_whitelists DELETE) regardless of exchange outcome.
+- `extract_info`: Added Stochastic (`mode_stoch`) and Bollinger Band (`mode_boll`) proximity branches with live OHLCV fetch, matching the RSI/CCI pattern.
+- In-trade trigger label: bots with no TP and no Grid orders now show `⚠️ NO ORDERS (Adopted?)` instead of silent `In Trade (desc)`.
+
+### v3.1.2 — 2026-05-11
+**Real-time Trigger Proximity Intelligence in Dashboard.**
+
+**monitor.py**:
+- `extract_info`: Added `get_indicator_val(pair, tf, itype)` inner function with a per-fragment `indicator_cache_f` dict. On each 15 s fragment refresh, RSI and CCI are calculated from live OHLCV (falling back to `market_cache.json` file cache first).
+- Proximity labels added for all trigger modes: `🟢 [IN RANGE]`, `🟡 [SOON]`, `⚪ [FAR]` for both price-threshold and oscillator conditions.
+- In-trade enrichment: When a bot has a live TP order, `Trigger` column shows `🟢/🟡/⚪ TP Proximity: X.X%` instead of a raw indicator string.
+- `physical_order_counts` now pre-computed before `extract_info` is called (resolves the `free variable referenced before assignment` scoping error).
+
+### v3.1.1 — 2026-05-09
+**`get_pair_virtual_net` partial-cancel fill inclusion.**
+
+**database.py**:
+- `get_pair_virtual_net` SQL: Added explicit handling for `status IN ('canceled','cancelled') AND filled_amount > 0` rows (ATR grid resize cancels old order but it may have been partially filled). These real fills now count toward the virtual net.
+- Hedge LIKE clause extended to handle `hedgetp%` prefix variants.
+
+### v3.1.0 — 2026-05-08
+**Bidirectional Forensic Adoption Disabled — Proof-Only Escalation.**
+
+**reconciler.py**:
+- Removed all `forensic_adoption_add` / `inject_adoption_row` calls from the PASS 3 failure branch.
+- Replaced with `REQUIRE_MANUAL_PROOF` status escalation and a detailed comment block (lines ~3595–3619) documenting the exact inflation mechanism that caused XRP 1 063 → 17 M.
+- `resolve_net_mismatch` global netting: switched from per-bot `trades.open_qty` snapshot to `get_pair_virtual_net(pair)` as the authoritative system-side quantity, eliminating stale-cache false alarms.
+
+**monitor.py**:
+- Mismatch section rewired to call `get_pair_virtual_net` for virtual side (was reading `total_invested` from the DataFrame).
+- `physical_order_counts` pre-computation hoisted above `extract_info` definition to fix `UnboundLocalError: free variable referenced before assignment in enclosing scope`.
 
 ### v2.0.0 — 2026-04-22
 **Major Release: Autonomous Reconciliation Stabilization.**
