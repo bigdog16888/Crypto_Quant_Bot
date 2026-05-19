@@ -1,17 +1,22 @@
 # Crypto Quant Bot — AI Agent Codebase Guide
-**Version: 3.1.4 | Last Updated: 2026-05-12**
+**Version: 3.4.2 | Last Updated: 2026-05-19**
 
 > **READ THIS FIRST** before touching any code. This is the single authoritative guide.
 > It supersedes `UNIFIED_BOT_DOCUMENTATION.md` and all older session notes.
-> Every invariant here was added because someone violated it and the system broke.
+> **Architecture deep-dive:** `docs/ARCHITECTURE_v3.4.md`
+> **Operator steps:** `docs/OPERATOR_MISMATCH_RUNBOOK.md`
 
 ---
 
 ## 🏗️ High-Level Engine Architecture
-The Crypto Quant Bot relies on a **Proof-Only Reconciliation Architecture**. 
-1. **Virtual Ledger (`crypto_bot.db`):** The system tracks exactly what each bot intends to hold through cryptographic proof (clientOrderIds like `CQB_###`).
-2. **Physical Imprint (Binance):** The system connects to Binance via CCXT & Raw FAPI to verify actual holdings.
-3. **The `StateReconciler`:** Compares the DB math against the physical imprint. If any impossible discrepancy occurs (e.g. Virtual > Physical), the system will NEVER invent numbers or guess (as it did historically across heuristical patching). It will default to the **Market Flatten Protocol**, physically wiping the exchange position safely to $0 and neutralizing the bot ledger to Step 0 to guarantee mathematical safety. No orphaned dust will survive.
+The Crypto Quant Bot uses a **Proof-Only Reconciliation Architecture** (v3.4.x).
+
+1. **Virtual ledger (`bot_orders` + `get_pair_virtual_net`)** — Only CQB-tagged fills count. No forensic inventing (`ALLOW_FORENSIC_ADOPT=False`).
+2. **Physical imprint (Binance one-way net)** — `fetch_positions()` signed `net_qty` per symbol.
+3. **`parity_gates.py`** — Blocks cycle reset and new orders when virtual ≠ exchange; purges phantom ledger when exchange is flat (testnet).
+4. **`StateReconciler`** — CQB history scan, seal, adopt; escalates to `REQUIRE_MANUAL_PROOF` instead of guessing.
+
+**Operator flow:** `run_bot.bat` → **Start Monitoring** → `startup_sync` → main loop. Optional: `run_stack.bat` starts both UI and engine.
 
 ---
 
@@ -60,7 +65,10 @@ Crypto_Quant_Bot/
 │   ├── exchange_interface.py  ← CCXT + raw Binance FAPI wrapper
 │   ├── ws_cache.py            ← In-memory position/order snapshot (WS + REST merged)
 │   ├── ws_event_handlers.py   ← Real-time WebSocket fill processing
+│   ├── parity_gates.py        ← Pair parity gates + proof flatten (v3.4.0)
 │   └── websocket_handler.py   ← WS connection manager
+├── scripts/run_startup_heal.py ← One-shot ledger heal (no trading loop)
+├── docs/OPERATOR_MISMATCH_RUNBOOK.md ← Human steps for mismatch rows (read this)
 ├── ui/app.py                  ← Streamlit dashboard entry point
 ├── ui/views/monitor.py        ← Live monitor & mismatch display
 ├── config/settings.py         ← Config loader (.env → config object)
@@ -269,6 +277,27 @@ To protect fully hedged bots (net quantity = 0 but gross invested > 0), the syst
 - **`entry_confirmed`**: Remains `1` if any proven fill exists for the current cycle, regardless of whether it was later offset by a hedge.
 - **`sync_trades_from_orders`**: If a bot is fully hedged, the logic preserves the `HEDGED` phase and `entry_confirmed=1` status, ensuring the bot doesn't "DNA-WIPE" while physically active.
 
+### 3.19. Phase A — Pair Parity Gates & Proof Flatten (v3.4.0)
+
+**Problem solved:** Cycle reset could clear `bot_orders` while the exchange still held size (LINK/SOL 2× class). Forensic WS adopt could invent ledger rows without exchange proof.
+
+**Module:** `engine/parity_gates.py`
+
+| Gate | When | Effect |
+|------|------|--------|
+| **Cycle reset** | Every `reset_bot_after_tp` / `_reset_bot_after_tp_internal` (except `MANUAL_CLOSE` / `SYSTEM_WIPE` with `human_approved=True`) | Blocks reset if `projected_pair_virtual_after_bot_flat ≠ exchange_net` |
+| **Trading** | `execute_entry`, `maintain_orders` | Blocks orders; sets bot `REQUIRE_MANUAL_PROOF` |
+| **Forensic adopt** | WS orphan/anonymous + reconciler `forensic_mode=True` | **Off** unless `ALLOW_FORENSIC_ADOPT=True` in `.env` |
+| **Proof flatten** | Monitor mismatch `💥 Close` | Cancel CQB orders → reduceOnly market → verify flat → `MANUAL_CLOSE` reset all bots on pair |
+
+**Config (`.env`):**
+```
+PAIR_PARITY_QTY_TOLERANCE=0.002
+ALLOW_FORENSIC_ADOPT=False
+```
+
+**Revert / soften (emergency only):** See `docs/OPERATOR_MISMATCH_RUNBOOK.md` § Revert.
+
 ### 3.18. Fractional Drift Sweeper — `drift_note` Protocol (v3.1.4)
 
 When the autonomous 48 h forensic fill scan (AUTONOMOUS-HEAL) still cannot close the gap between the system ledger and the physical exchange position, the engine applies a two-tier outcome:
@@ -289,6 +318,18 @@ status        = 'audit'        ← will never be processed as a live order
 client_order_id = CQB_{bot_id}_DRIFT_{symbol}_{ts}
 notes         = full diagnostic string for future audits
 ```
+
+## 3.19. `_is_order_net_reducing` — Absolute Account-Net Logic (v3.3.0)
+To prevent Binance **`-2022 ReduceOnly Order is rejected`** errors in hedged (One-Way mode) configurations, the reduction-check engine uses **Absolute Account-Wide Netting**:
+- **Rule**: The system queries the `active_positions` table for the *entire* pair (summing LONG and SHORT) before flagging an order as `reduceOnly`.
+- **Reasoning**: In a hedged pair where Bot A is LONG 0.1 and Bot B is SHORT 0.2 (Net SHORT 0.1), Bot A's exit (a SELL order) would increase the account's absolute net exposure to 0.2 SHORT. Binance rejects `reduceOnly` in this case because the order objectively increases account-level risk.
+- **Sibling-Aware Gating**: Stabilized the reduction-check engine to correctly identify multi-bot environments, suppressing autonomous overrides when multiple bots exist on a pair.
+
+### v3.3.1 — Snapshot Ledger Parity (CURRENT)
+- **Proof-Based Snapshotting**: Refactored `update_active_positions_snapshot` in `database.py` to use `get_pair_virtual_net()` (canonical proof-sum) instead of stale `trades` math.
+- **Pre-Snap Ledger Seal**: Implemented forced `sync_trades_from_orders` loop in `runner.py` and `reconciler.py` to guarantee trade state finality before physical snapshots are written.
+- **Adopt-From-Physical Fix**: Resolved `NameError` in the reconciler deep-scan path caused by uninitialized cursors in the idempotency guard.
+- **Aesthetic Parity**: Aligned `SNAP-ALLOCATE` debug markers to fire correctly for hedged pairs, eliminating false-positive "System Mismatch" alerts.
 
 ---
 
@@ -367,6 +408,77 @@ After restart, watch for:
 
 ## 7. Version History (Change Log)
 
+### v3.4.2 — 2026-05-19
+**Monitor UX + workspace cleanup + architecture doc.**
+
+**ui/views/monitor.py**:
+- Header row 2: Active Bots, In Trade, Scanning, Open Qty notional.
+- Renamed/clarified **Total Invested** metric (was only "Active Exposure").
+- Bot table: **Open Qty**, **Avg Entry** columns.
+
+**docs/ARCHITECTURE_v3.4.md** — full v3.4 stack description and monitoring checklist.
+
+**scratch/** — removed one-off debug scripts; use `scripts/diag_live_state.py`.
+
+### v3.4.1 — 2026-05-19
+**Phantom ledger purge when exchange is flat (testnet-safe).**
+
+**engine/parity_gates.py**:
+- `purge_phantom_ledger_when_exchange_flat()` — exchange net ≈ 0, ledger ≠ 0 → `safe_wipe_bot(force=True)` per bot on pair (no market order).
+- `startup_repair_mismatched_pairs()` — called from `runner.startup_sync` after CQB history scan.
+
+**config/settings.py**: `TESTNET_PURGE_PHANTOM_LEDGER` (default True on testnet).
+
+**scripts/repair_phantom_ledger.py** — manual one-shot for XRP-class phantom state.
+
+### v3.4.0 — 2026-05-19
+**Phase A — Proof-only parity gates (fundamental fix, not cosmetic).**
+
+**engine/parity_gates.py** (new):
+- `assert_cycle_reset_allowed` — blocks TP/cycle reset when exchange net ≠ projected pair virtual after this bot zeros.
+- `gate_trading_allowed` — blocks entry/maintain on mismatched pairs.
+- `proof_flatten_pair` — cancel CQB → market reduceOnly → verify flat → reset bots.
+- `forensic_adopt_allowed()` — default False.
+
+**engine/database.py**:
+- `reset_bot_after_tp(..., exchange=None)` passes exchange into parity gate.
+- `CycleResetBlockedError` → bot set to `REQUIRE_MANUAL_PROOF`, transaction aborted.
+
+**engine/bot_executor.py**, **engine/ws_event_handlers.py**, **engine/reconciler.py**, **engine/ledger.py**:
+- Trading and WS paths wired to gates; forensic adopt gated.
+
+**ui/views/monitor.py**:
+- Mismatch `💥 Close` uses `proof_flatten_pair` (replaces broken `ex.close_position()` + blind reset).
+
+**config/settings.py**:
+- `PAIR_PARITY_QTY_TOLERANCE`, `ALLOW_FORENSIC_ADOPT`.
+
+**tests/test_parity_gates.py** — gate regression tests.
+
+**Operator doc:** `docs/OPERATOR_MISMATCH_RUNBOOK.md`
+
+### v3.3.0 — 2026-05-14
+**Absolute Account-Net Accounting & ReduceOnly Fix.**
+
+**bot_executor.py**:
+- **Absolute Account-Net**: Refactored `_is_order_net_reducing` to query `active_positions` for the entire pair. Orders are only flagged `reduceOnly` if they reduce the total account exposure.
+- **Sibling-Aware Suppression**: Bot-aware overrides are now strictly gated by a sibling-count query to prevent incorrect flagging in hedged configurations.
+- **Import Fix**: Corrected `get_ws_cache` import path from `websocket_handler` to `ws_cache`.
+
+**tests/test_hedge_loop.py**:
+- Added v3.3.0 regression suite covering absolute net reduction logic and duplicate hedge placement guards.
+
+### v3.2.1 — 2026-05-14
+**Hedge Loop Regression Test Suite + Saturation Logic Fix.**
+
+**bot_executor.py**:
+- **Saturation Logic Fix**: `execute_hedge_lock` now uses `filled_amount` instead of `amount` when calculating the current hedge coverage. An order that is `open` but has `filled_amount=0` no longer satisfies the saturation check, allowing the bot to replace it if the target qty has changed.
+- **Debounce & WS-Guard Persistence**: Maintained strict Layer 0 (DB/Memory debounce) and Layer 1 (WS Cache check) guards to prevent recursive order placement while orders are in-flight.
+- **Variable Scope Fix**: Resolved `UnboundLocalError` for `total_hedged` in the resizing log path.
+
+**tests/test_hedge_loop.py**:
+- New integration test suite covering 7 critical failure modes: Saturation calculation, persistent debouncing across restarts, physical position capping for TP placement, and rapid-fire loop simulation.
+
 ### v3.1.4 — 2026-05-12
 **Fractional Drift Sweeper + `drift_note` Protocol + CODEBASE_GUIDE refresh.**
 
@@ -384,8 +496,8 @@ After restart, watch for:
 ### v3.1.3 — 2026-05-12
 **Robust Mismatch Recovery `Close` button + Stoch/Bollinger proximity labels.**
 
-**monitor.py**:
-- Mismatch section `💥 Close` button: rewritten to call `ex.close_position()` instead of raw `create_order(reduceOnly=True)`. Error handler now explicitly catches `reduceonly` / `400` / `not found` strings and issues a `st.warning` toast instead of aborting. **Bot state is always reset** (`reset_bot_after_tp` + manual_whitelists DELETE) regardless of exchange outcome.
+**monitor.py** (superseded by v3.4.0):
+- Mismatch `💥 Close` previously reset bots without exchange proof. **v3.4.0** uses `proof_flatten_pair` — reset only after exchange verified flat.
 - `extract_info`: Added Stochastic (`mode_stoch`) and Bollinger Band (`mode_boll`) proximity branches with live OHLCV fetch, matching the RSI/CCI pattern.
 - In-trade trigger label: bots with no TP and no Grid orders now show `⚠️ NO ORDERS (Adopted?)` instead of silent `In Trade (desc)`.
 
@@ -587,7 +699,7 @@ After restart, watch for:
 Run before every restart:
 ```powershell
 python -m pytest tests/ -x -q --tb=short
-# Expected: 64 passed, 6 skipped, 0 failed
+# Expected: 71 passed, 6 skipped, 0 failed (including tests/test_hedge_loop.py)
 ```
 
 Then verify in logs:
@@ -599,6 +711,7 @@ Then verify in logs:
 - [ ] `[SYNC-DRIFT]` only fires when EE interval steps OR exchange holds wrong price — NOT every cycle
 - [ ] `[SYNC-DRIFT]` log shows reason: `EE-stepped`, `price-drift`, or `qty-drift`
 - [ ] No `python-dotenv could not parse` warnings in logs
+- [ ] **`tests/test_hedge_loop.py` passes all 7 cases (Saturation, Debounce, Physical Guard, Loop Simulation)**
 
 ---
 
@@ -663,10 +776,11 @@ If `.env` ever gains extra garbage lines (e.g. after a test run), restore this e
 ### Grid Placement Lockout (Safety Mechanism)
 - **Lockout Rule**: If a bot has a pending reconciliation mismatch (`requires_manual_intervention = 1`), the Engine will **atomically block** grid placement.
 - **Purpose**: This prevents the bot from "fighting" a mismatch or placing orders based on an unconfirmed average price.
-- **Clearing Lockouts**:
-    1. **Auto-Adoption**: If the bot is the sole bot for a pair and the direction matches, the system will auto-adopt the exchange state and clear the lockout.
-    2. **Forensic Adopt**: Use the "Forensic Adopt" tool in the UI to scan history and force-sync the ledger.
-    3. **Manual Reset**: Cycle the bot to Step 0 if the exchange is flattened.
+- **Clearing Lockouts** (v3.4.0):
+    1. **Fix pair parity first** — virtual net must match exchange (`Global Netting` row green).
+    2. **Proof flatten** — Monitor mismatch `💥 Close` (see `docs/OPERATOR_MISMATCH_RUNBOOK.md`).
+    3. **Trade-history proof** — import missing fills from Binance `fetch_my_trades` / startup heal; never routine manual Binance edits.
+    4. **Forensic adopt** — disabled by default (`ALLOW_FORENSIC_ADOPT=False`).
 
 ### Dust-Aware Completion
 - Bots will automatically transition to **Step 0 (Scanning)** if the residual notional value is **< $1.00 USD** after an Exit Order (TP).

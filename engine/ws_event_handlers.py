@@ -139,6 +139,183 @@ def get_pending_cancel_after_tp() -> set:
 _notified_fills_max_size = 10000
 
 
+def _attribute_orphan_fill(bot_id: int, order_id: str, client_id: str, qty: float, price: float, order_type: str, fill_ts: int, symbol: str):
+    """
+    Handles fills for CQB_ orders that are missing from bot_orders DB.
+    Forensic adopt is disabled by default — flags REQUIRE_MANUAL_PROOF instead.
+    """
+    from engine.parity_gates import forensic_adopt_allowed, flag_orphan_fill_manual_proof
+    if not forensic_adopt_allowed():
+        flag_orphan_fill_manual_proof(bot_id, order_id, symbol, qty, 'orphan_ws')
+        return False
+
+    logger.warning(f"🕵️ [ORPHAN-RECOVERY] Bot {bot_id}: Order {order_id}/{client_id} missing from DB. Adopting forensically.")
+    try:
+        from engine.database import get_connection
+        from engine.ledger import seal_trade_state
+        conn = get_connection()
+        
+        # Get bot's current cycle/step to anchor the adoption
+        bot_info = conn.execute("""
+            SELECT t.cycle_id, t.current_step, b.direction 
+            FROM trades t 
+            JOIN bots b ON b.id = t.bot_id 
+            WHERE t.bot_id = ?
+        """, (bot_id,)).fetchone()
+        cycle_id = bot_info[0] if bot_info else -1
+        step = bot_info[1] if bot_info else 0
+        direction = bot_info[2] if bot_info else 'LONG'
+        
+        # side from direction
+        side = 'LONG' if direction == 'LONG' else 'SHORT'
+             
+        # Insert the missing row
+        conn.execute("""
+            INSERT INTO bot_orders (
+                bot_id, order_type, order_id, client_order_id, 
+                price, amount, filled_amount, status, 
+                cycle_id, step, position_side, 
+                created_at, updated_at, filled_at, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            bot_id, f"forensic_adoption_{order_type.lower()}", order_id, client_id,
+            price, qty, qty, 'filled',
+            cycle_id, step, side,
+            int(time.time()), int(time.time()), fill_ts,
+            f"Forensic Recovery: Missing {order_type} record adopted from WS."
+        ))
+        conn.commit()
+        conn.close()
+        
+        # Now that the row exists, seal the trade state
+        _enqueue_db_write(seal_trade_state, bot_id)
+        logger.info(f"✅ [ORPHAN-RECOVERY] Bot {bot_id}: Adopted {qty:.6f} @ {price:.4f}. Ledger truth restored.")
+        return True
+    except Exception as e:
+        logger.error(f"❌ [ORPHAN-RECOVERY] Failed to adopt orphan fill for bot {bot_id}: {e}")
+        return False
+
+
+def _attribute_anonymous_fill(event: Dict):
+    """
+    Scans active bots for matching symbol/side to adopt non-CQB fills.
+    Disabled when ALLOW_FORENSIC_ADOPT=False (proof-only mode).
+    """
+    from engine.parity_gates import forensic_adopt_allowed
+    if not forensic_adopt_allowed():
+        logger.warning(
+            f"[ANONYMOUS-NO-ADOPT] Non-CQB fill {event.get('order_id')} on {event.get('symbol')} "
+            f"— forensic adopt disabled. Use trade-history proof or proof flatten."
+        )
+        return False
+
+    symbol = event.get('symbol')
+    side = event.get('side', '').upper() # BUY or SELL
+    qty = float(event.get('filled_qty', 0))
+    price = float(event.get('avg_price', 0) or event.get('price', 0))
+    order_id = str(event.get('order_id', ''))
+    client_id = str(event.get('client_order_id', ''))
+    
+    if qty <= 0: return
+
+    logger.info(f"🕵️ [ANONYMOUS-SCAN] Checking bots for {symbol} {side} fill ({qty} @ {price})...")
+    
+    try:
+        from engine.database import get_connection
+        from engine.exchange_interface import normalize_symbol
+        from engine.ledger import seal_trade_state
+        conn = get_connection()
+
+        # ── SYMBOL NORMALISATION FIX ────────────────────────────────────────────
+        # The WebSocket delivers the raw Binance symbol (e.g. 'SOLUSDC').
+        # bots.pair stores the CCXT-unified format ('SOL/USDC:USDC').
+        # Match on the normalised form so the lookup never returns zero rows.
+        raw_symbol = symbol  # e.g. 'SOLUSDC'
+        active_bots = conn.execute("""
+            SELECT b.id, b.name, b.direction, t.cycle_id, t.current_step, b.pair
+            FROM bots b
+            JOIN trades t ON t.bot_id = b.id
+            WHERE b.is_active = 1
+              AND (
+                b.pair = ?                                   -- CCXT unified: 'SOL/USDC:USDC'
+                OR REPLACE(REPLACE(REPLACE(b.pair,'/',''),(SELECT '' WHERE 1),':USDC'),':USDT','') = ?  -- rough strip
+              )
+        """, (raw_symbol, raw_symbol)).fetchall()
+
+        # Fallback: normalise every bot pair and compare
+        if not active_bots:
+            all_bots = conn.execute("""
+                SELECT b.id, b.name, b.direction, t.cycle_id, t.current_step, b.pair
+                FROM bots b
+                JOIN trades t ON t.bot_id = b.id
+                WHERE b.is_active = 1
+            """).fetchall()
+            active_bots = [
+                row for row in all_bots
+                if normalize_symbol(row[5]) == normalize_symbol(raw_symbol)
+            ]
+
+        if not active_bots:
+            logger.warning(f"[ANONYMOUS-ADOPT] No active bots found for symbol '{raw_symbol}' — fill {order_id} unattributed.")
+            conn.close()
+            return False
+
+        for bid, name, direction, cycle_id, step, _pair in active_bots:
+            # Only adopt if this bot has NO open orders (deadlock / orphan sign)
+            open_orders_count = conn.execute(
+                "SELECT COUNT(*) FROM bot_orders WHERE bot_id = ? AND status IN ('new', 'open')",
+                (bid,)
+            ).fetchone()[0]
+
+            if open_orders_count == 0:
+                is_entry = (direction == 'LONG' and side == 'BUY') or (direction == 'SHORT' and side == 'SELL')
+                is_exit  = (direction == 'LONG' and side == 'SELL') or (direction == 'SHORT' and side == 'BUY')
+
+                if is_entry or is_exit:
+                    otype = "entry" if is_entry else "tp"
+                    logger.warning(
+                        f"🤝 [ANONYMOUS-ADOPT] Bot {name} ({bid}) adopting anonymous "
+                        f"{side} fill {order_id} (CID={client_id}) as {otype} qty={qty} @ {price}."
+                    )
+
+                    event_ts_ms = event.get('lastTradeTimestamp') or event.get('timestamp') or 0
+                    fill_ts = int(event_ts_ms / 1000) if event_ts_ms else int(time.time())
+
+                    # ── ATOMIC WRITE WITH PROOF METADATA ────────────────────────
+                    # wipe_proof_source = 'forensic_adopt' so future audits never
+                    # classify this row as a SUSPECT_WIPE legacy row.
+                    conn.execute("""
+                        INSERT OR IGNORE INTO bot_orders (
+                            bot_id, order_type, order_id, client_order_id,
+                            price, amount, filled_amount, status,
+                            cycle_id, step, position_side,
+                            created_at, updated_at, filled_at,
+                            wipe_proof_source, notes
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        bid, f"forensic_adoption_{otype}", order_id, client_id,
+                        price, qty, qty, 'filled',
+                        cycle_id, step, 'LONG' if direction == 'LONG' else 'SHORT',
+                        int(time.time()), int(time.time()), fill_ts,
+                        'forensic_adopt',
+                        f"Anonymous Adoption (WS): orphan {side} fill {order_id} adopted at runtime. "
+                        f"CID={client_id} qty={qty} @ {price} fill_ts={fill_ts}."
+                    ))
+                    conn.commit()
+                    conn.close()
+                    _enqueue_db_write(seal_trade_state, bid)
+                    logger.info(
+                        f"✅ [ANONYMOUS-ADOPT] Bot {bid}: adopted {qty:.4f} @ {price:.4f} "
+                        f"(order_id={order_id}) — proof=forensic_adopt."
+                    )
+                    return True
+
+        conn.close()
+    except Exception as e:
+        logger.error(f"[ANONYMOUS-ADOPT] Error adopting fill {order_id} for symbol '{symbol}': {e}", exc_info=True)
+    return False
+
+
 def handle_order_update(event: Dict):
     """
     Handle real-time order update from WebSocket.
@@ -167,7 +344,13 @@ def handle_order_update(event: Dict):
         
         # Only process bot orders (tagged with CQB_)
         if not client_id.startswith('CQB_'):
-            logger.info(f"⏭️ WS Ignoring non-bot order {order_id} (CID: {client_id})")
+            # 🚀 ANONYMOUS ATTRIBUTION (Phase 1)
+            # If a fill arrives without a CQB tag, it might be a manual trade
+            # or a bot order that lost its tag. Attempt to attribute to a deadlocked bot.
+            if status.upper() in ('FILLED', 'PARTIALLY_FILLED'):
+                _attribute_anonymous_fill(event)
+            else:
+                logger.debug(f"⏭️ WS Ignoring non-bot order {order_id} (CID: {client_id})")
             return
             
         # Parse bot ID from clientOrderId
@@ -425,23 +608,23 @@ def _handle_order_filled(bot_id: int, order_type: str, event: Dict):
             else:
                 # credit_fill returned False: most likely a race — save_bot_order hasn't
                 # created the DB row yet. Schedule a deferred retry via the write queue.
-                def _deferred_credit(bid, oid, cid, qty, px, otype):
+                def _deferred_credit(bid, oid, cid, qty, px, otype, fts, sym):
                     from engine.ledger import credit_fill as _cf, seal_trade_state as _sts
                     import time as _t
                     _t.sleep(0.5)  # Wait for save_bot_order to commit
-                    ok = _cf(bid, oid, qty, px, otype, is_cumulative=True)
+                    ok = _cf(bid, oid, qty, px, otype, is_cumulative=True, fill_ts=fts)
                     if not ok:
-                        ok = _cf(bid, cid, qty, px, otype, is_cumulative=True)
+                        ok = _cf(bid, cid, qty, px, otype, is_cumulative=True, fill_ts=fts)
                     if ok:
                         _sts(bid)
                         logger.info(f"[WS-FILL-RETRY] Bot {bid} {otype}: deferred credit OK.")
                     else:
-                        logger.warning(
-                            f"[WS-FILL-RETRY] Bot {bid} {otype}: order {oid}/{cid} "
-                            f"still not in bot_orders after retry. Fill may be lost."
-                        )
+                        # 🚀 ORPHAN ATTRIBUTION (Phase 1)
+                        # If it's still missing, it's a true orphan. Adopting forensically.
+                        _attribute_orphan_fill(bid, oid, cid, qty, px, otype, fts, sym)
+
                 _enqueue_db_write(_deferred_credit, bot_id, str(order_id), client_id,
-                                  cumulative_fill_qty, avg_price, order_type.lower())
+                                  cumulative_fill_qty, avg_price, order_type.lower(), fill_ts, symbol)
                 logger.warning(
                     f"[WS-FILL] Bot {bot_id} {order_type}: credit_fill returned False "
                     f"(race condition). Deferred retry enqueued for order {order_id}."

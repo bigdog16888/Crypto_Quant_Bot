@@ -75,9 +75,9 @@ def test_update_martingale_step_exists():
     import inspect
     sig = inspect.signature(update_martingale_step)
     params = list(sig.parameters.keys())
-    # The signature in database.py is (bot_id, step, total_invested, avg_price, tp_price)
+    # The signature in database.py is (bot_id, step, total_invested, avg_price, tp_price, fill_ts=None)
     expected_params = ['bot_id', 'step', 'total_invested', 'avg_price', 'tp_price']
-    assert params == expected_params, f"Unexpected signature: {params}"
+    assert all(p in params for p in expected_params), f"Unexpected signature: {params}"
     
     print("✅ update_martingale_step function test passed")
 

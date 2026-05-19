@@ -146,6 +146,19 @@ def credit_fill(
         existing_fill = float(existing_fill or 0)
         order_amount = float(order_amount or 0)
 
+        # Never credit more than the order's declared size (+5% rounding tolerance).
+        # Prevents unit bugs (e.g. amount=0.002 but exchange reports filled=1.0) from
+        # inflating virtual net to ~1 BTC when only 0.002 was ordered.
+        if order_amount > 0:
+            cap = order_amount * 1.05
+            if cumulative_qty > cap:
+                logger.error(
+                    f"[CREDIT-FILL-CAP] Bot {bot_id} order {order_id}: exchange cumulative "
+                    f"{cumulative_qty:.8f} > order amount {order_amount:.8f} (cap {cap:.8f}). "
+                    f"Capping to order size."
+                )
+                cumulative_qty = cap
+
         # MAX() protection: never reduce filled_amount
         if is_cumulative and cumulative_qty <= existing_fill:
             logger.debug(
@@ -346,11 +359,36 @@ def seal_trade_state(bot_id: int) -> Dict[str, Any]:
         logger.error(f"[SEAL] DB connect failed for bot {bot_id}: {_conn_err}")
         return {}
 
+    # ── PRE-FLIGHT: entry_confirmed guard ──────────────────────────────────────
+    # If the bot has a physical position (total_invested > 0) but entry_confirmed
+    # is still 0, a crash happened between fill credit and the DB write. Force it
+    # to 1 here, BEFORE cost recomputation, so the sealed row is fully consistent.
+    # Running this AFTER recompute would seal costs with entry_confirmed=0 still set.
+    try:
+        conn = get_connection()
+        _pf_row = conn.execute(
+            "SELECT total_invested, entry_confirmed FROM trades WHERE bot_id=?",
+            (bot_id,)
+        ).fetchone()
+        if _pf_row and float(_pf_row[0] or 0) > 0 and not _pf_row[1]:
+            logger.warning(
+                f"[LEDGER-PREFLIGHT] Bot {bot_id}: total_invested={_pf_row[0]:.4f} "
+                f"but entry_confirmed=0. Forcing entry_confirmed=1 before seal."
+            )
+            from engine.database import update_bot_status as _pf_ubs
+            _pf_ubs(bot_id, entry_confirmed=1)
+    except Exception as _pf_err:
+        logger.warning(f"[LEDGER-PREFLIGHT] Bot {bot_id}: pre-flight guard failed (non-fatal): {_pf_err}")
+    # ────────────────────────────────────────────────────────────────────────────
+
     try:
         cost, avg, qty, step, h_qty = recompute_invested_from_orders(bot_id)
     except Exception as e:
         logger.error(f"[SEAL] recompute_invested_from_orders failed for bot {bot_id}: {e}")
         return {}
+
+    from engine.database import basket_open_qty_from_recompute
+    main_open_qty = basket_open_qty_from_recompute(qty, h_qty)
 
     # ── OPEN_QTY ACCUMULATOR CROSS-CHECK [v2.3.2] ──────────────────────────────
     # trades.open_qty is the authoritative running total — it was incremented/decremented
@@ -365,41 +403,35 @@ def seal_trade_state(bot_id: int) -> Dict[str, Any]:
         ).fetchone()
         if _accum_row is not None:
             accumulator_qty = float(_accum_row[0] or 0)
-            if accumulator_qty > 0:
-                drift = abs(accumulator_qty - qty)
-                drift_pct = drift / accumulator_qty if accumulator_qty > 0 else 0
+            if abs(accumulator_qty) > 1e-8 or main_open_qty > 1e-8:
+                drift = abs(accumulator_qty - main_open_qty)
+                drift_base = max(abs(accumulator_qty), abs(main_open_qty), 1e-8)
+                drift_pct = drift / drift_base
                 if drift_pct > 0.05:
                     # ── LARGE-DRIFT SELF-HEAL [v2.3.2] ─────────────────────────
-                    # 🚀 FIX 4 (v3.0.7): Tightened threshold from 20% to 5%
-                    # If drift is above 5%, the recompute (which is based on 
-                    # individual confirmed fill rows) is considered more reliable
-                    # than the trades.open_qty accumulator cache.
                     logger.warning(
                         f"[QTY-DRIFT-HEAL] Bot {bot_id}: accumulator={accumulator_qty:.8f} "
-                        f"vs recomputed={qty:.8f} (drift={drift_pct:.2%} > 5%). "
-                        f"Overwriting accumulator with recomputed truth."
+                        f"vs basket_open={main_open_qty:.8f} (drift={drift_pct:.2%} > 5%). "
+                        f"Overwriting open_qty with recomputed basket truth."
                     )
                     conn.execute(
-                        "UPDATE trades SET open_qty=? WHERE bot_id=?",
-                        (qty, bot_id)
+                        "UPDATE trades SET open_qty=?, hedge_qty=? WHERE bot_id=?",
+                        (main_open_qty, h_qty, bot_id)
                     )
                     conn.commit()
-                    # qty already holds the correct recomputed value — do not override
                 elif drift_pct > 0.001:  # 0.1%–5%: minor drift → accumulator wins
                     logger.warning(
                         f"[QTY-DRIFT] Bot {bot_id}: accumulator={accumulator_qty:.8f} "
-                        f"vs recomputed={qty:.8f} (drift={drift_pct:.2%}). "
+                        f"vs basket_open={main_open_qty:.8f} (drift={drift_pct:.2%}). "
                         f"Accumulator is authoritative — using it."
                     )
-                    qty = accumulator_qty
-                    # 🚀 FIX: If we use accumulator qty, we must update cost to match
-                    # to prevent PnL explosion in the UI. cost = qty * avg.
+                    main_open_qty = max(0.0, accumulator_qty)
                     if avg > 0:
-                        cost = qty * avg
+                        cost = main_open_qty * avg
                 else:
-                    qty = accumulator_qty  # No meaningful drift — use accumulator
+                    main_open_qty = max(0.0, accumulator_qty)
                     if avg > 0:
-                        cost = qty * avg
+                        cost = main_open_qty * avg
     except Exception as _acc_err:
         logger.warning(f"[SEAL] Bot {bot_id}: accumulator read failed: {_acc_err}")
     # ────────────────────────────────────────────────────────────────────────────
@@ -426,36 +458,27 @@ def seal_trade_state(bot_id: int) -> Dict[str, Any]:
 
         basket_time_update = None
 
-        # PRIMARY: qty increased meaningfully → new fill, update timer
-        if qty > prev_qty * 1.01 and qty > 1e-8:
+        # PRIMARY: basket qty increased meaningfully → new fill, update timer
+        if main_open_qty > prev_qty * 1.01 and main_open_qty > 1e-8:
             basket_time_update = int(time.time())
 
-        # SAFETY NET: qty > 0 but basket_start_time is from a previous cycle
-        # (i.e. prev_step was 0 meaning we just came out of a reset, but basket_start_time
-        #  was not zeroed by the reset path — it holds the TP reset timestamp).
-        # Detect: basket_start_time exists but prev_invested was 0 (post-reset state).
-        # In this case, always anchor to now regardless of qty movement.
-        elif qty > 1e-8 and prev_step == 0 and prev_basket_ts > 0 and prev_invested <= 0.01:
+        # SAFETY NET: basket qty > 0 but basket_start_time is from a previous cycle
+        elif main_open_qty > 1e-8 and prev_step == 0 and prev_basket_ts > 0 and prev_invested <= 0.01:
             basket_time_update = int(time.time())
             logger.info(
                 f"[SEAL] Bot {bot_id}: basket_start_time reset — "
                 f"prev_step=0 + prev_invested=0 indicates stale TP-reset timestamp. "
-                f"Anchoring to now (qty={qty:.6f})."
+                f"Anchoring to now (basket_qty={main_open_qty:.6f})."
             )
 
-        # EXPLICIT ZERO: if position is flat, zero the basket_start_time so next
-        # cycle starts clean. This prevents the stale timestamp from ever persisting.
-        if qty <= 1e-8:
+        # EXPLICIT ZERO: flat basket and no hedge → zero basket timer
+        if main_open_qty <= 1e-8 and abs(h_qty) <= 1e-8:
             basket_time_update = 0
 
-        # Invariant: a bot with physical position (qty > 0) must have step >= 1.
-        # step=0 is the Scanning state. If recompute returned 0 (e.g. adoption rows
-        # have step=0 and _calculate_formula_step can't resolve martingale config),
-        # clamp to 1. This prevents heal_zombie_bots Scenario 1 from seeing
-        # "step=0, invested=0" and wiping a genuinely active position.
-        if qty > 1e-8 and step == 0:
+        # Clamp step when basket has size (hedge-only does not advance step)
+        if main_open_qty > 1e-8 and step == 0:
             step = 1
-            logger.info(f"[SEAL] Bot {bot_id}: clamped step 0→1 (qty={qty:.6f} > 0, position is active)")
+            logger.info(f"[SEAL] Bot {bot_id}: clamped step 0→1 (basket_qty={main_open_qty:.6f} > 0, position is active)")
 
         # Write to trades
         conn.execute("""
@@ -463,6 +486,8 @@ def seal_trade_state(bot_id: int) -> Dict[str, Any]:
                 total_invested   = ?,
                 avg_entry_price  = ?,
                 current_step     = ?,
+                open_qty         = ?,
+                hedge_qty        = ?,
                 entry_confirmed  = CASE WHEN ? > 0.01 OR abs(?) > 1e-8 THEN 1 ELSE 0 END,
                 basket_start_time = CASE 
                     WHEN ? IS NOT NULL THEN ?
@@ -473,7 +498,7 @@ def seal_trade_state(bot_id: int) -> Dict[str, Any]:
                     ELSE cycle_phase 
                 END
             WHERE bot_id = ?
-        """, (cost, avg, step, cost, h_qty, basket_time_update, basket_time_update, cost, bot_id))
+        """, (cost, avg, step, main_open_qty, h_qty, cost, h_qty, basket_time_update, basket_time_update, cost, bot_id))
 
 
         # Derive and update bot status
@@ -621,6 +646,49 @@ def handle_tp_completion(
 
     try:
         conn = get_connection()
+        bot_info = get_bot_status(bot_id)
+        if not bot_info:
+            logger.error(f"[TP-CASCADE] Bot {bot_id} not found.")
+            return False
+
+        # --- Step 0: Exchange Truth Check (Idempotency / Overshoot Guard) ---
+        try:
+            norm_pair = normalize_symbol(pair)
+            phys_positions = exchange.fetch_positions()
+            pos = next((p for p in phys_positions if p['symbol'] == norm_pair), None)
+            phys_size = pos.get('contracts', 0) if pos else 0.0
+            phys_side = str(pos.get('side', '')).lower() if pos else ''
+            
+            bot_direction = str(bot_info.get('direction', '')).upper()
+            
+            # Calculate other bots' exposure on this pair
+            cursor = conn.execute(
+                "SELECT SUM(open_qty) FROM trades t JOIN bots b ON t.bot_id = b.id "
+                "WHERE b.pair = ? AND b.id != ? AND b.is_active = 1", (pair, bot_id)
+            )
+            other_bots_qty = float(cursor.fetchone()[0] or 0.0)
+            
+            # Overshoot detection: If physical size significantly exceeds other bots,
+            # or side is completely flipped, we abort cascade to prevent ghosting.
+            if phys_size > (other_bots_qty + 0.001):
+                # If we are the only bot (other_bots_qty == 0), phys_size should be 0.
+                is_overshoot = False
+                if bot_direction == 'SHORT' and phys_side == 'long':
+                    is_overshoot = True
+                elif bot_direction == 'LONG' and phys_side == 'short':
+                    is_overshoot = True
+                    
+                if is_overshoot:
+                    logger.error(f"[TP-CASCADE] 🛑 ABORTING: Overshoot flip detected! Bot {bot_id} {pair} is {bot_direction} but physical side is {phys_side} ({phys_size}).")
+                    return False
+                else:
+                    # Physical size exceeds other bots but side is correct — 
+                    # this is normal for partial TPs. Do NOT abort.
+                    logger.warning(f"[TP-CASCADE] Physical size {phys_size} > other_bots {other_bots_qty} "
+                                   f"but direction correct. Proceeding with cascade.")
+                    # Fall through — only abort on actual side flip
+        except Exception as e_pos:
+            logger.warning(f"[TP-CASCADE] Could not verify physical position before cascade: {e_pos}")
 
         # Resolve cycle_id if not provided
         if cycle_id is None:
@@ -745,7 +813,8 @@ def handle_tp_completion(
                 exit_price=exit_price,
                 action_label='TP_HIT',
                 notes=f'Cascade via ledger.handle_tp_completion @ {exit_price:.6f}',
-                exit_fill_ts=exit_fill_ts
+                exit_fill_ts=exit_fill_ts,
+                exchange=exchange,
             )
             logger.info(f"[TP-CASCADE] ✅ Bot {bot_id}: Reset to Scanning. Cycle {cycle_id} → {cycle_id + 1} (cst={exit_fill_ts}).")
             return True

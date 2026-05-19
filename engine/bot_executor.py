@@ -67,9 +67,10 @@ def _to_ccxt_pair(normalized_or_ccxt: str, all_bot_pairs: list = None) -> str:
 class BotExecutor:
     # 🛡️ Binance margin and position limit rejection signals
     _MARGIN_SIGNALS = [
-        "-2019", "-2027", "-4131", "-4003",
+        "-2019", "-2027", "-4131", "-4003", "-4118",
         "margin is insufficient", "account has insufficient balance",
         "exceed maximum position", "position limit",
+        "reduceonly order is rejected", "would not reduce",
     ]
 
 
@@ -196,25 +197,56 @@ class BotExecutor:
             return None
 
 
-    def _is_order_net_reducing(self, pair, side, qty):
+    def _is_order_net_reducing(self, pair, side, qty, bot_id=None, bot_direction=None):
         """
-        Determines if a proposed order reduces the account's total physical net position.
-        This is critical for navigating 'Margin Cap' (-2019) rejections in multi-bot setups.
+        v3.2.6: Sibling-aware reduction check for One-Way mode.
+        Only uses bot-aware override when this bot is the sole active bot on the pair.
         """
-        pos_info = self._get_phys_pos(pair)
-        if not pos_info or pos_info['size'] == 0:
-            return False # No position to reduce
+        # Count active siblings
+        sibling_count = 1  # default: assume multi-bot
+        try:
+            from engine.database import get_connection as _gc
+            with _gc() as _c:
+                row = _c.execute(
+                    "SELECT COUNT(*) FROM bots b JOIN trades t ON b.id=t.bot_id "
+                    "WHERE b.pair=? AND t.total_invested>0 AND b.id!=?",
+                    (pair, bot_id or 0)
+                ).fetchone()
+                sibling_count = row[0] if row else 1
+        except Exception:
+            sibling_count = 1
 
-        # physical signed qty: + for long, - for short
-        phys_signed = pos_info['size'] if pos_info['side'] == 'LONG' else -pos_info['size']
-        # order signed qty: + for buy, - for sell
-        order_signed = qty if side.lower() == 'buy' else -qty
-        
-        # New net position if order fills
-        new_net = phys_signed + order_signed
-        
-        # Order is net reducing if the absolute account exposure decreases
-        return abs(new_net) < abs(phys_signed) - 0.0001
+        logger.debug(f"[NET-REDUCE] {pair} bot={bot_id} siblings={sibling_count} side={side} qty={qty}")
+
+        # Sole-bot path: bot's virtual exit IS a physical reduction
+        if sibling_count == 0 and bot_id and bot_direction:
+            bot_is_long = bot_direction.upper() == 'LONG'
+            order_is_sell = side.lower() == 'sell'
+            if (bot_is_long and order_is_sell) or (not bot_is_long and not order_is_sell):
+                return True
+
+        # Multi-bot: use TOTAL account net, not bot-owned slice
+        try:
+            from engine.exchange_interface import normalize_symbol
+            from engine.database import get_connection as _gc2
+            with _gc2() as _c2:
+                rows = _c2.execute(
+                    "SELECT side, size FROM active_positions WHERE pair=?",
+                    (normalize_symbol(pair),)
+                ).fetchall()
+            phys_net = sum(r[1] if str(r[0]).upper()=='LONG' else -r[1] for r in rows)
+        except Exception:
+            return False  # conservative: don't use reduceOnly if we can't verify
+
+        if abs(phys_net) < 0.0001:
+            return False
+
+        order_delta = qty if side.lower() == 'buy' else -qty
+        new_net = phys_net + order_delta
+
+        result = abs(new_net) < (abs(phys_net) - 0.0001)
+        logger.debug(f"[NET-REDUCE] phys_net={phys_net:.6f} delta={order_delta:.6f} new_net={new_net:.6f} result={result}")
+        return result
 
 
 
@@ -359,6 +391,35 @@ class BotExecutor:
         prec = exchange.get_symbol_precision(pair)
         tp_qty = exchange.round_to_step(bot_virtual_open_qty, prec['step_size'])
 
+        # v3.1.6: Clip tp_qty to live physical capacity to prevent -4118.
+        # In multi-bot pairs, physical net < each bot's virtual qty.
+        # A full-size reduceOnly TP exceeds physical capacity and is rejected.
+        try:
+            _live_pos = self._get_phys_pos(pair, direction=direction)
+            if _live_pos and _live_pos['size'] > 0:
+                from engine.database import get_connection as _gc_clip
+                with _gc_clip() as _cc:
+                    _other_open_tp = float(_cc.cursor().execute(
+                        "SELECT COALESCE(SUM(amount), 0) FROM bot_orders "
+                        "WHERE status IN ('open','new') AND order_type IN ('tp','dust_close') "
+                        "AND bot_id != ? AND pair = ?",
+                        (bot_id, pair)
+                    ).fetchone()[0] or 0.0)
+                _phys_capacity = exchange.round_to_step(
+                    max(0.0, _live_pos['size'] - _other_open_tp),
+                    prec['step_size']
+                )
+                if _phys_capacity > 0 and tp_qty > _phys_capacity:
+                    logger.warning(
+                        f"[TP-CLIP] {name}: tp_qty {tp_qty:.6f} > physical capacity "
+                        f"{_phys_capacity:.6f} (phys={_live_pos['size']:.6f}, "
+                        f"other_tp={_other_open_tp:.6f}). Clipping to prevent -4118."
+                    )
+                    tp_qty = _phys_capacity
+        except Exception as _clip_err:
+            logger.debug(f"[TP-CLIP] {name}: capacity clip check failed (non-blocking): {_clip_err}")
+
+
         if tp_qty <= 0:
             logger.info(f"INFO {name}: open_qty rounds to 0 after step_size. Snapping accumulator to 0.")
             try:
@@ -369,10 +430,18 @@ class BotExecutor:
                 pass
             return None, None
 
-        # 4. Log net-reducing direction for informational awareness
-        is_reducing = self._is_order_net_reducing(pair, side, tp_qty)
-        if not is_reducing:
-            logger.warning(f"⚠️ {name}: TP order {side.upper()} {tp_qty} NOTE: increases account NET exposure (multi-bot hedge scenario).")
+        # 4. Net-reducing check — use reduceOnly for closing TPs to bypass margin reservation.
+        # GTX/postOnly orders require Binance to reserve margin even for closing orders.
+        # reduceOnly orders never require margin — they can only reduce an existing position.
+        # Bot-aware: a LONG bot selling is ALWAYS reducing for that bot (v3.1.5 override).
+        # The clip above ensures tp_qty never exceeds physical capacity, so reduceOnly is safe.
+        is_reducing = self._is_order_net_reducing(pair, side, tp_qty, bot_id=bot_id, bot_direction=direction)
+        if is_reducing:
+            ccxt_params = {'reduceOnly': True, 'timeInForce': 'GTC'}
+            logger.debug(f"✅ {name}: TP is net-reducing — using reduceOnly GTC to bypass margin reservation.")
+        else:
+            logger.warning(f"⚠️ {name}: TP order {side.upper()} {tp_qty} increases account NET exposure (multi-bot hedge). Using GTX.")
+            ccxt_params = {'postOnly': True, 'timeInForce': 'GTX'}
 
         # 5. Dust check: if notional is below minimum, trigger dust close path
         _min_notional = prec.get('min_notional')
@@ -503,14 +572,36 @@ class BotExecutor:
                 # Drop GTX and place a plain limit (taker) as last resort.
                 fallback_params = {k: v for k, v in retry_params.items()
                                    if k not in ('postOnly', 'timeInForce')}
+                # Capture the original CID before we mutate it, so we can update bot_orders below
+                _original_cid = None
                 for cid_key in ('clientOrderId', 'newClientOrderId'):
                     if cid_key in fallback_params:
+                        _original_cid = fallback_params[cid_key]
                         fallback_params[cid_key] = f"{fallback_params[cid_key]}_F"
+                fallback_cid = fallback_params.get('clientOrderId') or fallback_params.get('newClientOrderId')
                 logger.warning(
                     f"[GTX-FALLBACK] {label}: GTX retry ALSO rejected. "
                     f"Placing plain limit (taker) @ {retry_price:.6f} to avoid silent loss."
                 )
-                return exchange.create_order(pair, 'limit', side, amount, retry_price, params=fallback_params)
+                fallback_order = exchange.create_order(pair, 'limit', side, amount, retry_price, params=fallback_params)
+                if fallback_order and _original_cid:
+                    fallback_exchange_id = fallback_order.get('id')
+                    # Critical (RCA fix): update bot_orders row so WS handler can match the fill
+                    # by the new exchange order_id, not just by the _F suffix naming convention.
+                    try:
+                        _fb_conn = get_connection()
+                        _fb_conn.execute(
+                            "UPDATE bot_orders SET order_id=?, client_order_id=? WHERE client_order_id=?",
+                            (str(fallback_exchange_id), fallback_cid, _original_cid)
+                        )
+                        _fb_conn.commit()
+                        logger.info(
+                            f"[GTX-FALLBACK] Linked fallback {fallback_exchange_id} "
+                            f"({fallback_cid}) in bot_orders (was {_original_cid})."
+                        )
+                    except Exception as _fb_db_err:
+                        logger.warning(f"[GTX-FALLBACK] DB row update failed (non-fatal): {_fb_db_err}")
+                return fallback_order
 
 
     # ---------------------------------------------------------------------------
@@ -761,7 +852,9 @@ class BotExecutor:
         time.sleep(random.uniform(0.1, 0.8))
         
         # 🚀 MANUAL-GATE PROTECTION: Suspend maintenance if bot requires proof verification
-        if 'REQUIRE_MANUAL' in bot_status_str.upper():
+        # The MANUAL GATE is incorrectly blocking maintain_orders for bots that are IN TRADE.
+        # It must NEVER block limit order placement (TP and Grid orders) for bots already IN TRADE.
+        if 'REQUIRE_MANUAL' in bot_status_str.upper() and db_invested <= 0:
             logger.warning(
                 f"🛑 [MANUAL-GATE] Bot {name} ({bot_id}) suspended. "
                 f"Status='{bot_status_str}'. Proof verification required."
@@ -875,6 +968,21 @@ class BotExecutor:
                     'entry_confirmed': 0
                 }
             
+            # 🚑 [HEAL-ENTRY] If the bot has capital deployed but entry_confirmed is 0,
+            # a crash or WS drop happened between the fill credit and the DB write.
+            # Write-through immediately so seal_trade_state and step-proof are consistent.
+            if bot_status.get('total_invested', 0) > 0 and not bot_status.get('entry_confirmed'):
+                logger.warning(
+                    f"🚑 [HEAL-ENTRY] {name}: total_invested={bot_status.get('total_invested')} "
+                    f"but entry_confirmed=0. Healing."
+                )
+                try:
+                    from engine.database import update_bot_status as _heal_ubs
+                    _heal_ubs(bot_id, entry_confirmed=1)
+                    bot_status['entry_confirmed'] = 1
+                except Exception as _heal_err:
+                    logger.warning(f"[HEAL-ENTRY] DB write failed for {name}: {_heal_err}")
+
             # 🚀 GHOST ORDER CLEANUP (Scanning/Idle Bots)
             # v2.3.7: Use cent-level threshold.
             if bot_status.get('total_invested', 0.0) < 0.01:
@@ -939,6 +1047,19 @@ class BotExecutor:
 
             trade_update_data = None # This will be populated by action methods
 
+            # 🚀 [EE-DECOUPLE] Compute the decayed TP once here — BEFORE any early-return
+            # branches (entry guard, cooldown, etc.) so that EE decay accrues every cycle
+            # regardless of which branch we take. The result is injected into bot_status so
+            # maintain_orders' internal _compute_effective_tp call picks it up via the DB
+            # (which was already updated by the call below) and returns the same value.
+            try:
+                if bot_status.get('total_invested', 0) > 0 and strategy:
+                    _ee_tp = self._compute_effective_tp(bot_id, name, bot_status, bot_config, strategy)
+                    if _ee_tp > 0:
+                        bot_status['target_tp_price'] = _ee_tp
+            except Exception as _ee_pre_err:
+                logger.debug(f"[EE-DECOUPLE] Pre-compute failed for {name} (non-fatal): {_ee_pre_err}")
+
             if mission:
                 if mission['action'] == 'entry':
                      
@@ -990,63 +1111,16 @@ class BotExecutor:
                                    logger.warning(f"🛑 {name}: Attempted NEW ENTRY but already invested ({am_i_invested}). Aborting.")
                                    can_enter = False
                               elif abs_size > 0 and not am_i_invested:
-                                   # 🛡️ ORPHAN / MISMATCH PROTECTION
-                                   # Before allowing "Virtual Hedging" entry, verify this physical size belongs to sibling bots.
-                                   from engine.database import get_all_active_trades_for_pair
-                                   sibling_bots = get_all_active_trades_for_pair(pair)
+                                   # 🛡️ GLOBAL LEDGER GUARD (v3.1.6b)
+                                   # Before allowing entry, verify that the physical position is explained by 
+                                   # the pair's global ledger history (including unowned hedges).
+                                   from engine.database import get_pair_virtual_net
                                    
-                                   # 🚀 Calculate exact signed virtual quantities directly from the ledger
-                                   # TWO-TIER: current-cycle first, then historical net fallback.
-                                   # Physical exchange positions are cumulative across ALL cycles —
-                                   # prior-cycle (reset_cleared) fills still affect the physical qty.
-                                   from engine.database import get_connection
+                                   # sib_net_qty remains 0.0 for current-cycle (since we are Step 0)
                                    sib_net_qty = 0.0
-                                   sib_hist_net_qty = 0.0
-                                   conn = get_connection()
-                                   try:
-                                        cursor = conn.cursor()
-                                        for b in sibling_bots:
-                                            sibling_id = b['bot_id']
-                                            # Current-cycle net (standard)
-                                            cursor.execute("""
-                                                SELECT COALESCE(SUM(
-                                                    CASE 
-                                                        WHEN order_type IN ('entry', 'grid', 'adoption_add', 'adoption') THEN filled_amount
-                                                        WHEN order_type IN ('adoption_reduce', 'tp', 'close', 'dust_close', 'sl') THEN -filled_amount
-                                                        WHEN order_type LIKE 'hedge%' AND order_type NOT LIKE '%tp%' THEN -filled_amount
-                                                        WHEN order_type LIKE 'hedge%tp%' OR order_type LIKE 'hedgetp%' THEN filled_amount
-                                                        ELSE 0.0
-                                                    END
-                                                ), 0.0) 
-                                                FROM bot_orders 
-                                                WHERE bot_id = ? AND status NOT IN ('reset_cleared', 'auto_closed', 'canceled', 'rejected')
-                                                AND (cycle_id = (SELECT cycle_id FROM trades WHERE bot_id = ?) OR cycle_id IS NULL)
-                                            """, (sibling_id, sibling_id))
-                                            row = cursor.fetchone()
-                                            q = float(row[0]) if row else 0.0
-
-                                            # Historical net (all cycles, includes reset_cleared fills)
-                                            cursor.execute("""
-                                                SELECT COALESCE(SUM(
-                                                    CASE 
-                                                        WHEN order_type IN ('entry', 'grid', 'adoption_add', 'adoption') THEN filled_amount
-                                                        WHEN order_type IN ('adoption_reduce', 'tp', 'close', 'dust_close', 'sl') THEN -filled_amount
-                                                        WHEN order_type LIKE 'hedge%' AND order_type NOT LIKE '%tp%' THEN -filled_amount
-                                                        WHEN order_type LIKE 'hedge%tp%' OR order_type LIKE 'hedgetp%' THEN filled_amount
-                                                        ELSE 0.0
-                                                    END
-                                                ), 0.0) 
-                                                FROM bot_orders 
-                                                WHERE bot_id = ? AND filled_amount > 0
-                                            """, (sibling_id,))
-                                            hist_row = cursor.fetchone()
-                                            hist_q = float(hist_row[0]) if hist_row else 0.0
-
-                                            sign = 1 if b['direction'].upper() == 'LONG' else -1
-                                            sib_net_qty += sign * q
-                                            sib_hist_net_qty += sign * hist_q
-                                   finally:
-                                        pass # conn.close() disabled for singleton safety
+                                   
+                                   # Use the supreme truth of the cross-cycle ledger
+                                   sib_hist_net_qty = get_pair_virtual_net(pair)
                                             
                                    # 🚀 Compare actual quantities — two-tier drift check
                                    phys_net_qty_abs = abs(size)
@@ -1054,7 +1128,7 @@ class BotExecutor:
                                    sib_hist_net_qty_abs = abs(sib_hist_net_qty)
 
                                    # Convert quantity drift back to USD to keep the $ threshold
-                                   _mismatch_threshold = exchange.get_symbol_precision(pair).get('min_notional', 5.0)
+                                   _mismatch_threshold = max(50.0, exchange.get_symbol_precision(pair).get('min_notional', 5.0))
                                    drift_qty = abs(sib_net_qty_abs - phys_net_qty_abs)
                                    drift_usd = drift_qty * current_price
                                    hist_drift_qty = abs(sib_hist_net_qty_abs - phys_net_qty_abs)
@@ -1135,6 +1209,16 @@ class BotExecutor:
                     tracker['count'] = 1
                     tracker['first_time'] = time.time()
 
+            # 🚀 PHASE 6: Targeted reconciliation on placement failure
+            err_str = str(e).lower()
+            if "reduceonly" in err_str or "-2022" in err_str or "would not reduce" in err_str or "-4118" in err_str:
+                logger.warning(f"🔄 [AUTO-RECONCILE] {name}: Placement exception ({e}) indicates possible ledger gap. Triggering immediate targeted reconciliation.")
+                try:
+                    if hasattr(self, 'runner') and hasattr(self.runner, '_reconciler') and self.runner._reconciler:
+                        self.runner._reconciler.adopt_from_physical_positions()
+                except Exception as _ar_err:
+                    logger.warning(f"⚠️ [AUTO-RECONCILE] Failed to trigger targeted reconciliation for {pair}: {_ar_err}")
+
             logger.error(f"Error processing bot {name} ({bot_id}): {e}")
             logger.error(traceback.format_exc())
             return None, None # Indicate an error occurred
@@ -1149,7 +1233,13 @@ class BotExecutor:
         if not config.TRADING_ENABLED and not config.DRY_RUN:
             logger.info(f"🛑 [ORDER-BLOCKED] Trading disabled. Bot {name} cannot maintain orders for {pair}.")
             return
-            
+
+        from engine.parity_gates import gate_trading_allowed
+        allowed, reason = gate_trading_allowed(bot_id, pair, exchange)
+        if not allowed:
+            logger.warning(f"🛑 [ENTRY-BLOCKED] {name}: {reason}")
+            return None
+
         last_exit = bot_status.get('last_exit_time', 0)
         basket_start = bot_status.get('basket_start_time', 0)
         logger.info(f"🧐 {name}: Checking Entry Logic. Invested={bot_status['total_invested']} LastExit={last_exit} BasketStart={basket_start}")
@@ -1791,8 +1881,8 @@ class BotExecutor:
             
             # C. Retirement Logic: If the last HEDGETP filled, retire the hedge orders BEFORE generating new ones
             cur.execute(
-                "SELECT status FROM bot_orders WHERE bot_id=? AND order_type='hedge_tp' AND (cycle_id=? OR cycle_id IS NULL) ORDER BY id DESC LIMIT 1",
-                (bot_id, bot_status.get('cycle_id', 0))
+                "SELECT status FROM bot_orders WHERE bot_id=? AND order_type='hedge_tp' AND status NOT IN ('reset_cleared','auto_closed','canceled','cancelled') ORDER BY id DESC LIMIT 1",
+                (bot_id,)
             )
             last_tp = cur.fetchone()
             if last_tp and last_tp[0] in ('filled', 'closed'):
@@ -1819,8 +1909,8 @@ class BotExecutor:
 
             cur.execute(
                 "SELECT SUM(filled_amount * price) / SUM(filled_amount), SUM(filled_amount), position_side FROM bot_orders "
-                "WHERE bot_id=? AND order_type='hedge' AND status IN ('filled', 'closed', 'hedge_exited') AND (cycle_id=? OR cycle_id IS NULL) GROUP BY position_side",
-                (bot_id, bot_status.get('cycle_id', 0))
+                "WHERE bot_id=? AND order_type='hedge' AND status IN ('filled', 'closed', 'hedge_exited') GROUP BY position_side",
+                (bot_id,)
             )
             res = cur.fetchone()
             pass # conn.close() disabled for singleton safety
@@ -1832,8 +1922,8 @@ class BotExecutor:
             hedge_qty = float(res[1])
             hedge_side = str(res[2]).lower()
             
-            # 2. Side of TP is opposite of hedge
-            exit_side = 'buy' if hedge_side == 'sell' else 'sell'
+            # 2. Side of TP is opposite of bot direction
+            exit_side = 'buy' if direction.upper() == 'LONG' else 'sell'
             
             # 3. Check for existing HEDGETP order
             existing_h_tp = next((o for o in bot_open_orders if '_HEDGETP_' in o.get('clientOrderId', '')), None)
@@ -1976,6 +2066,12 @@ class BotExecutor:
         if not config.TRADING_ENABLED and not config.DRY_RUN:
             logger.info(f"🛑 [MAINTAIN-BLOCKED] Trading disabled. Bot {name} cannot maintain orders.")
             return
+
+        from engine.parity_gates import gate_trading_allowed
+        allowed, reason = gate_trading_allowed(bot_id, pair, exchange)
+        if not allowed:
+            logger.warning(f"🛑 [MAINTAIN-BLOCKED] {name}: {reason}")
+            return None
 
         # 🚀 STRICT SYNCHRONOUS STATE LOCK
         # Query what the DB thinks is currently open right now before acting on CCXT.
@@ -2372,11 +2468,25 @@ class BotExecutor:
                             _cf_tp(bot_id=bot_id, order_id=str(local_tp_id),
                                    cumulative_qty=filled_amount, avg_price=actual_exit,
                                    order_type='tp', is_cumulative=True)
-                            register_tp_cascade(bot_id, pair, actual_exit, _exit_fill_ts)
-                            logger.info(f"[TP-EVICTOR] {name}: REST-detected TP fill registered for cascade (ts={_exit_fill_ts}). Runner will complete reset.")
+                            
+                            bot_open_qty = float(bot_status.get('open_qty', 0) or 0)
+                            remaining_qty = bot_open_qty - filled_amount
+                            
+                            if remaining_qty > 0.001:
+                                logger.info(f"🔄 [STALEMATE EVICTOR] {name}: Partial TP detected (Remaining: {remaining_qty:.4f}). Clearing tp_order_id and falling through.")
+                                from engine.database import get_connection as _gc
+                                _c = _gc()
+                                _c.execute("UPDATE trades SET tp_order_id = NULL WHERE bot_id = ?", (bot_id,))
+                                _c.commit(); _c.close()
+                                local_tp_id = None
+                                # Do NOT return None; fall through to place new TP
+                            else:
+                                register_tp_cascade(bot_id, pair, actual_exit, _exit_fill_ts)
+                                logger.info(f"[TP-EVICTOR] {name}: REST-detected TP fill registered for cascade (ts={_exit_fill_ts}). Runner will complete reset.")
+                                return None # Exit cycle for full TP
                         else:
                             logger.debug(f"⏭️ {name}: Stored TP ID {local_tp_id} is FILLED, but bot state already zeroed. Skipping.")
-                        return None # Exit cycle
+                            return None # Exit cycle if already zeroed
                     elif status_str in ['new', 'open', 'partially_filled']:
                          # 🚀 SNAPSHOT LAG FIX: The order IS confirmed live on exchange (status=new).
                          # It's simply absent from the stale start-of-cycle snapshot.
@@ -2552,11 +2662,33 @@ class BotExecutor:
                                     if order:
                                         save_bot_order(bot_id, 'tp', order['id'], tp_price, tp_amount, bot_status['current_step'], order.get('status', 'open'), client_order_id=client_order_id)
                                         logger.info(f"✅ {name}: Maintained TP order for {pair} @ {tp_price}")
+                                        # Clear any stale MARGIN_HELD phase stamp since TP is now placed
+                                        if str(bot_status.get('cycle_phase', '')).upper() == 'MARGIN_HELD':
+                                            try:
+                                                from engine.database import get_connection as _gc_mhc
+                                                with _gc_mhc() as _conn_mhc:
+                                                    _conn_mhc.execute(
+                                                        "UPDATE trades SET cycle_phase='ACTIVE' WHERE bot_id=? AND cycle_phase='MARGIN_HELD'",
+                                                        (bot_id,)
+                                                    )
+                                            except Exception:
+                                                pass
                             except Exception as e:
                                 err_msg = str(e)
                                 # Handle margin rejections that slip through clipping (e.g. rapid market moves)
                                 if any(s in err_msg.lower() for s in self._MARGIN_SIGNALS):
                                     logger.info(f"ℹ️ {name}: Margin Cap detected during TP placement for {pair}. [MARGIN-ON-HOLD]")
+                                    # Stamp MARGIN_HELD phase so monitor shows orange instead of red MISSING CRITICAL.
+                                    # This is cleared automatically on the next successful TP placement.
+                                    try:
+                                        from engine.database import get_connection as _gc_mh
+                                        with _gc_mh() as _conn_mh:
+                                            _conn_mh.execute(
+                                                "UPDATE trades SET cycle_phase='MARGIN_HELD' WHERE bot_id=? AND cycle_phase NOT IN ('HEDGED', 'HEDGE_EXIT_PENDING')",
+                                                (bot_id,)
+                                            )
+                                    except Exception as _mh_err:
+                                        logger.debug(f"[MARGIN-HOLD] DB stamp failed: {_mh_err}")
                                 else:
                                     logger.error(f"❌ {name}: Error maintaining TP: {e}")
 
@@ -2786,6 +2918,7 @@ class BotExecutor:
                                      "UPDATE trades SET entry_confirmed=1 WHERE bot_id=?", (bot_id,)
                                  )
                                  _csp.commit()
+                                 bot_status['entry_confirmed'] = 1
                              except Exception: pass
 
                          elif _invested > 0.01 and _avg > 0:
@@ -2805,6 +2938,7 @@ class BotExecutor:
                                      "UPDATE trades SET entry_confirmed=1 WHERE bot_id=?", (bot_id,)
                                  )
                                  _csp.commit()
+                                 bot_status['entry_confirmed'] = 1
                              except Exception as _heal_e:
                                  logger.error(f"[PROOF-T3] {name}: Failed to write entry_confirmed: {_heal_e}")
                              # Continue to grid placement — proof accepted
@@ -3061,7 +3195,7 @@ class BotExecutor:
                             # Check if this is a margin/position cap error (Binance error codes: -2019, -5022)
                             is_margin_cap = any(code in err_msg for code in ['-2019', '-5022', '-4028', 'margin', 'position limit'])
                             if is_margin_cap:
-                                is_reducing = self._is_order_net_reducing(pair, side, grid_amount)
+                                is_reducing = self._is_order_net_reducing(pair, side, grid_amount, bot_id=bot_id, bot_direction=direction)
                                 if is_reducing:
                                    logger.info(f"🚀 {name}: Margin Cap hit but order is Reductive. Force-Allowing for one-way netting.")
                                    # We continue without flagging pos_limit_hit=True if it's reducing
@@ -3214,7 +3348,7 @@ class BotExecutor:
             # maintain_orders already sees the order as 'open' in DB and places another.
             # Checking the live WS cache closes this race window entirely.
             try:
-                from engine.websocket_handler import get_ws_cache
+                from engine.ws_cache import get_ws_cache
                 _ws_cache = get_ws_cache()
                 _live_hedge_orders = [
                     o for o in _ws_cache.get_open_orders(pair)

@@ -414,8 +414,26 @@ class BotRunner:
             # so maintain_orders sees correct step/invested before placing new orders.
             if self._reconciler:
                 try:
-                    logger.info("🔍 [STARTUP-SYNC] Running offline fill detection (48h window)...")
-                    stats = self._reconciler.reconstruct_offline_fills(since_hours=48)
+                    # Compute offline duration from the last clean-shutdown timestamp.
+                    # This avoids over-scanning on a simple restart (e.g. 2h instead of 48h)
+                    # while still catching fills from a long outage (capped at 7 days).
+                    _shutdown_ts_file = 'last_shutdown.ts'
+                    _offline_hours = 168.0  # safe default if no record exists if file missing
+                    if os.path.exists(_shutdown_ts_file):
+                        try:
+                            with open(_shutdown_ts_file) as _sf:
+                                _last_shutdown = int(_sf.read().strip())
+                            _offline_hours = max(2, (time.time() - _last_shutdown) / 3600 + 1)
+                            logger.info(
+                                f"[STARTUP-SCAN] Engine was offline ~{_offline_hours:.1f}h "
+                                f"(last shutdown: {_last_shutdown}). Scanning fill history."
+                            )
+                        except Exception as _ts_err:
+                            logger.warning(f"[STARTUP-SCAN] Could not read last_shutdown.ts: {_ts_err}. Using 168h default.")
+                            _offline_hours = 168.0
+                    _scan_hours = min(_offline_hours, 168.0)  # cap at 7 days
+                    logger.info(f"🔍 [STARTUP-SYNC] Running offline fill detection ({_scan_hours:.1f}h window)...")
+                    stats = self._reconciler.reconstruct_offline_fills(since_hours=int(_scan_hours))
                     logger.info(f"✅ [STARTUP-SYNC] Offline fills credited: {stats}")
                 except Exception as _rf_err:
                     logger.warning(f"⚠️ [STARTUP-SYNC] Offline fill detection failed (non-fatal): {_rf_err}")
@@ -431,6 +449,78 @@ class BotRunner:
                 _active_ids = [r[0] for r in _conn.execute(
                     "SELECT id FROM bots WHERE is_active=1"
                 ).fetchall()]
+                from engine.database import (
+                    consolidate_duplicate_bot_orders,
+                    heal_inflated_filled_amounts,
+                    verify_filled_orders_against_exchange,
+                )
+                _inflated = heal_inflated_filled_amounts()
+                if _inflated:
+                    logger.warning(
+                        f"🩹 [STARTUP-FILL-CAP] Capped {_inflated} inflated filled_amount row(s)."
+                    )
+                _merged = consolidate_duplicate_bot_orders()
+                if _merged:
+                    logger.warning(
+                        f"🩹 [STARTUP-CID-DEDUP] Merged {_merged} duplicate client_order_id group(s)."
+                    )
+                _healed_fills = 0
+                for _mt, _ex in self.exchanges.items():
+                    if _ex:
+                        _healed_fills = verify_filled_orders_against_exchange(_ex)
+                        break
+                if _healed_fills:
+                    logger.warning(
+                        f"🩹 [STARTUP-FILL-HEAL] Re-credited {_healed_fills} order(s) from exchange truth."
+                    )
+                _parity_ex = None
+                for _mt, _ex in self.exchanges.items():
+                    if _ex:
+                        _parity_ex = _ex
+                        break
+                if _parity_ex:
+                    from engine.database import audit_pair_ledger_vs_exchange, flag_pair_ledger_mismatch
+                    _mismatches = audit_pair_ledger_vs_exchange(_parity_ex)
+                    if _mismatches:
+                        flag_pair_ledger_mismatch(_mismatches)
+                        for _p, _v, _ph, _d in _mismatches:
+                            logger.error(
+                                f"🚨 [STARTUP-PARITY] {_p}: ledger={_v:.6f} exchange={_ph:.6f} "
+                                f"delta={_d:.6f}"
+                            )
+                        # Proof-based repair: re-scan Binance fill history for CQB-tagged
+                        # orders on each mismatched pair (no forensic adopt).
+                        if self._reconciler:
+                            for _p, _v, _ph, _d in _mismatches:
+                                try:
+                                    logger.info(
+                                        f"🔍 [STARTUP-PAIR-REPAIR] {_p}: scanning CQB trade history "
+                                        f"(ledger={_v:.4f} exchange={_ph:.4f})..."
+                                    )
+                                    self._reconciler.reconstruct_offline_fills(
+                                        since_hours=int(_scan_hours),
+                                        pair_filter=_p,
+                                        forensic_mode=False,
+                                    )
+                                except Exception as _pr_err:
+                                    logger.warning(
+                                        f"⚠️ [STARTUP-PAIR-REPAIR] {_p} failed: {_pr_err}"
+                                    )
+                            _mismatches_after = audit_pair_ledger_vs_exchange(_parity_ex)
+                            if len(_mismatches_after) < len(_mismatches):
+                                logger.info(
+                                    f"✅ [STARTUP-PAIR-REPAIR] Parity improved: "
+                                    f"{len(_mismatches)} → {len(_mismatches_after)} mismatch(es)."
+                                )
+                            from engine.parity_gates import startup_repair_mismatched_pairs
+                            _repair_summary = startup_repair_mismatched_pairs(_parity_ex)
+                            if _repair_summary.get('purged'):
+                                logger.info(
+                                    f"✅ [STARTUP-PHANTOM-PURGE] {_repair_summary['purged']}"
+                                )
+                            _mismatches_after = audit_pair_ledger_vs_exchange(_parity_ex)
+                            if _mismatches_after:
+                                flag_pair_ledger_mismatch(_mismatches_after)
                 _fixes = sum(sync_trades_from_orders(bid) for bid in _active_ids)
                 if _fixes:
                     logger.info(f"✅ [STARTUP-LEDGER-VERIFY] Corrected {_fixes} bot(s) with ledger drift from order fills.")
@@ -1004,6 +1094,31 @@ class BotRunner:
                         'balance': snap_bal
                     }
                     
+                    # ── [v3.3.1] PRE-SNAPSHOT LEDGER SEAL ──────────────────────────
+                    # Seal all active bot ledgers from confirmed bot_orders fills BEFORE
+                    # writing the active_positions snapshot. Without this seal, a WS fill
+                    # event that committed to bot_orders in a previous cycle but whose
+                    # sync_trades_from_orders propagation hadn't landed yet would leave
+                    # trades.total_invested stale. SNAP-ALLOCATE (now proof-based since
+                    # v3.3.1) is immune, but sealing here keeps trades in lockstep with
+                    # bot_orders for every other consumer (bot_executor, circuit breaker,
+                    # UI PnL display) and eliminates any residual staleness window.
+                    # Overhead: O(N_active_bots) lightweight SQL reads — well within 5s budget.
+                    try:
+                        from engine.database import sync_trades_from_orders as _sts
+                        _seal_corrected = 0
+                        for _sb in bots:
+                            try:
+                                if _sts(_sb[0]):
+                                    _seal_corrected += 1
+                            except Exception as _ste:
+                                logger.debug(f"[PRE-SNAP-SEAL] Bot {_sb[0]} seal skipped: {_ste}")
+                        if _seal_corrected:
+                            logger.info(f"[PRE-SNAP-SEAL] Sealed {_seal_corrected} bot ledger(s) before snapshot.")
+                    except Exception as _seal_ex:
+                        logger.warning(f"⚠️ [PRE-SNAP-SEAL] Seal loop failed (non-fatal): {_seal_ex}")
+                    # ────────────────────────────────────────────────────────────────
+
                     # Fix 4: Write active_positions snapshot EVERY cycle so UI always has fresh data
                     try:
                         from engine.database import update_active_positions_snapshot
@@ -1431,7 +1546,15 @@ class BotRunner:
                                     side = 'sell' if qty > 0 else 'buy'  # Short if long, Long if short
                                     close_qty = abs(qty)
                                     logger.warning(f"Emergency Market Close {close_qty} {pair} for {name}")
-                                    ex.create_order(pair, 'market', side, close_qty)
+                                    _audit_conn = get_connection()
+                                    _audit_cursor = _audit_conn.cursor()
+                                    ex.create_order(
+                                        pair, 'market', side, close_qty,
+                                        emergency=True,
+                                        _audit_cursor=_audit_cursor,
+                                        _call_site="runner.emergency_liquidate:1476",
+                                    )
+                                    _audit_conn.commit()
                                     
                                     # CRITICAL FIX: Update DB to reflect closure
                                     # We use reset_bot_after_tp to clear the trade record
@@ -1632,5 +1755,13 @@ if __name__ == "__main__":
         logger.info(f"✅ [SHUTDOWN-SEAL] Sealed {corrected} active bot state(s) from confirmed fills.")
     except Exception as e:
         logger.error(f"[SHUTDOWN-SEAL] Failed to seal bot states on exit: {e}")
+
+    # Record clean-shutdown timestamp so startup_sync can compute the real offline window.
+    try:
+        with open('last_shutdown.ts', 'w') as _lsf:
+            _lsf.write(str(int(time.time())))
+        logger.info("✅ [SHUTDOWN] last_shutdown.ts written.")
+    except Exception as _lsts_err:
+        logger.warning(f"[SHUTDOWN] Could not write last_shutdown.ts: {_lsts_err}")
 
     lock.release()

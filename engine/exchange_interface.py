@@ -531,20 +531,107 @@ class ExchangeInterface:
         rounded = (d_val / d_step).quantize(Decimal('1'), rounding=ROUND_CEILING) * d_step
         return float(rounded)
 
-    def create_order(self, symbol, type, side, amount, price=None, params=None, post_only=False) -> dict:
+    # ═══════════════════════════════════════════════════════════════════════════
+    # LAYER 1 — CQB PREFIX ENFORCEMENT (v3.4.0)
+    # ═══════════════════════════════════════════════════════════════════════════
+    # All orders MUST have a CQB_ client order ID so the WebSocket handler can
+    # attribute fills to their originating bot.  Non-CQB orders are rejected
+    # unless the caller explicitly opts into the emergency path.
+    #
+    # Emergency path (reconciler healing, panic closes):
+    #   Pass emergency=True AND _audit_cursor (a live DB cursor).
+    #   An audit row is written to exchange_order_audit — the order is logged
+    #   even though no full bot_orders receipt exists.
+    #
+    # Bot-context path (all normal trading):
+    #   Use create_order_with_receipt() below.  It writes a pending bot_orders
+    #   row before touching the exchange and updates it with the real orderId
+    #   after.  Prefer this method for all new callers.
+    # ═══════════════════════════════════════════════════════════════════════════
+    def create_order(self, symbol, type, side, amount, price=None, params=None,
+                     post_only=False, emergency=False,
+                     _audit_cursor=None, _call_site: str = "unknown", human_approved: bool = False) -> dict:
+        """
+        Place an order on the exchange.
+
+        Signature is backward-compatible with all existing callers.
+        New keyword arguments carry the gate enforcement:
+
+        Args:
+            emergency:      Set True ONLY for reconciler/runner healing calls that
+                            have no owning bot.  Requires _audit_cursor.
+            _audit_cursor:  Mandatory when emergency=True.  The audit row is written
+                            to exchange_order_audit inside this method.
+            _call_site:     Human-readable identifier of the caller (file:function).
+                            Included in the audit row for traceability.
+        """
+        params = params or {}
+
+        # ── CID extraction ──────────────────────────────────────────────────
+        # The existing code maps CCXT-style 'clientOrderId' → 'newClientOrderId'
+        # later in the method.  Inspect both keys so the gate sees the CID
+        # regardless of which convention the caller used.
+        cid = (
+            params.get("newClientOrderId")
+            or params.get("clientOrderId")
+            or ""
+        )
+
+        # ── Layer 1 gate ────────────────────────────────────────────────────
+        if not emergency:
+            if not cid.startswith("CQB_"):
+                raise ValueError(
+                    f"[EXCHANGE-GATE] Order rejected: client_order_id='{cid}' "
+                    f"is missing the CQB_ prefix. "
+                    f"Use create_order_with_receipt() for bot-context orders. "
+                    f"For reconciler/runner healing calls pass emergency=True "
+                    f"with a valid _audit_cursor. "
+                    f"Call site: {_call_site}"
+                )
+        else:
+            # Emergency path — audit cursor is not optional
+            if _audit_cursor is None:
+                raise ValueError(
+                    f"[EXCHANGE-GATE] emergency=True requires _audit_cursor. "
+                    f"All emergency orders must be logged to exchange_order_audit. "
+                    f"Call site: {_call_site}"
+                )
+
+        # ── Layer 1.5 gate (Human Approval for Market/Close) ───────────────
+        import os
+        if config.REQUIRE_HUMAN_APPROVAL and type.upper() == 'MARKET':
+            if not human_approved and not params.get('human_approved', False):
+                bot_id = params.get('bot_id', 'unknown') if params else 'unknown'
+                log_line = f"{int(time.time())} | 🛡️ [BLOCKED-ACTION] | Bot: {bot_id} | Symbol: {symbol} | Type: {type.upper()} | Side: {side.upper()} | Amount: {amount} | Call Site: {_call_site}\n"
+                blocked_log_path = os.path.join(config.ROOT_DIR, "blocked_actions.log")
+                try:
+                    with open(blocked_log_path, "a", encoding="utf-8") as f:
+                        f.write(log_line)
+                except Exception as e:
+                    self.logger.error(f"Failed to write to blocked_actions.log: {e}")
+                
+                self.logger.critical(
+                    f"🛡️ [HUMAN-APPROVAL-REQUIRED] Blocked autonomous market order for {symbol}: "
+                    f"{side} {amount} units. Call site: {_call_site}"
+                )
+                raise ValueError(
+                    f"[HUMAN-APPROVAL-REQUIRED] Autonomous market order blocked for {symbol}. "
+                    f"Requires manual/UI execution or human_approved=True."
+                )
+
         try:
             # Use raw signature logic for order placement on Demo
             if config.TESTNET or config.DEMO_TRADING:
                 endpoint = '/fapi/v1/order'
-                
+
                 # 🚀 FIXED: DYNAMIC PRECISION CALCULATION
                 prec = self.get_symbol_precision(symbol)
-                
+
                 # 🚀 FUNDAMENTAL FIX: Precision Rounding
                 # Binance rejects if we don't round to the exact precision
                 amount_rounded = self.round_to_step(amount, prec['step_size'])
                 qty_str = "{:.{}f}".format(amount_rounded, prec['qty_precision'])
-                
+
                 raw_params = {
                     'symbol': normalize_symbol(symbol),
                     'side': side.upper(),
@@ -563,13 +650,13 @@ class ExchangeInterface:
                     del raw_params['positionSide']
                 if 'position_side' in raw_params:
                     del raw_params['position_side']
-                
+
                 if price:
                     price_rounded = self.round_to_step(price, prec['tick_size'])
                     price_str = "{:.{}f}".format(price_rounded, prec['price_precision'])
                     raw_params['price'] = price_str
                     raw_params['timeInForce'] = 'GTC'
-                
+
                 # Merge extra params (like clientOrderId)
                 if params:
                     # Rename CCXT-style keys to Binance-style keys
@@ -584,8 +671,7 @@ class ExchangeInterface:
                 res = self._raw_request(endpoint, method='POST', params=raw_params)
 
                 if res:
-                    # Return CCXT-like structure
-                    return {
+                    result = {
                         'id': res.get('orderId'),
                         'symbol': symbol,
                         'status': res.get('status', 'open').lower(),
@@ -593,16 +679,155 @@ class ExchangeInterface:
                     }
                 else:
                     raise Exception("Raw order placement returned empty response")
-            
-            # Fallback for Mainnet
-            if params is None: params = {}
-            if post_only and type.lower() == 'limit':
-                params['timeInForce'] = 'GTX'
-                
-            return self.exchange.create_order(symbol, type, side, amount, price, params)
+
+            else:
+                # Fallback for Mainnet
+                if post_only and type.lower() == 'limit':
+                    params['timeInForce'] = 'GTX'
+                result = self.exchange.create_order(symbol, type, side, amount, price, params)
+
+            # ── Emergency audit write ────────────────────────────────────────
+            # Written AFTER a successful placement so the order_id is available.
+            # If the exchange call raised above, no audit row is written (the
+            # order never landed on Binance, so there is nothing to audit).
+            if emergency and _audit_cursor is not None:
+                try:
+                    _audit_cursor.execute("""
+                        INSERT INTO exchange_order_audit (
+                            order_id, client_order_id, symbol, side, qty, price,
+                            call_site, context, placed_at, notes
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        str(result.get('id', '')),
+                        cid or result.get('clientOrderId', ''),
+                        symbol, side, amount, price or 0,
+                        _call_site, 'reconciler_emergency',
+                        int(time.time()),
+                        'Emergency healing order. No bot_orders receipt by design.'
+                    ))
+                    # Caller is responsible for committing their transaction.
+                except Exception as _ae:
+                    self.logger.warning(
+                        f"[EXCHANGE-GATE] Audit write failed for emergency order "
+                        f"{result.get('id')} — {_ae}"
+                    )
+
+            return result
+
+        except APIError:
+            raise
         except Exception as e:
             self.logger.error(f"Order Placement Failed: {e}")
             raise APIError(str(e))
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # LAYER 2 — RECEIPT-WRITING WRAPPER FOR ALL BOT-CONTEXT ORDERS (v3.4.0)
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Mandatory for every order placed on behalf of a specific bot.
+    # Writes a 'pending' bot_orders row BEFORE touching the exchange so that
+    # even a process crash mid-flight leaves an auditable trace the reconciler
+    # can find and heal.
+    # ═══════════════════════════════════════════════════════════════════════════
+    def create_order_with_receipt(
+        self,
+        cursor,               # DB cursor — mandatory, must be inside an open transaction
+        bot_id: int,
+        cycle_id: int,
+        symbol: str,
+        type: str,
+        side: str,
+        amount: float,
+        cqb_order_type: str,  # 'entry', 'grid', 'tp', 'hedge', 'anonymous_adopt', …
+        price: float = None,
+        params: dict = None,
+        post_only: bool = False,
+        notes: str = "",
+        human_approved: bool = False,
+    ) -> dict:
+        """
+        Receipt-writing wrapper.  Preferred path for all bot-context order placement.
+
+        Flow:
+          1. Generate CQB_ CID if params does not already carry newClientOrderId.
+             (Callers that pre-build their CID pass it via params["newClientOrderId"]
+             and the auto-generation is skipped — no double pending rows, no collision.)
+          2. INSERT a 'pending' row into bot_orders with the CID and intended qty.
+          3. Call create_order() — which enforces the CQB prefix via Layer 1.
+          4a. On success: UPDATE the pending row with the real exchange order_id
+              and set status = 'open'.
+          4b. On failure: UPDATE the pending row with status = 'failed' and the
+              error message.  Re-raises so the caller can handle appropriately.
+
+        Args:
+            cursor:          Live DB cursor inside the caller's transaction.
+                             The caller is responsible for committing.
+            bot_id:          Owning bot's integer ID.
+            cycle_id:        Current bot cycle (used in CID generation and the row).
+            cqb_order_type:  Semantic order type string stored in bot_orders.order_type.
+            params:          Extra exchange params.  If params["newClientOrderId"]
+                             is already set, it is used as-is (no auto-generation).
+        """
+        params = params or {}
+        ts = int(time.time())
+
+        # Auto-generate CID only when the caller hasn't provided one
+        if "newClientOrderId" not in params and "clientOrderId" not in params:
+            params["newClientOrderId"] = (
+                f"CQB_{bot_id}_{cqb_order_type.upper()}_{cycle_id}_{ts}"
+            )
+
+        cid = params.get("newClientOrderId") or params.get("clientOrderId")
+
+        # ── Step 2: Write pending receipt before touching exchange ───────────
+        cursor.execute("""
+            INSERT INTO bot_orders (
+                bot_id, order_type, client_order_id, price, amount,
+                filled_amount, status, cycle_id, created_at, updated_at, notes
+            ) VALUES (?, ?, ?, ?, ?, 0, 'pending', ?, ?, ?, ?)
+        """, (
+            bot_id, cqb_order_type, cid,
+            price or 0, amount,
+            cycle_id, ts, ts,
+            notes or f"Pending: {cqb_order_type.upper()} {side.upper()} {amount} {symbol}"
+        ))
+        pending_row_id = cursor.lastrowid
+
+        # ── Step 3: Place the order (Layer 1 gate fires inside create_order) ─
+        try:
+            result = self.create_order(
+                symbol=symbol,
+                type=type,
+                side=side,
+                amount=amount,
+                price=price,
+                params=params,
+                post_only=post_only,
+                # emergency=False (default) — CQB prefix enforced by Layer 1
+                human_approved=human_approved
+            )
+        except Exception as exc:
+            # ── Step 4b: Mark pending row as failed ──────────────────────────
+            cursor.execute("""
+                UPDATE bot_orders
+                SET status = 'failed', updated_at = ?, notes = ?
+                WHERE id = ?
+            """, (int(time.time()), f"Exchange error: {exc}", pending_row_id))
+            raise  # Caller decides how to handle
+
+        # ── Step 4a: Update pending row with real exchange order_id ──────────
+        real_order_id = str(result.get('id', ''))
+        cursor.execute("""
+            UPDATE bot_orders
+            SET order_id = ?, status = 'open', updated_at = ?
+            WHERE id = ?
+        """, (real_order_id, int(time.time()), pending_row_id))
+
+        self.logger.info(
+            f"[RECEIPT] Bot {bot_id} {cqb_order_type.upper()} {side.upper()} "
+            f"{amount} {symbol} → exchange order_id={real_order_id} (CID={cid})"
+        )
+
+        return result
 
     def fetch_order(self, order_id: str, symbol: str):
         try:

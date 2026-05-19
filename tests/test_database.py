@@ -102,8 +102,12 @@ class TestDatabase(unittest.TestCase):
         # Simulate active trade
         database.update_martingale_step(bot_id, 1, 100.0, 50000.0, 51000.0)
         
-        # Reset
-        database.reset_bot_after_tp(bot_id, exit_price=51000.0)
+        class _FlatEx:
+            def fetch_positions(self):
+                return []
+
+        # Reset (exchange flat required by pair parity gate)
+        database.reset_bot_after_tp(bot_id, exit_price=51000.0, exchange=_FlatEx())
         
         status = database.get_bot_status(bot_id)
         self.assertIsNotNone(status)

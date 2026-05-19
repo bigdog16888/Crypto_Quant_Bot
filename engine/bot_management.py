@@ -9,6 +9,7 @@ Provides functions to:
 """
 import logging
 import time
+import json
 from typing import Dict, Any, Optional, List
 from .database import (
     close_bot_position, get_bot_close_settings, update_bot_close_settings,
@@ -60,12 +61,26 @@ def close_position(bot_id: int, close_pct: float = 100.0, reason: str = "Manual 
     if current_price == 0:
         return {'success': False, 'error': 'Could not get current price'}
     
-    # Calculate close amount
-    close_amount = total_invested * (close_pct / 100.0)
+    # 1. Fetch physical position from the exchange to ensure we don't try to close more than we have
+    # (Binance rejects ReduceOnly orders that exceed the physical position)
+    actual_pos_qty = 0
+    try:
+        positions = exchange.fetch_positions()
+        if positions:
+            for p in positions:
+                if p['symbol'] == pair:
+                    actual_pos_qty = abs(p['net_qty'])
+                    break
+    except Exception as e:
+        logger.warning(f"⚠️ Could not verify exchange position for {pair}: {e}. Proceeding with ledger quantity.")
+        actual_pos_qty = None # Signal that we couldn't verify
+    
+    # Calculate close amount based on ledger
+    close_amount_ledger = total_invested * (close_pct / 100.0)
     
     # For futures: calculate quantity
     if market_type == 'future':
-        close_qty = close_amount / current_price
+        close_qty = close_amount_ledger / current_price
     else:
         # Spot: close the asset
         base_asset = pair.split('/')[0]
@@ -76,6 +91,24 @@ def close_position(bot_id: int, close_pct: float = 100.0, reason: str = "Manual 
         current_holdings = float(base_info.get('total', 0))
         close_qty = current_holdings * (close_pct / 100.0)
     
+    # 2. CAP the quantity by the physical reality
+    # If we think we have 1 BTC but exchange says 0.5 BTC, we must only try to close 0.5.
+    if actual_pos_qty is not None:
+        if actual_pos_qty <= 0:
+            logger.warning(f"ℹ️ [SYNC] Exchange says 0 position for {pair}. Wiping local ledger for bot {bot_id} without order placement.")
+            from .database import close_bot_position
+            return close_bot_position(
+                bot_id=bot_id,
+                close_type='MANUAL',
+                close_price=current_price,
+                close_pct=100.0,
+                notes=f"Exchange position 0. Ledger wiped."
+            )
+        
+        if close_qty > actual_pos_qty:
+            logger.warning(f"ℹ️ [CAP] Capping close quantity {close_qty:.6f} to physical max {actual_pos_qty:.6f} for {pair}.")
+            close_qty = actual_pos_qty
+
     if close_qty <= 0:
         return {'success': False, 'error': 'Invalid close quantity'}
     
@@ -86,16 +119,30 @@ def close_position(bot_id: int, close_pct: float = 100.0, reason: str = "Manual 
     try:
         mode_label = "LIMIT (Post-Only)" if order_type == 'limit' else "MARKET (Panic)"
         logger.info(f"🔴 {mode_label} Closing {close_pct:.0f}% of {name}'s position: {close_qty:.6f} {pair}")
+
+        # 3. Cancel any existing open orders for THIS bot to free up ReduceOnly capacity
+        cancelled = exchange.cancel_orders_by_bot_id(bot_id, pair)
+        if cancelled > 0:
+            logger.info(f"🗑️ [CLEANUP] Cancelled {cancelled} existing orders for bot {bot_id} before closing.")
         
-        # Professional Order Routing
+        # 4. Generate a professional Client Order ID so the reconciler can track this manual exit
+        timestamp = int(time.time() * 1000)
+        client_id = f"CQB_{bot_id}_{timestamp}_manual_exit"
+        
+        # 5. Execute order to close
         close_order = exchange.create_order(
             symbol=pair, 
             type=order_type, 
             side=close_side, 
             amount=close_qty,
             price=current_price if order_type == 'limit' else None,
-            params={'reduceOnly': True},
-            post_only=(order_type == 'limit')
+            params={
+                'reduceOnly': True,
+                'clientOrderId': client_id,
+                'human_approved': True
+            },
+            post_only=(order_type == 'limit'),
+            human_approved=True
         )
         
         if not close_order or close_order.get('status') == 'rejected':
@@ -224,7 +271,7 @@ def check_and_execute_stops(bot_id: int, exchange_interface=None) -> Optional[Di
         return None
     
     config_json = params[7]
-    config_dict = config_json if isinstance(config_json, dict) else {}
+    config_dict = json.loads(config_json) if isinstance(config_json, str) else (config_json or {})
     market_type = config_dict.get('market_type', 'future')
     
     exchange = exchange_interface or ExchangeInterface(market_type=market_type)
@@ -244,7 +291,6 @@ def check_and_execute_stops(bot_id: int, exchange_interface=None) -> Optional[Di
         current_pnl = (entry - current_price) / entry * invested
     
     # Calculate hours in trade
-    import time
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute('SELECT basket_start_time FROM trades WHERE bot_id = ?', (bot_id,))
@@ -306,7 +352,7 @@ def get_position_summary(bot_id: int) -> Dict[str, Any]:
         return {'error': 'Could not get bot params'}
     
     config_json = params[7]
-    config_dict = config_json if isinstance(config_json, dict) else {}
+    config_dict = json.loads(config_json) if isinstance(config_json, str) else (config_json or {})
     market_type = config_dict.get('market_type', 'future')
     
     exchange = ExchangeInterface(market_type=market_type)
@@ -375,7 +421,6 @@ def get_all_positions_summary() -> List[Dict[str, Any]]:
 
 if __name__ == "__main__":
     # Test
-    import json
     
     print("Bot Position Management API")
     print("=" * 40)

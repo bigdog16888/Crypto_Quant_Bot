@@ -184,16 +184,44 @@ class TestPhantomEntryDetection(unittest.TestCase):
         try:
             conn = sqlite3.connect(db_path)
             conn.execute("""CREATE TABLE bots (
-                id INTEGER PRIMARY KEY, name TEXT, pair TEXT, direction TEXT,
-                is_active INTEGER, status TEXT, strategy_type TEXT, config TEXT,
-                base_size REAL, martingale_multiplier REAL
+                id INTEGER PRIMARY KEY,
+                name TEXT,
+                pair TEXT,
+                normalized_pair TEXT,
+                direction TEXT,
+                is_active INTEGER,
+                status TEXT,
+                strategy_type TEXT,
+                config TEXT,
+                base_size REAL,
+                martingale_multiplier REAL,
+                rsi_limit REAL,
+                manual_close_pct REAL DEFAULT 100.0,
+                last_error TEXT,
+                last_error_time INTEGER,
+                pos_limit_hit INTEGER DEFAULT 0
             )""")
             conn.execute("""CREATE TABLE trades (
-                bot_id INTEGER PRIMARY KEY, total_invested REAL, avg_entry_price REAL,
-                entry_confirmed INTEGER, current_step INTEGER, basket_start_time INTEGER,
-                target_tp_price REAL, entry_order_id TEXT, tp_order_id TEXT,
-                bot_position_id TEXT, last_exit_price REAL, last_exit_time INTEGER,
-                close_type TEXT
+                bot_id INTEGER PRIMARY KEY,
+                current_step INTEGER DEFAULT 0,
+                total_invested REAL DEFAULT 0,
+                avg_entry_price REAL DEFAULT 0,
+                target_tp_price REAL DEFAULT 0,
+                last_exit_price REAL DEFAULT 0,
+                last_exit_time INTEGER DEFAULT 0,
+                basket_start_time INTEGER DEFAULT 0,
+                entry_confirmed BOOLEAN DEFAULT 0,
+                entry_order_id TEXT,
+                tp_order_id TEXT,
+                bot_position_id TEXT,
+                close_type TEXT DEFAULT NULL,
+                cycle_id INTEGER DEFAULT 1,
+                cycle_phase TEXT DEFAULT 'ACTIVE',
+                open_qty REAL DEFAULT 0,
+                wipe_wall_ts INTEGER DEFAULT 0,
+                hedge_qty REAL DEFAULT 0,
+                cycle_start_time INTEGER DEFAULT 0,
+                position_side TEXT DEFAULT 'BOTH'
             )""")
             conn.execute("""CREATE TABLE reconciliation_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER,
@@ -204,20 +232,60 @@ class TestPhantomEntryDetection(unittest.TestCase):
                 action TEXT, symbol TEXT, price REAL, amount REAL, cost_usdc REAL,
                 order_id TEXT, step INTEGER, notes TEXT, pnl REAL
             )""")
+            conn.execute("""CREATE TABLE bot_orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bot_id INTEGER,
+                step INTEGER DEFAULT 0,
+                order_type TEXT,
+                order_id TEXT,
+                price REAL DEFAULT 0,
+                amount REAL DEFAULT 0,
+                filled_amount REAL DEFAULT 0,
+                status TEXT DEFAULT 'open',
+                created_at INTEGER,
+                client_order_id TEXT,
+                updated_at INTEGER DEFAULT 0,
+                notes TEXT,
+                wipe_proof_source TEXT,
+                wipe_proof_snapshot TEXT,
+                cycle_id INTEGER DEFAULT 1,
+                position_side TEXT DEFAULT 'BOTH',
+                filled_at INTEGER DEFAULT 0
+            )""")
+            conn.execute("""CREATE TABLE active_positions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pair TEXT,
+                side TEXT,
+                size REAL
+            )""")
 
             # Phantom bot: total_invested > 0, avg_entry = 0, confirmed = 0
-            conn.execute("INSERT INTO bots VALUES (10002, 'Phantom_Bot', 'BTC/USDC:USDC', 'LONG', 1, 'Scanning', 'martingale', '{}', 0.002, 2.0)")
-            conn.execute("INSERT INTO trades VALUES (10002, 133.62, 0.0, 0, 2, 0, 0, NULL, NULL, NULL, 0, 0, NULL)")
+            conn.execute("""
+                INSERT INTO bots (id, name, pair, direction, is_active, status, strategy_type, config, base_size, martingale_multiplier)
+                VALUES (10002, 'Phantom_Bot', 'BTC/USDC:USDC', 'LONG', 1, 'Scanning', 'martingale', '{}', 0.002, 2.0)
+            """)
+            conn.execute("""
+                INSERT INTO trades (bot_id, total_invested, avg_entry_price, entry_confirmed, current_step, cycle_phase, cycle_id)
+                VALUES (10002, 133.62, 0.0, 0, 2, 'ACTIVE', 1)
+            """)
 
             # Valid bot
-            conn.execute("INSERT INTO bots VALUES (10010, 'Valid_Bot', 'ETH/USDC:USDC', 'LONG', 1, 'In Trade', 'martingale', '{}', 0.077, 2.0)")
-            conn.execute("INSERT INTO trades VALUES (10010, 149.19, 1937.53, 1, 1, 1000000, 1960, NULL, NULL, NULL, 0, 0, NULL)")
+            conn.execute("""
+                INSERT INTO bots (id, name, pair, direction, is_active, status, strategy_type, config, base_size, martingale_multiplier)
+                VALUES (10010, 'Valid_Bot', 'ETH/USDC:USDC', 'LONG', 1, 'In Trade', 'martingale', '{}', 0.077, 2.0)
+            """)
+            conn.execute("""
+                INSERT INTO trades (bot_id, total_invested, avg_entry_price, entry_confirmed, current_step, basket_start_time, target_tp_price, cycle_phase, cycle_id)
+                VALUES (10010, 149.19, 1937.53, 1, 1, 1000000, 1960, 'ACTIVE', 1)
+            """)
 
             conn.commit()
             conn.close()
 
-            with patch('engine.reconciler.get_connection') as mock_get_conn:
-                mock_get_conn.return_value = sqlite3.connect(db_path)
+            temp_db_conn = sqlite3.connect(db_path)
+            with patch('engine.reconciler.get_connection', return_value=temp_db_conn), \
+                 patch('engine.database.get_connection', return_value=temp_db_conn), \
+                 patch('config.settings.config.REQUIRE_HUMAN_APPROVAL', False):
 
                 reconciler = StateReconciler(exchanges={})
                 reconciler._cleanup_phantom_entries()

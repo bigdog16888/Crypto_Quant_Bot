@@ -48,6 +48,19 @@ class Config:
         # 🛡️ SAFETY TOGGLE: Strict Cleanup (True = Kill Manual Orders, False = Protect Them)
         self.STRICT_CLEANUP = os.getenv("STRICT_CLEANUP", "False").lower() == "true"
 
+        # 🛡️ SAFETY TOGGLE: Block autonomous execution in production (requires human approval)
+        self.REQUIRE_HUMAN_APPROVAL = os.getenv("REQUIRE_HUMAN_APPROVAL", "False").lower() == "true"
+
+        # Pair parity: max |virtual - exchange| qty before blocking trade / cycle reset
+        self.PAIR_PARITY_QTY_TOLERANCE = float(os.getenv("PAIR_PARITY_QTY_TOLERANCE", "0.002"))
+        # Forensic/anonymous WS adopt — off by default (proof-only ledger)
+        self.ALLOW_FORENSIC_ADOPT = os.getenv("ALLOW_FORENSIC_ADOPT", "False").lower() == "true"
+        # Testnet: when exchange net is 0 but ledger is not, safe-wipe bots (no market order)
+        _purge_default = "True" if self.TESTNET else "False"
+        self.TESTNET_PURGE_PHANTOM_LEDGER = os.getenv(
+            "TESTNET_PURGE_PHANTOM_LEDGER", _purge_default
+        ).lower() == "true"
+
         self.ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         self.PATHS = {
             "PID_FILE": os.path.join(self.ROOT_DIR, "engine.pid"),

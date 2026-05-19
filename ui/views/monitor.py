@@ -201,13 +201,23 @@ def render_monitor_view():
                     exchange_error = f"Exchange Order Sync Error: {e}"
                 
                 # 4. Fetch Hedge Orders
+                # ── ARCH NOTE ──────────────────────────────────────────────────────────
+                # Hedge orders are physical exchange SHORT positions. They are NOT
+                # bounded by wipe_wall_ts (which is a virtual accounting fence for
+                # ENTRY fills only). A hedge placed in cycle 5 is still open on the
+                # exchange in cycle 37 unless explicitly closed (reset_cleared / auto_closed).
+                # Removing the wipe_wall_ts filter here ensures:
+                #   1. hedged_bot_ids correctly includes bots with pre-reset hedges
+                #   2. hedge_amounts correctly sums all outstanding hedge exposure
+                #   3. MISSING CRITICAL ORDERS alert is not falsely fired for HEDGED bots
+                # ───────────────────────────────────────────────────────────────────────
                 query_h = """
                     SELECT bo.bot_id, bo.order_type, bo.filled_amount, bo.status, bo.created_at
                     FROM bot_orders bo
-                    JOIN trades t ON bo.bot_id = t.bot_id
-                    WHERE bo.order_type IN ('hedge', 'hedge_tp')
-                      AND bo.status NOT IN ('canceled', 'cancelled', 'rejected', 'failed', 'reset_cleared', 'auto_closed', 'placing')
-                      AND (t.wipe_wall_ts = 0 OR bo.created_at >= t.wipe_wall_ts)
+                    WHERE bo.order_type IN ('hedge', 'hedge_tp', 'hedgetp')
+                      AND bo.status NOT IN ('canceled', 'cancelled', 'rejected', 'failed',
+                                            'reset_cleared', 'auto_closed', 'placing')
+                      AND bo.filled_amount > 0
                 """
                 df_h = pd.read_sql(query_h, conn_fresh)
                 
@@ -305,14 +315,35 @@ def render_monitor_view():
                                 })
             except Exception: pass
 
-            total_equity = futures_balance + spot_balance + global_pnl_usd 
-            
+            total_equity = futures_balance + spot_balance + global_pnl_usd
+
+            cur.execute(
+                "SELECT COUNT(*) FROM trades t JOIN bots b ON b.id=t.bot_id "
+                "WHERE b.is_active=1 AND t.total_invested > 0.01"
+            )
+            bots_in_trade = int(cur.fetchone()[0] or 0)
+            cur.execute(
+                "SELECT COALESCE(SUM(t.open_qty * t.avg_entry_price), 0) "
+                "FROM trades t JOIN bots b ON b.id=t.bot_id "
+                "WHERE b.is_active=1 AND t.open_qty > 1e-8 AND t.avg_entry_price > 0"
+            )
+            open_qty_notional = float(cur.fetchone()[0] or 0.0)
+            scanning_count = max(0, int(active_count) - bots_in_trade)
+
             # Display Metrics Grid
             m1, m2, m3, m4 = st.columns(4)
             with m1: st.metric("Total Equity", f"${total_equity:,.2f}")
             with m2: st.metric("Futures Balance", f"${futures_balance:,.2f}")
             with m3: st.metric("Active PnL", f"${global_pnl_usd:,.2f}")
-            with m4: st.metric("Active Exposure", f"${total_invested_db:,.2f}")
+            with m4: st.metric("Total Invested", f"${total_invested_db:,.2f}",
+                              help="Sum of trades.total_invested across active bots (ledger exposure).")
+
+            r2a, r2b, r2c, r2d = st.columns(4)
+            with r2a: st.metric("Active Bots", f"{active_count}")
+            with r2b: st.metric("In Trade", f"{bots_in_trade}")
+            with r2c: st.metric("Scanning", f"{scanning_count}")
+            with r2d: st.metric("Open Qty (Notional)", f"${open_qty_notional:,.2f}",
+                              help="open_qty × avg_entry_price from trades table.")
 
             if assets_breakdown:
                 with st.expander("💰 Detailed Asset Breakdown"):
@@ -478,6 +509,8 @@ def render_monitor_view():
                     if c_phase == 'HEDGED' or h_amt > 1e-8:
                         if "EXITING" in b_status: return f"🛡️ HEDGE EXIT PENDING ({h_amt:.4f})"
                         return f"🛡️ HEDGED ({h_amt:.4f}) | Step {c_step}"
+                    if c_phase == 'MARGIN_HELD':
+                        return f"🚫 MARGIN HELD | Step {c_step}"
                     
                     # Consistent threshold for 'In Trade'
                     if c_phase == 'ACTIVE' or invested > 0.01:
@@ -534,14 +567,33 @@ def render_monitor_view():
                     except Exception as _vne:
                         virtual_net_by_norm[p_key] = 0.0
 
-                # Build physical_qty_by_pair from exchange position snapshot (unchanged)
-                if not df_physical_f.empty:
+                # Physical net: prefer LIVE exchange positions (one-way signed contracts).
+                # Summing active_positions LONG/SHORT rows can double-count when SNAP-ALLOCATE
+                # splits one net exchange position across multiple bot_id rows.
+                live_physical_net_by_pair = {}
+                try:
+                    ex_phys = get_exchange_instance(global_config.MARKET_TYPE)
+                    for _pos in (ex_phys.fetch_positions() or []):
+                        _amt = float(_pos.get('contracts', 0) or _pos.get('size', 0) or 0)
+                        if abs(_amt) < 1e-12:
+                            continue
+                        _pkey = _norm_universal(_pos.get('symbol', ''))
+                        live_physical_net_by_pair[_pkey] = live_physical_net_by_pair.get(_pkey, 0.0) + _amt
+                        _epx = float(_pos.get('entryPrice', 0) or 0)
+                        if _epx > 0 and _pkey not in pair_prices:
+                            pair_prices[_pkey] = _epx
+                except Exception as _lp_err:
+                    st.caption(f"⚠️ Live position fetch failed, using DB snapshot: {_lp_err}")
+
+                if not live_physical_net_by_pair and not df_physical_f.empty:
                     for _, row in df_physical_f.iterrows():
                         if pd.notna(row['size']) and pd.notna(row['entry_price']):
                             qty, price, side = abs(float(row['size'])), float(row['entry_price']), str(row['side']).upper().strip()
                             s_key, p_key = ('LONG' if side in ('BUY', 'LONG') else 'SHORT'), _norm_universal(row['pair'])
-                            if p_key not in pair_prices: pair_prices[p_key] = price
-                            physical_qty_by_pair[(p_key, s_key)] = physical_qty_by_pair.get((p_key, s_key), 0.0) + qty
+                            if p_key not in pair_prices:
+                                pair_prices[p_key] = price
+                            signed = qty if s_key == 'LONG' else -qty
+                            live_physical_net_by_pair[p_key] = live_physical_net_by_pair.get(p_key, 0.0) + signed
 
                 # 🔥 HEATMAP: Enrich pair_prices with LIVE ticker prices
                 # Overwrite stale avg_entry_price with real mark prices for accurate distance %
@@ -562,29 +614,33 @@ def render_monitor_view():
                 if not df_physical_f.empty:
                     all_symbols |= set(_norm_universal(p) for p in df_physical_f['pair'])
 
-                virtual_net_usd = 0.0
-                physical_net_usd = 0.0
+                worst_pair_usd = 0.0
+                mismatched_pair_count = 0
 
                 for p in sorted(all_symbols):
                     v_net_qty = virtual_net_by_norm.get(p, 0.0)
-                    ph_net_qty = physical_qty_by_pair.get((p, 'LONG'), 0.0) - physical_qty_by_pair.get((p, 'SHORT'), 0.0)
+                    ph_net_qty = live_physical_net_by_pair.get(p, 0.0)
                     whitelists = get_manual_whitelists(p)
                     for w in whitelists: ph_net_qty -= float(w['qty']) if w['side'] == 'LONG' else -float(w['qty'])
                     
                     ref_price = pair_prices.get(p, 1.0)
                     net_qty_diff = abs(v_net_qty - ph_net_qty)
                     net_usd_diff = net_qty_diff * ref_price
-                    virtual_net_usd += v_net_qty * ref_price
-                    physical_net_usd += ph_net_qty * ref_price
-                    if net_usd_diff > 0.01:
+                    if net_usd_diff > worst_pair_usd:
+                        worst_pair_usd = net_usd_diff
+                    # Per-pair threshold: virtual and physical must match in qty space.
+                    if net_usd_diff > 1.00:
+                        mismatched_pair_count += 1
                         mismatched_pairs.append((f"{p} NET", v_net_qty * ref_price, ph_net_qty * ref_price, net_usd_diff, v_net_qty, ph_net_qty, ph_net_qty - v_net_qty, ref_price))
 
                 # --- FRAGMENT UI RENDERING ---
+                # Do NOT sum virtual USD across unrelated symbols — that produces nonsense
+                # totals (e.g. BTC qty * BTC price + LINK qty * LINK price).
                 m_col1, m_col2, m_col3 = st.columns(3)
-                with m_col1: st.metric("Net Exposure (Virtual)", f"${virtual_net_usd:,.2f}")
-                with m_col2: st.metric("Exchange Net (Physical)", f"${physical_net_usd:,.2f}", delta=f"{physical_net_usd-virtual_net_usd:,.2f}")
+                with m_col1: st.metric("Mismatched Pairs", mismatched_pair_count)
+                with m_col2: st.metric("Worst Pair Gap (USD)", f"${worst_pair_usd:,.2f}")
                 with m_col3:
-                    _status = "HEALTHY" if abs(virtual_net_usd - physical_net_usd) <= 0.01 else "MISMATCH"
+                    _status = "HEALTHY" if mismatched_pair_count == 0 else "MISMATCH"
                     _color = "green" if _status == "HEALTHY" else "red"
                     st.markdown(f"**System Status:** <span style='color:{_color}; font-weight:bold;'>{_status}</span>", unsafe_allow_html=True)
                 
@@ -596,6 +652,7 @@ def render_monitor_view():
 
                 bots_with_missing_orders = []
                 bots_with_partial_orders = []
+                bots_with_margin_held = []
                 for _, row in df_pos_f.iterrows():
                     bid, bot_inv, c_step = int(row['id']), float(row['total_invested'] or 0), int(row.get('current_step', 0))
                     actual_ph = physical_order_counts.get(bid, 0)
@@ -604,15 +661,28 @@ def render_monitor_view():
                     if "EXITING" in str(row.get('status','')).upper() or ("SCANNING" in str(row.get('status','')).upper() and bot_inv <= 0.01):
                         continue
                         
+                    cycle_phase = str(row.get('cycle_phase', 'IDLE')).upper()
+
                     if bid in hedged_bot_ids:
-                        if actual_ph == 0: bots_with_missing_orders.append(f"{row['name']} (HEDGED)")
+                        # A bot in pure HEDGED phase legitimately has 0 physical orders:
+                        # its entry TP has been closed and it's holding a hedge SHORT
+                        # on the exchange, dormant, waiting for the hedge exit signal.
+                        # Only flag as MISSING if it's in HEDGE_EXIT_PENDING (actively
+                        # unwinding) but has no close/exit order placed.
+                        if cycle_phase == 'HEDGE_EXIT_PENDING' and actual_ph == 0:
+                            bots_with_missing_orders.append(f"{row['name']} (HEDGE_EXIT no order)")
+                        # If in pure HEDGED: no alert — it's intentionally dormant
+                    elif cycle_phase == 'MARGIN_HELD':
+                        # Engine tried to place orders but Binance rejected with margin insufficiency.
+                        # This is not a missing orders bug — it's a real account-level constraint.
+                        # Show as orange warning, not red critical.
+                        bots_with_margin_held.append(f"{row['name']}")
                     else:
                         # Stricter health: Step 1+ bots should generally have 2 orders (TP + Grid)
-                        cycle_phase = str(row.get('cycle_phase', 'IDLE')).upper()
                         # We flag as MISSING CRITICAL if they have 0 orders but are in trade
-                        if actual_ph == 0 and bot_inv > 0.01 and cycle_phase != 'CARRY_PENDING':
+                        if actual_ph == 0 and bot_inv > 0.01 and cycle_phase not in ('CARRY_PENDING', 'HEDGED'):
                             bots_with_missing_orders.append(row['name'])
-                        elif actual_ph == 0 and cycle_phase == 'CARRY_PENDING':
+                        elif actual_ph == 0 and cycle_phase in ('CARRY_PENDING', 'HEDGED'):
                             pass # Engine is intentionally holding without orders
                         # We flag as MISSING GRIDS if they have only 1 order but are mid-cycle (Step 1+)
                         elif actual_ph < 2 and c_step >= 1 and bot_inv > 0.01:
@@ -620,6 +690,8 @@ def render_monitor_view():
 
                 if bots_with_missing_orders:
                     order_health_msg, order_status_color = f"⚠️ MISSING CRITICAL ORDERS: {', '.join(bots_with_missing_orders)}!", "red"
+                elif bots_with_margin_held:
+                    order_health_msg, order_status_color = f"⚠️ MARGIN HELD: {', '.join(bots_with_margin_held)} — TP blocked by account margin limit. Free margin to allow TP placement.", "orange"
                 elif bots_with_partial_orders:
                     order_health_msg, order_status_color = f"⚠️ MISSING GRIDS: {', '.join(bots_with_partial_orders)}", "orange"
                 else:
@@ -634,8 +706,9 @@ def render_monitor_view():
                         debug_data = []
                         for p_dbg in sorted(all_symbols):
                             v_dbg = virtual_net_by_norm.get(p_dbg, 0.0)
-                            ph_l_dbg = physical_qty_by_pair.get((p_dbg, 'LONG'), 0.0)
-                            ph_s_dbg = physical_qty_by_pair.get((p_dbg, 'SHORT'), 0.0)
+                            ph_net_dbg = live_physical_net_by_pair.get(p_dbg, 0.0)
+                            ph_l_dbg = ph_net_dbg if ph_net_dbg > 0 else 0.0
+                            ph_s_dbg = abs(ph_net_dbg) if ph_net_dbg < 0 else 0.0
                             ph_net_dbg = ph_l_dbg - ph_s_dbg
                             debug_data.append({
                                 "Symbol": p_dbg, "System Net": f"{v_dbg:+.4f}",
@@ -649,50 +722,94 @@ def render_monitor_view():
                     for row_mp in mismatched_pairs:
                         mp_pair, mp_virt, mp_phys, mp_diff, mp_vqty, mp_pqty, mp_dqty, mp_price = row_mp
                         st.warning(f"   ⚠️ **{mp_pair}**: System ${mp_virt:,.2f} vs Exchange ${mp_phys:,.2f} (Diff: ${mp_diff:,.2f}) | Qty: sys={mp_vqty:+.4f} ex={mp_pqty:+.4f} diff={mp_dqty:.4f}")
+                        
+                        # ── Confirmation-gate keys ──────────────────────────────────
+                        _ck_adopt  = f"_confirm_adopt_{mp_pair}"
+                        _ck_manual = f"_confirm_manual_{mp_pair}"
+                        _ck_close  = f"_confirm_close_{mp_pair}"
+                        
                         _act_c1, _act_c2, _act_c3 = st.columns(3)
-                        with _act_c1:
-                            if st.button("🕵️ Forensic Adopt", key=f"f_{mp_pair}"):
-                                from engine.reconciler import StateReconciler
-                                _p_clean = mp_pair.split(' ')[0]
-                                clear_manual_whitelists_for_pair(_p_clean)
-                                StateReconciler().perform_forensic_reconstruction(_p_clean); st.rerun()
-                        with _act_c2:
-                            if st.button("📝 Manual", key=f"m_{mp_pair}"):
-                                add_manual_whitelist(mp_pair.split(' ')[0], 'LONG' if mp_dqty > 0 else 'SHORT', abs(mp_dqty)); st.rerun()
-                        with _act_c3:
-                            if st.button("💥 Close", key=f"c_{mp_pair}"):
-                                _p_clean = mp_pair.split(' ')[0]
-                                ex_m = get_exchange_instance('future')
-                                # 1. Clear any manual overrides first
-                                clear_manual_whitelists_for_pair(_p_clean)
-                                
-                                # 2. Attempt to flatten exchange
-                                if abs(mp_pqty) > 0.0001:
-                                    try:
-                                        # Use standard close which handles reduceOnly internally or fails safely
-                                        ex_m.close_position(_p_clean)
-                                        st.success(f"Exchange closed {_p_clean}")
-                                    except Exception as _close_ex_err:
-                                        err_m = str(_close_ex_err).lower()
-                                        if "reduceonly" in err_m or "400" in err_m or "not found" in err_m:
-                                            st.warning(f"Exchange close skipped/failed (Pos might be 0): {err_m[:50]}...")
-                                        else:
-                                            st.error(f"Exchange close failed: {_close_ex_err}")
 
-                                # 3. Zero ALL affected bots with a proper reset
-                                from engine.database import reset_bot_after_tp as _rbt
-                                try:
-                                    conn_m = sqlite3.connect(global_config.PATHS['DB_FILE'])
-                                    all_b = conn_m.execute("SELECT id, pair FROM bots WHERE is_active=1").fetchall()
-                                    conn_m.close()
-                                    target_bids = [b[0] for b in all_b if _norm_universal(b[1]) == _norm_universal(_p_clean)]
-                                    for b in target_bids:
-                                        _rbt(b, exit_price=0.0, action_label='MANUAL_CLOSE',
-                                             notes=f"UI Close: exchange={mp_pqty:+.4f}, virtual={mp_vqty:+.4f}")
-                                    st.success(f"Reset {len(target_bids)} bots.")
-                                except Exception as _rbt_err:
-                                    st.warning(f"Reset failed: {_rbt_err}")
-                                st.rerun()
+                        # ── 🕵️ Forensic Adopt (2-step) ───────────────────────────────
+                        with _act_c1:
+                            if not st.session_state.get(_ck_adopt):
+                                if st.button("🕵️ Forensic Adopt", key=f"f_{mp_pair}"):
+                                    st.session_state[_ck_adopt] = True
+                                    st.rerun()
+                            else:
+                                st.caption(f"⚠️ Adopt exchange qty into ledger for **{mp_pair}**?")
+                                cc1, cc2 = st.columns(2)
+                                with cc1:
+                                    if st.button("✅ Confirm Adopt", key=f"fc_{mp_pair}", type="primary"):
+                                        st.session_state[_ck_adopt] = False
+                                        from engine.reconciler import StateReconciler
+                                        _p_clean = mp_pair.split(' ')[0]
+                                        clear_manual_whitelists_for_pair(_p_clean)
+                                        StateReconciler().perform_forensic_reconstruction(_p_clean)
+                                        st.rerun()
+                                with cc2:
+                                    if st.button("❌ Cancel", key=f"fcancel_{mp_pair}"):
+                                        st.session_state[_ck_adopt] = False
+                                        st.rerun()
+
+                        # ── 📝 Manual Whitelist (2-step) ─────────────────────────────
+                        with _act_c2:
+                            if not st.session_state.get(_ck_manual):
+                                if st.button("📝 Manual", key=f"m_{mp_pair}"):
+                                    st.session_state[_ck_manual] = True
+                                    st.rerun()
+                            else:
+                                _side_str = 'LONG' if mp_dqty > 0 else 'SHORT'
+                                st.caption(f"⚠️ Whitelist {_side_str} {abs(mp_dqty):.4f} for **{mp_pair.split(' ')[0]}**?")
+                                cc1, cc2 = st.columns(2)
+                                with cc1:
+                                    if st.button("✅ Confirm Manual", key=f"mc_{mp_pair}", type="primary"):
+                                        st.session_state[_ck_manual] = False
+                                        add_manual_whitelist(mp_pair.split(' ')[0], _side_str, abs(mp_dqty))
+                                        st.rerun()
+                                with cc2:
+                                    if st.button("❌ Cancel", key=f"mcancel_{mp_pair}"):
+                                        st.session_state[_ck_manual] = False
+                                        st.rerun()
+
+                        # ── 💥 Close / Reset (2-step, most dangerous) ───────────────
+                        with _act_c3:
+                            if not st.session_state.get(_ck_close):
+                                if st.button("💥 Close", key=f"c_{mp_pair}"):
+                                    st.session_state[_ck_close] = True
+                                    st.rerun()
+                            else:
+                                st.error(f"🚨 IRREVERSIBLE: Close exchange pos + reset ALL {mp_pair.split(' ')[0]} bots?")
+                                cc1, cc2 = st.columns(2)
+                                with cc1:
+                                    if st.button("🔴 YES, CLOSE", key=f"cc_{mp_pair}"):
+                                        st.session_state[_ck_close] = False
+                                        _p_clean = mp_pair.split(' ')[0]
+                                        ex_m = get_exchange_instance('future')
+                                        clear_manual_whitelists_for_pair(_p_clean)
+                                        from engine.parity_gates import proof_flatten_pair
+                                        _ccxt_pair = _p_clean
+                                        if ':' not in _ccxt_pair and _ccxt_pair.endswith('/USDC'):
+                                            _ccxt_pair = f"{_ccxt_pair}:USDC"
+                                        elif ':' not in _ccxt_pair and _ccxt_pair.endswith('/USDT'):
+                                            _ccxt_pair = f"{_ccxt_pair}:USDT"
+                                        flat = proof_flatten_pair(
+                                            ex_m, _ccxt_pair, human_approved=True,
+                                        )
+                                        if flat.get('success'):
+                                            st.success(
+                                                f"Proof flatten OK: cancelled {flat.get('cancelled_orders', 0)} orders, "
+                                                f"reset {len(flat.get('bots_reset', []))} bots."
+                                            )
+                                        else:
+                                            st.error(flat.get('error', 'Proof flatten failed'))
+                                            for err in flat.get('errors', []):
+                                                st.warning(str(err))
+                                        st.rerun()
+                                with cc2:
+                                    if st.button("❌ Cancel", key=f"ccancel_{mp_pair}"):
+                                        st.session_state[_ck_close] = False
+                                        st.rerun()
 
                 # --- Position Details & Grids ---
                 st.subheader("🤖 Active Bot Positions")
@@ -949,10 +1066,23 @@ def render_monitor_view():
                 df_pos_f['EE Status'] = info_df['EE_Status']
                 df_pos_f['Pos Age'] = info_df['Action_Age']   # basket_start_time: when this entry filled
                 df_pos_f['Cycle Age'] = info_df['Trade_Age']  # cycle_start_time: when the cycle started (last TP)
-                df_pos_f['Total Invested'] = df_pos_f['total_invested'].apply(lambda x: f"${x:,.2f}" if x > 0.01 else "-")
+                df_pos_f['Total Invested'] = df_pos_f['total_invested'].apply(
+                    lambda x: f"${x:,.2f}" if x > 0.01 else "-"
+                )
+                df_pos_f['Open Qty'] = df_pos_f['open_qty'].apply(
+                    lambda x: f"{float(x):.4f}" if pd.notna(x) and float(x) > 1e-8 else "-"
+                )
+                df_pos_f['Avg Entry'] = df_pos_f['avg_entry_price'].apply(
+                    lambda x: f"${float(x):,.4f}" if pd.notna(x) and float(x) > 0 else "-"
+                )
 
                 st.dataframe(
-                    df_pos_f[['name', 'pair', 'direction', 'status', 'Trigger Condition', 'Total Invested', 'Pos Age', 'Expected Profit', 'EE Status', 'Cycle Age', 'Active TP', 'Next Grid', 'Active Orders']], 
+                    df_pos_f[[
+                        'name', 'pair', 'direction', 'status', 'Trigger Condition',
+                        'Total Invested', 'Open Qty', 'Avg Entry',
+                        'Pos Age', 'Expected Profit', 'EE Status', 'Cycle Age',
+                        'Active TP', 'Next Grid', 'Active Orders',
+                    ]],
                     width="stretch",
                     hide_index=True
                 )
@@ -1005,31 +1135,43 @@ def render_monitor_view():
                 
                 # 🚀 UPGRADE 2: Visual Intelligence Overlays
                 if selected_bot_id:
-                    # Fetch current bot status for lines
-                    cur_bot = df_pos[df_pos['id'] == selected_bot_id]
-                    if not cur_bot.empty:
-                        be = float(cur_bot.iloc[0]['avg_entry_price'] or 0)
-                        tp = float(cur_bot.iloc[0]['target_tp_price'] or 0)
-                        
-                        # 1. Average Entry (Yellow Solid)
-                        if be > 0:
-                            fig.add_hline(y=be, line_dash="solid", line_color="#FFD700", 
-                                          annotation_text=f"ENTRY: {be:,.4f}", 
-                                          annotation_position="top left")
-                        
-                        # 2. Take Profit (Green Solid)
-                        if tp > 0:
-                            fig.add_hline(y=tp, line_dash="solid", line_color="#00FF00", 
-                                          annotation_text=f"TP: {tp:,.4f}", 
-                                          annotation_position="bottom right")
+                    # Fetch bot entry/tp directly from DB — df_pos_f only exists inside
+                    # the fragment scope and is not accessible here at the tab level.
+                    try:
+                        _conn_chart = get_connection()
+                        _chart_row = _conn_chart.execute(
+                            "SELECT t.avg_entry_price, t.open_qty "
+                            "FROM trades t WHERE t.bot_id = ?",
+                            (selected_bot_id,)
+                        ).fetchone()
+                        # Best available TP: look for a live TP order on exchange for this bot
+                        _chart_prefix = f"CQB_{selected_bot_id}_"
+                        _tp_orders = [o for o in market_orders
+                                      if str(o.get('clientOrderId', '')).startswith(_chart_prefix)
+                                      and 'TP' in str(o.get('clientOrderId', ''))]
+                        be = float(_chart_row[0] or 0) if _chart_row else 0.0
+                        tp = float(_tp_orders[0].get('price', 0)) if _tp_orders else 0.0
+                    except Exception as _ce:
+                        be, tp = 0.0, 0.0
+
+                    # 1. Average Entry (Yellow Solid)
+                    if be > 0:
+                        fig.add_hline(y=be, line_dash="solid", line_color="#FFD700",
+                                      annotation_text=f"ENTRY: {be:,.4f}",
+                                      annotation_position="top left")
+
+                    # 2. Take Profit (Green Solid — from live exchange order)
+                    if tp > 0:
+                        fig.add_hline(y=tp, line_dash="solid", line_color="#00FF00",
+                                      annotation_text=f"TP: {tp:,.4f}",
+                                      annotation_position="bottom right")
 
                     # 3. Active Grid/Safety Orders (Orange Dashed)
-                    # Filter exchange orders for THIS bot specifically
                     prefix = f"CQB_{selected_bot_id}_"
-                    bot_orders = [o for o in market_orders if str(o.get('clientOrderId', '')).startswith(prefix)]
-                    
-                    grid_orders = [o for o in bot_orders if 'GRID' in str(o.get('clientOrderId', ''))]
-                    # Sort by proximity to current price
+                    bot_orders_chart = [o for o in market_orders
+                                        if str(o.get('clientOrderId', '')).startswith(prefix)]
+                    grid_orders = [o for o in bot_orders_chart
+                                   if 'GRID' in str(o.get('clientOrderId', ''))]
                     last_price = float(df_ohlcv['close'].iloc[-1])
                     grid_orders.sort(key=lambda x: abs(float(x.get('price', 0)) - last_price))
                     

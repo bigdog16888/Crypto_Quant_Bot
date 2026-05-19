@@ -13,11 +13,16 @@ from engine.runner import BotRunner
 
 class TestGhostClearingHedged(unittest.TestCase):
     def setUp(self):
-        self.runner = BotRunner()
+        with patch('engine.runner.BotRunner._initialize_exchanges'), \
+             patch('engine.database.check_and_fix_integrity'), \
+             patch('engine.migrations.migration_001_v2_schema.run'), \
+             patch('engine.runner.BotRunner._post_init'):
+            self.runner = BotRunner()
         # Mock dependencies
         self.runner.get_active_bots = MagicMock()
         self.runner.exchanges = {'future': MagicMock()}
         self.mock_db = MagicMock()
+        self.runner._reconciler = MagicMock()
         
     @patch('engine.database.get_connection')
     @patch('engine.database.log_trade')
