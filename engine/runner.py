@@ -184,11 +184,19 @@ class BotRunner:
     def _write_pid_file(self):
         """Write PID file for UI status detection (Streamlit reads this)."""
         try:
-            pid_file = config.PATHS["PID_FILE"]
-            with open(pid_file, 'w') as f:
-                f.write(str(os.getpid()))
+            from engine.shutdown_control import write_pid
+            write_pid()
         except Exception as e:
             logger.error(f"Failed to write PID file: {e}")
+
+    def _abort_if_stop_requested(self, phase: str) -> bool:
+        """Return True if cooperative stop was requested (sets running=False)."""
+        from engine.shutdown_control import is_stop_requested
+        if is_stop_requested():
+            logger.info(f"🛑 Stop requested during {phase} — aborting.")
+            self.running = False
+            return True
+        return False
 
     def _post_init(self):
         """Post-initialization: safety baseline, startup sync, trading mode."""
@@ -198,7 +206,10 @@ class BotRunner:
         try:
             logger.info("Starting Startup Sync...")
             self.startup_sync()
-            logger.info("Startup Sync Complete")
+            if self._abort_if_stop_requested("startup-sync"):
+                logger.info("Startup sync aborted by stop signal.")
+            else:
+                logger.info("Startup Sync Complete")
         except Exception as e:
             logger.error(f"Failed to sync bots on startup (non-fatal): {e}")
         
@@ -376,7 +387,9 @@ class BotRunner:
         - Adopts active positions if missing from DB.
         """
         logger.info("🔄 [STARTUP-SYNC] Analyzing Exchange Reality...")
-        
+        if self._abort_if_stop_requested("startup-sync"):
+            return
+
         try:
             # 0a. 📡 PRIME POSITION SNAPSHOT — fetch fresh exchange reality BEFORE any reconciliation.
             # ─────────────────────────────────────────────────────────────────────────────────────────
@@ -408,6 +421,9 @@ class BotRunner:
                     logger.warning("⚠️ [STARTUP-PRIME] Could not prime active_positions — reconciler will use stale snapshot.")
             except Exception as _prime_err:
                 logger.warning(f"⚠️ [STARTUP-PRIME] Position prime failed (non-fatal): {_prime_err}")
+
+            if self._abort_if_stop_requested("startup-sync"):
+                return
 
             # 0b. 🛡️ Offline Fill Detection — now runs against fresh exchange reality.
             # This credits any fills that happened while the engine was offline,
@@ -512,13 +528,44 @@ class BotRunner:
                                     f"✅ [STARTUP-PAIR-REPAIR] Parity improved: "
                                     f"{len(_mismatches)} → {len(_mismatches_after)} mismatch(es)."
                                 )
+                            from engine.oneway_netting import reconcile_oneway_pair_open_qty
+                            from engine.database import audit_pair_ledger_vs_exchange
+                            _pairs_for_ow = [
+                                r[0] for r in get_connection().execute(
+                                    "SELECT DISTINCT pair FROM bots WHERE is_active=1"
+                                ).fetchall()
+                            ]
+                            for _ow_p in _pairs_for_ow:
+                                _ow_msg = reconcile_oneway_pair_open_qty(_parity_ex, _ow_p)
+                                if _ow_msg:
+                                    logger.warning(
+                                        f"⚖️ [STARTUP-ONEWAY-REPAIR] {_ow_p}: {_ow_msg}"
+                                    )
                             from engine.parity_gates import startup_repair_mismatched_pairs
                             _repair_summary = startup_repair_mismatched_pairs(_parity_ex)
                             if _repair_summary.get('purged'):
                                 logger.info(
                                     f"✅ [STARTUP-PHANTOM-PURGE] {_repair_summary['purged']}"
                                 )
+                            if _repair_summary.get('deflated'):
+                                logger.warning(
+                                    f"🔧 [STARTUP-DEFLATE] {_repair_summary['deflated']}"
+                                )
+                            if _repair_summary.get('orphan_repaired'):
+                                logger.warning(
+                                    f"🔧 [STARTUP-ORPHAN-REPAIR] {_repair_summary['orphan_repaired']}"
+                                )
                             _mismatches_after = audit_pair_ledger_vs_exchange(_parity_ex)
+                            if not _mismatches_after:
+                                logger.info(
+                                    "✅ [STARTUP-PARITY] All pairs within tolerance after repair."
+                                )
+                            else:
+                                for _p, _v, _ph, _d in _mismatches_after:
+                                    logger.error(
+                                        f"🚨 [STARTUP-PARITY-REMAINING] {_p}: "
+                                        f"ledger={_v:.6f} exchange={_ph:.6f} delta={_d:.6f}"
+                                    )
                             if _mismatches_after:
                                 flag_pair_ledger_mismatch(_mismatches_after)
                 _fixes = sum(sync_trades_from_orders(bid) for bid in _active_ids)
@@ -912,6 +959,8 @@ class BotRunner:
     def run_cycle(self):
         start_time = time.time()
         logger.debug("Entering run_cycle")
+        if self._abort_if_stop_requested("run-cycle"):
+            return False
         self.orders_this_cycle = 0
         self.cycle_count += 1
 
@@ -1286,7 +1335,8 @@ class BotRunner:
         
         # Signal file checks are handled in the main while loop in __main__.
         # Keeping a lightweight in-cycle check here as a secondary safety net.
-        if os.path.exists(config.PATHS["EMERGENCY_FILE"]) or os.path.exists(config.PATHS["STOP_FILE"]):
+        from engine.shutdown_control import is_stop_requested
+        if os.path.exists(config.PATHS["EMERGENCY_FILE"]) or is_stop_requested():
             return False  # Main loop will handle the file cleanup and liquidation
 
         # 3. Process Bots
@@ -1572,7 +1622,15 @@ class BotRunner:
 
 
 if __name__ == "__main__":
+    from engine.shutdown_control import (
+        clear_stop_signal,
+        interruptible_sleep,
+        is_stop_requested,
+        remove_pid,
+    )
+
     STOP, EMERGENCY = config.PATHS["STOP_FILE"], config.PATHS["EMERGENCY_FILE"]
+    shutdown_fast = False
 
     # --- STEP 1: OS-ENFORCED SINGLETON (SocketLock) ---
     lock = SocketLock()
@@ -1606,14 +1664,23 @@ if __name__ == "__main__":
         sys.exit(1)
     
     logger.info("Bot Service Started.")
-    try: runner = BotRunner()
+    try:
+        runner = BotRunner()
     except Exception as e:
         logger.critical(f"FATAL: {e}")
         # === METRICS SERVER STOP ===
         metrics_server.stop()
+        remove_pid()
+        clear_stop_signal()
         lock.release()
         sys.exit(1)
-    runner.running = True
+
+    if is_stop_requested():
+        logger.info("🛑 Stop signal present after startup — exiting without main loop.")
+        runner.running = False
+        shutdown_fast = True
+    else:
+        runner.running = True
 
     # 🚀 ROOT CAUSE FIX: Graceful Signal Handling
     def _graceful_shutdown(signum, frame):
@@ -1634,29 +1701,34 @@ if __name__ == "__main__":
     if os.path.exists(EMERGENCY):
         os.remove(EMERGENCY)
         logger.info("Cleared stale emergency file")
-    
-    if os.path.exists(STOP): os.remove(STOP)
-    
+
     failures = 0
     last_heartbeat = 0
     last_cleanup = 0
     cycle_sleep = 15.0 # Default fallback
-    
-    # Import cleanup utility and WS Server
-    from engine.exchange_interface import cleanup_caches
-    from engine.websocket_server import WebSocketServer
-    
-    # Start WebSocket Server
-    ws_server = None
-    try:
 
-        logger.info("Starting WebSocket Server thread...")
-        ws_server = WebSocketServer(port=8765)
-        ws_server.start()
-        logger.info("WebSocket Server thread started.")
-    except Exception as e:
-        logger.error(f"Failed to start WebSocket Server: {e}")
-    
+    if not runner.running:
+        shutdown_fast = True
+        remove_pid()
+        clear_stop_signal()
+        lock.release()
+        logger.info("🛑 Exiting before main loop (stop during startup or init abort).")
+    else:
+        clear_stop_signal()
+
+        # Import cleanup utility and WS Server
+        from engine.exchange_interface import cleanup_caches
+        from engine.websocket_server import WebSocketServer
+
+        ws_server = None
+        try:
+            logger.info("Starting WebSocket Server thread...")
+            ws_server = WebSocketServer(port=8765)
+            ws_server.start()
+            logger.info("WebSocket Server thread started.")
+        except Exception as e:
+            logger.error(f"Failed to start WebSocket Server: {e}")
+
     while runner.running:
         try:
             # ── SIGNAL FILE CHECKS (checked every cycle) ─────────────────────
@@ -1674,9 +1746,12 @@ if __name__ == "__main__":
                 runner.running = False
                 break
 
-            if os.path.exists(STOP):
-                logger.info("🛑 STOP signal received. Shutting down gracefully...")
-                os.remove(STOP)
+            if is_stop_requested():
+                logger.info("🛑 STOP signal received. Releasing lock and shutting down...")
+                shutdown_fast = True
+                clear_stop_signal()
+                remove_pid()
+                lock.release()
                 runner.running = False
                 break
             # ─────────────────────────────────────────────────────────────────
@@ -1732,29 +1807,37 @@ if __name__ == "__main__":
             logger.critical(f"🛑 FATAL RUNNER ERROR: {e}", exc_info=True)
             break
             
-        time.sleep(cycle_sleep)
+        if interruptible_sleep(cycle_sleep):
+            shutdown_fast = True
+            clear_stop_signal()
+            remove_pid()
+            lock.release()
+            runner.running = False
+            break
+
     # === METRICS SERVER STOP ===
     metrics_server.stop()
-    
-    # Step 2: Drain async DB write queue — all queued fills must be committed.
+    remove_pid()
+    clear_stop_signal()
+
+    _db_timeout = 3.0 if shutdown_fast else 15.0
     try:
         from engine.ws_event_handlers import stop_db_worker
-        logger.info("Flushing async DB write queue before exit...")
-        stop_db_worker(timeout=15.0)  # Extended from 10s to 15s
+        logger.info(f"Flushing async DB write queue before exit (timeout={_db_timeout}s)...")
+        stop_db_worker(timeout=_db_timeout)
         logger.info("✅ DB write queue flushed.")
     except Exception as e:
         logger.error(f"Failed to flush DB write queue: {e}")
 
-    # Step 3: Seal all active bot states from the confirmed DB ledger.
-    # This re-derives total_invested, avg_entry, open_qty from bot_orders fills,
-    # ensuring the DB is self-consistent even if an in-flight WS fill was lost.
-    # On next restart, recompute_invested_from_orders will agree with trades table.
-    try:
-        from engine.ledger import seal_all_active_bots
-        corrected = seal_all_active_bots()
-        logger.info(f"✅ [SHUTDOWN-SEAL] Sealed {corrected} active bot state(s) from confirmed fills.")
-    except Exception as e:
-        logger.error(f"[SHUTDOWN-SEAL] Failed to seal bot states on exit: {e}")
+    if not shutdown_fast:
+        try:
+            from engine.ledger import seal_all_active_bots
+            corrected = seal_all_active_bots()
+            logger.info(f"✅ [SHUTDOWN-SEAL] Sealed {corrected} active bot state(s) from confirmed fills.")
+        except Exception as e:
+            logger.error(f"[SHUTDOWN-SEAL] Failed to seal bot states on exit: {e}")
+    else:
+        logger.info("⚡ [FAST-SHUTDOWN] Skipping full seal (stop signal).")
 
     # Record clean-shutdown timestamp so startup_sync can compute the real offline window.
     try:

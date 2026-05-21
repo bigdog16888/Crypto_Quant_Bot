@@ -1,6 +1,17 @@
-# Operator Runbook — Pair Mismatch & MANUAL GATE (v3.4.2)
+# Operator Runbook — Pair Mismatch & MANUAL GATE (v3.5.2)
 
 **Read when:** Global Netting shows `SYSTEM MISMATCH`, bots show `🚨 MANUAL GATE`, or Order Health says `MISSING CRITICAL ORDERS`.
+
+**Architecture:** `docs/ARCHITECTURE_v3.5.md` | **Changelog:** `docs/CHANGELOG.md`
+
+### Pass/fail rule (v3.5)
+
+| UI | Meaning |
+|----|---------|
+| **HEALTHY** | `audit_pair_ledger_vs_exchange()` = **0** mismatched pairs (qty within `PAIR_PARITY_QTY_TOLERANCE`, default 0.002) |
+| **MISMATCH** | One or more pairs outside tolerance — trading on those pairs is gated until repair or proof flatten succeeds |
+
+Dollar columns in the UI are illustrative (`qty × price`). **Decisions are made in contract qty space.**
 
 ---
 
@@ -18,16 +29,18 @@ Engine log markers: `[STARTUP-PARITY]`, `[STARTUP-PAIR-REPAIR]`, `[PHANTOM-PURGE
 
 ---
 
-## What the new code does (fundamental, not cosmetic)
+## What v3.5 does (fundamental, not cosmetic)
 
-| Before v3.4.0 | After v3.4.0 |
-|---------------|--------------|
-| TP/cycle reset could clear DB while exchange still held size | **Blocked** until pair virtual ≈ exchange |
-| Bot could place TP/grid on wrong ledger | **Blocked** on mismatched pairs |
-| WS could invent `forensic_adoption_*` rows | **Disabled** — `REQUIRE_MANUAL_PROOF` instead |
-| UI Close reset bots even if exchange still open | **Proof flatten** — flat exchange first, then reset |
+| Before v3.5 | After v3.5 |
+|-------------|------------|
+| Startup `[HEALING]` used raw SQL on `filled_amount` | **Only** `credit_fill` + pair heal budget |
+| Parity gate blocked TP/grid on in-trade bots | **`gate_maintain_orders_allowed`** — grids restore while ledger repair runs |
+| DB “grid exists” blocked placement with no exchange order | Stale row **cancelled**, grid re-placed |
+| Ledger > exchange after bad heal | **`deflate_pair_ledger_overcount`** on startup |
+| Ledger 0, exchange has size (XAU class) | **`repair_exchange_orphan_when_ledger_flat`** (CQB proof or flatten) |
+| Stop Monitoring hung 30s+ | **`shutdown_control`** — lock released first |
 
-This stops **new** corruption. It does **not** auto-fix existing gaps — you resolve those once per pair.
+v3.4 stopped **new** corruption; v3.5 **enforces** proof paths and **deterministic repair** when startup audit fails.
 
 ---
 
@@ -218,4 +231,37 @@ When Global Netting shows **0 mismatched pairs** and **ORDERS SYNCED**:
 
 **Prove the fix (not a patch):** After each TP hit, check Global Netting stays green without manual Close. If red appears, check `engine.log` for `[CYCLE-RESET-BLOCKED]` or `[PAIR-LEDGER-MISMATCH]`.
 
-Full architecture: `docs/ARCHITECTURE_v3.4.md`
+Full architecture: `docs/ARCHITECTURE_v3.5.md`
+
+---
+
+## Known patterns — v3.5.2 additions
+
+### Pattern D — `WIPE BLOCKED` loop after startup orphan flatten (v3.5.2 fixed)
+
+**Log signature:**
+```
+[ORPHAN-EXCHANGE] XRP/USDC:USDC: ledger≈0, exchange=16.9 — flattening exchange...
+[ORPHAN-EXCHANGE] Bot 10017 reset after flatten: WIPE BLOCKED: Bot 10017 has live LONG position (16.90)
+[ORPHAN-EXCHANGE] XRP/USDC:USDC: ledger flat, exchange had 16.9 — flattened 16.9.
+Raw API Error 400: {"code":-2022,"msg":"ReduceOnly Order is rejected."}
+```
+
+**What happened:** Startup orphan repair flattened exchange correctly, but the bot ledger was never
+cleared — `active_positions` still showed the pre-flatten size. The engine then tried to TP-maintain
+a phantom position every 7 s, each attempt getting `-2022` rejected.
+
+**Status in v3.5.2:** Auto-fixed. `repair_exchange_orphan_when_ledger_flat` now deletes the stale
+`active_positions` row before resetting. If you see this pattern on an older build, restart the
+engine (v3.5.2 startup repair will resolve it) or run `proof_flatten_pair` via the UI `💥 Close`.
+
+**Manual check (confirm system is clean after startup):**
+```sql
+SELECT b.name, b.pair, t.open_qty, t.total_invested, t.cycle_phase, b.status
+FROM bots b JOIN trades t ON t.bot_id = b.id
+WHERE b.is_active = 1
+AND (t.open_qty > 0 OR t.total_invested > 0)
+ORDER BY b.pair;
+```
+If this returns **only genuinely in-trade bots** (those with real exchange positions), and Global
+Netting shows **0 mismatches**, the system is clean.

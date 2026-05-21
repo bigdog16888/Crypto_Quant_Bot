@@ -1049,7 +1049,8 @@ def calculate_step_from_position(total_invested: float, base_size: float, multip
     return max(0, int(round(step)))
 
 def _reset_bot_after_tp_internal(cursor, bot_id, exit_price, direction=None, action_label='TP_HIT', notes='', exit_fill_ts: int = 0, human_approved: bool = False, exchange=None):
-    excluded_carry_labels = ['SYSTEM_WIPE', 'MANUAL_CLOSE', 'PARTIAL_MANUAL', 'CARRY_WIPE']
+    excluded_carry_labels = ['SYSTEM_WIPE', 'MANUAL_CLOSE', 'PARTIAL_MANUAL', 'CARRY_WIPE',
+                              'ORPHAN_EXCHANGE_REPAIR']  # Orphan repair: caller verified exchange flat
     """
     Internal implementation of reset_bot_after_tp.
     Assumes an active transaction cursor is passed in. Does NOT call conn.commit().
@@ -2957,10 +2958,27 @@ def heal_inflated_filled_amounts(bot_id: int = None) -> int:
         return healed
 
 
+def _score_bot_order_row_for_keeper(row) -> tuple:
+    """Higher score = better row to keep when merging duplicate CIDs."""
+    _id, filled, status, order_id, updated_at = row
+    fill = float(filled or 0)
+    st = (status or '').lower()
+    oid = str(order_id or '')
+    score = fill * 1_000_000
+    if oid and not oid.startswith('PLACING_'):
+        score += 10_000
+    if st in ('open', 'new', 'partially_filled', 'filled', 'closed'):
+        score += 1_000
+    if st in ('open', 'new', 'partially_filled'):
+        score += 500
+    score += int(updated_at or 0) / 1e12
+    return (score, fill, int(updated_at or 0), _id)
+
+
 def consolidate_duplicate_bot_orders(bot_id: int = None) -> int:
     """
     Merge duplicate bot_orders rows that share the same (bot_id, client_order_id).
-    Keeps the row with the highest filled_amount; marks others auto_closed.
+    Keeps the best row (highest fill, real exchange order_id); merges fills/ids; marks others auto_closed.
     Returns count of groups consolidated.
     """
     conn = get_connection()
@@ -2973,8 +2991,7 @@ def consolidate_duplicate_bot_orders(bot_id: int = None) -> int:
             params = (bot_id,)
 
         groups = cursor.execute(f"""
-            SELECT bot_id, client_order_id,
-                   GROUP_CONCAT(id), MAX(filled_amount)
+            SELECT bot_id, client_order_id, GROUP_CONCAT(id)
             FROM bot_orders
             WHERE COALESCE(client_order_id, '') != ''
               AND status NOT IN ('reset_cleared', 'auto_closed')
@@ -2984,23 +3001,36 @@ def consolidate_duplicate_bot_orders(bot_id: int = None) -> int:
         """, params).fetchall()
 
         consolidated = 0
-        for _bid, cid, id_csv, max_fill in groups:
+        for _bid, cid, id_csv in groups:
             ids = [int(x) for x in str(id_csv).split(',') if x]
             if len(ids) < 2:
                 continue
-            keeper = cursor.execute(
+            rows = cursor.execute(
                 """
-                SELECT id FROM bot_orders
-                WHERE id IN ({})
-                ORDER BY filled_amount DESC, id DESC LIMIT 1
+                SELECT id, filled_amount, status, order_id, updated_at
+                FROM bot_orders WHERE id IN ({})
                 """.format(','.join('?' * len(ids))),
                 ids,
-            ).fetchone()[0]
-            dupes = [i for i in ids if i != keeper]
+            ).fetchall()
+            rows_sorted = sorted(rows, key=_score_bot_order_row_for_keeper, reverse=True)
+            keeper_id = rows_sorted[0][0]
+            best_fill = max(float(r[1] or 0) for r in rows)
+            best_oid = None
+            for r in rows_sorted:
+                oid = str(r[3] or '')
+                if oid and not oid.startswith('PLACING_'):
+                    best_oid = oid
+                    break
+            dupes = [i for i in ids if i != keeper_id]
             cursor.execute(
-                "UPDATE bot_orders SET filled_amount=? WHERE id=?",
-                (float(max_fill or 0), keeper),
+                "UPDATE bot_orders SET filled_amount=?, updated_at=? WHERE id=?",
+                (best_fill, int(time.time()), keeper_id),
             )
+            if best_oid:
+                cursor.execute(
+                    "UPDATE bot_orders SET order_id=? WHERE id=? AND (order_id IS NULL OR order_id='' OR order_id LIKE 'PLACING_%')",
+                    (best_oid, keeper_id),
+                )
             for dup_id in dupes:
                 cursor.execute(
                     """
@@ -3013,8 +3043,8 @@ def consolidate_duplicate_bot_orders(bot_id: int = None) -> int:
                 )
             consolidated += 1
             logger.warning(
-                f"[CID-CONSOLIDATE] Bot {_bid} cid={cid}: kept row {keeper} "
-                f"(fill={max_fill}), closed {len(dupes)} duplicate row(s)."
+                f"[CID-CONSOLIDATE] Bot {_bid} cid={cid}: kept row {keeper_id} "
+                f"(fill={best_fill}), closed {len(dupes)} duplicate row(s)."
             )
 
         if consolidated:
@@ -3029,12 +3059,17 @@ def consolidate_duplicate_bot_orders(bot_id: int = None) -> int:
         return 0
 
 
-def audit_pair_ledger_vs_exchange(exchange, qty_tolerance: float = 0.0001) -> list:
+def audit_pair_ledger_vs_exchange(exchange, qty_tolerance: float = None) -> list:
     """
     Compare proof-based virtual net per pair to live signed exchange position.
     Returns list of (pair, virtual_qty, physical_qty, delta) for mismatches.
+    Uses PAIR_PARITY_QTY_TOLERANCE from config when qty_tolerance is omitted.
     """
     from engine.exchange_interface import normalize_symbol
+
+    if qty_tolerance is None:
+        from engine.parity_gates import qty_tolerance as _pair_tol
+        qty_tolerance = _pair_tol()
 
     mismatches = []
     if not exchange:
@@ -3151,14 +3186,43 @@ def verify_filled_orders_against_exchange(exchange, bot_id: int = None) -> int:
             if order_cap > 0:
                 ex_fill = min(ex_fill, order_cap * 1.05)
 
-            if abs(ex_fill - float(db_fill or 0)) <= 1e-8:
+            ex_oid = str(exch_order.get('id') or oid or cid)
+            db_fill_f = float(db_fill or 0)
+            if abs(ex_fill - db_fill_f) <= 1e-8:
                 continue
 
-            if ex_fill < float(db_fill or 0) - 1e-8:
+            if ex_fill < db_fill_f - 1e-8:
                 logger.warning(
                     f"[EXCHANGE-FILL-HEAL] Bot {bid} {otype} cid={cid}: "
-                    f"DB filled={db_fill} > exchange filled={ex_fill}. Reducing ledger."
+                    f"DB filled={db_fill_f} > exchange filled={ex_fill}. "
+                    f"Syncing ledger down to exchange truth."
                 )
+                credit_fill(
+                    bot_id=bid,
+                    order_id=ex_oid,
+                    cumulative_qty=ex_fill,
+                    avg_price=float(
+                        exch_order.get('average')
+                        or exch_order.get('avg_price')
+                        or exch_order.get('price')
+                        or 0
+                    ),
+                    order_type=str(otype).lower(),
+                    is_cumulative=True,
+                    sync_to_exchange=True,
+                )
+                bots_sealed.add(bid)
+                healed += 1
+                continue
+
+            from engine.parity_gates import gate_heal_fill_qty, gate_heal_exit_without_entry
+
+            delta = ex_fill - db_fill_f
+            if not gate_heal_exit_without_entry(bid, str(otype).lower(), delta):
+                continue
+            allowed_delta = gate_heal_fill_qty(pair, delta, exchange=exchange)
+            if allowed_delta <= 0:
+                continue
 
             ex_price = float(
                 exch_order.get('average')
@@ -3166,24 +3230,16 @@ def verify_filled_orders_against_exchange(exchange, bot_id: int = None) -> int:
                 or exch_order.get('price')
                 or 0
             )
-            ex_oid = str(exch_order.get('id') or oid or cid)
+            target_fill = round(db_fill_f + allowed_delta, 8)
             logger.warning(
                 f"[EXCHANGE-FILL-HEAL] Bot {bid} {otype} cid={cid}: "
-                f"DB filled={db_fill} < exchange filled={ex_fill}. Crediting ledger."
+                f"DB filled={db_fill_f} < exchange filled={ex_fill}. "
+                f"Crediting +{allowed_delta:.6f} (target {target_fill:.6f})."
             )
-            cursor.execute(
-                """
-                UPDATE bot_orders
-                SET order_id=?, filled_amount=?, status='filled', updated_at=?
-                WHERE id=?
-                """,
-                (ex_oid, ex_fill, int(time.time()), db_id),
-            )
-            conn.commit()
             credit_fill(
                 bot_id=bid,
                 order_id=ex_oid,
-                cumulative_qty=ex_fill,
+                cumulative_qty=target_fill,
                 avg_price=ex_price,
                 order_type=str(otype).lower(),
                 is_cumulative=True,
@@ -3233,8 +3289,27 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None) -> tuple:
 
         target_cycle = row_trade[0]
         if target_cycle is None:
-            logger.warning(f"[RECOMPUTE] Bot {bot_id}: cycle_id is NULL. Returning zero to prevent phantom accumulation.")
-            return 0.0, 0.0, 0.0, 0, 0.0
+            logger.warning(f"[RECOMPUTE] Bot {bot_id}: cycle_id is NULL. Returning zero to prevent phantom accumulation, but computing hedge_qty since hedges outlive cycles.")
+            cursor.execute("""
+                SELECT 
+                    ROUND(COALESCE(SUM(
+                        CASE 
+                            WHEN bo.status NOT IN ('auto_closed', 'reset_cleared', 'rejected', 'failed')
+                                 AND bo.order_type LIKE 'hedge%' AND bo.order_type NOT LIKE '%tp%' 
+                            THEN bo.filled_amount 
+                            WHEN bo.status NOT IN ('auto_closed', 'reset_cleared', 'rejected', 'failed')
+                                 AND (bo.order_type LIKE 'hedge%tp%' OR bo.order_type LIKE 'hedgetp%') 
+                            THEN -bo.filled_amount
+                            ELSE 0.0 
+                        END
+                    ), 0.0), 8) AS hedge_qty
+                FROM bot_orders bo
+                WHERE bo.bot_id = ?
+                  AND bo.filled_amount > 0
+            """, (bot_id,))
+            row_hq = cursor.fetchone()
+            hedge_qty = float(row_hq[0] or 0) if row_hq else 0.0
+            return 0.0, 0.0, 0.0, 0, hedge_qty
             
         wall_ts = int(row_trade[2] or 0)
         bot_side = row_trade[3] or 'LONG'
@@ -3323,9 +3398,12 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None) -> tuple:
             
             # 🚀 V3.3.1: WIPE AUDIT INTEGRATION
             from .reconciler_wipe_audit import check_recompute_for_suspects
-            suspects = check_recompute_for_suspects(cursor, bot_id, "") # we don't have pair here easily but it's okay for the audit
+            suspects = check_recompute_for_suspects(cursor, bot_id, "")
             if suspects:
-                logger.warning(f"🚨 [WIPE-AUDIT] Bot {bot_id} has {len(suspects)} suspect 'reset_cleared' rows without proof snapshots. Potential ledger gap.")
+                logger.debug(
+                    f"[WIPE-AUDIT] Bot {bot_id}: {len(suspects)} legacy reset_cleared row(s) "
+                    f"without proof snapshots (historical; not an active gap)."
+                )
 
             return total_invested, avg_price, total_net_qty, max_step, hedge_qty
 
@@ -3419,9 +3497,12 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None) -> tuple:
         )
         # 🚀 V3.3.1: WIPE AUDIT INTEGRATION
         from .reconciler_wipe_audit import check_recompute_for_suspects
-        suspects = check_recompute_for_suspects(cursor, bot_id, "") 
+        suspects = check_recompute_for_suspects(cursor, bot_id, "")
         if suspects:
-            logger.warning(f"🚨 [WIPE-AUDIT] Bot {bot_id} has {len(suspects)} suspect 'reset_cleared' rows without proof snapshots. Potential ledger gap.")
+            logger.debug(
+                f"[WIPE-AUDIT] Bot {bot_id}: {len(suspects)} legacy reset_cleared row(s) "
+                f"without proof snapshots (historical; not an active gap)."
+            )
 
         return 0.0, 0.0, 0.0, 0, hedge_qty
     except Exception as e:
@@ -3431,136 +3512,45 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None) -> tuple:
 
 def get_pair_virtual_net(symbol: str) -> float:
     """
-    Returns the signed virtual net quantity for a normalized symbol across ALL active bots.
-    
-    This is the SINGLE SOURCE OF TRUTH for virtual position accounting.
-    Uses identical logic to recompute_invested_from_orders() — same cycle guard,
-    same wipe_wall filter, same order type buckets, same hedge treatment.
-    
-    LONG bots contribute positive qty. SHORT bots contribute negative qty.
-    Net result mirrors what the exchange sees in one-way mode.
-    
-    Args:
-        symbol: Symbol in any format (e.g. 'SOLUSDC', 'SOL/USDC:USDC')
-    
-    Returns:
-        Signed float. Positive = net virtual LONG. Negative = net virtual SHORT.
+  Signed virtual net for a pair in ONE-WAY mode.
+
+  Uses trades.open_qty (maintained by credit_fill + one-way cross-bot reductions)
+  plus hedge adjustment per bot — NOT a raw sum of bot_orders fills, which
+  double-counts when LONG and SHORT bots share the same exchange position.
     """
     from engine.exchange_interface import normalize_symbol
+
     norm_symbol = normalize_symbol(symbol).upper()
-    
     conn = get_connection()
-    cursor = conn.cursor()
-    
+    total_net = 0.0
+
     try:
-        # Get all active bots. We'll filter them by normalized pair in Python to be 100% sure.
-        cursor.execute("""
-            SELECT b.id, b.direction, b.pair, b.normalized_pair,
-                   t.cycle_id as cycle_id,
-                   COALESCE(t.wipe_wall_ts, 0) as wipe_wall_ts,
-                   COALESCE(t.position_side, b.direction) as position_side
+        rows = conn.execute(
+            """
+            SELECT b.id, b.direction, b.pair, b.normalized_pair, COALESCE(t.open_qty, 0)
             FROM bots b
-            LEFT JOIN trades t ON t.bot_id = b.id
+            JOIN trades t ON t.bot_id = b.id
             WHERE b.is_active = 1
-        """)
-        
-        all_active_bots = cursor.fetchall()
-        if not all_active_bots:
+            """
+        ).fetchall()
+        if not rows:
             return 0.0
-        
-        total_net = 0.0
-        
-        for bot_id, direction, raw_pair, bot_norm_pair, cycle_id, wipe_wall_ts, position_side in all_active_bots:
-            # Normalize the bot's pair to compare with our target norm_symbol
-            # Priority: (1) b.normalized_pair, (2) normalize_symbol(b.pair)
+
+        for bot_id, direction, raw_pair, bot_norm_pair, open_qty in rows:
             current_bot_norm = (bot_norm_pair or normalize_symbol(raw_pair)).upper()
-            
             if current_bot_norm != norm_symbol:
                 continue
-            
-            # Allow hedge-only bots through, just zero out the cycle-dependent params
-            if cycle_id is None:
-                # Hedge is cross-cycle — still calculate it.
-                # Entry/exit queries will return 0 (cycle_id=None matches nothing), 
-                # which is correct for a Step 0 hedged bot with no active entries.
-                cycle_id_safe = -1  # Will match nothing in cycle_id = ? comparisons
-                wipe_wall_ts_safe = 0
-            else:
-                cycle_id_safe = cycle_id
-                wipe_wall_ts_safe = int(wipe_wall_ts or 0)
-            
-            # Use identical SQL to recompute_invested_from_orders
-            res = cursor.execute(f"""
-                SELECT
-                    COALESCE(SUM(
-                        CASE WHEN bo.cycle_id = ? 
-                             AND bo.status NOT IN ('auto_closed', 'reset_cleared')
-                             AND (? = 0 OR bo.created_at >= ?)
-                             AND bo.order_type IN ('entry','grid','adoption_add','adoption','carry')
-                        THEN bo.filled_amount ELSE 0.0 END
-                    ), 0.0) AS bought_qty,
-                    
-                    COALESCE(SUM(
-                        CASE WHEN bo.cycle_id = ?
-                             AND bo.status NOT IN ('auto_closed', 'reset_cleared')
-                             AND (? = 0 OR bo.created_at >= ?)
-                             AND bo.order_type IN ('adoption_reduce','tp','close','dust_close','sl','virtual_netting')
-                        THEN bo.filled_amount ELSE 0.0 END
-                    ), 0.0) AS sold_qty,
-                    
-                    -- Hedge: cross-cycle, no wipe_wall — matches recompute_invested_from_orders exactly
-                    ROUND(COALESCE(SUM(
-                        CASE 
-                            WHEN bo.status NOT IN ('auto_closed','reset_cleared','rejected','failed')
-                                 AND bo.order_type LIKE 'hedge%' AND bo.order_type NOT LIKE '%tp%'
-                            THEN bo.filled_amount
-                            WHEN bo.status NOT IN ('auto_closed','reset_cleared','rejected','failed')
-                                 AND (bo.order_type LIKE 'hedge%tp%' OR bo.order_type LIKE 'hedgetp%')
-                            THEN -bo.filled_amount
-                            ELSE 0.0
-                        END
-                    ), 0.0), 8) AS hedge_qty
-                    
-                {_canonical_bot_orders_from('bo')}
-                  AND bo.bot_id = ?
-                  AND (
-                      bo.order_type LIKE 'hedge%' 
-                      OR bo.position_side = ? 
-                      OR bo.position_side IS NULL 
-                      OR bo.position_side = 'BOTH' 
-                      OR bo.position_side = ''
-                  )
-                  AND (
-                      bo.status IN ('filled', 'closed', 'auto_closed', 'hedge_exited')
-                      OR (bo.status IN ('canceled', 'cancelled') AND bo.filled_amount > 0)
-                  )
-                  AND bo.filled_amount > 0
-            """, (
-                cycle_id_safe, wipe_wall_ts_safe, wipe_wall_ts_safe,  # bought_qty
-                cycle_id_safe, wipe_wall_ts_safe, wipe_wall_ts_safe,  # sold_qty
-                # hedge_qty: no cycle/wall params — unconditional
-                bot_id, position_side
-            )).fetchone()
-            
-            if not res:
-                continue
-            
-            bought_qty, sold_qty, hedge_qty = float(res[0] or 0), float(res[1] or 0), float(res[2] or 0)
-            
-            # Net entry/exit qty (no hedge here — hedge is a separate exchange-side position)
-            bot_net_qty = round(bought_qty - sold_qty, 8)
-            
-            # Sign by direction for one-way mode netting
+            oq = float(open_qty or 0)
+            hedge_qty = get_bot_hedge_qty(bot_id)
             direction_upper = str(direction).upper()
             if direction_upper == 'LONG':
-                signed_qty = bot_net_qty - hedge_qty   # hedge is a SHORT, reduces net LONG
+                signed_qty = round(oq - hedge_qty, 8)
             else:
-                signed_qty = -bot_net_qty + hedge_qty  # hedge on a SHORT bot adds back LONG
-                
+                signed_qty = round(-oq + hedge_qty, 8)
             total_net = round(total_net + signed_qty, 8)
-        
+
         return total_net
-        
+
     except Exception as e:
         logger.error(f"[get_pair_virtual_net] Error for {symbol}: {e}")
         return 0.0

@@ -9,7 +9,9 @@ A professional-grade, multi-bot algorithmic trading system designed for **Binanc
 *   **Ghost-Proof Order Management:** Advanced string-parsing logic for `clientOrderId` eliminates infinite cancel/recreate loops and stale order "ghosting."
 *   **Drift-Aware Consensus:** Pair-consensus logic accounts for sibling virtual positions on the same pair, preventing false-positive drift alerts in One-Way accounts.
 *   **Atomic State Integrity:** Consolidates snapshots into `BEGIN IMMEDIATE` transaction blocks with fail-safe recovery for TP and Grid placements.
-*   **High-Precision Arithmetic:** All calculations use cent-level ($0.01) precision guards, eliminating floating-point noise across all assets.
+*   **High-Precision Arithmetic & Ledger Mapping:** All calculations use cent-level ($0.01) precision guards. WebSocket order fills map correctly to `pnl` and `cost_usdc` database columns, eliminating numerical noise.
+*   **🛡️ [DEDUP-GUARD] Pre-flight Check (v3.1):** Enforces a strict pre-flight state lock in `bot_executor.py` preventing duplicate orders from being placed during runner retry loops if an order is already executing.
+*   **💥 Single-Click Close Orphan UI (v3.1):** Dashboard features a visual mismatch-action button allowing users to immediately resolve and flatten orphaned positions on the exchange with single-click precision.
 *   **Async DB Write Queue:** WebSocket fill events are dispatched to a non-blocking background SQLite worker, keeping the CCXT listener lag-free.
 *   **Dynamic Fragment UI Refresh:** Dashboard utilizes independent `@st.fragment` zones for Header (30s) and Bot Grid (15s) with live data-sync timestamps — zero full-page flickering.
 *   **SocketLock Singleton:** OS-enforced process protection (TCP port 19888) to prevent duplicate runners.

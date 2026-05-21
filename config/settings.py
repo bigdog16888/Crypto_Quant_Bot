@@ -60,6 +60,15 @@ class Config:
         self.TESTNET_PURGE_PHANTOM_LEDGER = os.getenv(
             "TESTNET_PURGE_PHANTOM_LEDGER", _purge_default
         ).lower() == "true"
+        # When ledger is flat but exchange still holds size, auto repair (adopt with proof or flatten)
+        _orphan_default = "True" if self.TESTNET else "False"
+        self.AUTO_REPAIR_ORPHAN_EXCHANGE = os.getenv(
+            "AUTO_REPAIR_ORPHAN_EXCHANGE", _orphan_default
+        ).lower() == "true"
+        # One-way: block opposite-direction entry while siblings hold open_qty
+        self.ONE_WAY_BLOCK_OPPOSITE_ENTRY = os.getenv(
+            "ONE_WAY_BLOCK_OPPOSITE_ENTRY", "True"
+        ).lower() == "true"
 
         self.ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         self.PATHS = {

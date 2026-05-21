@@ -1,20 +1,25 @@
 # Crypto Quant Bot — AI Agent Codebase Guide
-**Version: 3.4.2 | Last Updated: 2026-05-19**
+**Version: 3.5.2 | Last Updated: 2026-05-21**
 
 > **READ THIS FIRST** before touching any code. This is the single authoritative guide.
 > It supersedes `UNIFIED_BOT_DOCUMENTATION.md` and all older session notes.
-> **Architecture deep-dive:** `docs/ARCHITECTURE_v3.4.md`
+> **Architecture (current):** `docs/ARCHITECTURE_v3.5.md`
+> **Version history:** `docs/CHANGELOG.md`
+> **Architecture v3.4 (historical):** `docs/ARCHITECTURE_v3.4.md`
 > **Operator steps:** `docs/OPERATOR_MISMATCH_RUNBOOK.md`
 
 ---
 
 ## 🏗️ High-Level Engine Architecture
-The Crypto Quant Bot uses a **Proof-Only Reconciliation Architecture** (v3.4.x).
+The Crypto Quant Bot uses a **Proof-Only Reconciliation Architecture** (v3.5.0 enforces v3.4 design).
 
-1. **Virtual ledger (`bot_orders` + `get_pair_virtual_net`)** — Only CQB-tagged fills count. No forensic inventing (`ALLOW_FORENSIC_ADOPT=False`).
+**Parity pass (exact):** For every pair, `abs(virtual_qty - exchange_qty) <= PAIR_PARITY_QTY_TOLERANCE` (default 0.002). UI **HEALTHY** only when `audit_pair_ledger_vs_exchange()` returns zero rows. No “close enough.”
+
+1. **Virtual ledger (`bot_orders` + `get_pair_virtual_net`)** — Only CQB-tagged fills via `credit_fill()`. No raw SQL heal. No forensic inventing (`ALLOW_FORENSIC_ADOPT=False`).
 2. **Physical imprint (Binance one-way net)** — `fetch_positions()` signed `net_qty` per symbol.
-3. **`parity_gates.py`** — Blocks cycle reset and new orders when virtual ≠ exchange; purges phantom ledger when exchange is flat (testnet).
-4. **`StateReconciler`** — CQB history scan, seal, adopt; escalates to `REQUIRE_MANUAL_PROOF` instead of guessing.
+3. **`parity_gates.py`** — Cycle reset gate; **entry** gate (strict); **maintain** gate (in-trade TP/grid); startup repair (deflate / orphan / phantom purge).
+4. **`StateReconciler`** — CQB history scan through heal gates only; escalates to `REQUIRE_MANUAL_PROOF` instead of guessing.
+5. **`shutdown_control.py`** — Cooperative engine stop (port 19888 + PID).
 
 **Operator flow:** `run_bot.bat` → **Start Monitoring** → `startup_sync` → main loop. Optional: `run_stack.bat` starts both UI and engine.
 
@@ -65,7 +70,8 @@ Crypto_Quant_Bot/
 │   ├── exchange_interface.py  ← CCXT + raw Binance FAPI wrapper
 │   ├── ws_cache.py            ← In-memory position/order snapshot (WS + REST merged)
 │   ├── ws_event_handlers.py   ← Real-time WebSocket fill processing
-│   ├── parity_gates.py        ← Pair parity gates + proof flatten (v3.4.0)
+│   ├── parity_gates.py        ← Pair parity, heal gates, repair, proof flatten (v3.5.0)
+│   ├── shutdown_control.py    ← Stop file, SocketLock port, PID lifecycle (v3.5.0)
 │   └── websocket_handler.py   ← WS connection manager
 ├── scripts/run_startup_heal.py ← One-shot ledger heal (no trading loop)
 ├── docs/OPERATOR_MISMATCH_RUNBOOK.md ← Human steps for mismatch rows (read this)
@@ -383,6 +389,7 @@ To prevent Binance **`-2022 ReduceOnly Order is rejected`** errors in hedged (On
 | Virtual net explodes to millions (XRP 1k→17M) | Forensic adoption wrote `adoption_add` rows which `get_pair_virtual_net()` counted as real fills, doubling the gap each cycle and triggering a new adoption record | Fixed in v3.1.0: Bidirectional forensic adoption disabled. v3.1.4 adds fractional drift sweeper using `drift_note` (invisible to ledger math) for sub-$5 / sub-0.5u residuals |
 | Monitor `Trigger` column shows `N/A` for all scanning bots | `extract_info` computed price-threshold proximity only; RSI/CCI branches existed but returned the raw level string without live value | Fixed in v3.1.2: `get_indicator_val()` fetches live OHLCV and computes RSI/CCI/Stoch in-fragment with a local cache; proximity label (`🟢 IN RANGE / 🟡 SOON / ⚪ FAR`) attached to every trigger type |
 | `💥 Close` on mismatch row returns Binance 400 ReduceOnly error, bot stays stuck | `create_order(reduceOnly=True)` rejected because position already flat; error aborted the bot-state reset | Fixed in v3.1.3: `Close` now catches `reduceOnly`/`400`/`not found` errors, issues a warning toast, and **always** proceeds to `reset_bot_after_tp` so bot returns to IDLE even when exchange is already flat |
+| `WIPE BLOCKED: Bot X has live SHORT/LONG position` after startup orphan flatten | `repair_exchange_orphan_when_ledger_flat` sent a `reduceOnly` market close, then immediately called `reset_bot_after_tp`. `_fetch_pos_wrapper` inside `safe_mark_reset_cleared` reads `active_positions` (stale — not yet updated by the WS fill that's still in-flight). Guard sees non-zero qty → raises `WipeBlockedError` → bot ledger stays stuck with phantom `open_qty` despite exchange being flat. Loop fires every 7s. | Fixed in v3.5.2: (1) `repair_exchange_orphan_when_ledger_flat` deletes the `active_positions` row for the pair **after** confirming flatten and before calling reset. (2) `'ORPHAN_EXCHANGE_REPAIR'` added to `excluded_carry_labels` and `CYCLE_RESET_CARRY_LABELS` so `safe_mark_reset_cleared` uses `allow_nonzero_wipe=True` for this path. |
 
 ---
 
@@ -408,7 +415,24 @@ After restart, watch for:
 
 ## 7. Version History (Change Log)
 
-### v3.4.2 — 2026-05-19
+### v3.5.2 — 2026-05-21
+**Orphan-repair stale-snapshot deadlock fix. Zero mismatches verified live.**
+
+**engine/parity_gates.py**:
+- `repair_exchange_orphan_when_ledger_flat`: After a successful `reduceOnly` market flatten, now **clears `active_positions`** for the affected pair before calling `reset_bot_after_tp`. The old `active_positions` row predates the market order, so `_fetch_pos_wrapper` still saw a non-zero physical qty and raised `WipeBlockedError`, leaving bot ledgers stuck with phantom `open_qty` despite the exchange being flat.
+- Increased post-flatten sleep 0.5 s → 1.0 s to give Binance extra processing time.
+- Added `'ORPHAN_EXCHANGE_REPAIR'` to `CYCLE_RESET_CARRY_LABELS` so `assert_cycle_reset_allowed` bypasses the parity gate for this label (caller already verified exchange flat).
+
+**engine/database.py**:
+- `_reset_bot_after_tp_internal`: Added `'ORPHAN_EXCHANGE_REPAIR'` to `excluded_carry_labels`. This sets `allow_nonzero_wipe=True` in `safe_mark_reset_cleared`, bypassing the `WipeBlockedError` when the exchange just confirmed the flatten but `active_positions` hasn't refreshed yet.
+
+**One-off DB recovery (2026-05-21)**:
+- Bot 10016 (`long btc price`): Cancelled 2 phantom BTC grid orders on exchange; reset ledger to IDLE. Exchange confirmed flat.
+- Bot 10022 (`short btc`): Cleared `REQUIRE_MANUAL_PROOF` → `Scanning`. Set by startup when BTC orphan was detected; already resolved by startup flatten.
+
+**Verified clean:** `SELECT ... WHERE open_qty > 0` returns exactly the 4 genuinely in-trade bots; parity check across all 8 pairs = 0 mismatches.
+
+### v3.5.1 — 2026-05-20 — Parity repair correctness
 **Monitor UX + workspace cleanup + architecture doc.**
 
 **ui/views/monitor.py**:

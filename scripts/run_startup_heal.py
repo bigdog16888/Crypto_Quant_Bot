@@ -69,10 +69,31 @@ def main():
     for bid_row in conn.execute("SELECT id FROM bots WHERE is_active=1"):
         sync_trades_from_orders(bid_row[0])
 
+    print("\n[6/7] One-way open_qty repair (cross-bot netting)...")
+    from engine.oneway_netting import reconcile_oneway_pair_open_qty
+    conn = get_connection()
+    for (pair,) in conn.execute("SELECT DISTINCT pair FROM bots WHERE is_active=1"):
+        msg = reconcile_oneway_pair_open_qty(ex, pair)
+        if msg:
+            print(f"      {pair}: {msg}")
+
+    print("\n[7/7] Pair parity repair (deflate / orphan flatten)...")
+    from engine.parity_gates import startup_repair_mismatched_pairs, qty_tolerance
+    repair = startup_repair_mismatched_pairs(ex)
+    if repair.get("deflated"):
+        print(f"      deflated: {repair['deflated']}")
+    if repair.get("orphan_repaired"):
+        print(f"      orphan repaired: {repair['orphan_repaired']}")
+    if repair.get("purged"):
+        print(f"      purged: {repair['purged']}")
+    if repair.get("remaining"):
+        print(f"      still mismatched: {repair['remaining']}")
+
     print("\n" + "=" * 60)
     print("PAIR PARITY (virtual vs live exchange)")
     print("=" * 60)
-    mismatches = audit_pair_ledger_vs_exchange(ex)
+    tol = qty_tolerance()
+    mismatches = audit_pair_ledger_vs_exchange(ex, tol)
     pairs = conn.execute(
         "SELECT DISTINCT pair FROM bots WHERE is_active=1"
     ).fetchall()
@@ -83,7 +104,7 @@ def main():
         for pos in ex.fetch_positions() or []:
             if normalize_symbol(pos.get("symbol", "")).upper() == norm:
                 phys += float(pos.get("contracts", 0) or pos.get("size", 0) or 0)
-        ok = abs(v - phys) < 0.001
+        ok = abs(v - phys) <= tol
         flag = "OK" if ok else "MISMATCH"
         print(f"  [{flag}] {norm}: virtual={v:+.4f}  exchange={phys:+.4f}  delta={phys - v:+.4f}")
 

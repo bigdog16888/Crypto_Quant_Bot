@@ -98,6 +98,7 @@ def test_get_pair_virtual_net(memory_db):
     memory_db.commit()
     
     database.recompute_invested_from_orders(1, 1)
+    database.sync_trades_from_orders(1)
     
     net = database.get_pair_virtual_net('BTC/USDC:USDC')
     assert net == 2.0 
@@ -179,6 +180,7 @@ def test_canonical_dedup_uses_max_fill_row(memory_db):
     )
     memory_db.commit()
     _cost, _avg, basket_net, _step, _hq = database.recompute_invested_from_orders(1, 1)
+    database.sync_trades_from_orders(1)
     assert basket_net == pytest.approx(1.08)
     assert database.get_pair_virtual_net('LINK/USDC:USDC') == pytest.approx(-1.08)
 
@@ -224,6 +226,7 @@ def test_hedge_order_virtual_net(memory_db):
     memory_db.commit()
     
     database.recompute_invested_from_orders(1, 1)
+    database.sync_trades_from_orders(1)
     
     net = database.get_pair_virtual_net('BTC/USDC:USDC')
     # Net should be +2.0 (entry) - 1.0 (hedge) = +1.0
@@ -238,6 +241,7 @@ def test_cancelled_partial_fill_not_phantom(memory_db):
         VALUES (1, 'entry', 'order_link_1', 15.0, 10.0, 5.28, 'cancelled', 1, 1)
     """)
     memory_db.commit()
+    database.sync_trades_from_orders(1)
     
     # Assert virtual net before reset is 5.28 (since it's a partially filled cancelled order)
     assert database.get_pair_virtual_net('LINK/USDT:USDT') == 5.28
@@ -305,6 +309,7 @@ def test_hedge_position_side_short_counted(memory_db):
     memory_db.commit()
     
     database.recompute_invested_from_orders(1, 1)
+    database.sync_trades_from_orders(1)
     net = database.get_pair_virtual_net('BTC/USDC:USDC')
     # Net should include the hedge: 2.0 (entry) - 1.0 (hedge) = 1.0
     assert net == 1.0
@@ -488,6 +493,7 @@ def test_duplicate_entry_same_cid_not_double_counted(memory_db):
     
     # Assert recompute_invested_from_orders only counts unique fills, not duplicates
     total_invested, avg_price, open_qty, max_step, hedge_qty = database.recompute_invested_from_orders(1, 1)
+    database.sync_trades_from_orders(1)
     assert open_qty == 1.0
     assert total_invested == 50000.0
     

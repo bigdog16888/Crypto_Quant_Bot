@@ -61,8 +61,17 @@ def test_database_initialization():
         print("  ✓ position_locks table correctly removed")
     finally:
         engine.database.DB_PATH = original_path
+        if hasattr(engine.database._local, 'connection') and engine.database._local.connection:
+            try:
+                engine.database._local.connection.close()
+            except Exception:
+                pass
+            engine.database._local.connection = None
         if os.path.exists(test_dir):
-            shutil.rmtree(test_dir)
+            try:
+                shutil.rmtree(test_dir)
+            except Exception as e:
+                print(f"Warning: temp dir cleanup failed: {e}")
 
 def test_update_martingale_step_exists():
     """Test that update_martingale_step function exists and is callable"""

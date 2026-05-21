@@ -87,7 +87,8 @@ def credit_fill(
     avg_price: float,
     order_type: str = 'grid',
     is_cumulative: bool = True,
-    fill_ts: int = 0
+    fill_ts: int = 0,
+    sync_to_exchange: bool = False,
 ) -> bool:
     """
     Record a fill (or partial fill) in bot_orders.
@@ -159,13 +160,18 @@ def credit_fill(
                 )
                 cumulative_qty = cap
 
-        # MAX() protection: never reduce filled_amount
+        # MAX() protection: never reduce filled_amount unless syncing to exchange truth
         if is_cumulative and cumulative_qty <= existing_fill:
-            logger.debug(
-                f"[CREDIT-FILL] Bot {bot_id} order {order_id}: "
-                f"cumulative {cumulative_qty:.6f} <= existing {existing_fill:.6f} — skip (idempotent)."
+            if not sync_to_exchange or abs(cumulative_qty - existing_fill) <= 1e-12:
+                logger.debug(
+                    f"[CREDIT-FILL] Bot {bot_id} order {order_id}: "
+                    f"cumulative {cumulative_qty:.6f} <= existing {existing_fill:.6f} — skip."
+                )
+                return False
+            logger.warning(
+                f"[CREDIT-FILL-SYNC] Bot {bot_id} order {order_id}: "
+                f"reducing filled {existing_fill:.6f} → {cumulative_qty:.6f} (exchange truth)."
             )
-            return False
 
         # Determine new status
         fully_filled = order_amount > 0 and (cumulative_qty / order_amount) >= 0.99
@@ -266,26 +272,62 @@ def credit_fill(
         # ── OPEN_QTY ACCUMULATOR [v2.1] ─────────────────────────────────────────
         # Maintain trades.open_qty as an explicit running total of confirmed fills.
         # delta = net NEW qty credited this call (cumulative_qty - prior existing_fill).
-        delta = cumulative_qty - existing_fill  # always > 0 (guarded above by MAX check)
+        delta = cumulative_qty - existing_fill
         _otype_lower = str(order_type).lower()
         try:
             if _otype_lower in _ENTRY_TYPES:
-                conn.execute(
-                    "UPDATE trades SET open_qty = ROUND(COALESCE(open_qty, 0) + ?, 8) "
-                    "WHERE bot_id = ?",
-                    (delta, bot_id)
-                )
-                logger.debug(f"[OPEN-QTY] Bot {bot_id}: +{delta:.8f} ({_otype_lower}) delta")
+                if delta >= 0:
+                    conn.execute(
+                        "UPDATE trades SET open_qty = ROUND(COALESCE(open_qty, 0) + ?, 8) "
+                        "WHERE bot_id = ?",
+                        (delta, bot_id),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE trades SET open_qty = MAX(0, ROUND(COALESCE(open_qty, 0) + ?, 8)) "
+                        "WHERE bot_id = ?",
+                        (delta, bot_id),
+                    )
+                logger.debug(f"[OPEN-QTY] Bot {bot_id}: {delta:+.8f} ({_otype_lower})")
             elif _otype_lower in _EXIT_TYPES:
-                conn.execute(
-                    "UPDATE trades SET open_qty = MAX(0, ROUND(COALESCE(open_qty, 0) - ?, 8)) "
-                    "WHERE bot_id = ?",
-                    (delta, bot_id)
-                )
-                logger.debug(f"[OPEN-QTY] Bot {bot_id}: -{delta:.8f} ({_otype_lower}) delta")
+                if delta >= 0:
+                    conn.execute(
+                        "UPDATE trades SET open_qty = MAX(0, ROUND(COALESCE(open_qty, 0) - ?, 8)) "
+                        "WHERE bot_id = ?",
+                        (delta, bot_id),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE trades SET open_qty = ROUND(COALESCE(open_qty, 0) + ?, 8) "
+                        "WHERE bot_id = ?",
+                        (-delta, bot_id),
+                    )
+                logger.debug(f"[OPEN-QTY] Bot {bot_id}: exit delta {delta:+.8f} ({_otype_lower})")
         except Exception as _oq_err:
             # Non-fatal: open_qty will be backfilled by check_and_fix_integrity on next startup
             logger.warning(f"[OPEN-QTY] Bot {bot_id}: accumulator update failed: {_oq_err}")
+
+        # One-way shared book: opposite-direction siblings must lose open_qty when this
+        # entry/grid fill nets against their side on the exchange.
+        if _otype_lower in _ENTRY_TYPES and delta > 1e-12:
+            try:
+                pair_row = conn.execute(
+                    "SELECT pair, direction FROM bots WHERE id = ?", (bot_id,)
+                ).fetchone()
+                if pair_row:
+                    from engine.oneway_netting import apply_oneway_entry_cross_reduction
+                    apply_oneway_entry_cross_reduction(
+                        bot_id,
+                        pair_row[0],
+                        pair_row[1],
+                        delta,
+                        str(order_id),
+                        avg_price,
+                    )
+            except Exception as _ow_err:
+                logger.warning(
+                    f"[ONEWAY-CROSS] Bot {bot_id} post-fill netting failed: {_ow_err}"
+                )
 
         conn.commit()
 

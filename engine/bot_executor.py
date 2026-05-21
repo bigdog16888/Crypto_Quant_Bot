@@ -1276,9 +1276,8 @@ class BotExecutor:
         # to ACTIVE right now, then fall through to normal execution.
         if bot_status.get('cycle_phase') == 'CARRY_PENDING':
             try:
-                from engine.database import get_connection as _gc_cp
                 from engine.ledger import seal_trade_state as _seal_cp
-                _conn_cp = _gc_cp()
+                _conn_cp = get_connection()
                 _carry_filled = _conn_cp.execute(
                     "SELECT COUNT(*) FROM bot_orders "
                     "WHERE bot_id=? AND order_type IN ('entry','carry') "
@@ -1403,8 +1402,7 @@ class BotExecutor:
         #   - 30s lock expired → bot tries to place ANOTHER entry
         # Solution: retroactively credit the fill from DB, never spam a new order.
         try:
-            from engine.database import get_connection as _gc
-            _conn = _gc()
+            _conn = get_connection()
             # ── ANCHOR GUARD v2: scope to CURRENT cycle_id only ─────────────────────
             # BUG-FIX: Without cycle_id scoping, historical filled rows from prior cycles
             # remain in bot_orders (status='filled', not reset_cleared) and permanently
@@ -1523,6 +1521,12 @@ class BotExecutor:
                     except Exception as e:
                         logger.error(f"⚠️ {name}: Maker alignment error: {e}")
 
+                    from engine.oneway_netting import gate_oneway_opposite_entry
+                    _ow_ok, _ow_reason = gate_oneway_opposite_entry(bot_id, pair, direction)
+                    if not _ow_ok:
+                        logger.warning(f"🛑 {name}: {_ow_reason}")
+                        return None
+
                     valid, amount, price, msg = exchange.validate_order(pair, side, amount, price)
                     if not valid:
                         logger.error(f"❌ Entry Order validation failed for {name} {pair}: {msg}")
@@ -1532,11 +1536,26 @@ class BotExecutor:
                     logger.info(f"🧐 {name}: Creating Order on Exchange...")
                     cycle_id = bot_status.get('cycle_id', 0)
                     client_order_id = self._generate_deterministic_id(bot_id, 'ENTRY', cycle_id, 1)
+
+                    # 🚀 [DEDUP-GUARD] pre-flight check
+                    try:
+                        _dedup_conn = get_connection()
+                        _existing_count = _dedup_conn.execute(
+                            "SELECT COUNT(*) FROM bot_orders "
+                            "WHERE client_order_id = ? "
+                            "AND status NOT IN ('cancelled', 'canceled', 'failed', 'reset_cleared', 'auto_closed', 'rejected')",
+                            (client_order_id,)
+                        ).fetchone()[0]
+                        logger.info(f"🔍 [DEDUP-GUARD-DEBUG] client_order_id={client_order_id} count={_existing_count}")
+                        if _existing_count > 0:
+                            logger.warning(f"🛡️ [DEDUP-GUARD] Entry already exists for this CID: {client_order_id}. Skipping placement.")
+                            return None
+                    except Exception as _dedup_err:
+                        logger.error(f"❌ {name}: [DEDUP-GUARD] check failed: {_dedup_err}")
                     
                     # 🚀 CONCURRENCY LOCK: Set basket_start_time BEFORE calling exchange
                     # This prevents rapid-fire loops from bypassing the in-flight check.
                     try:
-                        from engine.database import get_connection
                         conn = get_connection()
                         cursor = conn.cursor()
                         cursor.execute("UPDATE trades SET basket_start_time = ? WHERE bot_id = ?", (int(time.time()), bot_id))
@@ -1588,7 +1607,6 @@ class BotExecutor:
 
                         # Record entry_order_id in trades for quick lookup
                         try:
-                            from engine.database import get_connection
                             conn = get_connection()
                             conn.execute(
                                 "UPDATE trades SET entry_order_id = ? WHERE bot_id = ?",
@@ -2067,8 +2085,13 @@ class BotExecutor:
             logger.info(f"🛑 [MAINTAIN-BLOCKED] Trading disabled. Bot {name} cannot maintain orders.")
             return
 
-        from engine.parity_gates import gate_trading_allowed
-        allowed, reason = gate_trading_allowed(bot_id, pair, exchange)
+        from engine.parity_gates import gate_maintain_orders_allowed
+        allowed, reason = gate_maintain_orders_allowed(
+            bot_id,
+            pair,
+            exchange=exchange,
+            total_invested=float(bot_status.get('total_invested', 0) or 0),
+        )
         if not allowed:
             logger.warning(f"🛑 [MAINTAIN-BLOCKED] {name}: {reason}")
             return None
@@ -2792,14 +2815,37 @@ class BotExecutor:
              try:
                  from engine.database import get_connection
                  _conn = get_connection()
-                 _placed_grid = _conn.execute(
-                     "SELECT 1 FROM bot_orders WHERE bot_id=? AND cycle_id=? AND step=? AND order_type='grid' AND status IN ('placing', 'new', 'open', 'partially_filled', 'filled', 'closed')", 
-                     (bot_id, bot_status.get('cycle_id', 0), expected_grid_step)
+                 # Only block when an exchange-tracked grid is actively open (not filled/closed ghosts).
+                 _active_grid = _conn.execute(
+                     """
+                     SELECT id, order_id, status FROM bot_orders
+                     WHERE bot_id=? AND cycle_id=? AND step=? AND order_type='grid'
+                       AND status IN ('placing', 'new', 'open', 'partially_filled')
+                       AND COALESCE(order_id, '') NOT LIKE 'PLACING_%'
+                     """,
+                     (bot_id, bot_status.get('cycle_id', 0), expected_grid_step),
                  ).fetchone()
-                 if _placed_grid:
-                     logger.warning(f"🛡️ {name}: DB mathematically proves Grid step {expected_grid_step} is ALREADY placed/filled. Yielding Grid placement to prevent double-tap.")
-                     return None
-             except: pass
+                 if _active_grid:
+                     _gid, _goid, _gst = _active_grid
+                     _on_exchange = any(
+                         str(o.get('id')) == str(_goid)
+                         for o in (open_orders or [])
+                         if '_GRID_' in str(o.get('clientOrderId', ''))
+                     )
+                     if _on_exchange:
+                         logger.info(
+                             f"🛡️ {name}: Grid step {expected_grid_step} live on exchange ({_goid}). "
+                             f"Skipping duplicate placement."
+                         )
+                         return None
+                     logger.warning(
+                         f"👻 {name}: DB grid step {expected_grid_step} ({_gst}) not on exchange — "
+                         f"clearing stale row {_gid} to restore grid."
+                     )
+                     from engine.database import update_order_status as _uos_grid
+                     _uos_grid(str(_goid or _gid), 'cancelled', bot_id=bot_id)
+             except Exception as _grid_idem_err:
+                 logger.debug(f"{name}: grid idempotency check: {_grid_idem_err}")
 
              # 🚀 STRICT SEQUENCING: Do NOT place Grid orders if an Entry order is still open.
              if existing_entry_orders:
@@ -3159,6 +3205,14 @@ class BotExecutor:
                             update_bot_error(bot_id, f"Grid Validation Failed: {msg}")
                     else:
                         try:
+                            from engine.oneway_netting import gate_oneway_opposite_entry
+                            _gow_ok, _gow_reason = gate_oneway_opposite_entry(
+                                bot_id, pair, direction
+                            )
+                            if not _gow_ok:
+                                logger.warning(f"🛑 {name}: grid blocked — {_gow_reason}")
+                                return None
+
                             cycle_id = bot_status.get('cycle_id', 0)
                             client_order_id_grid = self._generate_deterministic_id(bot_id, 'GRID', cycle_id, bot_status['current_step'] + 1)
 
@@ -3650,8 +3704,9 @@ class BotExecutor:
         Checks if a global stop file exists.
         This file is created by an external mechanism or user to halt trading.
         """
-        if os.path.exists(config.PATHS["STOP_FILE"]):
-            logger.critical(f"🛑 GLOBAL STOP FILE DETECTED: {config.PATHS['STOP_FILE']}. Halting trading.")
+        from engine.shutdown_control import is_stop_requested
+        if is_stop_requested():
+            logger.critical("🛑 GLOBAL STOP FILE DETECTED. Halting trading.")
             self.runner.running = False
             return True
         return False

@@ -1248,14 +1248,41 @@ class StateReconciler:
 
                                 elif float(ex_filled or 0) <= 0 and o_filled > 0:
 
-                                    logger.info(f"🩹 [HEALING] Order {o_cid} exists with 0 fill but exchange reports {o_filled}. Healing ledger.")
+                                    from engine.parity_gates import gate_heal_fill_qty, gate_heal_exit_without_entry
+                                    from engine.ledger import credit_fill, seal_trade_state
 
-                                    _oi_cur.execute("UPDATE bot_orders SET filled_amount=?, price=?, status=?, updated_at=? WHERE id=?",
+                                    _raw_otype = parts[2].upper() if len(parts) > 2 else 'GRID'
+                                    _heal_otype = (
+                                        _raw_otype.lower()
+                                        if _raw_otype in ('ENTRY', 'GRID', 'TP', 'HEDGETP', 'HEDGE', 'DUST', 'SL', 'CLOSE')
+                                        else 'grid'
+                                    )
+                                    if not gate_heal_exit_without_entry(
+                                        attributed_bot_id, _heal_otype, float(o_filled)
+                                    ):
+                                        continue
 
-                                                    (o_filled, o_price, o_status if o_status in ('filled', 'closed', 'canceled', 'cancelled') else 'filled', int(time.time()), ex_id))
+                                    _allow = gate_heal_fill_qty(
+                                        gap_pair,
+                                        float(o_filled),
+                                        exchange=self.exchanges.get('future'),
+                                    )
+                                    if _allow <= 0:
+                                        continue
 
-                                    _oi_conn.commit()
-
+                                    logger.info(
+                                        f"🩹 [HEALING] Order {o_cid}: crediting {_allow:.6f} "
+                                        f"(order fill {o_filled:.6f}) via credit_fill."
+                                    )
+                                    credit_fill(
+                                        bot_id=attributed_bot_id,
+                                        order_id=str(o_id),
+                                        cumulative_qty=_allow,
+                                        avg_price=o_price,
+                                        order_type=_heal_otype,
+                                        is_cumulative=True,
+                                    )
+                                    seal_trade_state(attributed_bot_id)
                                     continue  # Healed in place, no insert needed
 
                                 else:
@@ -6939,9 +6966,21 @@ class StateReconciler:
 
                                 ex_order = ex.exchange.fetch_order(row[1], symbol)
 
-                                if float(ex_order.get('filled') or 0) > 0:
-
-                                    cursor.execute("UPDATE bot_orders SET filled_amount=?, status='filled', updated_at=? WHERE id=?", (ex_order.get('filled'), int(time.time()), row[0]))
+                                ex_f = float(ex_order.get('filled') or 0)
+                                if ex_f > 0:
+                                    from engine.ledger import credit_fill
+                                    credit_fill(
+                                        bot_id=bot_id,
+                                        order_id=str(row[1] or row[2]),
+                                        cumulative_qty=ex_f,
+                                        avg_price=float(
+                                            ex_order.get('average')
+                                            or ex_order.get('price')
+                                            or 0
+                                        ),
+                                        order_type=str(row[3] or 'grid').lower(),
+                                        is_cumulative=True,
+                                    )
 
                             except: continue
 

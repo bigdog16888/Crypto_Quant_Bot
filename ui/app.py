@@ -388,44 +388,17 @@ with st.sidebar:
     st.divider()
     st.header("🛠️ Engine Control")
     
-    PID_FILE = config.PATHS["PID_FILE"]
-    STOP_FILE = config.PATHS["STOP_FILE"]
     EMERGENCY_FILE = config.PATHS["EMERGENCY_FILE"]
-    
-    def is_engine_running():
-        """Check if engine is running via SocketLock port OR PID file."""
-        # Method 1: Check SocketLock port (authoritative)
-        import socket
-        try:
-            test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            test_sock.settimeout(0.5)
-            test_sock.bind(("127.0.0.1", 19888))
-            test_sock.close()
-            # Port is FREE → engine is NOT running
-        except OSError:
-            # Port is BOUND → engine IS running
-            # Try to get PID from file for display
-            pid = None
-            if os.path.exists(PID_FILE):
-                try:
-                    with open(PID_FILE, "r") as f:
-                        pid = int(f.read().strip())
-                except Exception:
-                    pass
-            return True, pid
-        
-        # Method 2: Fallback to PID file
-        if os.path.exists(PID_FILE):
-            try:
-                with open(PID_FILE, "r") as f:
-                    pid = int(f.read().strip())
-                os.kill(pid, 0)
-                return True, pid
-            except Exception:
-                # Stale PID file — clean it up
-                os.remove(PID_FILE)
-                return False, None
-        return False, None
+
+    from engine.shutdown_control import (
+        is_engine_running,
+        request_stop,
+        read_pid,
+        terminate_process,
+        clear_stop_signal,
+        remove_pid,
+        is_stop_requested,
+    )
 
     engine_running, pid = is_engine_running()
     
@@ -436,15 +409,13 @@ with st.sidebar:
             
             # Redirect stdout/stderr to DEVNULL. runner.py natively uses its own RotatingFileHandler.
             # Passing a file handle here locks the file on Windows and causes RotatingFileHandler to crash.
-            process = subprocess.Popen([sys.executable, runner_path], 
-                                       stdout=subprocess.DEVNULL, 
-                                       stderr=subprocess.DEVNULL, 
-                                       creationflags=subprocess.CREATE_NEW_CONSOLE if sys.platform == "win32" else 0,
-                                       close_fds=True)
-
-            
-            with open(PID_FILE, "w") as f:
-                f.write(str(process.pid))
+            subprocess.Popen(
+                [sys.executable, runner_path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NEW_CONSOLE if sys.platform == "win32" else 0,
+                close_fds=True,
+            )
             st.success("Monitoring service started. Refreshing page...")
             time.sleep(2) # Give it a moment
             st.rerun()
@@ -452,52 +423,64 @@ with st.sidebar:
         st.success(f"Monitoring Running (PID: {pid})")
         if st.button("🛑 Stop Monitoring"):
             try:
-                with open(STOP_FILE, "w") as f:
-                    f.write("stop")
-                st.info("Stop signal sent. Waiting for graceful shutdown...")
+                request_stop()
+                st.info("Stop signal sent. Waiting for engine to release lock and exit...")
 
-                # More robust waiting logic
-                with st.spinner("Waiting for engine to terminate..."):
-                    shutdown_success = False
-                    for i in range(30):  # Wait up to 30 seconds
-                        is_running, _ = is_engine_running()
-                        if not is_running:
+                shutdown_success = False
+                escalated = False
+                status = st.empty()
+                with st.spinner("Stopping engine..."):
+                    # Phase 1: runner should consume engine.stop quickly
+                    for _ in range(20):
+                        if not is_stop_requested():
+                            break
+                        time.sleep(0.25)
+
+                    # Phase 2: SocketLock port 19888 must be free (authoritative)
+                    for i in range(60):
+                        running, _pid = is_engine_running()
+                        if not running:
                             shutdown_success = True
                             break
+                        status.caption(f"Waiting for lock release… ({i + 1}s)")
                         time.sleep(1)
-                
-                if shutdown_success:
-                    st.success("✅ Engine stopped gracefully!")
-                    if os.path.exists(PID_FILE): # Cleanup just in case
-                        os.remove(PID_FILE)
-                else:
-                    st.error("Engine did not stop in time. Consider Force Kill.")
 
-                time.sleep(1)
+                    # Phase 3: cooperative stop failed — terminate runner PID from engine.pid
+                    if not shutdown_success:
+                        kill_pid = read_pid() or pid
+                        if kill_pid and terminate_process(kill_pid):
+                            escalated = True
+                            time.sleep(1.5)
+                            shutdown_success = not is_engine_running()[0]
+
+                remove_pid()
+                clear_stop_signal()
+
+                if shutdown_success:
+                    if escalated:
+                        st.warning("Engine stopped after process terminate (runner was stuck).")
+                    else:
+                        st.success("Engine stopped.")
+                else:
+                    st.error(
+                        "Engine did not stop. Use Force Kill or close the runner console window."
+                    )
+
+                time.sleep(0.5)
                 st.rerun()
 
             except Exception as e:
                 st.error(f"Failed to send stop signal: {e}")
-        
+
         if st.button("💀 Force Kill Monitoring", type="secondary"):
-            if pid is None:
+            kill_pid = read_pid() or pid
+            if kill_pid is None:
                 st.error("Cannot kill: PID not found.")
                 st.rerun()
-                
-            # Attempt to kill by PID first
-            try:
-                os.kill(pid, 9) # SIGKILL
-            except OSError:
-                pass # Process might already be dead
-            
-            # Fallback for Windows or if PID kill fails
-            if sys.platform == "win32":
-                subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True)
-            else:
-                subprocess.run(["kill", "-9", str(pid)], capture_output=True)
 
-            if os.path.exists(PID_FILE): os.remove(PID_FILE)
-            if os.path.exists(STOP_FILE): os.remove(STOP_FILE)
+            terminate_process(kill_pid)
+            remove_pid()
+            clear_stop_signal()
             st.error("Engine force-killed.")
             st.rerun()
 

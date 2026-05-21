@@ -15,6 +15,7 @@ from engine.database import (
     add_manual_whitelist, clear_manual_whitelists_for_pair, get_manual_whitelists
 )
 from engine.reconciler import StateReconciler, ReconciliationAction
+from engine.parity_gates import qty_tolerance as pair_qty_tolerance
 from config.settings import config as global_config
 from engine.exchange_interface import normalize_symbol as _norm_universal
 
@@ -628,8 +629,8 @@ def render_monitor_view():
                     net_usd_diff = net_qty_diff * ref_price
                     if net_usd_diff > worst_pair_usd:
                         worst_pair_usd = net_usd_diff
-                    # Per-pair threshold: virtual and physical must match in qty space.
-                    if net_usd_diff > 1.00:
+                    # Pass/fail in contract qty space (same rule as engine parity gates).
+                    if net_qty_diff > pair_qty_tolerance():
                         mismatched_pair_count += 1
                         mismatched_pairs.append((f"{p} NET", v_net_qty * ref_price, ph_net_qty * ref_price, net_usd_diff, v_net_qty, ph_net_qty, ph_net_qty - v_net_qty, ref_price))
 
@@ -686,7 +687,15 @@ def render_monitor_view():
                             pass # Engine is intentionally holding without orders
                         # We flag as MISSING GRIDS if they have only 1 order but are mid-cycle (Step 1+)
                         elif actual_ph < 2 and c_step >= 1 and bot_inv > 0.01:
-                            bots_with_partial_orders.append(f"{row['name']} ({actual_ph}/2)")
+                            # 🚀 NETTING GATE GUARD: Suppress alert if grid is legitimately blocked by one-way netting opposite entry block
+                            gow_ok = True
+                            try:
+                                from engine.oneway_netting import gate_oneway_opposite_entry
+                                gow_ok, _ = gate_oneway_opposite_entry(bid, row['pair'], row['direction'])
+                            except Exception:
+                                pass
+                            if gow_ok:
+                                bots_with_partial_orders.append(f"{row['name']} ({actual_ph}/2)")
 
                 if bots_with_missing_orders:
                     order_health_msg, order_status_color = f"⚠️ MISSING CRITICAL ORDERS: {', '.join(bots_with_missing_orders)}!", "red"
@@ -727,8 +736,25 @@ def render_monitor_view():
                         _ck_adopt  = f"_confirm_adopt_{mp_pair}"
                         _ck_manual = f"_confirm_manual_{mp_pair}"
                         _ck_close  = f"_confirm_close_{mp_pair}"
+                        _ck_orphan = f"_confirm_orphan_{mp_pair}"
                         
-                        _act_c1, _act_c2, _act_c3 = st.columns(3)
+                        _p_clean = mp_pair.split(' ')[0]
+                        pair_bots = df_pos_f[df_pos_f['pair'].apply(_norm_universal) == _p_clean]
+                        can_close_orphan = True
+                        for _, bot_row in pair_bots.iterrows():
+                            invested = float(bot_row.get('total_invested', 0) or 0)
+                            derived_status = str(bot_row.get('status', '')).upper()
+                            c_phase = str(bot_row.get('cycle_phase', 'IDLE')).upper()
+                            is_scanning_or_idle = ("SCANNING" in derived_status) or ("IDLE" in derived_status) or (c_phase == "IDLE")
+                            if invested > 0.01 or not is_scanning_or_idle:
+                                can_close_orphan = False
+                                break
+                        
+                        if can_close_orphan:
+                            _act_c1, _act_c2, _act_c3, _act_c4 = st.columns(4)
+                        else:
+                            _act_c1, _act_c2, _act_c3 = st.columns(3)
+                            _act_c4 = None
 
                         # ── 🕵️ Forensic Adopt (2-step) ───────────────────────────────
                         with _act_c1:
@@ -811,6 +837,64 @@ def render_monitor_view():
                                         st.session_state[_ck_close] = False
                                         st.rerun()
 
+                        # ── 💥 Close Orphan (2-step, reduceOnly order only) ───────────
+                        if _act_c4 is not None:
+                            with _act_c4:
+                                if not st.session_state.get(_ck_orphan):
+                                    if st.button("💥 Close Orphan", key=f"co_btn_{mp_pair}"):
+                                        st.session_state[_ck_orphan] = True
+                                        st.rerun()
+                                else:
+                                    st.warning(f"🚨 CONFIRM: Close physical {abs(mp_pqty):.4f} {_p_clean} residual WITHOUT touching ledger?")
+                                    cco1, cco2 = st.columns(2)
+                                    with cco1:
+                                        if st.button("🔴 YES, FLAT", key=f"co_confirm_{mp_pair}"):
+                                            st.session_state[_ck_orphan] = False
+                                            ex_m = get_exchange_instance('future')
+                                            clear_manual_whitelists_for_pair(_p_clean)
+                                            _ccxt_pair = _p_clean
+                                            if ':' not in _ccxt_pair and _ccxt_pair.endswith('/USDC'):
+                                                _ccxt_pair = f"{_ccxt_pair}:USDC"
+                                            elif ':' not in _ccxt_pair and _ccxt_pair.endswith('/USDT'):
+                                                _ccxt_pair = f"{_ccxt_pair}:USDT"
+                                            
+                                            close_side = 'sell' if mp_pqty > 0 else 'buy'
+                                            close_qty = abs(mp_pqty)
+                                            try:
+                                                prec = ex_m.get_symbol_precision(_ccxt_pair)
+                                                step = float(prec.get('amount_step', prec.get('step_size', 0)) or 0)
+                                                if step > 0:
+                                                    close_qty = ex_m.round_to_step(close_qty, step)
+                                            except Exception:
+                                                pass
+                                            
+                                            if close_qty <= 0:
+                                                st.error("Error: close_qty rounded to zero.")
+                                            else:
+                                                from engine.parity_gates import _repair_client_order_id
+                                                client_id = _repair_client_order_id('CQB_ORPH', _ccxt_pair)
+                                                try:
+                                                    close_order = ex_m.create_order(
+                                                        symbol=_ccxt_pair,
+                                                        type='market',
+                                                        side=close_side,
+                                                        amount=close_qty,
+                                                        price=None,
+                                                        params={
+                                                            'reduceOnly': True,
+                                                            'clientOrderId': client_id,
+                                                            'human_approved': True,
+                                                        },
+                                                    )
+                                                    st.success(f"Orphan closed: {close_qty} {_ccxt_pair} market reduceOnly placed.")
+                                                except Exception as _co_err:
+                                                    st.error(f"Market close failed: {_co_err}")
+                                            st.rerun()
+                                    with cco2:
+                                        if st.button("❌ Cancel", key=f"co_cancel_{mp_pair}"):
+                                            st.session_state[_ck_orphan] = False
+                                            st.rerun()
+
                 # --- Position Details & Grids ---
                 st.subheader("🤖 Active Bot Positions")
                 
@@ -818,11 +902,11 @@ def render_monitor_view():
                 indicator_cache_f = {} # Per-fragment local cache
                 def extract_info(row):
                     res = {
-                        'Trigger': 'N/A', 'Orders': '0', 'TP_Price': 0.0, 
-                        'Grid_Price': 0.0, 'Grid_Amount': 0.0, 
-                        'Expected_Profit': 0.0, 'EE_Status': '-', 'Basket_Age': '-', 'Cycle_Age': '-',
+                        'Trigger': 'N/A', 'Orders': '0', 'TP_Price': 0.0,
+                        'Grid_Price': 0.0, 'Grid_Amount': 0.0,
+                        'Expected_Profit': 0.0, 'EE_Status': '-',
                         'TP_Price_Str': '-', 'Grid_Price_Str': '-',
-                        'Action_Age': '-', 'Trade_Age': '-'
+                        'Action_Age': '-', 'Trade_Age': '-', 'Ages': '-',
                     }
                     def _clean(val):
                         if pd.isna(val) or val is None: return 0.0
@@ -977,18 +1061,52 @@ def render_monitor_view():
                         else:
                             res['Grid_Price_Str'] = f"{res['Grid_Amount']:.4f} @ ${res['Grid_Price']:,.2f}" if res['Grid_Price'] > 0 else "-"
                         
-                        # 🎯 HEATMAP ENRICHMENT (Final Step): 
+                        # 🎯 HEATMAP ENRICHMENT (Final Step):
                         if is_in_trade:
-                            if res['TP_Price'] > 0:
-                                dist = abs(current_price - res['TP_Price']) / res['TP_Price'] * 100
-                                label = "🟢 [READY]" if dist < 0.2 else ("🟡 [NEAR]" if dist < 1.0 else "⚪ [DISTANCE]")
-                                res['Trigger'] = f"{label} TP Proximity: {dist:.1f}%"
-                            elif res['Grid_Price'] > 0:
-                                dist = abs(current_price - res['Grid_Price']) / res['Grid_Price'] * 100
-                                label = "🟡 [NEAR]" if dist < 1.0 else "⚪ [DISTANCE]"
-                                res['Trigger'] = f"{label} Grid Proximity: {dist:.1f}%"
+                            parts = []
+                            direction_upper = str(row.get('direction', 'LONG')).upper()
+
+                            # — TP proximity —
+                            if res['TP_Price'] > 0 and current_price > 0:
+                                tp_dist = abs(current_price - res['TP_Price']) / res['TP_Price'] * 100
+                                # For SHORT bots TP is below price; for LONG TP is above.
+                                tp_signed = (res['TP_Price'] - current_price) / res['TP_Price'] * 100
+                                if direction_upper == 'SHORT':
+                                    tp_signed = (current_price - res['TP_Price']) / res['TP_Price'] * 100
+                                tp_label = "🟢 TP" if tp_dist < 0.2 else ("🟡 TP" if tp_dist < 1.0 else "⚪ TP")
+                                parts.append(f"{tp_label} {tp_dist:.1f}% ({tp_signed:+.1f}%)")
+
+                            # — Grid proximity (next grid order in the adverse direction) —
+                            if current_price > 0:
+                                # Scan all open orders for this bot to find the best grid candidate
+                                bot_id_local = int(row['id'])
+                                grid_candidates = [
+                                    o for o in market_orders_f
+                                    if str(o.get('clientOrderId', '')).startswith(f"CQB_{bot_id_local}_")
+                                    and 'GRID' in str(o.get('clientOrderId', ''))
+                                ]
+                                if grid_candidates:
+                                    # Pick the grid closest to current price
+                                    best_grid = min(
+                                        grid_candidates,
+                                        key=lambda o: abs(float(o.get('price', 0) or 0) - current_price)
+                                    )
+                                    grid_px = float(best_grid.get('price', 0) or 0)
+                                    grid_qty = float(best_grid.get('amount', 0) or 0)
+                                    if grid_px > 0:
+                                        grid_dist = abs(current_price - grid_px) / grid_px * 100
+                                        # For SHORT: grid is above price (adds to short)
+                                        # For LONG: grid is below price (adds to long)
+                                        grid_signed = (grid_px - current_price) / grid_px * 100
+                                        if direction_upper == 'SHORT':
+                                            grid_signed = (current_price - grid_px) / grid_px * 100
+                                        grid_label = "🔴 GRID" if grid_dist < 0.3 else ("🟡 GRID" if grid_dist < 1.0 else "⚪ GRID")
+                                        parts.append(f"{grid_label} {grid_dist:.1f}% ({grid_signed:+.1f}%)")
+
+                            if parts:
+                                res['Trigger'] = " | ".join(parts)
                             else:
-                                res['Trigger'] = f"⚠️ NO ORDERS (Adopted?)"
+                                res['Trigger'] = "⚠️ NO ORDERS"
                         
                         # 3. Expected Profit
                         o_qty = _clean(row.get('open_qty'))
@@ -999,7 +1117,7 @@ def render_monitor_view():
                             if side == 'SHORT': res['Expected_Profit'] = (avg_p - tp_p) * o_qty
                             else: res['Expected_Profit'] = (tp_p - avg_p) * o_qty
                         
-                        # 4. Early Exit (EE) Status
+                        # 4. Early Exit (EE) Status — compact format
                         b_start = _clean(row.get('basket_start_time'))
                         if is_in_trade and cfg.get('UseEarlyExit') and b_start > 0:
                             ee_start_h = _clean(cfg.get('EEStartHours'))
@@ -1010,50 +1128,42 @@ def render_monitor_view():
                                 intervals = (elapsed_h - ee_start_h) * 60 / decay_mins
                                 total_decay = min(100.0, intervals * decay_pct)
                                 if total_decay >= 100.0:
-                                    res['EE_Status'] = f"ACTIVE (100%) 🔴"
+                                    res['EE_Status'] = "🔥100%"
                                 else:
-                                    # Show intervals remaining until 100%
                                     intervals_to_full = (100.0 - total_decay) / decay_pct
                                     mins_to_full = intervals_to_full * decay_mins
                                     h_to_full = mins_to_full / 60
-                                    if h_to_full < 1.0:
-                                        time_to_full = f"{mins_to_full:.0f}m"
-                                    else:
-                                        time_to_full = f"{h_to_full:.1f}h"
-                                    res['EE_Status'] = f"ACTIVE ({total_decay:.0f}%) → 100% in {time_to_full}"
+                                    ttf = f"{mins_to_full:.0f}m" if h_to_full < 1.0 else f"{h_to_full:.1f}h"
+                                    res['EE_Status'] = f"🔥{total_decay:.0f}%▸{ttf}"
                             else:
-                                # Show time remaining until EE activates
                                 wait_h = ee_start_h - elapsed_h
-                                if wait_h < 1.0:
-                                    res['EE_Status'] = f"Wait {wait_h*60:.0f}m"
-                                else:
-                                    res['EE_Status'] = f"Wait {wait_h:.1f}h"
-                        
-                        # 5. Pos Age (Position Age = basket_start_time = when entry filled)
+                                wait_str = f"{wait_h*60:.0f}m" if wait_h < 1.0 else f"{wait_h:.1f}h"
+                                res['EE_Status'] = f"⏳{wait_str}"
+
+                        # 5+6. Ages — merge pos age / cycle age into one field
                         b_start = _clean(row.get('basket_start_time'))
-                        if is_in_trade and b_start > 0:
-                            b_age_h = (time.time() - b_start) / 3600
-                            if b_age_h < 1.0: res['Action_Age'] = f"{b_age_h*60:.0f}m"
-                            elif b_age_h < 24.0: res['Action_Age'] = f"{b_age_h:.1f}h"
-                            else: res['Action_Age'] = f"{b_age_h/24:.1f}d"
-                        
-                        # 6. Cycle Age (cycle_start_time = when the cycle began = last TP exit)
                         c_start = _clean(row.get('cycle_start_time'))
-                        if is_in_trade and c_start > 0:
-                            c_age_h = (time.time() - c_start) / 3600
-                            if c_age_h < 1.0: res['Trade_Age'] = f"{c_age_h*60:.0f}m"
-                            else: res['Trade_Age'] = f"{c_age_h:.1f}h"
+                        def _fmt_age(secs_since_epoch):
+                            if secs_since_epoch <= 0: return "-"
+                            h = (time.time() - secs_since_epoch) / 3600
+                            if h < 1.0: return f"{h*60:.0f}m"
+                            if h < 24.0: return f"{h:.1f}h"
+                            return f"{h/24:.1f}d"
+                        pos_age  = _fmt_age(b_start) if is_in_trade else "-"
+                        cyc_age  = _fmt_age(c_start) if is_in_trade else "-"
+                        # combined: "21m / 3.2h"  (pos / cycle)
+                        res['Ages'] = f"{pos_age}/{cyc_age}"
 
                     except Exception as e:
                         print(f"Error extracting info for bot {row.get('id')}: {e}")
                     return res
 
                 info_df = df_pos_f.apply(extract_info, axis=1, result_type='expand')
-                df_pos_f['Trigger Condition'] = info_df['Trigger']
+                df_pos_f['TP | Grid'] = info_df['Trigger']
                 df_pos_f['Active Orders'] = info_df['Orders']
                 df_pos_f['Active TP'] = info_df['TP_Price_Str']
                 df_pos_f['Next Grid'] = info_df['Grid_Price_Str']
-                
+
                 # Visual Profit Feedback
                 def format_profit(row):
                     x = row['Expected_Profit']
@@ -1062,10 +1172,9 @@ def render_monitor_view():
                         return "-"
                     return f"${x:,.2f}"
 
-                df_pos_f['Expected Profit'] = info_df.apply(format_profit, axis=1)
-                df_pos_f['EE Status'] = info_df['EE_Status']
-                df_pos_f['Pos Age'] = info_df['Action_Age']   # basket_start_time: when this entry filled
-                df_pos_f['Cycle Age'] = info_df['Trade_Age']  # cycle_start_time: when the cycle started (last TP)
+                df_pos_f['Exp $'] = info_df.apply(format_profit, axis=1)
+                df_pos_f['EE'] = info_df['EE_Status']
+                df_pos_f['Ages (pos/cyc)'] = info_df['Ages']
                 df_pos_f['Total Invested'] = df_pos_f['total_invested'].apply(
                     lambda x: f"${x:,.2f}" if x > 0.01 else "-"
                 )
@@ -1076,14 +1185,59 @@ def render_monitor_view():
                     lambda x: f"${float(x):,.4f}" if pd.notna(x) and float(x) > 0 else "-"
                 )
 
+                # Unrealized PnL: (current_price - avg_entry) * open_qty, signed by direction
+                def calc_unrealised(row):
+                    try:
+                        inv = float(row.get('total_invested') or 0)
+                        if inv <= 0.01:
+                            return "-"
+                        aq = float(row.get('open_qty') or 0)
+                        ap = float(row.get('avg_entry_price') or 0)
+                        pk = _norm_universal(row.get('pair', ''))
+                        cp = float(pair_prices.get(pk, 0))
+                        if aq < 1e-8 or ap < 1e-8 or cp < 1e-8:
+                            return "-"
+                        direction_u = str(row.get('direction', 'LONG')).upper()
+                        if direction_u == 'SHORT':
+                            pnl = (ap - cp) * aq
+                        else:
+                            pnl = (cp - ap) * aq
+                        arrow = "▲" if pnl >= 0 else "▼"
+                        return f"{arrow}${pnl:,.2f}"
+                    except:
+                        return "-"
+
+                df_pos_f['PnL'] = df_pos_f.apply(calc_unrealised, axis=1)
+
+                # Entry trigger (only meaningful for scanning bots)
+                df_pos_f['Entry Trigger'] = info_df['Trigger'].where(
+                    ~df_pos_f['status'].str.contains('IN TRADE|HEDGED|DUST', na=False),
+                    other=""
+                )
+
                 st.dataframe(
                     df_pos_f[[
-                        'name', 'pair', 'direction', 'status', 'Trigger Condition',
-                        'Total Invested', 'Open Qty', 'Avg Entry',
-                        'Pos Age', 'Expected Profit', 'EE Status', 'Cycle Age',
-                        'Active TP', 'Next Grid', 'Active Orders',
+                        'name', 'pair', 'status',
+                        'Total Invested', 'Open Qty', 'Avg Entry', 'PnL',
+                        'Exp $', 'EE', 'Ages (pos/cyc)',
+                        'TP | Grid', 'Active TP', 'Next Grid',
                     ]],
-                    width="stretch",
+                    column_config={
+                        'name':            st.column_config.TextColumn('Bot',       width='small'),
+                        'pair':            st.column_config.TextColumn('Pair',      width='small'),
+                        'status':          st.column_config.TextColumn('Status',    width='medium'),
+                        'Total Invested':  st.column_config.TextColumn('Invested',  width='small'),
+                        'Open Qty':        st.column_config.TextColumn('Qty',       width='small'),
+                        'Avg Entry':       st.column_config.TextColumn('Entry',     width='small'),
+                        'PnL':             st.column_config.TextColumn('PnL',       width='small'),
+                        'Exp $':           st.column_config.TextColumn('Exp $',     width='small'),
+                        'EE':              st.column_config.TextColumn('EE',        width='small'),
+                        'Ages (pos/cyc)':  st.column_config.TextColumn('Age p/c',   width='small'),
+                        'TP | Grid':       st.column_config.TextColumn('TP | Grid', width='medium'),
+                        'Active TP':       st.column_config.TextColumn('TP @',      width='small'),
+                        'Next Grid':       st.column_config.TextColumn('Grid @',    width='small'),
+                    },
+                    use_container_width=True,
                     hide_index=True
                 )
 

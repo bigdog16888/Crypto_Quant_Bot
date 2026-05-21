@@ -110,6 +110,171 @@ def get_terminal_order_cache_size() -> int:
         return len(_terminal_order_ids)
 
 
+# ---------------------------------------------------------------------------
+# ⚡ PENDING FILL RETRY QUEUE — credit_fill race window fix
+# ---------------------------------------------------------------------------
+# Problem: a taker order fills on the exchange before BotExecutor's
+# save_bot_order() has committed the bot_orders row. The WS FILL event
+# arrives, credit_fill() finds no matching row, returns False. The old code
+# enqueued a single 0.5 s deferred retry; if that also failed it fell through
+# to _attribute_orphan_fill() which — with ALLOW_FORENSIC_ADOPT=False —
+# silently dropped the fill, leaving the ledger understating the position.
+#
+# Fix: store the full fill payload here. _drain_pending_fills() is called at
+# the top of every handle_order_update() invocation so retries fire every WS
+# cycle (~1 s) without blocking the listener. After PENDING_FILL_MAX_RETRIES
+# exhausted we escalate to REQUIRE_MANUAL_PROOF — never silent drop.
+# This queue is proof-based (real exchange order_id), not forensic invention,
+# and therefore operates regardless of ALLOW_FORENSIC_ADOPT.
+# ---------------------------------------------------------------------------
+PENDING_FILL_MAX_RETRIES: int = 3          # ~3 WS cycles ≈ 3 s
+PENDING_FILL_MAX_AGE_S: int   = 30         # Hard safety ceiling — escalate after 30 s no matter what
+_pending_fills: dict = {}                  # order_id → payload dict
+_pending_fills_lock = threading.Lock()
+
+
+def _handle_fill_with_pending_retry(
+    bot_id: int, order_id: str, client_id: str,
+    qty: float, price: float, order_type: str,
+    fill_ts: int, symbol: str,
+) -> None:
+    """
+    Attempt credit_fill immediately. If no DB row exists yet (race), enqueue
+    in _pending_fills for retry on the next WS cycle rather than dropping or
+    invoking forensic adoption.
+    """
+    credited = _credit_fill_with_retry(bot_id, order_id, client_id, qty, price, order_type, fill_ts)
+    if credited:
+        from engine.ledger import seal_trade_state
+        _enqueue_db_write(seal_trade_state, bot_id)
+        logger.info(f"[WS-FILL] Bot {bot_id} {order_type}: credit_fill OK → seal enqueued.")
+        return
+
+    # Row not committed yet — park in retry queue
+    with _pending_fills_lock:
+        if order_id not in _pending_fills:
+            _pending_fills[order_id] = {
+                'bot_id':     bot_id,
+                'client_id':  client_id,
+                'qty':        qty,
+                'price':      price,
+                'order_type': order_type,
+                'fill_ts':    fill_ts,
+                'symbol':     symbol,
+                'retries':    0,
+                'first_seen': int(time.time()),
+            }
+    logger.warning(
+        f"[WS-FILL] Bot {bot_id} {order_type}: credit_fill returned False "
+        f"(race — DB row not yet committed). Parked in retry queue for order {order_id}."
+    )
+
+
+def _credit_fill_with_retry(bot_id: int, order_id: str, client_id: str,
+                            qty: float, price: float, order_type: str,
+                            fill_ts: int) -> bool:
+    """
+    Try credit_fill by exchange order_id first, then by client_order_id.
+    Returns True on success.
+    """
+    try:
+        from engine.ledger import credit_fill
+        ok = credit_fill(
+            bot_id=bot_id, order_id=order_id,
+            cumulative_qty=qty, avg_price=price,
+            order_type=order_type, is_cumulative=True, fill_ts=fill_ts,
+        )
+        if ok:
+            return True
+        # Fallback: try client_order_id (exchange may not have stamped order_id yet)
+        if client_id and client_id != order_id:
+            ok = credit_fill(
+                bot_id=bot_id, order_id=client_id,
+                cumulative_qty=qty, avg_price=price,
+                order_type=order_type, is_cumulative=True, fill_ts=fill_ts,
+            )
+        return ok
+    except Exception as e:
+        logger.error(f"[CREDIT-FILL-RETRY] Bot {bot_id} order {order_id}: {e}")
+        return False
+
+
+def _drain_pending_fills() -> None:
+    """
+    Re-attempt credit_fill for all pending fills. Called at the top of every
+    handle_order_update() so retries happen on the next WS cycle (~1 s gap).
+
+    Retry logic:
+      - Success → remove from queue, enqueue seal_trade_state.
+      - retries < PENDING_FILL_MAX_RETRIES and age < PENDING_FILL_MAX_AGE_S → increment retries.
+      - Exhausted → flag_orphan_fill_manual_proof + remove (no silent drop).
+    """
+    if not _pending_fills:
+        return
+
+    now = int(time.time())
+    to_remove = []
+    to_escalate = []
+
+    with _pending_fills_lock:
+        items = list(_pending_fills.items())
+
+    for order_id, pf in items:
+        bid        = pf['bot_id']
+        client_id  = pf['client_id']
+        qty        = pf['qty']
+        price      = pf['price']
+        otype      = pf['order_type']
+        fill_ts    = pf['fill_ts']
+        symbol     = pf['symbol']
+        retries    = pf['retries']
+        first_seen = pf['first_seen']
+        age        = now - first_seen
+
+        # Hard ceiling — something is very wrong if still unresolved after 30 s
+        if retries >= PENDING_FILL_MAX_RETRIES or age >= PENDING_FILL_MAX_AGE_S:
+            to_escalate.append((order_id, bid, client_id, qty, price, otype, fill_ts, symbol, retries, age))
+            continue
+
+        credited = _credit_fill_with_retry(bid, order_id, client_id, qty, price, otype, fill_ts)
+        if credited:
+            from engine.ledger import seal_trade_state
+            _enqueue_db_write(seal_trade_state, bid)
+            logger.info(
+                f"[PENDING-FILL-RETRY] Bot {bid} {otype}: credited on retry #{retries + 1} "
+                f"for order {order_id}."
+            )
+            to_remove.append(order_id)
+        else:
+            with _pending_fills_lock:
+                if order_id in _pending_fills:
+                    _pending_fills[order_id]['retries'] += 1
+            logger.warning(
+                f"[PENDING-FILL-RETRY] Bot {bid} {otype}: retry #{retries + 1} still no DB row "
+                f"for order {order_id}. {PENDING_FILL_MAX_RETRIES - retries - 1} attempt(s) left."
+            )
+
+    # Remove successfully credited fills
+    with _pending_fills_lock:
+        for oid in to_remove:
+            _pending_fills.pop(oid, None)
+
+    # Escalate exhausted fills — REQUIRE_MANUAL_PROOF (never silent drop)
+    for order_id, bid, client_id, qty, price, otype, fill_ts, symbol, retries, age in to_escalate:
+        logger.error(
+            f"[PENDING-FILL-EXHAUSTED] Bot {bid} {otype} order {order_id}: "
+            f"credit_fill failed after {retries} retries ({age}s elapsed). "
+            f"Escalating to REQUIRE_MANUAL_PROOF — fill qty={qty:.6f} @ {price:.4f} NOT dropped."
+        )
+        try:
+            from engine.parity_gates import flag_orphan_fill_manual_proof
+            flag_orphan_fill_manual_proof(bid, order_id, symbol, qty, 'pending_fill_exhausted')
+        except Exception as _e:
+            logger.error(f"[PENDING-FILL-ESCALATE] flag_orphan_fill_manual_proof failed: {_e}")
+        with _pending_fills_lock:
+            _pending_fills.pop(order_id, None)
+
+
 # Auto-start the worker when this module is imported
 start_db_worker()
 
@@ -336,6 +501,13 @@ def handle_order_update(event: Dict):
         'timestamp': 1234567890
     }
     """
+    # ── DRAIN PENDING FILL RETRY QUEUE ─────────────────────────────────────
+    # Re-attempt credit_fill for any fills that raced ahead of save_bot_order().
+    # This is the first thing we do on every WS cycle so retries get the full
+    # remaining cycle budget without blocking the listener.
+    _drain_pending_fills()
+    # ────────────────────────────────────────────────────────────────────────
+
     try:
         status = event.get('status')
         client_id = event.get('client_order_id', '')
@@ -593,42 +765,24 @@ def _handle_order_filled(bot_id: int, order_type: str, event: Dict):
             event_ts_ms = event.get('lastTradeTimestamp') or event.get('timestamp') or 0
             fill_ts = int(event_ts_ms / 1000) if event_ts_ms else 0
             lookup_id = str(order_id) if order_id else client_id
-            credited = credit_fill(
+            # ── RACE-SAFE CREDIT PATH [v2.1.3] ────────────────────────────
+            # _handle_fill_with_pending_retry() attempts credit_fill immediately.
+            # If no DB row exists yet (taker fill racing ahead of save_bot_order),
+            # it parks the fill in _pending_fills for retry on the next WS cycle.
+            # After PENDING_FILL_MAX_RETRIES exhausted → REQUIRE_MANUAL_PROOF.
+            # Never sleeps, never silently drops, independent of ALLOW_FORENSIC_ADOPT.
+            # ─────────────────────────────────────────────────────────────────
+            _handle_fill_with_pending_retry(
                 bot_id=bot_id,
                 order_id=lookup_id,
-                cumulative_qty=cumulative_fill_qty,
-                avg_price=avg_price,
+                client_id=client_id,
+                qty=cumulative_fill_qty,
+                price=avg_price,
                 order_type=order_type.lower(),
-                is_cumulative=True,
-                fill_ts=fill_ts
+                fill_ts=fill_ts,
+                symbol=symbol,
             )
-            if credited:
-                _enqueue_db_write(seal_trade_state, bot_id)
-                logger.info(f"[WS-FILL] Bot {bot_id} {order_type}: credit_fill OK → seal enqueued.")
-            else:
-                # credit_fill returned False: most likely a race — save_bot_order hasn't
-                # created the DB row yet. Schedule a deferred retry via the write queue.
-                def _deferred_credit(bid, oid, cid, qty, px, otype, fts, sym):
-                    from engine.ledger import credit_fill as _cf, seal_trade_state as _sts
-                    import time as _t
-                    _t.sleep(0.5)  # Wait for save_bot_order to commit
-                    ok = _cf(bid, oid, qty, px, otype, is_cumulative=True, fill_ts=fts)
-                    if not ok:
-                        ok = _cf(bid, cid, qty, px, otype, is_cumulative=True, fill_ts=fts)
-                    if ok:
-                        _sts(bid)
-                        logger.info(f"[WS-FILL-RETRY] Bot {bid} {otype}: deferred credit OK.")
-                    else:
-                        # 🚀 ORPHAN ATTRIBUTION (Phase 1)
-                        # If it's still missing, it's a true orphan. Adopting forensically.
-                        _attribute_orphan_fill(bid, oid, cid, qty, px, otype, fts, sym)
-
-                _enqueue_db_write(_deferred_credit, bot_id, str(order_id), client_id,
-                                  cumulative_fill_qty, avg_price, order_type.lower(), fill_ts, symbol)
-                logger.warning(
-                    f"[WS-FILL] Bot {bot_id} {order_type}: credit_fill returned False "
-                    f"(race condition). Deferred retry enqueued for order {order_id}."
-                )
+            # Note: credit_fill OK / retry-queued logging is inside _handle_fill_with_pending_retry
         except Exception as e:
             logger.error(f"[WS-FILL] ENTRY/GRID credit failed for bot {bot_id}: {e}")
 
@@ -649,13 +803,16 @@ def _handle_order_filled(bot_id: int, order_type: str, event: Dict):
 
     try:
         if order_type == 'TP':
-            log_trade(bot_id, 'WS_TP_FILL', symbol, avg_price, cumulative_fill_qty, realized_pnl, 'TP')
+            cost_val = avg_price * cumulative_fill_qty
+            log_trade(bot_id, 'WS_TP_FILL', symbol, avg_price, cumulative_fill_qty, cost_val, 'TP', pnl=realized_pnl)
             add_notification('success', f"TP Hit {symbol} (PnL ${realized_pnl:.2f})", bot_id)
         elif order_type == 'ENTRY':
-            log_trade(bot_id, 'WS_ENTRY_FILL', symbol, avg_price, cumulative_fill_qty, 0, 'ENTRY')
+            cost_val = avg_price * cumulative_fill_qty
+            log_trade(bot_id, 'WS_ENTRY_FILL', symbol, avg_price, cumulative_fill_qty, cost_val, 'ENTRY')
             add_notification('info', f"Entry Filled {symbol} qty={cumulative_fill_qty:.4f} @ {avg_price:.4f}", bot_id)
         elif order_type == 'GRID':
-            log_trade(bot_id, 'WS_GRID_FILL', symbol, avg_price, cumulative_fill_qty, 0, 'GRID')
+            cost_val = avg_price * cumulative_fill_qty
+            log_trade(bot_id, 'WS_GRID_FILL', symbol, avg_price, cumulative_fill_qty, cost_val, 'GRID')
     except Exception as e:
         logger.debug(f"[WS-FILL] Notification/log failed (non-fatal): {e}")
 

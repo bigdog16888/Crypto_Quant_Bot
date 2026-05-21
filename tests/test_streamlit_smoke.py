@@ -14,7 +14,9 @@ class MockStreamlit:
         self._session_state = {}
         
     def __getattr__(self, name):
-        # Return a no-op function for any st.* call
+        # Return a no-op function/decorator for any st.* call
+        if name in ('fragment', 'dialog', 'experimental_fragment', 'experimental_dialog'):
+            return lambda *args, **kwargs: (args[0] if (len(args) == 1 and callable(args[0]) and not kwargs) else (lambda f: f))
         def noop(*args, **kwargs):
             return None
         return noop
@@ -59,11 +61,15 @@ class MockStreamlit:
                 return noop
         return MockForm()
     
-    def cache_resource(self, func):
-        return func
+    def cache_resource(self, *args, **kwargs):
+        if len(args) == 1 and callable(args[0]) and not kwargs:
+            return args[0]
+        return lambda func: func
     
-    def cache_data(self, func):
-        return func
+    def cache_data(self, *args, **kwargs):
+        if len(args) == 1 and callable(args[0]) and not kwargs:
+            return args[0]
+        return lambda func: func
 
 # Install mock
 sys.modules['streamlit'] = MockStreamlit()
