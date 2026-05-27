@@ -295,8 +295,8 @@ class TestEntryDedupGuard(unittest.TestCase):
 
     @patch('engine.bot_executor.logger')
     def test_entry_placed_when_previous_excluded(self, mock_logger):
-        for excluded_status in ('reset_cleared', 'auto_closed', 'rejected'):
-            bot_id = 10009 + hash(excluded_status) % 1000
+        for idx, excluded_status in enumerate(('reset_cleared', 'auto_closed', 'rejected')):
+            bot_id = 10009 + idx
             pair = "SOL/USDC:USDC"
             direction = "LONG"
             

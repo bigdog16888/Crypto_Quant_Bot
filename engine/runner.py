@@ -489,6 +489,41 @@ class BotRunner:
                     logger.warning(
                         f"🩹 [STARTUP-FILL-HEAL] Re-credited {_healed_fills} order(s) from exchange truth."
                     )
+                # 🚀 [STARTUP-SYNC-BARRIER]
+                # Run sync_trades_from_orders exactly once for all active bots to sync trades table.
+                _fixes = sum(sync_trades_from_orders(bid) for bid in _active_ids)
+                if _fixes:
+                    logger.info(f"✅ [STARTUP-BARRIER] Initial sync_trades_from_orders corrected {_fixes} bot(s) with ledger drift from order fills.")
+                else:
+                    logger.info("✅ [STARTUP-BARRIER] All bot ledgers are in sync with confirmed order fills.")
+
+                # Synchronization barrier: wait until active trades count stabilizes
+                _last_count = None
+                _consecutive_matches = 0
+                _max_barrier_retries = 10
+                _barrier_stable = False
+                
+                logger.info("⏳ [STARTUP-BARRIER] Entering active trades count stability check (max 10s)...")
+                for _attempt in range(1, _max_barrier_retries + 1):
+                    _check_conn = get_connection()
+                    _count = _check_conn.execute("SELECT COUNT(*) FROM trades WHERE total_invested > 0").fetchone()[0]
+                    logger.info(f"   [STARTUP-BARRIER] Check {_attempt}: active trades count = {_count}")
+                    
+                    if _last_count is not None and _count == _last_count:
+                        _consecutive_matches += 1
+                        if _consecutive_matches >= 1:
+                            logger.info(f"✅ [STARTUP-BARRIER] Active trades count stabilized at {_count} across checks.")
+                            _barrier_stable = True
+                            break
+                    else:
+                        _consecutive_matches = 0
+                        
+                    _last_count = _count
+                    time.sleep(1)
+                    
+                if not _barrier_stable:
+                    logger.warning("⚠️ [STARTUP-BARRIER] Active trades count did not stabilize after 10s. Proceeding anyway.")
+
                 _parity_ex = None
                 for _mt, _ex in self.exchanges.items():
                     if _ex:
@@ -568,11 +603,6 @@ class BotRunner:
                                     )
                             if _mismatches_after:
                                 flag_pair_ledger_mismatch(_mismatches_after)
-                _fixes = sum(sync_trades_from_orders(bid) for bid in _active_ids)
-                if _fixes:
-                    logger.info(f"✅ [STARTUP-LEDGER-VERIFY] Corrected {_fixes} bot(s) with ledger drift from order fills.")
-                else:
-                    logger.info("✅ [STARTUP-LEDGER-VERIFY] All bot ledgers are in sync with confirmed order fills.")
             except Exception as _lv_err:
                 logger.warning(f"⚠️ [STARTUP-LEDGER-VERIFY] Ledger verification failed (non-fatal): {_lv_err}")
 
@@ -689,7 +719,7 @@ class BotRunner:
             # but eliminates this entire class of post-restart false alarms.
             try:
                 if self._reconciler:
-                    WS_WARMUP_SECONDS = 8
+                    WS_WARMUP_SECONDS = 20
                     logger.info(f"⏳ [STARTUP-RECON] Waiting {WS_WARMUP_SECONDS}s for WS cache to warm up before reconcile_all...")
                     time.sleep(WS_WARMUP_SECONDS)
                     
@@ -749,7 +779,7 @@ class BotRunner:
 
                 _now = int(time.time())
                 for _cbot_id, _cbot_name, _cpair, _c_invested, _c_wall, _c_phase in _cold_bots:
-                    if str(_c_phase or '').upper() in ('CARRY_PENDING', 'HEDGED', 'HEDGE_EXIT_PENDING'):
+                    if str(_c_phase or '').upper() == 'CARRY_PENDING':
                         continue
                     _norm = str(_cpair).split(':')[0].replace('/', '').upper()
                     _phys_qty = _cold_phys.get(_norm, 0.0)

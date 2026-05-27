@@ -181,7 +181,7 @@ def render_monitor_view():
                            t.target_tp_price AS target_tp_price, b.is_active AS is_active, b.status AS status, 
                            b.error AS error, t.basket_start_time AS basket_start_time, 
                            t.cycle_start_time AS cycle_start_time, t.cycle_phase AS cycle_phase, 
-                           t.open_qty AS open_qty
+                           t.open_qty AS open_qty, b.bot_type AS bot_type
                     FROM bots b
                     LEFT JOIN trades t ON b.id = t.bot_id
                     WHERE b.is_active = 1
@@ -410,7 +410,7 @@ def render_monitor_view():
         # Layout hack to align button with selectboxes
         st.write("")
         st.write("")
-        if st.button("🔄 Refresh Now", use_container_width=True):
+        if st.button("🔄 Refresh Now", width='stretch'):
             st.cache_data.clear()
             st.rerun()
 
@@ -500,16 +500,11 @@ def render_monitor_view():
                     b_status = str(row.get('status', '')).upper()
                     if 'REQUIRE_MANUAL' in b_status: return "🚨 MANUAL GATE"
                     if 'CARRY_PENDING' in b_status: return "⏳ CARRY/PENDING"
-                    if 'HEDGE_EXIT_PENDING' in b_status: return "🛡️ HEDGE EXITING"
                     
                     c_phase = str(row.get('cycle_phase', 'IDLE')).upper()
                     c_step = int(row.get('current_step', 0) if pd.notna(row.get('current_step')) else 0)
                     invested = float(row.get('total_invested', 0) or 0)
-                    h_amt = hedge_amounts.get(row['id'], 0)
                     
-                    if c_phase == 'HEDGED' or h_amt > 1e-8:
-                        if "EXITING" in b_status: return f"🛡️ HEDGE EXIT PENDING ({h_amt:.4f})"
-                        return f"🛡️ HEDGED ({h_amt:.4f}) | Step {c_step}"
                     if c_phase == 'MARGIN_HELD':
                         return f"🚫 MARGIN HELD | Step {c_step}"
                     
@@ -686,7 +681,7 @@ def render_monitor_view():
                         elif actual_ph == 0 and cycle_phase in ('CARRY_PENDING', 'HEDGED'):
                             pass # Engine is intentionally holding without orders
                         # We flag as MISSING GRIDS if they have only 1 order but are mid-cycle (Step 1+)
-                        elif actual_ph < 2 and c_step >= 1 and bot_inv > 0.01:
+                        elif actual_ph < 2 and c_step >= 1 and bot_inv > 0.01 and row.get('bot_type', 'standard') == 'standard':
                             # 🚀 NETTING GATE GUARD: Suppress alert if grid is legitimately blocked by one-way netting opposite entry block
                             gow_ok = True
                             try:
@@ -946,10 +941,18 @@ def render_monitor_view():
                             dist_pct = abs(current_price - t_p) / t_p * 100
                             
                         # Proximity Labels for Price Entry
-                        entry_label = ""
-                        if dist_pct < 0.5: entry_label = "🟢 [IN RANGE]"
-                        elif dist_pct < 2.0: entry_label = "🟡 [SOON]"
-                        else: entry_label = "⚪ [FAR]"
+                        is_met = False
+                        if m_p == 1 and current_price >= t_p:
+                            is_met = True
+                        elif m_p == 2 and current_price <= t_p:
+                            is_met = True
+
+                        if is_met:
+                            entry_label = "🟢 [MET]"
+                        else:
+                            if dist_pct < 0.5: entry_label = "🟢 [IN RANGE]"
+                            elif dist_pct < 2.0: entry_label = "🟡 [SOON]"
+                            else: entry_label = "⚪ [FAR]"
 
                         if m_p == 1: 
                             dist_str = f" ({((current_price - t_p)/t_p*100):.1f}%)" if current_price > 0 and t_p > 0 else ""
@@ -1237,7 +1240,7 @@ def render_monitor_view():
                         'Active TP':       st.column_config.TextColumn('TP @',      width='small'),
                         'Next Grid':       st.column_config.TextColumn('Grid @',    width='small'),
                     },
-                    use_container_width=True,
+                    width='stretch',
                     hide_index=True
                 )
 

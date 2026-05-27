@@ -137,5 +137,117 @@ class TestDatabase(unittest.TestCase):
         self.assertTrue(result['success'])
         self.assertIn('status', result)
 
+    def test_consolidate_merges_filled_duplicate_keeps_one(self):
+        """v3.5.8 (Fix 2): Two 'filled' rows with same CID should now be consolidated.
+        Previously the consolidator excluded 'filled' rows, so identical-CID filled pairs
+        were invisible — one became a ghost double-credit. Now the consolidator merges them:
+        one row (the keeper) survives with the best fill; the other is marked auto_closed.
+        """
+        database.init_db()
+        conn = database.get_connection()
+        cursor = conn.cursor()
+
+        # Insert two filled rows with the same client_order_id (GTX retry double-fill scenario)
+        cursor.execute(
+            "INSERT INTO bot_orders (bot_id, order_id, client_order_id, order_type, price, amount, filled_amount, status, created_at, updated_at) "
+            "VALUES (10016, 'order_1', 'CQB_10016_ENTRY_1', 'entry', 50000.0, 0.002, 0.002, 'filled', 1000, 1000)"
+        )
+        cursor.execute(
+            "INSERT INTO bot_orders (bot_id, order_id, client_order_id, order_type, price, amount, filled_amount, status, created_at, updated_at) "
+            "VALUES (10016, 'order_2', 'CQB_10016_ENTRY_1', 'entry', 50000.0, 0.002, 0.002, 'filled', 1001, 1001)"
+        )
+        conn.commit()
+
+        # Run consolidation — Fix 2 means both filled rows are now visible to the consolidator
+        consolidated = database.consolidate_duplicate_bot_orders(bot_id=10016)
+
+        # Exactly 1 group should be consolidated
+        self.assertEqual(consolidated, 1)
+
+        # One row must survive as 'filled', the other must be 'auto_closed'
+        rows = cursor.execute(
+            "SELECT status FROM bot_orders WHERE client_order_id='CQB_10016_ENTRY_1' ORDER BY created_at"
+        ).fetchall()
+        statuses = [r[0] for r in rows]
+        self.assertEqual(len(statuses), 2)
+        self.assertIn('filled', statuses,
+                      "Keeper row must remain 'filled'")
+        self.assertIn('auto_closed', statuses,
+                      "Duplicate row must be marked 'auto_closed'")
+
+    def test_consolidate_does_not_touch_single_filled_row(self):
+        """A single 'filled' row with unique CID must never be touched by consolidation."""
+        database.init_db()
+        conn = database.get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            "INSERT INTO bot_orders (bot_id, order_id, client_order_id, order_type, price, amount, filled_amount, status, created_at, updated_at) "
+            "VALUES (10016, 'order_solo', 'CQB_10016_ENTRY_SOLO', 'entry', 50000.0, 0.002, 0.002, 'filled', 1000, 1000)"
+        )
+        conn.commit()
+
+        consolidated = database.consolidate_duplicate_bot_orders(bot_id=10016)
+        self.assertEqual(consolidated, 0, "Single unique CID row must not be consolidated")
+
+        row = cursor.execute(
+            "SELECT status FROM bot_orders WHERE client_order_id='CQB_10016_ENTRY_SOLO'"
+        ).fetchone()
+        self.assertEqual(row[0], 'filled', "Status must remain 'filled'")
+
+
+    # ------------------------------------------------------------------ #
+    #  ADR-002 TICKET-1: Schema migration tests                           #
+    # ------------------------------------------------------------------ #
+
+    def test_ticket1_schema_columns_exist(self):
+        """All four ADR-002 columns exist in the bots table."""
+        database.init_db()
+        conn = database.get_connection()
+        # Will raise sqlite3.OperationalError if column missing
+        conn.execute(
+            "SELECT bot_type, parent_bot_id, hedge_child_bot_id, hedge_trigger_step "
+            "FROM bots LIMIT 1"
+        )
+        # Verify pragma lists all four columns
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(bots)").fetchall()}
+        for col in ('bot_type', 'parent_bot_id', 'hedge_child_bot_id', 'hedge_trigger_step'):
+            self.assertIn(col, cols, f"Column '{col}' missing from bots table")
+
+    def test_ticket1_default_values(self):
+        """Existing bots default to bot_type='standard', NULLs for FK columns."""
+        database.init_db()
+        conn = database.get_connection()
+        # Insert a plain bot without specifying new columns
+        conn.execute(
+            "INSERT INTO bots (name, pair, direction, is_active) "
+            "VALUES ('test_default_bot', 'BTCUSDC', 'LONG', 0)"
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT bot_type, parent_bot_id, hedge_child_bot_id, hedge_trigger_step "
+            "FROM bots WHERE name='test_default_bot'"
+        ).fetchone()
+        self.assertIsNotNone(row)
+        bot_type, parent_id, child_id, trigger_step = row
+        # bot_type must default to 'standard' (or NULL for pre-existing rows before migration)
+        self.assertIn(bot_type, ('standard', None),
+                      f"bot_type should be 'standard' or NULL, got '{bot_type}'")
+        self.assertIsNone(parent_id, "parent_bot_id must default to NULL")
+        self.assertIsNone(child_id, "hedge_child_bot_id must default to NULL")
+        self.assertIsNone(trigger_step, "hedge_trigger_step must default to NULL")
+
+    def test_ticket1_schema_idempotent(self):
+        """Calling init_db() twice does not raise or duplicate columns."""
+        database.init_db()
+        database.init_db()  # second call must be a no-op
+        conn = database.get_connection()
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(bots)").fetchall()]
+        # Each ADR-002 column appears exactly once
+        for col in ('bot_type', 'parent_bot_id', 'hedge_child_bot_id', 'hedge_trigger_step'):
+            self.assertEqual(cols.count(col), 1,
+                             f"Column '{col}' appears {cols.count(col)} time(s), expected 1")
+
+
 if __name__ == '__main__':
     unittest.main()

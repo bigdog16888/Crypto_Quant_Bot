@@ -79,13 +79,12 @@ def test_recompute_invested(memory_db):
     """)
     memory_db.commit()
     
-    invested, avg_price, open_qty, max_step, hedge_qty = database.recompute_invested_from_orders(1, 1)
+    invested, avg_price, open_qty, max_step = database.recompute_invested_from_orders(1, 1)
     
     assert invested == 90000.0
     assert open_qty == 2.0
     assert avg_price == 45000.0
     assert max_step == 2
-    assert hedge_qty == 0.0
 
 def test_get_pair_virtual_net(memory_db):
     setup_bot_fixture(memory_db, 1, 'Test Bot', 'BTC/USDC:USDC', 'LONG')
@@ -119,7 +118,7 @@ def test_partial_tp_fill(memory_db):
     """)
     memory_db.commit()
     
-    invested, avg_price, open_qty, max_step, hedge_qty = database.recompute_invested_from_orders(1, 1)
+    invested, avg_price, open_qty, max_step = database.recompute_invested_from_orders(1, 1)
     assert open_qty == 1.0
     assert invested == 50000.0
 
@@ -139,7 +138,7 @@ def test_full_tp_cascade(memory_db):
     """)
     memory_db.commit()
     
-    invested, avg_price, open_qty, max_step, hedge_qty = database.recompute_invested_from_orders(1, 1)
+    invested, avg_price, open_qty, max_step = database.recompute_invested_from_orders(1, 1)
     assert open_qty == 0.0
     assert invested == 0.0
 
@@ -161,7 +160,7 @@ def test_credit_fill_caps_to_order_amount(memory_db):
     row = cursor.execute("SELECT filled_amount FROM bot_orders WHERE order_id='ex1'").fetchone()
     assert row[0] == pytest.approx(0.0021, rel=1e-4)  # amount * 1.05 cap
     seal_trade_state(1)
-    _c, _a, net_qty, _s, _h = database.recompute_invested_from_orders(1, 1)
+    _c, _a, net_qty, _s = database.recompute_invested_from_orders(1, 1)
     assert net_qty == pytest.approx(0.0021, rel=1e-4)
 
 
@@ -179,57 +178,58 @@ def test_canonical_dedup_uses_max_fill_row(memory_db):
         """
     )
     memory_db.commit()
-    _cost, _avg, basket_net, _step, _hq = database.recompute_invested_from_orders(1, 1)
+    _cost, _avg, basket_net, _step = database.recompute_invested_from_orders(1, 1)
     database.sync_trades_from_orders(1)
     assert basket_net == pytest.approx(1.08)
     assert database.get_pair_virtual_net('LINK/USDC:USDC') == pytest.approx(-1.08)
 
 
-def test_hedge_only_open_qty_not_negative(memory_db):
-    """Hedge-only bots must not store negative open_qty (basket=0, hedge in hedge_qty)."""
+def test_hedge_child_open_qty_calculation(memory_db):
+    """Hedge child bot (SHORT) has standard positive open_qty and is calculated correctly."""
     setup_bot_fixture(memory_db, 1, 'Long Bot', 'SOL/USDC:USDC', 'LONG')
+    setup_bot_fixture(memory_db, 2, 'Short Bot', 'SOL/USDC:USDC', 'SHORT')
     cursor = memory_db.cursor()
+    cursor.execute("UPDATE bots SET hedge_child_bot_id = 2 WHERE id = 1")
+    cursor.execute("UPDATE bots SET parent_bot_id = 1, bot_type = 'hedge_child' WHERE id = 2")
+    
+    # Insert entry order for child (SHORT)
     cursor.execute("""
-        INSERT INTO bot_orders (bot_id, order_type, order_id, price, amount, filled_amount, status, cycle_id, step)
-        VALUES (1, 'hedge', 'hedge_only', 80.0, 2.32, 2.32, 'filled', 1, 0)
+        INSERT INTO bot_orders (bot_id, order_type, order_id, price, amount, filled_amount, status, cycle_id, step, position_side)
+        VALUES (2, 'entry', 'child_entry', 80.0, 2.32, 2.32, 'filled', 1, 1, 'SHORT')
     """)
     memory_db.commit()
-
-    _cost, _avg, net_qty, _step, hedge_qty = database.recompute_invested_from_orders(1, 1)
-    assert net_qty == pytest.approx(-2.32)
-    assert hedge_qty == pytest.approx(2.32)
-
-    cursor.execute("UPDATE trades SET open_qty = -2.32 WHERE bot_id = 1")
-    memory_db.commit()
-
-    database.sync_trades_from_orders(1)
-    row = cursor.execute("SELECT open_qty, hedge_qty FROM trades WHERE bot_id = 1").fetchone()
-    assert row[0] == pytest.approx(0.0)
-    assert row[1] == pytest.approx(2.32)
-
-
-def test_hedge_order_virtual_net(memory_db):
-    setup_bot_fixture(memory_db, 1, 'Long Bot', 'BTC/USDC:USDC', 'LONG')
     
+    invested, avg_price, open_qty, max_step = database.recompute_invested_from_orders(2, 1)
+    assert open_qty == pytest.approx(2.32)
+
+
+def test_hedge_child_order_virtual_net(memory_db):
+    """Pair virtual net includes both parent and child bots."""
+    setup_bot_fixture(memory_db, 1, 'Long Bot', 'BTC/USDC:USDC', 'LONG')
+    setup_bot_fixture(memory_db, 2, 'Short Bot', 'BTC/USDC:USDC', 'SHORT')
     cursor = memory_db.cursor()
+    cursor.execute("UPDATE bots SET hedge_child_bot_id = 2 WHERE id = 1")
+    cursor.execute("UPDATE bots SET parent_bot_id = 1, bot_type = 'hedge_child' WHERE id = 2")
+    
     # Add an entry order for bot 1 (+2.0 net)
     cursor.execute("""
-        INSERT INTO bot_orders (bot_id, order_type, order_id, price, amount, filled_amount, status, cycle_id, step)
-        VALUES (1, 'entry', 'order_1', 50000.0, 2.0, 2.0, 'filled', 1, 1)
+        INSERT INTO bot_orders (bot_id, order_type, order_id, price, amount, filled_amount, status, cycle_id, step, position_side)
+        VALUES (1, 'entry', 'order_1', 50000.0, 2.0, 2.0, 'filled', 1, 1, 'LONG')
     """)
-    
-    # Add a hedge order for the same LONG bot (hedge = SHORT = -1.0 net)
+    # Add an entry order for child bot (-1.0 net)
     cursor.execute("""
-        INSERT INTO bot_orders (bot_id, order_type, order_id, price, amount, filled_amount, status, cycle_id, step)
-        VALUES (1, 'hedge', 'hedge_1', 45000.0, 1.0, 1.0, 'filled', 1, 0)
+        INSERT INTO bot_orders (bot_id, order_type, order_id, price, amount, filled_amount, status, cycle_id, step, position_side)
+        VALUES (2, 'entry', 'child_entry', 50000.0, 1.0, 1.0, 'filled', 1, 1, 'SHORT')
     """)
     memory_db.commit()
     
     database.recompute_invested_from_orders(1, 1)
     database.sync_trades_from_orders(1)
+    database.recompute_invested_from_orders(2, 1)
+    database.sync_trades_from_orders(2)
     
     net = database.get_pair_virtual_net('BTC/USDC:USDC')
-    # Net should be +2.0 (entry) - 1.0 (hedge) = +1.0
+    # Net should be +2.0 (parent) - 1.0 (child) = +1.0
     assert net == 1.0
 
 def test_cancelled_partial_fill_not_phantom(memory_db):
@@ -292,45 +292,7 @@ def test_partial_tp_no_cascade_block(memory_db):
     assert row2[1] is None
     assert row2[2] == 1  # Cycle is NOT reset
 
-def test_hedge_position_side_short_counted(memory_db):
-    setup_bot_fixture(memory_db, 1, 'Long Bot', 'BTC/USDC:USDC', 'LONG')
-    
-    cursor = memory_db.cursor()
-    # Add entry order (+2.0)
-    cursor.execute("""
-        INSERT INTO bot_orders (bot_id, order_type, order_id, price, amount, filled_amount, status, cycle_id, step, position_side)
-        VALUES (1, 'entry', 'order_1', 81000.0, 2.0, 2.0, 'filled', 1, 1, 'LONG')
-    """)
-    # Add a hedge order with position_side = 'SHORT'
-    cursor.execute("""
-        INSERT INTO bot_orders (bot_id, order_type, order_id, price, amount, filled_amount, status, cycle_id, step, position_side)
-        VALUES (1, 'hedge', 'hedge_1', 81000.0, 1.0, 1.0, 'filled', 1, 0, 'SHORT')
-    """)
-    memory_db.commit()
-    
-    database.recompute_invested_from_orders(1, 1)
-    database.sync_trades_from_orders(1)
-    net = database.get_pair_virtual_net('BTC/USDC:USDC')
-    # Net should include the hedge: 2.0 (entry) - 1.0 (hedge) = 1.0
-    assert net == 1.0
 
-def test_cycle_id_none_hedge_bot(memory_db):
-    setup_bot_fixture(memory_db, 1, 'Long Bot', 'BTC/USDC:USDC', 'LONG')
-    cursor = memory_db.cursor()
-    
-    # Set cycle_id to NULL in trades
-    cursor.execute("UPDATE trades SET cycle_id = NULL WHERE bot_id = 1")
-    
-    # Add a hedge order of 0.003
-    cursor.execute("""
-        INSERT INTO bot_orders (bot_id, order_type, order_id, price, amount, filled_amount, status, cycle_id, step)
-        VALUES (1, 'hedge', 'hedge_btc_1', 77000.0, 0.003, 0.003, 'filled', NULL, 0)
-    """)
-    memory_db.commit()
-    
-    net = database.get_pair_virtual_net('BTC/USDC:USDC')
-    # Since cycle_id is None, entries/grids are 0.0. The hedge (0.003 SHORT) gives -0.003 net.
-    assert net == -0.003
 
 def test_tp_cascade_idempotent(memory_db):
     from engine.ledger import handle_tp_completion
@@ -441,7 +403,7 @@ def test_anonymous_fill_adoption(memory_db):
     memory_db.commit()
     
     # Now run recompute_invested_from_orders to update trades/check results
-    total_invested, avg_price, open_qty, current_step, hedge_qty = database.recompute_invested_from_orders(1, 1)
+    total_invested, avg_price, open_qty, current_step = database.recompute_invested_from_orders(1, 1)
     
     # Update the trades table cache with the recomputed values (as in production)
     cursor.execute("""
@@ -473,7 +435,7 @@ def test_cancelled_partial_fill_not_counted_as_active(memory_db):
     memory_db.commit()
     
     # Assert recompute_invested_from_orders does NOT count it in bought_qty / open_qty
-    total_invested, avg_price, open_qty, max_step, hedge_qty = database.recompute_invested_from_orders(1, 1)
+    total_invested, avg_price, open_qty, max_step = database.recompute_invested_from_orders(1, 1)
     assert open_qty == 0.0
     assert total_invested == 0.0
 
@@ -492,7 +454,7 @@ def test_duplicate_entry_same_cid_not_double_counted(memory_db):
     memory_db.commit()
     
     # Assert recompute_invested_from_orders only counts unique fills, not duplicates
-    total_invested, avg_price, open_qty, max_step, hedge_qty = database.recompute_invested_from_orders(1, 1)
+    total_invested, avg_price, open_qty, max_step = database.recompute_invested_from_orders(1, 1)
     database.sync_trades_from_orders(1)
     assert open_qty == 1.0
     assert total_invested == 50000.0

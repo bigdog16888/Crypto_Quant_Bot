@@ -17,10 +17,7 @@ def run_reconciliation():
     exchanges = {}
     try:
         ex = ExchangeInterface(
-            api_key=config.BINANCE_API_KEY,
-            api_secret=config.BINANCE_API_SECRET,
-            market_type=config.MARKET_TYPE,
-            testnet=config.TESTNET
+            market_type=config.MARKET_TYPE
         )
         exchanges[config.MARKET_TYPE] = ex
     except Exception as e:

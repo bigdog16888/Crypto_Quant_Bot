@@ -1,5 +1,5 @@
 # Crypto Quant Bot — AI Agent Codebase Guide
-**Version: 3.5.2 | Last Updated: 2026-05-21**
+**Version: 3.5.8 | Last Updated: 2026-05-26**
 
 > **READ THIS FIRST** before touching any code. This is the single authoritative guide.
 > It supersedes `UNIFIED_BOT_DOCUMENTATION.md` and all older session notes.
@@ -390,6 +390,13 @@ To prevent Binance **`-2022 ReduceOnly Order is rejected`** errors in hedged (On
 | Monitor `Trigger` column shows `N/A` for all scanning bots | `extract_info` computed price-threshold proximity only; RSI/CCI branches existed but returned the raw level string without live value | Fixed in v3.1.2: `get_indicator_val()` fetches live OHLCV and computes RSI/CCI/Stoch in-fragment with a local cache; proximity label (`🟢 IN RANGE / 🟡 SOON / ⚪ FAR`) attached to every trigger type |
 | `💥 Close` on mismatch row returns Binance 400 ReduceOnly error, bot stays stuck | `create_order(reduceOnly=True)` rejected because position already flat; error aborted the bot-state reset | Fixed in v3.1.3: `Close` now catches `reduceOnly`/`400`/`not found` errors, issues a warning toast, and **always** proceeds to `reset_bot_after_tp` so bot returns to IDLE even when exchange is already flat |
 | `WIPE BLOCKED: Bot X has live SHORT/LONG position` after startup orphan flatten | `repair_exchange_orphan_when_ledger_flat` sent a `reduceOnly` market close, then immediately called `reset_bot_after_tp`. `_fetch_pos_wrapper` inside `safe_mark_reset_cleared` reads `active_positions` (stale — not yet updated by the WS fill that's still in-flight). Guard sees non-zero qty → raises `WipeBlockedError` → bot ledger stays stuck with phantom `open_qty` despite exchange being flat. Loop fires every 7s. | Fixed in v3.5.2: (1) `repair_exchange_orphan_when_ledger_flat` deletes the `active_positions` row for the pair **after** confirming flatten and before calling reset. (2) `'ORPHAN_EXCHANGE_REPAIR'` added to `excluded_carry_labels` and `CYCLE_RESET_CARRY_LABELS` so `safe_mark_reset_cleared` uses `allow_nonzero_wipe=True` for this path. |
+| Runaway cycle-align adoption inflates bot qty in one pass | `adopt_from_physical_positions` used full pair-level `net_phys_qty` as target for single bot on shared pair | [v3.5.4] `MAX_ADOPTION_QTY_PER_CYCLE` circuit breaker aborts and sets `REQUIRE_MANUAL_PROOF` if single-pass adoption exceeds 0.5 units |
+| Bot IN TRADE with existing position has grid blocked by one-way gate | `gate_oneway_opposite_entry` called during grid maintenance, not just new entries | [v3.5.4] Gate skipped when `total_invested > 0.01` AND `current_step > 0` |
+| Startup shows all System=0 vs Exchange=non-zero | `audit_pair_ledger_vs_exchange` fires before `sync_trades_from_orders` completes | [v3.5.5] Sync barrier: `sync_trades_from_orders` runs once for all bots before any parity audit |
+| BTC/USDC qty mismatch (sys=-0.046 vs ex=-0.090) | `reconstruct_offline_fills` CID lookup matched a `virtual_netting` row from a prior OWAY_REPAIR across cycles; the `OR client_order_id=?` in two UPDATE statements also corrupted sibling rows | [v3.5.5] CID lookup restricted to `order_id=? OR (client_order_id=? AND cycle_id=?)` for current cycle only; UPDATE statements narrowed to `order_id=?` only; new physical order guard added when CID matches but exchange order_id differs |
+| False [DRIFT-ALERT] on shared pairs (e.g. ETH, SUI) | Drift-check compared individual bot's virtual net to full-pair physical net | [v3.5.6] Sibling check: suppress bot-level drift warnings if active sibling bots exist on the same pair |
+| OWAY_REPAIR fakes exit fills in ledger, corrupting it | `reconcile_oneway_pair_open_qty` wrote `virtual_netting` rows with `status='filled'` to database | [v3.5.6] Ledger-neutral: OWAY_REPAIR writes `drift_note` (zero ledger impact) instead of fake fills |
+| 408/Network timeouts hammer Binance every cycle | Engine did not implement backoff on grid placement errors, retrying immediately | [v3.5.6] Grid backoff: exponential retry backoff up to 60s for grid placement network errors |
 
 ---
 
@@ -414,6 +421,75 @@ After restart, watch for:
 ---
 
 ## 7. Version History (Change Log)
+
+### v3.6.0 — 2026-05-27
+**Global Flatten safety guards, forensic proof gate fix, audit fill receipts, and manual database repairs.**
+
+**engine/reconciler.py** (`resolve_net_mismatch`):
+- **Candidate Gating Check**: Filter candidate bots (`suspects`) to exclude those with status `REQUIRE_MANUAL_PROOF`, `MANUAL_GATE`, `FLATTENING`, `HEDGE_STANDBY`, or `STOPPED`, and inactive bots (`is_active = 0`). If all suspects are gated, the reconciler blocks the global flatten order, flags all candidate bots as `REQUIRE_MANUAL_PROOF`, and continues to the next pair.
+- **Forensic DNA Gate Fix**: Added missing `b4_ran = True` assignment at the end of the B.4 claimant block. This prevents the reconciler from incorrectly falling through to the Aggressive Market Flatten protocol when valid forensic DNA/TP proofs exist.
+- **Auditable Close Fill Receipts**: Captured the CCXT market order result and wrote a closing order receipt to `bot_orders` + called `credit_fill` to cleanly decrement `open_qty` before resetting the bot's virtual state, preventing post-flatten ledger corruption.
+- **tests/test_reconciler_manual_gate.py**: Added integration tests `test_global_flatten_skips_gated_bots` and `test_b4_forensic_proof_prevents_flatten` to verify these safety behaviors.
+- **tests/test_global_flatten_writes_bot_orders_row.py**: Added tests for verifying the flatten fill receipt creation.
+
+**One-off DB recovery (2026-05-27)**:
+- Recovered BTC bot `10016` (status `IN TRADE`, `open_qty = 0.006`, `total_invested = 455.097`) and ETH bot `10011` (removed stale `tp_order_id` block).
+
+### v3.5.8 — 2026-05-26
+**Canonical dedup ranking fix (Fix 5 — root cause), consolidate post-seal expansion (Fixes 1+2), one-way netting inactive-bot guard (Fix 4), and surgical DB repairs.**
+
+**engine/database.py** (`_BOT_ORDERS_CANONICAL_SUBSELECT`):
+- **Fix 5 — Canonical Ranking for Canceled+Filled Rows**: `canceled`/`cancelled` rows with `filled_amount > 0` now rank equally to `filled`/`auto_closed` rows in the dedup ORDER BY. Previously, a canceled TP with a real fill (e.g., `fill=0.97` for SOL, `fill=22.4` for SUI) lost rank to an `auto_closed` zero-fill duplicate. `recompute_invested_from_orders` then selected the zero-fill canonical row, making `sold_qty=0` → `open_qty` never decremented after the TP. This was the single root cause of all SOL/SUI persistent open_qty inflation.
+
+**engine/database.py** (`consolidate_duplicate_bot_orders`):
+- **Fix 2 — Remove 'filled' from status NOT IN**: Consolidator now catches groups where the WS already set one duplicate to `'filled'` while partial/open retries remain. Previously those groups were invisible (the filled row excluded the whole CID group from the HAVING COUNT(*) > 1 result).
+- **Fix 1 — All-row seal detection**: Seal check now inspects all rows in a consolidated group (including the keeper, which is typically the canonical filled TP row) rather than only non-keepers. Extended EXIT_TYPES to include `'forensic_adoption_reduce'`.
+- **Improved seal logging**: Single `logger.warning` reports how many bots were sealed after the commit, rather than per-bot `logger.info`.
+
+**engine/oneway_netting.py** (`apply_oneway_entry_cross_reduction`):
+- **Fix 4 — Inactive-bot status guard**: Fetches `b.status` in the neighbors SQL query. `SCANNING`/`Scanning`/`REQUIRE_MANUAL_PROOF`/`STOPPED` bots are skipped. A bot with a stale `open_qty` residual that is not actively in trade would otherwise receive phantom `virtual_netting` reductions, creating a false impression that the SHORT bot's cross-reduction was consumed by an already-flat sibling.
+
+**One-off DB recovery (2026-05-26)**:
+- Fixed `short sui` (100000) and `short sol` (100001) MANUAL_PROOF gates: returned to `Scanning` after confirming `open_qty=0` and `total_invested=0`.
+- `sui long` (10018) `open_qty` force-corrected `580.3 → 557.9` (accumulator was stale; recompute after Fix 5 confirmed `557.9` = exchange physical).
+- `sol` (10008) `open_qty` sealed to `0.42` via `seal_trade_state` (was `1.39`; Fix 5 correctly accounted for the 0.97 canceled TP fill).
+
+### v3.5.6 — 2026-05-26
+**Drift alert check, OWAY_REPAIR ledger-neutral rows, and exponential grid placement backoff.**
+
+**engine/bot_executor.py**:
+- **Drift Alert Suppression**: Suppress bot-level warning alerts if active sibling bots exist on the same pair (since they share the exchange position, individual comparison is invalid; pair-level parity is already audited by reconciler).
+- **Grid Exponential Backoff**: Add per-bot `self._grid_backoff` registry tracking network timeouts, ccxt network errors, and Binance 408 rejections. Grid placement/re-placement is skipped exponentially (up to 60 seconds) on failure, recovering cleanly when the backoff duration expires.
+
+**engine/oneway_netting.py**:
+- **Ledger-Neutral OWAY_REPAIR**: Modify `reconcile_oneway_pair_open_qty` to write `'drift_note'` rows with `amount=0.0` and `status='audit'` instead of `'virtual_netting'` exit fills, preventing OWAY_REPAIR from corrupting the ledger.
+
+### v3.5.5 — 2026-05-25
+**Reconciler offline-sync CID dedup fix; BTC/USDC parity restoration.**
+
+**engine/runner.py**:
+- **Sync Barrier**: `sync_trades_from_orders` runs once for all active bots at startup before any exchange parity audit (prevents all-System=0 false alarm during cold start).
+
+**engine/reconciler.py** (`reconstruct_offline_fills`):
+- **CID Cycle Guard**: The CID lookup query now restricts the `client_order_id` match to the bot's current cycle (`AND cycle_id=?`). Historical rows from past cycles with the same CID prefix are no longer considered, preventing them from masking legitimate new fills.
+- **New-Physical-Order Guard**: If the DB row matched by CID has a different real exchange `order_id` than the fill being processed, the row is treated as a new physical order (`row=None`) rather than silently skipped.
+- **Surgical UPDATE (×2)**: Two `UPDATE bot_orders` statements that used `OR client_order_id=?` have been narrowed to `WHERE order_id=?` only, preventing corruption of sibling rows (e.g., `virtual_netting` rows from prior repair passes) that happen to share the same CID prefix.
+
+**One-off DB recovery (2026-05-25)**:
+- Bot 10022 (`short btc`): Deleted erroneous `virtual_netting` row `CQB_10022_OWAY_REPAIR_1779752456` (filled_amount=0.044) that was offsetting legitimate fills. Called `sync_trades_from_orders(10022)`. `trades.open_qty` corrected from 0.046 → **0.090** (matches exchange). Bot reset from `REQUIRE_MANUAL_PROOF` to `IN TRADE`.
+
+### v3.5.4 — 2026-05-25
+**Consolidated core stability fixes: NameError, WS Warmup Timing, Oneway opposite gate, and Adoption Circuit Breaker.**
+
+**engine/bot_executor.py**:
+- **Fix 1 — `phys_net_signed` NameError**: Replaced undefined reference `phys_net_signed` with `phys_net_qty` in the drift-alert logic.
+- **Fix 3 — Oneway Opposite Gate Bypass**: Skip the `gate_oneway_opposite_entry` check during grid maintenance if the bot is already in-trade (`total_invested > 0.01` and `current_step > 0`).
+
+**engine/runner.py**:
+- **Fix 2 — WS Warmup Timing**: Increased `WS_WARMUP_SECONDS` from 8 to 20 to prevent startup race conditions where reconciliation starts before WS cache is populated.
+
+**engine/reconciler.py**:
+- **Fix 4 — Adoption Circuit Breaker**: Tracks cumulative quantity adopted per bot per pass. If it exceeds `MAX_ADOPTION_QTY_PER_CYCLE` (default 0.5), it aborts the adoption, logs an `ERROR`, and sets the bot status to `REQUIRE_MANUAL_PROOF`.
 
 ### v3.5.2 — 2026-05-21
 **Orphan-repair stale-snapshot deadlock fix. Zero mismatches verified live.**
@@ -786,6 +862,7 @@ LOG_LEVEL=INFO
 ALLOWED_SYMBOLS=BTC/USDT,ETH/USDT,BNB/USDT,BTC/USDC
 MAX_ORDER_USD=20000
 GLOBAL_STOP_LOSS_PCT=70.0
+MAX_ADOPTION_QTY_PER_CYCLE=0.5
 ```
 
 If `.env` ever gains extra garbage lines (e.g. after a test run), restore this exact structure manually.

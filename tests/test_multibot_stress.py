@@ -72,75 +72,108 @@ def test_concurrent_cycles(num_cycles=10):
     print("🧪 MULTI-BOT STRESS TEST")
     print("="*60 + "\n")
     
-    # Initialize
-    init_db()
+    import tempfile
+    import shutil
+    import engine.database
     
-    # Create test bots
-    print("Creating test bots...")
-    bot_ids = create_test_bots(5)
+    test_dir = tempfile.mkdtemp()
+    test_db = os.path.join(test_dir, "test_multibot_stress.db")
     
-    if len(bot_ids) < 3:
-        print("❌ Failed to create enough bots for stress test")
-        return False
+    original_db_path = engine.database.DB_PATH
+    engine.database.DB_PATH = test_db
     
-    print(f"\n📊 Testing with {len(bot_ids)} bots running {num_cycles} cycles...\n")
-    
-    # Mock exchange to avoid real API calls
-    with patch('engine.runner.ExchangeInterface') as MockExchange:
-        mock_instance = MagicMock()
-        mock_instance.fetch_balance.return_value = {'USDT': {'total': 10000.0, 'free': 10000.0}}
-        mock_instance.fetch_ohlcv.return_value = [
-            [int(time.time()*1000), 50000, 50100, 49900, 50050, 1000]
-            for _ in range(100)
-        ]
-        mock_instance.get_last_price.return_value = 50050.0
-        MockExchange.return_value = mock_instance
+    if hasattr(engine.database._local, 'connection'):
+        del engine.database._local.connection
         
-        try:
-            runner = BotRunner()
-            runner.running = True
+    success = False
+    bot_ids = []
+    
+    try:
+        # Initialize
+        init_db()
+        
+        # Create test bots
+        print("Creating test bots...")
+        bot_ids = create_test_bots(5)
+        
+        if len(bot_ids) < 3:
+            print("❌ Failed to create enough bots for stress test")
+            return False
+        
+        print(f"\n📊 Testing with {len(bot_ids)} bots running {num_cycles} cycles...\n")
+        
+        # Mock exchange to avoid real API calls
+        with patch('engine.runner.ExchangeInterface') as MockExchange:
+            mock_instance = MagicMock()
+            mock_instance.fetch_balance.return_value = {'USDT': {'total': 10000.0, 'free': 10000.0}}
+            mock_instance.fetch_ohlcv.return_value = [
+                [int(time.time()*1000), 50000, 50100, 49900, 50050, 1000]
+                for _ in range(100)
+            ]
+            mock_instance.get_last_price.return_value = 50050.0
+            MockExchange.return_value = mock_instance
             
-            errors = []
-            cycles_completed = 0
+            try:
+                runner = BotRunner()
+                runner.running = True
+                
+                errors = []
+                cycles_completed = 0
+                
+                for cycle in range(num_cycles):
+                    try:
+                        result = runner.run_cycle()
+                        cycles_completed += 1
+                        
+                        # Check order limits are working
+                        if runner.orders_this_cycle > runner.MAX_ORDERS_PER_CYCLE:
+                            errors.append(f"Cycle {cycle}: Order limit exceeded!")
+                        
+                        print(f"  ✓ Cycle {cycle+1}/{num_cycles} - Orders: {runner.orders_this_cycle}")
+                        
+                    except Exception as e:
+                        errors.append(f"Cycle {cycle}: {str(e)}")
+                        print(f"  ✗ Cycle {cycle+1} FAILED: {e}")
+                
+                # Summary
+                print("\n" + "="*60)
+                print("📊 STRESS TEST RESULTS")
+                print("="*60)
+                print(f"Cycles completed: {cycles_completed}/{num_cycles}")
+                print(f"Errors encountered: {len(errors)}")
+                
+                if errors:
+                    print("\nErrors:")
+                    for err in errors[:10]:  # Show first 10
+                        print(f"  - {err}")
+                        
+                success = len(errors) == 0 and cycles_completed == num_cycles
+                print(f"\nResult: {'✅ PASSED' if success else '❌ FAILED'}")
+                
+            except Exception as e:
+                print(f"❌ FATAL ERROR: {e}")
+                success = False
             
-            for cycle in range(num_cycles):
+        # Cleanup test bots in the test DB
+        print("\nCleaning up test bots...")
+        cleanup_test_bots(bot_ids)
+        
+    finally:
+        # Restore database configuration and cleanup directory
+        engine.database.DB_PATH = original_db_path
+        if hasattr(engine.database._local, 'connection'):
+            if engine.database._local.connection:
                 try:
-                    result = runner.run_cycle()
-                    cycles_completed += 1
-                    
-                    # Check order limits are working
-                    if runner.orders_this_cycle > runner.MAX_ORDERS_PER_CYCLE:
-                        errors.append(f"Cycle {cycle}: Order limit exceeded!")
-                    
-                    print(f"  ✓ Cycle {cycle+1}/{num_cycles} - Orders: {runner.orders_this_cycle}")
-                    
-                except Exception as e:
-                    errors.append(f"Cycle {cycle}: {str(e)}")
-                    print(f"  ✗ Cycle {cycle+1} FAILED: {e}")
+                    engine.database._local.connection.close()
+                except Exception:
+                    pass
+            del engine.database._local.connection
             
-            # Summary
-            print("\n" + "="*60)
-            print("📊 STRESS TEST RESULTS")
-            print("="*60)
-            print(f"Cycles completed: {cycles_completed}/{num_cycles}")
-            print(f"Errors encountered: {len(errors)}")
+        try:
+            shutil.rmtree(test_dir)
+        except Exception:
+            pass
             
-            if errors:
-                print("\nErrors:")
-                for err in errors[:10]:  # Show first 10
-                    print(f"  - {err}")
-                    
-            success = len(errors) == 0 and cycles_completed == num_cycles
-            print(f"\nResult: {'✅ PASSED' if success else '❌ FAILED'}")
-            
-        except Exception as e:
-            print(f"❌ FATAL ERROR: {e}")
-            success = False
-        
-    # Cleanup
-    print("\nCleaning up test bots...")
-    cleanup_test_bots(bot_ids)
-    
     return success
 
 if __name__ == "__main__":

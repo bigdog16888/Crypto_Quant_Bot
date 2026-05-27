@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 class Config:
-    VERSION = "3.1.4"  # Single-Source Netting + Post-TP Dust Sweep
+    VERSION = "3.5.7"  # OWAY_REPAIR downward trim detection (Fix B) & repair qty guard (Fix C)
     ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
     def __init__(self):
@@ -61,7 +61,7 @@ class Config:
             "TESTNET_PURGE_PHANTOM_LEDGER", _purge_default
         ).lower() == "true"
         # When ledger is flat but exchange still holds size, auto repair (adopt with proof or flatten)
-        _orphan_default = "True" if self.TESTNET else "False"
+        _orphan_default = "False"
         self.AUTO_REPAIR_ORPHAN_EXCHANGE = os.getenv(
             "AUTO_REPAIR_ORPHAN_EXCHANGE", _orphan_default
         ).lower() == "true"
@@ -69,6 +69,10 @@ class Config:
         self.ONE_WAY_BLOCK_OPPOSITE_ENTRY = os.getenv(
             "ONE_WAY_BLOCK_OPPOSITE_ENTRY", "True"
         ).lower() == "true"
+        # Circuit Breaker: Max quantity allowed to be adopted/aligned for a single bot per cycle (default 0.5)
+        self.MAX_ADOPTION_QTY_PER_CYCLE = float(os.getenv("MAX_ADOPTION_QTY_PER_CYCLE", "0.5"))
+        # Max quantity allowed to be automatically trimmed/aligned by OWAY_REPAIR (default 50.0)
+        self.MAX_OWAY_REPAIR_QTY = float(os.getenv("MAX_OWAY_REPAIR_QTY", "50.0"))
 
         self.ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         self.PATHS = {

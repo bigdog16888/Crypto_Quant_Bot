@@ -43,9 +43,8 @@ def forensic_adopt_allowed() -> bool:
 
 
 def get_bot_signed_contribution(bot_id: int) -> float:
-    """Signed virtual qty this bot contributes to pair netting (matches get_pair_virtual_net)."""
-    from engine.database import get_connection, get_bot_hedge_qty
-
+    """Signed virtual qty this bot contributes to pair netting."""
+    from engine.database import get_connection
     conn = get_connection()
     row = conn.execute(
         "SELECT b.direction, COALESCE(t.open_qty, 0) FROM bots b "
@@ -54,13 +53,11 @@ def get_bot_signed_contribution(bot_id: int) -> float:
     ).fetchone()
     if not row:
         return 0.0
-
     direction = str(row[0] or 'LONG').upper()
     open_qty = float(row[1] or 0)
-    hedge_qty = get_bot_hedge_qty(bot_id)
-    if direction == 'LONG':
-        return round(open_qty - hedge_qty, 8)
-    return round(-open_qty + hedge_qty, 8)
+    # Hedge child bots have direction='SHORT' and their own open_qty.
+    # No special hedge_qty subtraction needed — they are proper bots.
+    return round(open_qty if direction == 'LONG' else -open_qty, 8)
 
 
 def pair_heal_budget(exchange, pair: str) -> float:
@@ -763,12 +760,13 @@ def proof_flatten_pair(
     norm_target = normalize_symbol(pair).upper()
     conn = get_connection()
     bot_rows = conn.execute(
-        "SELECT id, pair FROM bots WHERE is_active=1"
+        "SELECT id, pair, direction FROM bots WHERE is_active=1"
     ).fetchall()
-    target_bot_ids = [
-        r[0] for r in bot_rows
+    target_bots = [
+        {'id': r[0], 'direction': r[2]} for r in bot_rows
         if normalize_symbol(r[1]).upper() == norm_target
     ]
+    target_bot_ids = [b['id'] for b in target_bots]
 
     # 1. Cancel CQB orders
     try:
@@ -791,7 +789,24 @@ def proof_flatten_pair(
 
     tol = qty_tolerance()
     if abs(net) > tol:
+        # close_side is always determined by the physical exchange net — this is the
+        # authoritative source. proof_flatten_pair must close whatever the exchange holds,
+        # regardless of what direction individual bots think they are.
+        # An opposite-sign mismatch (e.g. SHORT bot but exchange LONG) is precisely
+        # the case where proof flatten is needed — blocking it here makes recovery
+        # impossible. Log the mismatch for audit; do NOT block the flatten.
         close_side = 'sell' if net > 0 else 'buy'
+
+        for bot in target_bots:
+            expected_side = 'buy' if bot['direction'] == 'SHORT' else 'sell'
+            if close_side != expected_side:
+                logger.warning(
+                    f"⚠️ [PROOF-FLATTEN-OPPOSITE-SIGN] Bot {bot['id']} direction={bot['direction']} "
+                    f"expects close_side='{expected_side}' but exchange net={net:.6f} requires "
+                    f"close_side='{close_side}'. Proceeding with exchange-authority flatten. "
+                    f"Bot ledger will be reset after exchange is verified flat."
+                )
+
         close_qty = abs(net)
         try:
             prec = exchange.get_symbol_precision(pair)

@@ -210,7 +210,7 @@ def credit_fill(
         _ENTRY_TYPES = ('entry', 'grid', 'adoption_add', 'adoption',
                         'forensic_adoption_add')
         _EXIT_TYPES  = ('tp', 'close', 'sl', 'dust_close', 'adoption_reduce',
-                        'forensic_adoption_reduce', 'hedge', 'hedge_tp')
+                        'forensic_adoption_reduce')
 
         if order_type in _ENTRY_TYPES and row_step is not None and row_cycle is not None and order_amount > 0:
             try:
@@ -424,13 +424,12 @@ def seal_trade_state(bot_id: int) -> Dict[str, Any]:
     # ────────────────────────────────────────────────────────────────────────────
 
     try:
-        cost, avg, qty, step, h_qty = recompute_invested_from_orders(bot_id)
+        cost, avg, qty, step = recompute_invested_from_orders(bot_id)
     except Exception as e:
         logger.error(f"[SEAL] recompute_invested_from_orders failed for bot {bot_id}: {e}")
         return {}
 
-    from engine.database import basket_open_qty_from_recompute
-    main_open_qty = basket_open_qty_from_recompute(qty, h_qty)
+    main_open_qty = max(0.0, qty)
 
     # ── OPEN_QTY ACCUMULATOR CROSS-CHECK [v2.3.2] ──────────────────────────────
     # trades.open_qty is the authoritative running total — it was incremented/decremented
@@ -457,8 +456,8 @@ def seal_trade_state(bot_id: int) -> Dict[str, Any]:
                         f"Overwriting open_qty with recomputed basket truth."
                     )
                     conn.execute(
-                        "UPDATE trades SET open_qty=?, hedge_qty=? WHERE bot_id=?",
-                        (main_open_qty, h_qty, bot_id)
+                        "UPDATE trades SET open_qty=? WHERE bot_id=?",
+                        (main_open_qty, bot_id)
                     )
                     conn.commit()
                 elif drift_pct > 0.001:  # 0.1%–5%: minor drift → accumulator wins
@@ -513,8 +512,8 @@ def seal_trade_state(bot_id: int) -> Dict[str, Any]:
                 f"Anchoring to now (basket_qty={main_open_qty:.6f})."
             )
 
-        # EXPLICIT ZERO: flat basket and no hedge → zero basket timer
-        if main_open_qty <= 1e-8 and abs(h_qty) <= 1e-8:
+        # EXPLICIT ZERO: flat basket → zero basket timer
+        if main_open_qty <= 1e-8:
             basket_time_update = 0
 
         # Clamp step when basket has size (hedge-only does not advance step)
@@ -529,8 +528,7 @@ def seal_trade_state(bot_id: int) -> Dict[str, Any]:
                 avg_entry_price  = ?,
                 current_step     = ?,
                 open_qty         = ?,
-                hedge_qty        = ?,
-                entry_confirmed  = CASE WHEN ? > 0.01 OR abs(?) > 1e-8 THEN 1 ELSE 0 END,
+                entry_confirmed  = CASE WHEN ? > 0.01 THEN 1 ELSE 0 END,
                 basket_start_time = CASE 
                     WHEN ? IS NOT NULL THEN ?
                     ELSE basket_start_time 
@@ -540,12 +538,13 @@ def seal_trade_state(bot_id: int) -> Dict[str, Any]:
                     ELSE cycle_phase 
                 END
             WHERE bot_id = ?
-        """, (cost, avg, step, main_open_qty, h_qty, cost, h_qty, basket_time_update, basket_time_update, cost, bot_id))
+        """, (cost, avg, step, main_open_qty, cost, basket_time_update, basket_time_update, cost, bot_id))
 
 
         # Derive and update bot status
-        # 🚀 HEDGE-AWARE STATUS: Even if net qty is 0, if cost > 0 we are in a cycle.
-        if cost > 0.01 or abs(h_qty) > 1e-8:
+        # A bot is IN TRADE if it has: cost > 0, OR an outstanding position (main_open_qty > 0).
+        # A hedge_child bot with a migrated position will have main_open_qty > 0 but cost=0 (audit entry has price=0), so we check both.
+        if cost > 0.01 or main_open_qty > 1e-8:
             new_status = 'IN TRADE'
         else:
             new_status = 'Scanning'
@@ -788,7 +787,7 @@ def handle_tp_completion(
         try:
             db_locked = conn.execute(
                 "UPDATE bot_orders SET status='auto_closed', notes=?, updated_at=? "
-                "WHERE bot_id=? AND status IN ('open', 'new', 'placing') AND order_type NOT IN ('hedge', 'hedge_tp')",
+                "WHERE bot_id=? AND status IN ('open', 'new', 'placing')",
                 (
                     f"TP_CASCADE_RACE_GUARD: locked at tp_ts={exit_fill_ts}",
                     int(time.time()),
@@ -813,7 +812,7 @@ def handle_tp_completion(
             # Do NOT trust the trades table for the TP Hit log. 
             # If seal_trade_state hasn't run yet, total_invested might be stale.
             # Recompute from the absolute ledger truth (bot_orders).
-            invested, avg_entry, qty, current_step, h_qty = recompute_invested_from_orders(bot_id)
+            invested, avg_entry, qty, current_step = recompute_invested_from_orders(bot_id)
             
             bot_state = get_bot_status(bot_id)
             if bot_state:
@@ -859,6 +858,59 @@ def handle_tp_completion(
                 exchange=exchange,
             )
             logger.info(f"[TP-CASCADE] ✅ Bot {bot_id}: Reset to Scanning. Cycle {cycle_id} → {cycle_id + 1} (cst={exit_fill_ts}).")
+
+            # 🛡️ HEDGE CHILD: place break-even TP if parent has an active hedge child
+            try:
+                from engine.database import get_connection as _gc_hc
+                _hc_conn = _gc_hc()
+                _hc_row = _hc_conn.execute(
+                    "SELECT hedge_child_bot_id FROM bots WHERE id=?", (bot_id,)
+                ).fetchone()
+                if _hc_row and _hc_row[0]:
+                    child_id = _hc_row[0]
+                    child_state = _hc_conn.execute(
+                        "SELECT open_qty, avg_entry_price, cycle_id, status FROM trades t "
+                        "JOIN bots b ON b.id=t.bot_id WHERE t.bot_id=?", (child_id,)
+                    ).fetchone()
+                    if child_state:
+                        child_open_qty, child_avg, child_cycle, child_status = child_state
+                        child_open_qty = float(child_open_qty or 0)
+                        child_avg = float(child_avg or 0)
+                        if child_open_qty > 0.0001 and child_avg > 0:
+                            # Break-even TP = avg_entry_price of the hedge child
+                            be_price = child_avg
+                            child_direction = _hc_conn.execute(
+                                "SELECT direction FROM bots WHERE id=?", (child_id,)
+                            ).fetchone()[0]
+                            # TP side is opposite to child's position direction
+                            tp_side = 'buy' if child_direction == 'SHORT' else 'sell'
+                            be_cid = f"CQB_{child_id}_TP_{child_cycle}_BE"
+
+                            # Check if BE TP already exists
+                            existing_be = _hc_conn.execute(
+                                "SELECT id FROM bot_orders WHERE bot_id=? AND client_order_id=?",
+                                (child_id, be_cid)
+                            ).fetchone()
+                            if not existing_be:
+                                # Register intent — actual order placed by bot_executor on next cycle
+                                # (exchange object not available here in ledger context)
+                                from engine.database import save_bot_order
+                                save_bot_order(
+                                    child_id, 'tp', f'PENDING_BE_{child_id}_{child_cycle}',
+                                    be_price, child_open_qty, step=0,
+                                    status='pending_placement',
+                                    client_order_id=be_cid,
+                                    notes=f"Break-even TP pending placement: parent {bot_id} TP hit",
+                                    cycle_id=child_cycle,
+                                )
+                                logger.info(
+                                    f"[HEDGE-BE-TP] Child {child_id}: break-even TP registered "
+                                    f"@ {be_price:.4f} for {child_open_qty:.6f} {child_direction}. "
+                                    f"Will be placed by bot_executor on next cycle."
+                                )
+            except Exception as _hc_err:
+                logger.warning(f"[HEDGE-BE-TP] Failed to register child TP (non-fatal): {_hc_err}")
+
             return True
 
         except Exception as e_reset:

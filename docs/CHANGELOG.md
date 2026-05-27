@@ -2,7 +2,63 @@
 
 All notable **architecture** changes are documented here. Version numbers match `CODEBASE_GUIDE.md` and `docs/ARCHITECTURE_v3.x.md`.
 
----
+## v3.5.6 — 2026-05-26 — Drift check, OWAY_REPAIR ledger-neutral rows, and exponential grid placement backoff
+
+- **engine/bot_executor.py**:
+  - **Drift Alert Sibling Check**: Added checks for active sibling bots sharing the same pair. If active sibling bots exist, the bot-level warning drift alert is suppressed, leaving pair-level parity audits to the reconciler.
+  - **Grid Placement Backoff**: Implemented exponential backoff for grid order placement. When CCXT throws a network timeout / connection error or Binance returns a 408, grid placement is deferred per-bot (delay scales from 2 to 60 seconds). Successfully placing a grid order resets backoff.
+
+- **engine/oneway_netting.py**:
+  - **Ledger-Neutral OWAY_REPAIR**: Modified `reconcile_oneway_pair_open_qty` to write `'drift_note'` rows with `amount=0.0` and `status='audit'` instead of `'virtual_netting'` exit fills. This ensures that startup alignments document physical discrepancies without faking ledger fills and corrupting subsequent recomputations.
+
+- **config/settings.py**:
+  - **Version Bump**: Incremented `VERSION` to `"3.5.6"`.
+
+## v3.5.5 — 2026-05-25 — Reconciler CID Dedup Fix & BTC/USDC Parity Restoration
+
+**Root cause (BTC/USDC parity mismatch, sys=-0.046 vs ex=-0.090):**
+`reconstruct_offline_fills` used `OR client_order_id=?` in its CID lookup query **without** a cycle restriction. A historical `virtual_netting` row (`CQB_10022_OWAY_REPAIR_1779752456`, filled_amount=0.044) inserted by an earlier OWAY_REPAIR path was matched across cycles and caused `sync_trades_from_orders` to compute `open_qty=0.046` instead of the correct `0.090`. Additionally, two `UPDATE bot_orders` statements used `OR client_order_id=?` which could corrupt sibling rows that happened to share the same CID prefix.
+
+- **engine/reconciler.py** (`reconstruct_offline_fills`):
+  - **CID Cycle Guard**: CID lookup now uses `(order_id=? OR (client_order_id=? AND cycle_id=?))` so only rows from the bot's current cycle are matched. Historical rows from prior cycles with the same CID prefix are ignored.
+  - **New-Physical-Order Guard**: If the DB row matched by CID has a different real exchange `order_id` from the fill being processed, the match is treated as a brand-new physical order (`row=None`) instead of being silently skipped.
+  - **Surgical UPDATEs (×2)**: The two `UPDATE bot_orders SET status='filled'` statements that previously used `OR client_order_id=?` have been narrowed to `WHERE order_id=?` only, preventing collateral mutation of sibling rows.
+
+- **engine/runner.py**:
+  - **Sync Barrier**: `sync_trades_from_orders` runs exactly once for all active bots at startup before any exchange parity audit begins. Barrier polls for count stability (up to 10 s, 1 s sleep) and logs a WARNING then proceeds if not stabilized—preventing indefinite startup blocks.
+
+- **One-off DB recovery (2026-05-25)**:
+  - Bot 10022 (`short btc`): Deleted erroneous `virtual_netting` row id=103359 (`CQB_10022_OWAY_REPAIR_1779752456`, filled_amount=0.044). Called `sync_trades_from_orders(10022)`. `trades.open_qty` corrected 0.046 → **0.090** (matches exchange). Bot reset `REQUIRE_MANUAL_PROOF` → `IN TRADE`.
+
+## v3.5.4 — 2026-05-25 — Consolidated Core Stability Fixes
+
+Consolidated stability fixes across NameError handling, WS warmup startup timing, oneway opposite gate, and an adoption circuit breaker.
+
+- **Fix 1 — `phys_net_signed` NameError (`engine/bot_executor.py`):**
+  - Replaced undefined reference `phys_net_signed` with `phys_net_qty` in the drift-alert logic within `maintain_orders`.
+
+- **Fix 2 — WS Warmup Timing (`engine/runner.py`):**
+  - Increased `WS_WARMUP_SECONDS` from 8 to 20 to prevent startup race conditions where reconciliation starts before WS cache trades sync finishes.
+
+- **Fix 3 — Oneway Opposite Gate Bypass (`engine/bot_executor.py`):**
+  - Skip the `gate_oneway_opposite_entry` check during grid maintenance if the bot is already in-trade (`total_invested > 0.01` and `current_step > 0`). The gate now only blocks new entries for scanning bots.
+
+- **Fix 4 — Adoption Circuit Breaker (`engine/reconciler.py`):**
+  - Track cumulative quantity adopted per bot per pass inside `adopt_from_physical_positions`.
+  - Abort adoption, log an `ERROR`, and set status to `REQUIRE_MANUAL_PROOF` if the cumulative quantity exceeds the `MAX_ADOPTION_QTY_PER_CYCLE` limit (default `0.5`, configurable via `.env`).
+
+- **Config — `config/settings.py`:**
+  - Added `MAX_ADOPTION_QTY_PER_CYCLE` to config settings, reading from `.env` (defaulting to `0.5`).
+
+## v3.5.3 — 2026-05-22 — DNA-WIPE client order ID deadlock
+
+**Root cause:** When no ledger fills were found, the `DNA-WIPE` protocol reset the bot's trade stats and phase to `IDLE`/`Scanning`, but left stale `entry_order_id` / `tp_order_id` in the `trades` table and failed to increment the `cycle_id`. Consequently, the bot remained in the same cycle and when placing a new entry order, used the same `client_order_id` as the previous cycle, which triggered `DEDUP-GUARD` and locked the bot in a permanent `🟢 SCANNING` state.
+
+- **Fix — `engine/database.py`:**
+  - Updated the `DNA-WIPE` UPDATE query to set `entry_order_id = NULL`, `tp_order_id = NULL`, `open_qty = 0`, and increment `cycle_id = COALESCE(cycle_id, 1) + 1`.
+- **Verified:**
+  - Ran the database healing script to resolve active bot deadlocks (XRP, LINK, SUI).
+  - Confirmed the bots resumed correct behavior (XRP long successfully placed its entry order, and LINK/SUI short are scanning correctly).
 
 ## v3.5.2 — 2026-05-21 — Orphan-repair stale-snapshot deadlock
 

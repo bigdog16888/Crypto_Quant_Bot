@@ -1,6 +1,8 @@
 # Architecture — Proof-Only Trading Stack (v3.4.x)
 
-**Status:** Production design for testnet/mainnet. Supersedes ad-hoc reconciliation patches.
+> **Superseded by `docs/ARCHITECTURE_v3.5.md` (2026-05-20).** Read v3.5 for heal gates, maintain vs entry gates, shutdown, and deterministic repair. This file remains as historical context for v3.4.0–v3.4.2.
+
+**Status:** Historical (v3.4.0–v3.4.2). Supersedes ad-hoc reconciliation patches.
 
 ---
 

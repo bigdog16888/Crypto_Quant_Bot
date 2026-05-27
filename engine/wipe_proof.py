@@ -77,35 +77,17 @@ def safe_mark_reset_cleared(
             f"({snapshot.qty:.8f}). Ledger wipe would cause phantom drift."
         )
 
-    # 3. Apply the wipe logic (Hedge Preservation Gate remains)
-    is_destruction = action_label in excluded_carry_labels
-    
-    if is_destruction:
-        # Clear everything
-        cursor.execute("""
-            UPDATE bot_orders 
-            SET status = 'reset_cleared', 
-                updated_at = ?,
-                wipe_proof_source = ?,
-                wipe_proof_snapshot = ?
-            WHERE (bot_id = ? AND status NOT IN ('auto_closed', 'reset_cleared'))
-                  -- Also sweep cancelled rows that had partial fills (they survive normal filters
-                  -- and get counted as active sells in get_pair_virtual_net, causing sign flips)
-                  OR (bot_id = ? AND status IN ('cancelled','canceled') AND filled_amount > 0)
-        """, (now, snapshot.source.value, snapshot.to_json(), bot_id, bot_id))
-    else:
-        # Normal TP: clear entries/TPs/grids but preserve hedges
-        cursor.execute("""
-            UPDATE bot_orders 
-            SET status = 'reset_cleared', 
-                updated_at = ?,
-                wipe_proof_source = ?,
-                wipe_proof_snapshot = ?
-            WHERE (bot_id = ? AND status NOT IN ('auto_closed', 'reset_cleared') 
-                  AND NOT (order_type LIKE 'hedge%' AND filled_amount > 0))
-                  -- Also sweep cancelled rows that had partial fills (same phantom prevention)
-                  OR (bot_id = ? AND status IN ('cancelled','canceled') AND filled_amount > 0
-                      AND NOT (order_type LIKE 'hedge%' AND filled_amount > 0))
-        """, (now, snapshot.source.value, snapshot.to_json(), bot_id, bot_id))
+    # 3. Apply the wipe logic
+    cursor.execute("""
+        UPDATE bot_orders 
+        SET status = 'reset_cleared', 
+            updated_at = ?,
+            wipe_proof_source = ?,
+            wipe_proof_snapshot = ?
+        WHERE (bot_id = ? AND status NOT IN ('auto_closed', 'reset_cleared'))
+              -- Also sweep cancelled rows that had partial fills (they survive normal filters
+              -- and get counted as active sells in get_pair_virtual_net, causing sign flips)
+              OR (bot_id = ? AND status IN ('cancelled','canceled') AND filled_amount > 0)
+    """, (now, snapshot.source.value, snapshot.to_json(), bot_id, bot_id))
 
     logger.info(f"🛡️ [WIPE-PROOF] Bot {bot_id} ledger reset with proof: {snapshot.side} {snapshot.qty:.8f} (source: {snapshot.source.value})")

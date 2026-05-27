@@ -77,15 +77,33 @@ def gate_oneway_opposite_entry(
     tol = _qty_tol()
 
     conn = get_connection()
+
+    # Bypass condition: if this is a fresh entry (total_invested == 0 and current_step == 0),
+    # allow the entry regardless of sibling bot positions.
+    try:
+        t_row = conn.execute(
+            "SELECT total_invested, current_step FROM trades WHERE bot_id = ?",
+            (bot_id,)
+        ).fetchone()
+        if t_row:
+            total_invested, current_step = t_row
+            if float(total_invested or 0) <= 0.01 and int(current_step or 0) == 0:
+                return True, ''
+    except Exception as e:
+        logger.warning(f"Failed to fetch trade status for bypass check on bot {bot_id}: {e}")
+
     opp_open = 0.0
     for _bid, bdir, raw_pair, bot_norm, oq in conn.execute(
         """
         SELECT b.id, b.direction, b.pair, b.normalized_pair, COALESCE(t.open_qty, 0)
         FROM bots b
         JOIN trades t ON t.bot_id = b.id
-        WHERE b.is_active = 1 AND b.id != ?
+        WHERE b.is_active = 1 
+          AND b.id != ?
+          AND b.id != COALESCE((SELECT hedge_child_bot_id FROM bots WHERE id = ?), -1)
+          AND b.id != COALESCE((SELECT parent_bot_id FROM bots WHERE id = ?), -1)
         """,
-        (bot_id,),
+        (bot_id, bot_id, bot_id),
     ).fetchall():
         if (bot_norm or normalize_symbol(raw_pair)).upper() != norm:
             continue
@@ -125,18 +143,33 @@ def apply_oneway_entry_cross_reduction(
     conn = get_connection()
 
     neighbors: List[Tuple[int, float]] = []
-    for bid, bdir, raw_pair, bot_norm, oq in conn.execute(
+    # Fix 4 (v3.5.8): Also fetch b.status so we can skip bots that are not actively
+    # trading. A SCANNING or REQUIRE_MANUAL_PROOF bot may have a stale open_qty
+    # residual from a prior cycle — cross-reducing against it creates phantom
+    # virtual_netting rows and inflates the SHORT bot's open_qty reduction count.
+    _INACTIVE_STATUSES = frozenset({
+        'scanning', '\U0001f7e2 scanning',   # 🟢 SCANNING
+        'stopped', 'require_manual_proof',
+    })
+    for bid, bdir, raw_pair, bot_norm, oq, b_status in conn.execute(
         """
-        SELECT b.id, b.direction, b.pair, b.normalized_pair, COALESCE(t.open_qty, 0)
+        SELECT b.id, b.direction, b.pair, b.normalized_pair,
+               COALESCE(t.open_qty, 0), b.status
         FROM bots b
         JOIN trades t ON t.bot_id = b.id
-        WHERE b.is_active = 1 AND b.id != ?
+        WHERE b.is_active = 1 
+          AND b.id != ?
+          AND b.id != COALESCE((SELECT hedge_child_bot_id FROM bots WHERE id = ?), -1)
+          AND b.id != COALESCE((SELECT parent_bot_id FROM bots WHERE id = ?), -1)
         """,
-        (filling_bot_id,),
+        (filling_bot_id, filling_bot_id, filling_bot_id),
     ).fetchall():
         if (bot_norm or normalize_symbol(raw_pair)).upper() != norm:
             continue
         if str(bdir).upper() != target_dir:
+            continue
+        # Skip bots that are not actively holding a position.
+        if str(b_status or '').lower() in _INACTIVE_STATUSES:
             continue
         oqf = float(oq or 0)
         if oqf > 1e-12:
@@ -247,6 +280,13 @@ def reconcile_oneway_pair_open_qty(
                 cut = round(min(oq, remaining), 8)
                 if cut <= 0:
                     continue
+                
+                # Fix C: Add a MAX_OWAY_REPAIR_QTY guard
+                MAX_REPAIR_QTY = float(getattr(config, 'MAX_OWAY_REPAIR_QTY', 50.0))
+                if cut > MAX_REPAIR_QTY:
+                    logger.error(f"[ONEWAY-REPAIR] Refusing to trim {cut:.4f} > MAX_OWAY_REPAIR_QTY ({MAX_REPAIR_QTY}). Set manually.")
+                    continue
+
                 conn.execute(
                     "UPDATE trades SET open_qty = MAX(0, ROUND(open_qty - ?, 8)) WHERE bot_id=?",
                     (cut, bid),
@@ -258,19 +298,15 @@ def reconcile_oneway_pair_open_qty(
                 audit_cid = f"CQB_{bid}_OWAY_REPAIR_{int(time.time())}"
                 save_bot_order(
                     bid,
-                    'virtual_netting',
+                    'drift_note',
                     audit_cid,
                     0.0,
-                    cut,
+                    0.0,
                     0,
-                    status='filled',
+                    status='audit',
                     client_order_id=audit_cid,
                     notes=f"ONEWAY_REPAIR: align open_qty to exchange (cut {cut:.6f})",
                     cycle_id=cycle_id,
-                )
-                conn.execute(
-                    "UPDATE bot_orders SET filled_amount = ? WHERE client_order_id = ? AND bot_id = ?",
-                    (cut, audit_cid, bid),
                 )
                 remaining -= cut
                 logger.warning(
@@ -279,5 +315,17 @@ def reconcile_oneway_pair_open_qty(
                 )
         conn.commit()
         return f"trimmed virtual excess {diff:.6f} on {norm}"
+
+    elif diff < -1e-8:
+        # Fix B: Virtual too LOW — system under-reports vs exchange
+        # Write a diagnostic drift_note; do NOT auto-inflate open_qty
+        # (that would require knowing which bot owns the missing qty)
+        norm = _pair_norm(pair)
+        logger.warning(
+            f"⚠️ [ONEWAY-REPAIR-LOW] {norm}: virtual {virtual:.6f} < physical {physical:.6f} "
+            f"(gap {abs(diff):.6f}). System under-reports. Manual review required."
+        )
+        # Optionally write a drift_note for audit trail here
+        return f"under-report gap {abs(diff):.6f} on {norm} — manual review"
 
     return None

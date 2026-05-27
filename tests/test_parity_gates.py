@@ -226,3 +226,84 @@ def test_bot_signed_contribution_matches_virtual(memory_db):
     v = database.get_pair_virtual_net('LINK/USDC:USDC')
     c = get_bot_signed_contribution(103)
     assert v == pytest.approx(c, abs=1e-6)
+
+
+def test_proof_flatten_opposite_sign_proceeds(memory_db):
+    """
+    REGRESSION: proof_flatten_pair must succeed when a SHORT bot exists but the exchange
+    holds a LONG position (opposite-sign mismatch). This is exactly when proof flatten is
+    needed — the old code raised AssertionError here, making recovery impossible.
+    Close side is always determined by exchange physical net (authority), not bot direction.
+    """
+    from engine.parity_gates import proof_flatten_pair
+    _setup_short_bot(memory_db, 103)
+
+    class ExtendedMockExchange:
+        def __init__(self):
+            self.created_order = None
+            self.net_qty = 1.0
+
+        def fetch_positions(self):
+            if abs(self.net_qty) < 1e-12:
+                return []
+            return [{'symbol': 'LINK/USDC:USDC', 'net_qty': self.net_qty, 'contracts': self.net_qty}]
+
+        def fetch_open_orders(self, pair):
+            return []
+
+        def get_symbol_precision(self, pair):
+            return {'amount_step': 0.01}
+
+        def round_to_step(self, qty, step):
+            return qty
+
+        def create_order(self, symbol, type, side, amount, price=None, params=None):
+            self.created_order = {'symbol': symbol, 'type': type, 'side': side, 'amount': amount}
+            self.net_qty = 0.0
+            return self.created_order
+
+    ex = ExtendedMockExchange()
+    # SHORT bot on pair but exchange LONG +1.0 — must NOT raise, must flatten
+    res = proof_flatten_pair(ex, 'LINK/USDC:USDC', human_approved=True)
+    assert res['success'] is True
+    assert ex.created_order is not None
+    # Exchange is LONG (+1.0), so close must be 'sell' regardless of bot direction
+    assert ex.created_order['side'] == 'sell'
+
+
+def test_proof_flatten_matching_direction(memory_db):
+    """proof_flatten also works when bot direction matches exchange side (normal case)."""
+    from engine.parity_gates import proof_flatten_pair
+
+    _setup_short_bot(memory_db, 107)
+    memory_db.execute("UPDATE bots SET direction = 'LONG' WHERE id = 107")
+    memory_db.commit()
+
+    class SimpleMockExchange:
+        def __init__(self):
+            self.net_qty = 1.0
+            self.created_order = None
+
+        def fetch_positions(self):
+            if abs(self.net_qty) < 1e-12:
+                return []
+            return [{'symbol': 'LINK/USDC:USDC', 'net_qty': self.net_qty, 'contracts': self.net_qty}]
+
+        def fetch_open_orders(self, pair):
+            return []
+
+        def get_symbol_precision(self, pair):
+            return {'amount_step': 0.01}
+
+        def round_to_step(self, qty, step):
+            return qty
+
+        def create_order(self, symbol, type, side, amount, price=None, params=None):
+            self.created_order = {'side': side, 'amount': amount}
+            self.net_qty = 0.0
+            return self.created_order
+
+    ex = SimpleMockExchange()
+    res = proof_flatten_pair(ex, 'LINK/USDC:USDC', human_approved=True)
+    assert res['success'] is True
+    assert ex.created_order['side'] == 'sell'
