@@ -844,6 +844,62 @@ def handle_tp_completion(
         except Exception as e_log:
             logger.warning(f"[TP-CASCADE] Bot {bot_id}: trade_history log failed (non-fatal): {e_log}")
 
+        # 🛡️ HEDGE CHILD: place break-even TP if parent has an active hedge child
+        # Signal child with BE TP pending_placement BEFORE wiping parent.
+        # This way, even if the parent wipe is blocked, the child is already protected.
+        try:
+            from engine.database import get_connection as _gc_hc
+            _hc_conn = _gc_hc()
+            _hc_row = _hc_conn.execute(
+                "SELECT hedge_child_bot_id FROM bots WHERE id=?", (bot_id,)
+            ).fetchone()
+            if _hc_row and _hc_row[0]:
+                child_id = _hc_row[0]
+                child_state = _hc_conn.execute(
+                    "SELECT open_qty, avg_entry_price, cycle_id, status FROM trades t "
+                    "JOIN bots b ON b.id=t.bot_id WHERE t.bot_id=?", (child_id,)
+                ).fetchone()
+                if child_state:
+                    child_open_qty, child_avg, child_cycle, child_status = child_state
+                    child_open_qty = float(child_open_qty or 0)
+                    child_avg = float(child_avg or 0)
+                    if child_open_qty > 0.0001 and child_avg > 0:
+                        # Break-even TP = avg_entry_price of the hedge child
+                        be_price = child_avg
+                        child_direction = _hc_conn.execute(
+                            "SELECT direction FROM bots WHERE id=?", (child_id,)
+                        ).fetchone()[0]
+                        be_cid = f"CQB_{child_id}_TP_{child_cycle}_BE"
+
+                        # Check if active BE TP already exists
+                        existing_be = _hc_conn.execute(
+                            "SELECT id FROM bot_orders WHERE bot_id=? AND client_order_id LIKE ? "
+                            "AND status IN ('pending_placement', 'open', 'new', 'partially_filled', 'pending', 'placing')",
+                            (child_id, f"{be_cid}%")
+                        ).fetchone()
+                        if not existing_be:
+                            # Register intent — actual order placed by bot_executor on next cycle
+                            from engine.database import save_bot_order
+                            save_bot_order(
+                                child_id, 'tp', f'PENDING_BE_{child_id}_{child_cycle}',
+                                be_price, child_open_qty, step=0,
+                                status='pending_placement',
+                                client_order_id=be_cid,
+                                notes=f"Break-even TP pending placement: parent {bot_id} TP hit",
+                                cycle_id=child_cycle,
+                            )
+                            logger.info(
+                                f"[HEDGE-BE-TP] Child {child_id}: break-even TP registered "
+                                f"@ {be_price:.4f} for {child_open_qty:.6f} {child_direction}. "
+                                f"Will be placed by bot_executor on next cycle."
+                            )
+        except Exception as _hc_err:
+            logger.warning(
+                f"⚠️ [HANDLE-TP-COMPLETION] Failed to register BE TP for hedge child "
+                f"bot_id={locals().get('child_id', '?')}: {_hc_err}",
+                exc_info=True
+            )
+
         # --- Step 3: Full atomic reset via existing reset_bot_after_tp ---
         # This handles: mark reset_cleared, increment cycle_id, zero trades row
         # Pass the exchange fill timestamp so cycle_start_time is anchored to
@@ -858,59 +914,6 @@ def handle_tp_completion(
                 exchange=exchange,
             )
             logger.info(f"[TP-CASCADE] ✅ Bot {bot_id}: Reset to Scanning. Cycle {cycle_id} → {cycle_id + 1} (cst={exit_fill_ts}).")
-
-            # 🛡️ HEDGE CHILD: place break-even TP if parent has an active hedge child
-            try:
-                from engine.database import get_connection as _gc_hc
-                _hc_conn = _gc_hc()
-                _hc_row = _hc_conn.execute(
-                    "SELECT hedge_child_bot_id FROM bots WHERE id=?", (bot_id,)
-                ).fetchone()
-                if _hc_row and _hc_row[0]:
-                    child_id = _hc_row[0]
-                    child_state = _hc_conn.execute(
-                        "SELECT open_qty, avg_entry_price, cycle_id, status FROM trades t "
-                        "JOIN bots b ON b.id=t.bot_id WHERE t.bot_id=?", (child_id,)
-                    ).fetchone()
-                    if child_state:
-                        child_open_qty, child_avg, child_cycle, child_status = child_state
-                        child_open_qty = float(child_open_qty or 0)
-                        child_avg = float(child_avg or 0)
-                        if child_open_qty > 0.0001 and child_avg > 0:
-                            # Break-even TP = avg_entry_price of the hedge child
-                            be_price = child_avg
-                            child_direction = _hc_conn.execute(
-                                "SELECT direction FROM bots WHERE id=?", (child_id,)
-                            ).fetchone()[0]
-                            # TP side is opposite to child's position direction
-                            tp_side = 'buy' if child_direction == 'SHORT' else 'sell'
-                            be_cid = f"CQB_{child_id}_TP_{child_cycle}_BE"
-
-                            # Check if BE TP already exists
-                            existing_be = _hc_conn.execute(
-                                "SELECT id FROM bot_orders WHERE bot_id=? AND client_order_id=?",
-                                (child_id, be_cid)
-                            ).fetchone()
-                            if not existing_be:
-                                # Register intent — actual order placed by bot_executor on next cycle
-                                # (exchange object not available here in ledger context)
-                                from engine.database import save_bot_order
-                                save_bot_order(
-                                    child_id, 'tp', f'PENDING_BE_{child_id}_{child_cycle}',
-                                    be_price, child_open_qty, step=0,
-                                    status='pending_placement',
-                                    client_order_id=be_cid,
-                                    notes=f"Break-even TP pending placement: parent {bot_id} TP hit",
-                                    cycle_id=child_cycle,
-                                )
-                                logger.info(
-                                    f"[HEDGE-BE-TP] Child {child_id}: break-even TP registered "
-                                    f"@ {be_price:.4f} for {child_open_qty:.6f} {child_direction}. "
-                                    f"Will be placed by bot_executor on next cycle."
-                                )
-            except Exception as _hc_err:
-                logger.warning(f"[HEDGE-BE-TP] Failed to register child TP (non-fatal): {_hc_err}")
-
             return True
 
         except Exception as e_reset:

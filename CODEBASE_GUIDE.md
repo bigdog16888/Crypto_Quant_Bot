@@ -1,5 +1,5 @@
 # Crypto Quant Bot — AI Agent Codebase Guide
-**Version: 3.5.8 | Last Updated: 2026-05-26**
+**Version: 3.8.0 | Last Updated: 2026-06-02**
 
 > **READ THIS FIRST** before touching any code. This is the single authoritative guide.
 > It supersedes `UNIFIED_BOT_DOCUMENTATION.md` and all older session notes.
@@ -337,6 +337,107 @@ To prevent Binance **`-2022 ReduceOnly Order is rejected`** errors in hedged (On
 - **Adopt-From-Physical Fix**: Resolved `NameError` in the reconciler deep-scan path caused by uninitialized cursors in the idempotency guard.
 - **Aesthetic Parity**: Aligned `SNAP-ALLOCATE` debug markers to fire correctly for hedged pairs, eliminating false-positive "System Mismatch" alerts.
 
+### 3.20. Hedge Child cycle_id Sync — MANDATORY (v3.6.1)
+
+INVARIANT: A hedge child bot's trades.cycle_id MUST always equal the cycle_id used in its bot_orders filled rows.
+
+Owner: _signal_hedge_child_entry (bot_executor.py) is the ONLY function that initializes a child's position. It MUST update trades.cycle_id immediately after saving the bot_orders row.
+
+Why: recompute_invested_from_orders filters by trades.cycle_id. If the child's trades.cycle_id differs from its bot_orders rows, recompute returns qty=0. seal_trade_state then overwrites the correct credit_fill increment with 0. open_qty becomes 0. get_pair_virtual_net sees 0. Mismatch alert fires.
+
+This was the root cause of SUI (v3.5.4), XRP (v3.5.5), and SOL (v3.6.1) hedge mismatch bugs.
+
+The idempotency check in _signal_hedge_child_entry must exclude auto_closed and rejected rows — these are consolidation artifacts, not real filled orders.
+
+NO other writer may change a child bot's cycle_id except:
+- _signal_hedge_child_entry (on entry)
+- safe_wipe_bot (on full wipe, sets to NULL)
+
+### 3.21. TP Capacity is Direction-Aware (v3.6.2)
+
+The TP capacity clip in _prepare_tp_order_params compares the physical position SIDE against the bot's closing direction:
+- LONG bot SELL TP: requires LONG-side physical capacity
+- SHORT bot BUY TP: requires SHORT-side physical capacity
+
+If the physical net is on the opposite side, capacity = 0 and the order falls through to GTX (non-reduceOnly maker order).
+
+The sole-bot override in _is_order_net_reducing also verifies physical net direction before returning True. A stale sibling count (sibling just reset but physical not yet updated) will not trigger a false reduceOnly=True on the wrong-side physical net.
+
+This is the permanent fix for MARGIN HELD on SHORT bots in net-LONG pairs (and vice versa).
+
+### 3.22. Proof Gate Must Not Fire During WS Fill Credit Window (v3.6.5)
+
+**"The proof gate must never fire within 60 seconds of a confirmed fill on the same pair. WS fill crediting is asynchronous — a mismatch during the credit window is expected, not a proof failure."**
+
+Root cause: The `StateReconciler.bidirectional_proof_reconciliation` compares the proved virtual net (`get_pair_virtual_net`) against the physical exchange position. A fill can be:
+1. Visible on the exchange immediately (physical updates instantly)
+2. Written to `bot_orders` with `filled_amount > 0` and `status='filled'` (WS handler)
+3. Propagated to `trades.open_qty` via `seal_trade_state` / `sync_trades_from_orders` (async)
+
+There is a race window between steps 2 and 3 where the proved net is still stale but the fill is already in `bot_orders`. Without the guard, the reconciler sees a mismatch, runs the forensic scan (which sees the fill but `open_qty` not yet updated), and sets `REQUIRE_MANUAL_PROOF` on all bots sharing the ticker.
+
+**Guard (reconciler.py, before the AUTONOMOUS SELF-HEAL block):**
+```sql
+SELECT COUNT(*) FROM bot_orders
+WHERE bot_id IN (SELECT id FROM bots WHERE pair LIKE '%{symbol}%')
+AND filled_amount > 0
+AND status = 'filled'
+AND created_at >= (strftime('%s','now') - 60)
+```
+If count > 0: log `[PROOF-GRACE]` and `continue` to the next ticker. Do NOT set gate.
+If count = 0 AND mismatch persists: proceed to forensic scan and potential gate.
+
+**Observed false positive (2026-05-29):** `short eth` TP fill of 0.119 ETH landed at engine restart. 19 seconds later `open_qty` was sealed. The reconciler's proof scan ran during that 19s window, found `System=-0.324 vs Physical=-0.301` (diff 0.023), and gated all 3 ETH hedge child bots with `REQUIRE_MANUAL_PROOF`. The ledger was correct — only the timing was wrong.
+
+### 3.23. Hedge Child base_size Config Bypass (v3.6.4)
+
+INVARIANT: Hedge child bots have `base_size = 0` by design. They never place independent entries.
+
+The strict `base_size < exchange_min_notional` config check in `process_bot` (bot_executor.py) MUST be bypassed entirely for `bot_type = 'hedge_child'`. Bypassing this guard ensures that hedge child bots are not halted with `Config Error` at startup.
+
+### 3.24. Continuous TP Fill Audit REST Pricing (v3.6.6)
+
+INVARIANT (INV-X): `_audit_pending_exits()` runs every reconciler cycle. It is the authoritative catch for missed WebSocket TP fills. It uses exchange REST prices, never `avg_entry_price`.
+
+### 3.25. Global Flattening Safety Guards (v3.6.6)
+
+INVARIANT (INV-X+1): Global flattening override requires 3 consecutive flat snapshots (Guard A) and snapshot freshness < 60s (Guard B). A single flat snapshot never triggers a wipe.
+
+### 3.26. Single Crediting Path via credit_fill (v3.6.6)
+
+INVARIANT (INV-X+2): `credit_fill()` is the only path for crediting fills — WebSocket, REST audit, or otherwise. Manual `bot_orders` injection is a last-resort emergency procedure, not a normal recovery path.
+
+### 3.27. Cross-Reduction Suppression (INV-3) (v3.7.2)
+
+INVARIANT (INV-3): `apply_oneway_entry_cross_reduction()` never modifies `trades.open_qty` of a hedge child bot as a result of its parent bot's fills. Cross-reduction between parent and hedge child is permanently suppressed.
+
+**Extension (v3.7.2):** INV-3 applies to ALL three oneway_netting functions: apply_oneway_entry_cross_reduction, reconcile_oneway_pair_open_qty, and gate_oneway_opposite_entry. Hedge child bots are completely insulated from all one-way netting adjustments.
+
+### 3.28. Hedge Child open_qty Modification Limits (INV-7) (v3.6.7)
+
+INVARIANT (INV-7): A hedge child's `open_qty` is modified only by: (a) `credit_fill()` when the child's own entry/TP/close orders fill, and (b) `seal_trade_state()` recompute. Never by cross-reduction from the parent bot.
+
+### 3.29. Active Positions Ownership (INV-8) (v3.6.7)
+
+INVARIANT (INV-8): `update_active_positions_snapshot()` assigns the hedge child's SHORT position to the hedge child bot's `bot_id`. `bot_id=0` (orphan) never occurs for positions owned by active hedge child bots.
+
+### 3.30. recompute_invested_from_orders 4-Tuple Contract (INV-6) (v3.6.7)
+
+INVARIANT (INV-6): `recompute_invested_from_orders()` returns exactly a 4-tuple `(cost, avg, qty, step)`. The legacy fifth element `h_qty` has been completely deleted.
+* **Verification Note:** All call sites verified to match the 4-tuple contract on 2026-06-01.
+
+### 3.31. Hedge Cycle Carry Forward Sync (v3.6.8)
+
+INVARIANT (INV-10): During the synchronization of the hedge child bot's `cycle_id` with its parent bot's `cycle_id` (pre-entry and post-entry), if the child bot still has an active position from a previous cycle (`trades.open_qty > 0.0001`), the engine automatically updates the `cycle_id` of all `bot_orders` belonging to that old cycle to the new `cycle_id`. This prevents active filled orders from being orphaned/ignored, avoiding virtual netting mismatches.
+
+### 3.32. Hedge Child TP Order Routing (INV-11) (v3.6.8)
+
+INVARIANT (INV-11): Hedge child TP orders in One-Way mode cannot use `reduceOnly` (they increase account net exposure). They must use `GTC` without `postOnly`. `postOnly` GTX is forbidden for hedge child TPs because GTX cancels on spread-cross, causing silent non-fill.
+
+### 3.33. Wipe-Proof Drift Check & TP Sequence Optimization (INV-12) (v3.7.0)
+
+INVARIANT (INV-12): The wipe-proof safety guard in `reset_bot_after_tp` uses the pair-level virtual-to-physical net drift check instead of individual bot active_positions ownership (which is unreliable in One-Way mode). The reset wipe is blocked only if wiping the bot's virtual position would increase the overall pair-level drift. Additionally, the hedge child's break-even TP is always registered in `bot_orders` before the parent bot is reset/wiped, ensuring the child is protected even if the parent reset is blocked.
+
 ---
 
 ## 4. Reconciler Architecture
@@ -421,6 +522,22 @@ After restart, watch for:
 ---
 
 ## 7. Version History (Change Log)
+ 
+### v3.8.0 — 2026-06-02
+**Database standardization (v4.0.0 column cleanup), silent exception audit, check_state.py diagnostics upgrade, and test suite refactoring.**
+
+**engine/database.py**:
+- **v4.0.0 Database Schema Standardization**: Dropped the deprecated `hedge_qty` column from the `trades` table. All database and logic methods (`get_bot_status`, `sync_trades_from_orders`, and `recompute_invested_from_orders`) have been completely refactored to remove all references to `hedge_qty`.
+- **Hedge Relationship Tracking**: Hedge child relationship tracking is now handled natively using `parent_bot_id` and `hedge_child_bot_id` fields in `bots` table, completely decoupled from the old `hedge_qty` float field.
+
+**engine/bot_executor.py & engine/reconciler.py**:
+- **Silent Exception Audit**: Audited and replaced over 22 bare `except: pass` and `except Exception: pass` blocks in `bot_executor.py` and `reconciler.py` with structured logging. Non-critical cache operations and expected exchange call failures now log at `DEBUG` or `WARNING` level with full contextual details to prevent silent logic errors (e.g. `[CACHE]`, `[EXPECTED]`, or `[SILENT-EXCEPT]`).
+
+**check_state.py**:
+- **Diagnostic Tool Upgrade**: Added `--pair` and `--bot` command-line filters. Created a netting table showing parent ↔ child hedge relationships and overall virtual net exposure. Added a final "SYSTEM HEALTHY" or itemized issue list for flags like `GHOST_STEP`, `PHANTOM_INVESTED`, and `ZERO_AVG_PRICE`.
+
+**tests/**:
+- **Test Suite Refactoring**: Updated `tests/test_hedge_lifecycle.py`, `tests/test_database.py`, `tests/test_entry_dedup.py`, `tests/test_netsum_ghost.py`, and `tests/test_reconciler_cid_parsing.py` to remove `hedge_qty` references and mock schemas. Marked obsolete one-time migration tests as skipped. Verified 100% of the test suite passes.
 
 ### v3.6.0 — 2026-05-27
 **Global Flatten safety guards, forensic proof gate fix, audit fill receipts, and manual database repairs.**

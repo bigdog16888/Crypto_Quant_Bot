@@ -170,6 +170,11 @@ class BotRunner:
         # LAYER 3 FIX: Cycle counter for periodic reconciliation
         self.cycle_count = 0
 
+        # ASYNC FLATTEN: Track how many cycles each bot has waited for its
+        # pending_close market order to be confirmed filled.  Keyed by bot_id.
+        # Cleared when the order fills or the bot is wiped.
+        self.pending_close_cycles: dict = {}
+
         # Persistent reconciler instance for offline fill detection
         try:
             from engine.reconciler import StateReconciler
@@ -986,13 +991,265 @@ class BotRunner:
             logger.error(f"Failed to get expected positions count: {e}")
             return 0
 
+    # ================================================================
+    # 🛑 ASYNC FLATTEN HELPERS  (v3.5.0)
+    # ================================================================
+    # Stateless helpers called from run_cycle.  All exchange and DB
+    # access is done inline so we don't need a sub-thread or extra
+    # process-level state beyond self.pending_close_cycles.
+    # ================================================================
+
+    def _handle_pending_flatten(self, bot_id: int, bot_name: str, pair: str, direction: str) -> None:
+        """
+        Called once when a bot's status transitions to 'pending_flatten'.
+
+        Flow:
+          1. Cancel all CQB_<bot_id>_ open child orders.
+          2. Physical pre-check: query exchange for live position qty.
+             - If already 0 (BE TP beat us): wipe bot directly, no market order.
+          3. Compute close qty from trades ledger.
+          4. Place reduceOnly market close order.
+          5. Record status='pending_close' in bot_orders.
+          6. Set bot DB status → 'pending_close'.
+          7. Start cycle counter.
+        """
+        logger.info(f"[HEDGE-FLATTEN] Bot {bot_name} (ID {bot_id}) pending_flatten detected — starting async close.")
+        ex = list(self.exchanges.values())[0] if self.exchanges else None
+        if not ex:
+            logger.error(f"[HEDGE-FLATTEN] No exchange available for bot {bot_name}. Cannot flatten.")
+            return
+
+        # ── Step 1: Cancel all child orders ──────────────────────────────────
+        try:
+            open_ords = ex.fetch_open_orders(pair) or []
+            prefix = f"CQB_{bot_id}_"
+            for o in open_ords:
+                cid = o.get('clientOrderId', '')
+                if cid.startswith(prefix):
+                    try:
+                        ex.cancel_order(o['id'], pair)
+                        logger.info(f"  ✅ [HEDGE-FLATTEN] Cancelled child order {cid}")
+                    except Exception as _ce:
+                        logger.warning(f"  ⚠️ [HEDGE-FLATTEN] Could not cancel {cid}: {_ce}")
+        except Exception as _oe:
+            logger.warning(f"  ⚠️ [HEDGE-FLATTEN] Child order cancellation failed (non-fatal): {_oe}")
+
+        # ── Step 2: Physical position pre-check ──────────────────────────────
+        # Query the exchange NOW to see if the physical position still exists.
+        # Break-even TP may have filled between the parent TP event and this cycle.
+        phys_qty = 0.0
+        try:
+            live_positions = ex.fetch_positions() or []
+            for pos in live_positions:
+                sym_match = (
+                    pos.get('symbol', '').replace('/', '').replace(':USDT', '').replace(':USDC', '')
+                    == pair.replace('/', '').replace(':USDT', '').replace(':USDC', '')
+                )
+                side_match = pos.get('side', '').upper() == direction.upper()
+                if sym_match and side_match:
+                    phys_qty += abs(float(pos.get('contracts', 0)))
+        except Exception as _pe:
+            logger.warning(f"  ⚠️ [HEDGE-FLATTEN] Could not fetch live positions for pre-check: {_pe}")
+
+        if phys_qty == 0.0:
+            logger.info(
+                f"[HEDGE-FLATTEN] Physical already flat for bot {bot_name} ({pair} {direction}) "
+                f"— skipping market close, wiping directly."
+            )
+            try:
+                from engine.database import safe_wipe_bot
+                wiped = safe_wipe_bot(
+                    bot_id=bot_id, pair=pair, direction=direction,
+                    reason="HEDGE-FLATTEN: physical already flat before market close"
+                )
+                if wiped:
+                    self.pending_close_cycles.pop(bot_id, None)
+                    logger.info(f"✅ [HEDGE-FLATTEN] Bot {bot_name} wiped directly (exchange was already flat).")
+                else:
+                    logger.warning(
+                        f"⚠️ [HEDGE-FLATTEN] safe_wipe_bot blocked for {bot_name} even though exchange is flat. "
+                        f"Will remain in pending_flatten — reconciler will resolve."
+                    )
+            except Exception as _we:
+                logger.error(f"❌ [HEDGE-FLATTEN] safe_wipe_bot raised: {_we}")
+            return
+
+        # ── Step 3: Compute close quantity from ledger ────────────────────────
+        close_qty = None
+        conn = get_connection()
+        try:
+            row = conn.execute(
+                "SELECT total_invested, avg_entry_price FROM trades WHERE bot_id=?", (bot_id,)
+            ).fetchone()
+            if row and row[0] and row[1] and float(row[1]) > 0:
+                close_qty = float(row[0]) / float(row[1])
+        except Exception as _qe:
+            logger.warning(f"  ⚠️ [HEDGE-FLATTEN] Could not read trade qty for bot {bot_name}: {_qe}")
+
+        if not close_qty or close_qty <= 0:
+            logger.warning(
+                f"[HEDGE-FLATTEN] Bot {bot_name} has no virtual position in ledger "
+                f"(but physical exists — qty={phys_qty:.8f}). Falling back to physical qty."
+            )
+            close_qty = phys_qty
+
+        # ── Step 4: Place reduceOnly market close ──────────────────────────────
+        exit_side = 'buy' if direction.upper() == 'SHORT' else 'sell'
+        cid = f"CQB_{bot_id}_FLATTEN_CLOSE_{int(time.time())}"
+        order_result = None
+        try:
+            order_result = ex.create_order(
+                pair, 'market', exit_side, close_qty,
+                params={'reduceOnly': True, 'clientOrderId': cid}
+            )
+            logger.info(
+                f"  ✅ [HEDGE-FLATTEN] Market close placed — CID={cid} "
+                f"side={exit_side} qty={close_qty:.6f} {pair}"
+            )
+        except Exception as _ord_err:
+            logger.error(f"  ❌ [HEDGE-FLATTEN] Market close order failed: {_ord_err}")
+            # Leave bot in pending_flatten — next cycle will retry the whole handler.
+            return
+
+        # ── Step 5: Write pending_close receipt to bot_orders ─────────────────
+        try:
+            exchange_order_id = str(order_result.get('id', '')) if order_result else ''
+            save_bot_order(
+                bot_id=bot_id,
+                order_type='flatten_close',
+                exchange_order_id=exchange_order_id,
+                price=0.0,
+                amount=close_qty,
+                step=0,
+                status='pending_close',
+                client_order_id=cid,
+                notes=f"ASYNC-FLATTEN market close for {pair} {direction}",
+            )
+        except Exception as _se:
+            logger.warning(f"  ⚠️ [HEDGE-FLATTEN] Could not save bot_order receipt: {_se}")
+
+        # ── Step 6: Set bot status → pending_close ────────────────────────────
+        try:
+            _c = get_connection()
+            _c.execute("UPDATE bots SET status='pending_close' WHERE id=?", (bot_id,))
+            _c.commit()
+            logger.info(f"  ⏳ [HEDGE-FLATTEN] Bot {bot_name} status → pending_close (awaiting fill).")
+        except Exception as _ue:
+            logger.error(f"  ❌ [HEDGE-FLATTEN] Could not update bot status: {_ue}")
+
+        # ── Step 7: Initialise cycle counter ──────────────────────────────────
+        self.pending_close_cycles[bot_id] = 0
+
+    def _handle_pending_close(self, bot_id: int, bot_name: str, pair: str, direction: str) -> None:
+        """
+        Called every cycle while a bot is in status='pending_close'.
+
+        Checks whether the flatten_close market order has been filled (via the
+        WS-credited filled_amount in bot_orders, or a REST poll).  Once confirmed,
+        calls safe_wipe_bot without force so the physical guard naturally passes
+        (the exchange will be flat).  After 3 cycles without fill confirmation
+        a warning is logged but no automated escalation is performed.
+        """
+        cycle_n = self.pending_close_cycles.get(bot_id, 0)
+        MAX_WAIT_CYCLES = 3
+
+        conn = get_connection()
+        # Find the most recent flatten_close order for this bot
+        row = conn.execute("""
+            SELECT id, order_id, client_order_id, filled_amount, status
+            FROM bot_orders
+            WHERE bot_id=? AND order_type='flatten_close'
+            ORDER BY id DESC LIMIT 1
+        """, (bot_id,)).fetchone()
+
+        if not row:
+            logger.warning(
+                f"[HEDGE-FLATTEN-POLL] Bot {bot_name} is pending_close but no flatten_close "
+                f"order found in bot_orders. Will retry next cycle."
+            )
+            self.pending_close_cycles[bot_id] = cycle_n + 1
+            return
+
+        db_row_id, exchange_oid, cid, filled_amount, order_status = row
+        filled_amount = float(filled_amount or 0)
+
+        # ── Check fill via WS-credited amount ────────────────────────────────
+        is_filled = filled_amount > 0 or str(order_status).lower() in ('filled', 'closed')
+
+        # ── Fallback: poll the exchange directly ──────────────────────────────
+        if not is_filled and exchange_oid:
+            try:
+                ex = list(self.exchanges.values())[0] if self.exchanges else None
+                if ex:
+                    closed = ex.fetch_closed_orders(pair, limit=20)
+                    for o in (closed or []):
+                        if (str(o.get('id')) == str(exchange_oid) or
+                                o.get('clientOrderId', '') == cid):
+                            if float(o.get('amount', 0)) > 0:
+                                is_filled = True
+                                # Update the DB row so future cycles don't re-poll
+                                conn.execute(
+                                    "UPDATE bot_orders SET filled_amount=?, status='filled', updated_at=? WHERE id=?",
+                                    (float(o.get('amount', 0)), int(time.time()), db_row_id)
+                                )
+                                conn.commit()
+                                break
+            except Exception as _poll_err:
+                logger.warning(f"  ⚠️ [HEDGE-FLATTEN-POLL] REST poll failed (non-fatal): {_poll_err}")
+
+        if is_filled:
+            logger.info(
+                f"✅ [HEDGE-FLATTEN-POLL] Bot {bot_name} flatten_close confirmed filled "
+                f"(cid={cid}). Calling safe_wipe_bot..."
+            )
+            try:
+                from engine.database import safe_wipe_bot
+                wiped = safe_wipe_bot(
+                    bot_id=bot_id, pair=pair, direction=direction,
+                    reason="HEDGE-FLATTEN: market close confirmed filled"
+                )
+                if wiped:
+                    self.pending_close_cycles.pop(bot_id, None)
+                    logger.info(f"✅ [HEDGE-FLATTEN-POLL] Bot {bot_name} wiped cleanly after fill confirmation.")
+                else:
+                    logger.warning(
+                        f"⚠️ [HEDGE-FLATTEN-POLL] safe_wipe_bot blocked for {bot_name} even after fill. "
+                        f"Physical guard fired — exchange may not be fully flat yet. Will retry next cycle."
+                    )
+                    self.pending_close_cycles[bot_id] = cycle_n + 1
+            except Exception as _we:
+                logger.error(f"❌ [HEDGE-FLATTEN-POLL] safe_wipe_bot raised: {_we}")
+                self.pending_close_cycles[bot_id] = cycle_n + 1
+        else:
+            self.pending_close_cycles[bot_id] = cycle_n + 1
+            if cycle_n + 1 >= MAX_WAIT_CYCLES:
+                logger.warning(
+                    f"⚠️ [HEDGE-FLATTEN-POLL] Bot {bot_name} flatten_close order still UNFILLED "
+                    f"after {cycle_n + 1} cycles (cid={cid}). "
+                    f"Not escalating automatically — manual review recommended."
+                )
+            else:
+                logger.info(
+                    f"[HEDGE-FLATTEN-POLL] Bot {bot_name} flatten_close not yet filled "
+                    f"(cycle {cycle_n + 1}/{MAX_WAIT_CYCLES}). Will check next cycle."
+                )
+
     def run_cycle(self):
+
         start_time = time.time()
         logger.debug("Entering run_cycle")
         if self._abort_if_stop_requested("run-cycle"):
             return False
         self.orders_this_cycle = 0
         self.cycle_count += 1
+
+        # 🚨 Continuous Fill Audit: Runs every cycle to check for active bots with TP orders
+        # that filled on the exchange but were missed by the WebSocket.
+        if self._reconciler:
+            try:
+                self._reconciler._audit_pending_exits()
+            except Exception as _audit_err:
+                logger.warning(f"Continuous fill audit failed (non-fatal): {_audit_err}")
 
         # 🛡️ PERIODIC OFFLINE FILL DETECTION (every 10 cycles ≈ every 5 min)
         # Safety net for Demo WS which can silently miss fill events.
@@ -1452,7 +1709,54 @@ class BotRunner:
         bots = [b for b in bots if b[0] not in sl_flagged_ids]
 
         # ================================================================
+        # 🛑 ASYNC FLATTEN INTERCEPT  (v3.5.0)
+        # Bots flagged pending_flatten → fire async market-close flow.
+        # Bots already pending_close   → poll for fill confirmation.
+        # Both are removed from the normal process_bot run list.
+        # ================================================================
+        flatten_intercepted_ids = set()
+        try:
+            _f_conn = get_connection()
+            _f_cur = _f_conn.cursor()
+            _f_cur.execute(
+                "SELECT id, name, pair, direction FROM bots "
+                "WHERE status IN ('pending_flatten', 'pending_close') AND is_active=1"
+            )
+            flatten_flagged = _f_cur.fetchall()
+        except Exception as _ff_err:
+            logger.warning(f"[ASYNC-FLATTEN] Could not query flatten-flagged bots: {_ff_err}")
+            flatten_flagged = []
+
+        for f_bid, f_name, f_pair, f_dir in flatten_flagged:
+            flatten_intercepted_ids.add(f_bid)
+            # Determine which status this bot is currently in.
+            # (We can look it up from flatten_flagged row but the query already gave us both statuses;
+            #  re-query the single row to get the exact current status cheaply.)
+            try:
+                _s_row = get_connection().execute(
+                    "SELECT status FROM bots WHERE id=?", (f_bid,)
+                ).fetchone()
+                current_status = (_s_row[0] if _s_row else 'unknown') or 'unknown'
+            except Exception:
+                current_status = 'unknown'
+
+            if current_status == 'pending_flatten':
+                try:
+                    self._handle_pending_flatten(f_bid, f_name, f_pair, f_dir)
+                except Exception as _hpf_err:
+                    logger.error(f"[ASYNC-FLATTEN] _handle_pending_flatten raised for {f_name}: {_hpf_err}")
+            elif current_status == 'pending_close':
+                try:
+                    self._handle_pending_close(f_bid, f_name, f_pair, f_dir)
+                except Exception as _hpc_err:
+                    logger.error(f"[ASYNC-FLATTEN] _handle_pending_close raised for {f_name}: {_hpc_err}")
+
+        # Remove flatten-intercepted bots so they skip normal strategy execution
+        bots = [b for b in bots if b[0] not in flatten_intercepted_ids]
+
+        # ================================================================
         # 🔁 v2.0 TP CASCADE DRAIN
+
         # WS handler cannot cancel exchange orders (no exchange obj).
         # It registers (bot_id, pair, exit_price) in ledger.
         # We drain it here with exchange access for the full atomic workflow.

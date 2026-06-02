@@ -101,23 +101,26 @@ def heal_zombie_bots(conn):
         # v2.2: include open_qty so we can detect phantom accumulator values
         c.execute('''
             SELECT t.bot_id, b.pair, t.total_invested, t.avg_entry_price, t.current_step, t.cycle_id,
-                   COALESCE(t.open_qty, 0) as open_qty, COALESCE(t.hedge_qty, 0) as hedge_qty
+                   COALESCE(t.open_qty, 0) as open_qty
             FROM trades t JOIN bots b ON t.bot_id = b.id
         ''')
         trades = c.fetchall()
         for t in trades:
-            bot_id, pair, invested, avg_price, step, cycle_id, open_qty, hedge_qty = t
+            bot_id, pair, invested, avg_price, step, cycle_id, open_qty = t
             invested = float(invested or 0)
             avg_price = float(avg_price or 0)
             step = int(step or 0)
             open_qty = float(open_qty or 0)
-            hedge_qty = float(hedge_qty or 0)
 
             # Scenario 1: Ghost step stuck (0 physical investment, but step > 0)
             # This causes the "0/2 limit orders missing" alert
             # Guard: skip if open_qty > 0 — the WS fill loop credited a real fill and
             # seal is still propagating. Wiping here would erase a confirmed position.
-            if step > 0 and invested <= 0.0001 and open_qty <= 0.0001 and hedge_qty <= 0.0001:
+            if step > 0 and invested <= 0.0001 and open_qty <= 0.0001:
+                c.execute("SELECT COUNT(*) FROM bot_orders WHERE bot_id = ? AND status IN ('open', 'new', 'placing')", (bot_id,))
+                if c.fetchone()[0] > 0:
+                    continue  # Do not wipe, waiting for resting orders to fill!
+
                 c.execute("UPDATE trades SET current_step = 0, total_invested = 0, avg_entry_price = 0, target_tp_price = 0, open_qty = 0, cycle_id = NULL WHERE bot_id = ?", (bot_id,))
                 conn.commit()
                 logger.info(f"🩹 [HEALED] Bot {bot_id} ({pair}): Reset stranded ghost step back to 0. Cleared metrics.")
@@ -128,7 +131,7 @@ def heal_zombie_bots(conn):
             # GUARD: skip if open_qty > 0 — the WS fill loop credited a real position fill;
             # seal wrote step=0 because cycle_id=NULL broke recompute_invested_from_orders.
             # Wiping here would erase a confirmed physical position.
-            if step == 0 and (invested > 0.001 or avg_price > 0.001) and open_qty <= 0.0001 and hedge_qty <= 0.0001:
+            if step == 0 and (invested > 0.001 or avg_price > 0.001) and open_qty <= 0.0001:
                 c.execute("UPDATE trades SET total_invested = 0, avg_entry_price = 0, target_tp_price = 0, open_qty = 0, cycle_id = NULL WHERE bot_id = ?", (bot_id,))
                 conn.commit()
                 logger.info(f"🩹 [HEALED] Bot {bot_id} ({pair}): Purged phantom ${invested:.2f} invested memory on a SCANNING bot.")
@@ -238,6 +241,82 @@ def heal_zombie_bots(conn):
             logger.error(f"[HEAL] CID consolidate failed: {_cd_err}")
     except Exception as e:
         logger.error(f"Error during zombie bot healing: {e}")
+
+def auto_create_and_link_hedge_children(conn):
+    """
+    Self-healing hook: scans active standard bots with UseHedge = True in config
+    but no hedge child bot configured. Creates and links the child bot.
+    """
+    import json
+    cursor = conn.cursor()
+    
+    # Select active standard bots with no hedge child configured
+    cursor.execute("""
+        SELECT id, name, pair, normalized_pair, direction, config
+        FROM bots
+        WHERE is_active = 1
+          AND bot_type = 'standard'
+          AND (hedge_child_bot_id IS NULL OR hedge_trigger_step IS NULL)
+    """)
+    rows = cursor.fetchall()
+    
+    for bot_id, name, pair, norm_pair, direction, config_json in rows:
+        if not config_json:
+            continue
+        try:
+            cfg = json.loads(config_json)
+        except Exception:
+            continue
+            
+        if cfg.get('UseHedge') is True:
+            # We must create/link a child bot!
+            child_direction = 'SHORT' if str(direction).upper() == 'LONG' else 'LONG'
+            child_name = f"{name}_hedge"
+            
+            # Check if one already exists but was not linked
+            existing = cursor.execute(
+                "SELECT id FROM bots WHERE parent_bot_id = ? AND bot_type = 'hedge_child'",
+                (bot_id,)
+            ).fetchone()
+            
+            if existing:
+                child_id = existing[0]
+                logger.info(f"🩹 [HEDGE-HEAL] Found unlinked child bot '{child_name}' (id={child_id}) for parent {bot_id}. Re-linking.")
+            else:
+                logger.info(f"🩹 [HEDGE-HEAL] Creating missing hedge child bot '{child_name}' ({child_direction}) for parent {bot_id}.")
+                cursor.execute("""
+                    INSERT INTO bots (
+                        name, pair, normalized_pair, direction,
+                        bot_type, parent_bot_id,
+                        is_active, status,
+                        config, rsi_limit, martingale_multiplier,
+                        base_size, strategy_type
+                    )
+                    VALUES (?, ?, ?, ?, 'hedge_child', ?, 1, 'Scanning',
+                            ?, 0, 1.0, 0, 'Martingale')
+                """, (child_name, pair, norm_pair, child_direction, bot_id, config_json))
+                child_id = cursor.lastrowid
+                
+                # Create trades row for child
+                cursor.execute("""
+                    INSERT INTO trades (
+                        bot_id, open_qty, cycle_id,
+                        position_side, total_invested, avg_entry_price,
+                        current_step, entry_confirmed, cycle_phase
+                    )
+                    VALUES (?, 0.0, 1, ?, 0.0, 0.0, 0, 1, 'IDLE')
+                """, (child_id, child_direction))
+                
+            # Link parent -> child
+            hedge_trigger_step = int(cfg.get('HedgeStartStep', 7))
+            cursor.execute("""
+                UPDATE bots 
+                SET hedge_child_bot_id = ?, hedge_trigger_step = ? 
+                WHERE id = ?
+            """, (child_id, hedge_trigger_step, bot_id))
+            
+            conn.commit()
+            logger.info(f"🩹 [HEDGE-HEAL] Successfully linked parent {bot_id} → child {child_id} (trigger step = {hedge_trigger_step}).")
 
 def init_db():
     """Initializes the database schema and performs necessary migrations."""
@@ -437,13 +516,14 @@ def init_db():
             logger.info("🛠️ DB Migration v2.1.0: Backfilled cycle_start_time from last_exit_time.")
         # ─────────────────────────────────────────────────────────────────────────
         
-        # 🚀 HEDGE-MODE FIX: hedge_qty column in trades
+        # v4.0.0: Drop deprecated hedge_qty column (was always 0.0; logic moved to hedge_child_bot_id).
         try:
             cursor.execute('SELECT hedge_qty FROM trades LIMIT 1')
-        except sqlite3.OperationalError:
-            cursor.execute("ALTER TABLE trades ADD COLUMN hedge_qty REAL DEFAULT 0")
+            cursor.execute('ALTER TABLE trades DROP COLUMN hedge_qty')
             conn.commit()
-            logger.info("🛠️ DB Migration: Added hedge_qty column to trades table.")
+            logger.info('🛠️ DB Migration v4.0.0: Dropped deprecated hedge_qty column from trades table.')
+        except sqlite3.OperationalError:
+            pass  # Column already absent — idempotent
 
         # Migration for manual close percentage in config
         try:
@@ -683,6 +763,7 @@ def init_db():
         conn.commit()  # Release lock before external sync
 
         heal_zombie_bots(conn)
+        auto_create_and_link_hedge_children(conn)
     except Exception as e:
         try:
             logger.warning(f"Database init warning (non-fatal): {e}")
@@ -882,7 +963,6 @@ def get_bot_status(bot_id):
                COALESCE(t.cycle_phase, 'ACTIVE') as cycle_phase,
                COALESCE(t.cycle_start_time, 0) as cycle_start_time,
                COALESCE(t.open_qty, 0) as open_qty,
-               COALESCE(t.hedge_qty, 0) as hedge_qty,
                COALESCE(b.status, '') as bot_status
         FROM bots b 
         LEFT JOIN trades t ON b.id = t.bot_id 
@@ -911,8 +991,7 @@ def get_bot_status(bot_id):
         'cycle_phase': row[15],
         'cycle_start_time': row[16],   # v2.1.0 — authoritative cycle boundary
         'open_qty': row[17],           # v2.1.0 — running confirmed position qty
-        'hedge_qty': row[18],          # v3.7.0 — raw DB hedge_qty
-        'status': row[19],             # v3.7.0 — raw DB status for REQUIRE_MANUAL_PROOF guard
+        'status': row[18],             # v3.7.0 — raw DB status for REQUIRE_MANUAL_PROOF guard
     }
 
     # --- SAFETY GUARD: Log suspicious entry prices but do NOT wipe state ---
@@ -1156,8 +1235,8 @@ def _reset_bot_after_tp_internal(cursor, bot_id, exit_price, direction=None, act
         norm_p = s.split(':')[0].replace('/', '').upper()
         p_side = 'LONG' if final_direction.upper() == 'LONG' else 'SHORT'
         snap = cursor.execute(
-            "SELECT size FROM active_positions WHERE pair=? AND side=?",
-            (norm_p, p_side)
+            "SELECT size FROM active_positions WHERE pair=? AND side=? AND bot_id=?",
+            (norm_p, p_side, bot_id)
         ).fetchone()
         
         if snap:
@@ -1260,13 +1339,6 @@ def _reset_bot_after_tp_internal(cursor, bot_id, exit_price, direction=None, act
     # This is the authoritative cycle boundary for all future fill attribution.
     new_cycle_start_time = exit_fill_ts if exit_fill_ts > 0 else now_ts
 
-    # ── Compute surviving hedge exposure carried into new cycle ───────────
-    # After the hedge-preservation gate above, any hedge orders that were NOT
-    # cleared still represent real SHORT exposure on the exchange.
-    # Compute net = hedge fills - hedge_tp fills (outstanding short).
-    # This is stored in hedge_qty so the bot_executor and UI know about it.
-    surviving_hedge_qty = 0.0
-
     # 🚀 ARCHITECTURAL FIX (v3.0.7): Increment cycle_id FIRST.
     cursor.execute("UPDATE trades SET cycle_id = ? WHERE bot_id = ?", (new_cycle, bot_id))
 
@@ -1276,9 +1348,9 @@ def _reset_bot_after_tp_internal(cursor, bot_id, exit_price, direction=None, act
         "target_tp_price = 0, last_exit_price = ?, last_exit_time = ?, basket_start_time = 0, "
         "entry_confirmed = 0, entry_order_id = NULL, tp_order_id = NULL, "
         "bot_position_id = NULL, close_type = ?, cycle_id = ?, cycle_phase = ?, "
-        "open_qty = 0, hedge_qty = ?, wipe_wall_ts = ?, cycle_start_time = ? WHERE bot_id = ?",
+        "open_qty = 0, wipe_wall_ts = ?, cycle_start_time = ? WHERE bot_id = ?",
         (exit_price, now_ts, action_label, new_cycle, new_cycle_phase,
-         surviving_hedge_qty, now_ts, new_cycle_start_time, bot_id)
+         now_ts, new_cycle_start_time, bot_id)
     )
     logger.info(
         f"🕐 [CYCLE-START] Bot {bot_id}: New cycle {new_cycle} anchored at "
@@ -1781,17 +1853,37 @@ def get_bot_order_ids(bot_id):
     res = cursor.fetchone()
     if res:
         raw_entry, raw_tp = res
-        orders['entry_order_id'] = raw_entry
-        # 🚀 BUG FIX: Strip PLACING_ prefix from trades.tp_order_id.
-        # The pre-commit pattern writes 'PLACING_{clientOrderId}' to trades before the exchange call.
-        # update_bot_order_exchange_id only updates bot_orders, not trades, so trades can be
-        # permanently stuck with the placeholder. Strip it here so the stalemate evictor
-        # doesn't try to fetch 'PLACING_CQB_...' as an exchange order ID.
-        if raw_tp and str(raw_tp).startswith('PLACING_'):
+        
+        # Strip/resolve PLACING_ or PENDING_ prefix from trades.entry_order_id.
+        if raw_entry and (str(raw_entry).startswith('PLACING_') or str(raw_entry).startswith('PENDING_')):
+            cursor.execute(
+                "SELECT order_id FROM bot_orders WHERE bot_id=? AND order_type='entry'"
+                " AND status IN ('open','new','placed','filled') AND order_id NOT LIKE 'PLACING_%' AND order_id NOT LIKE 'PENDING_%'"
+                " ORDER BY created_at DESC LIMIT 1",
+                (bot_id,)
+            )
+            real_entry_row = cursor.fetchone()
+            if real_entry_row and real_entry_row[0]:
+                orders['entry_order_id'] = real_entry_row[0]
+                try:
+                    conn.execute(
+                        "UPDATE trades SET entry_order_id=? WHERE bot_id=? AND entry_order_id=?",
+                        (real_entry_row[0], bot_id, raw_entry)
+                    )
+                    conn.commit()
+                except Exception:
+                    pass
+            else:
+                orders['entry_order_id'] = None
+        else:
+            orders['entry_order_id'] = raw_entry
+            
+        # Strip/resolve PLACING_ or PENDING_ prefix from trades.tp_order_id.
+        if raw_tp and (str(raw_tp).startswith('PLACING_') or str(raw_tp).startswith('PENDING_')):
             # Try to find the real exchange ID in bot_orders for this bot's tp type
             cursor.execute(
                 "SELECT order_id FROM bot_orders WHERE bot_id=? AND order_type='tp'"
-                " AND status IN ('open','new','placed') AND order_id NOT LIKE 'PLACING_%'"
+                " AND status IN ('open','new','placed') AND order_id NOT LIKE 'PLACING_%' AND order_id NOT LIKE 'PENDING_%'"
                 " ORDER BY created_at DESC LIMIT 1",
                 (bot_id,)
             )
@@ -1816,7 +1908,8 @@ def get_bot_order_ids(bot_id):
     if not orders['entry_order_id']:
         cursor.execute(
             "SELECT order_id FROM bot_orders WHERE bot_id = ? AND order_type = 'entry'"
-            " AND status IN ('open','new','placing') ORDER BY created_at DESC LIMIT 1",
+            " AND status IN ('open','new','placing') AND order_id NOT LIKE 'PLACING_%' AND order_id NOT LIKE 'PENDING_%'"
+            " ORDER BY created_at DESC LIMIT 1",
             (bot_id,)
         )
         entry_row = cursor.fetchone()
@@ -1826,7 +1919,7 @@ def get_bot_order_ids(bot_id):
     if not orders['tp_order_id']:
         cursor.execute(
             "SELECT order_id FROM bot_orders WHERE bot_id = ? AND order_type = 'tp'"
-            " AND status IN ('open','new','placing') AND order_id NOT LIKE 'PLACING_%'"
+            " AND status IN ('open','new','placing') AND order_id NOT LIKE 'PLACING_%' AND order_id NOT LIKE 'PENDING_%'"
             " ORDER BY created_at DESC LIMIT 1",
             (bot_id,)
         )
@@ -1842,7 +1935,7 @@ def get_bot_order_ids(bot_id):
     # causes local_grid_ids to be [], making the engine think no grid exists and try to place one.
     cursor.execute(
         "SELECT order_id FROM bot_orders WHERE bot_id = ? AND order_type = 'grid'"
-        " AND status IN ('open','new','placing') AND order_id NOT LIKE 'PLACING_%'",
+        " AND status IN ('open','new','placing') AND order_id NOT LIKE 'PLACING_%' AND order_id NOT LIKE 'PENDING_%'",
         (bot_id,)
     )
     orders['grid_orders'] = [{'order_id': r[0]} for r in cursor.fetchall() if r[0]]
@@ -2431,6 +2524,13 @@ def update_active_positions_snapshot(positions: list):
                     logger.debug(f"[SNAP] Bot {owner_id} → {side} {symbol} qty={data['size']:.6f}")
 
 
+        if not agg_positions:
+            conn.execute(
+                "INSERT INTO active_positions (bot_id, pair, side, size, entry_price, last_checked) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (0, 'GLOBAL', 'FLAT', 0.0, 0.0, ts)
+            )
+
         conn.commit()
         logger.info(f"\u2705 [SNAP] active_positions refreshed: {owned_count} owned + {orphan_count} orphans ({len(agg_positions)} total).")
 
@@ -2913,7 +3013,7 @@ _BOT_ORDERS_CANONICAL_SUBSELECT = """
           -- fill=0.97 would lose to an auto_closed zero-fill duplicate (score 0 vs 1),
           -- causing recompute to see sold_qty=0 and leaving open_qty inflated.
           CASE WHEN b2.status IN ('filled', 'closed', 'auto_closed', 'hedge_exited') THEN 1
-               WHEN b2.status IN ('canceled', 'cancelled') AND b2.filled_amount > 0 THEN 1
+               WHEN b2.status IN ('partially_filled', 'canceled', 'cancelled') AND b2.filled_amount > 0 THEN 1
                ELSE 0 END DESC,
           b2.filled_amount DESC,
           b2.id DESC
@@ -3383,7 +3483,7 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None) -> tuple:
               )
               -- 🚀 [v3.1.1 PARTIAL-CANCEL FIX]: Include 'cancelled' orders that have actual fills.
               AND (
-                  bo.status IN ('filled', 'closed', 'auto_closed', 'hedge_exited')
+                  bo.status IN ('filled', 'closed', 'auto_closed', 'hedge_exited', 'partially_filled')
                   OR (bo.status IN ('canceled', 'cancelled') AND bo.filled_amount > 0)
               )
               AND bo.filled_amount > 0
@@ -3542,7 +3642,7 @@ def get_pair_virtual_net(symbol: str) -> float:
             SELECT b.id, b.direction, b.pair, b.normalized_pair, COALESCE(t.open_qty, 0)
             FROM bots b
             JOIN trades t ON t.bot_id = b.id
-            WHERE b.is_active = 1
+            WHERE b.is_active >= 0
             """
         ).fetchall()
         if not rows:
@@ -3592,14 +3692,14 @@ def sync_trades_from_orders(bot_id: int) -> bool:
         conn = get_connection()
         cursor = conn.cursor()
         row = cursor.execute(
-            "SELECT total_invested, avg_entry_price, current_step, cycle_phase, hedge_qty, open_qty FROM trades WHERE bot_id = ?",
+            "SELECT total_invested, avg_entry_price, current_step, cycle_phase, open_qty FROM trades WHERE bot_id = ?",
             (bot_id,)
         ).fetchone()
         if not row:
             return False
 
-        cached_invested, cached_avg, cached_step, cached_phase, cached_hedge = float(row[0] or 0), float(row[1] or 0), int(row[2] or 0), str(row[3] or 'IDLE'), float(row[4] or 0)
-        cached_open_qty = float(row[5] or 0)
+        cached_invested, cached_avg, cached_step, cached_phase = float(row[0] or 0), float(row[1] or 0), int(row[2] or 0), str(row[3] or 'IDLE')
+        cached_open_qty = float(row[4] or 0)
 
         # 🚀 SELF-HEALING PHASE PROTOCOL (v3.2 - Hedge Aware)
         # Derive phase from ledger truth:
@@ -3646,7 +3746,6 @@ def sync_trades_from_orders(bot_id: int) -> bool:
             round(recomputed_avg, 8), 
             recomputed_step, 
             derived_phase, 
-            0.0, 
             round(main_open_qty, 8),
             round(main_open_qty, 8),  # entry_confirmed gate
             round(recomputed_cost, 8)
@@ -3667,7 +3766,6 @@ def sync_trades_from_orders(bot_id: int) -> bool:
                 avg_entry_price = ?,
                 current_step    = ?,
                 cycle_phase     = ?,
-                hedge_qty       = ?,
                 open_qty        = ?,
                 entry_confirmed = CASE WHEN (? > 1e-8 OR ? > 0.01) THEN 1 ELSE entry_confirmed END
                 {sql_ee}
@@ -3736,7 +3834,7 @@ def reconcile_with_db(bot_id, current_price, open_orders, exchange_position):
                 return {'success': True}  # Position is live — do NOT wipe
 
             # Source B: check bot_orders ground truth
-            recomputed_cost, recomputed_avg, recomputed_qty, _, _ = recompute_invested_from_orders(bot_id)
+            recomputed_cost, recomputed_avg, recomputed_qty, _ = recompute_invested_from_orders(bot_id)
             if recomputed_qty > 1e-6:
                 logger.warning(
                     f"🛡️ [RECONCILE-GUARD] Bot {bot_id}: exchange_position=None but "
@@ -4481,57 +4579,3 @@ def clear_manual_whitelists_for_pair(pair: str):
     except Exception as e:
         logger.error(f"❌ Failed to clear whitelists for {pair}: {e}")
         return False
-
-
-def __getattr__(name):
-    if name == 'get_bot_hedge_qty':
-        import sys
-        try:
-            frame = sys._getframe(1)
-            curr = frame
-            while curr:
-                if 'test_ticket3' in curr.f_code.co_name:
-                    raise AttributeError("module 'engine.database' has no attribute 'get_bot_hedge_qty'")
-                curr = curr.f_back
-        except AttributeError:
-            raise
-        except Exception:
-            pass
-        return lambda bot_id: 0.0
-
-    if name == 'basket_open_qty_from_recompute':
-        import sys
-        try:
-            frame = sys._getframe(1)
-            curr = frame
-            while curr:
-                if 'test_ticket3' in curr.f_code.co_name:
-                    raise AttributeError("module 'engine.database' has no attribute 'basket_open_qty_from_recompute'")
-                curr = curr.f_back
-        except AttributeError:
-            raise
-        except Exception:
-            pass
-        return lambda net_qty, hedge_qty: max(0.0, round(float(net_qty or 0) + float(hedge_qty or 0), 8))
-
-    raise AttributeError(f"module 'engine.database' has no attribute '{name}'")
-
-
-def __dir__():
-    import sys
-    caller = ''
-    try:
-        frame = sys._getframe(1)
-        curr = frame
-        while curr:
-            if 'test_ticket3' in curr.f_code.co_name:
-                caller = 'test_ticket3'
-                break
-            curr = curr.f_back
-    except Exception:
-        pass
-    
-    current_dir = list(globals().keys())
-    if 'test_ticket3' in caller:
-        current_dir = [x for x in current_dir if x not in ('get_bot_hedge_qty', 'basket_open_qty_from_recompute')]
-    return current_dir

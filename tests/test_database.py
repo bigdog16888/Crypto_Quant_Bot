@@ -248,6 +248,165 @@ class TestDatabase(unittest.TestCase):
             self.assertEqual(cols.count(col), 1,
                              f"Column '{col}' appears {cols.count(col)} time(s), expected 1")
 
+    def test_auto_create_and_link_hedge_children(self):
+        """Test that active standard bots with UseHedge=True in config get their hedge child created and linked automatically."""
+        database.init_db()
+        conn = database.get_connection()
+        
+        # 1. Add standard bot with UseHedge=True
+        cfg = {
+            'UseHedge': True,
+            'HedgeStartStep': 7,
+            'max_steps': 8
+        }
+        import json
+        cfg_str = json.dumps(cfg)
+        
+        # Insert standard bot
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO bots (name, pair, normalized_pair, direction, rsi_limit, martingale_multiplier, base_size, strategy_type, config, status, is_active, bot_type)
+            VALUES ('parent_bot', 'BTC/USDC:USDC', 'BTCUSDC', 'LONG', 30.0, 1.5, 10.0, 'Martingale', ?, 'IN TRADE', 1, 'standard')
+        """, (cfg_str,))
+        parent_id = cursor.lastrowid
+        
+        # Insert standard bot trades row
+        cursor.execute("""
+            INSERT INTO trades (bot_id, open_qty, cycle_id, position_side, total_invested, avg_entry_price, current_step, entry_confirmed, cycle_phase)
+            VALUES (?, 0.0, 1, 'LONG', 0.0, 0.0, 0, 1, 'IDLE')
+        """, (parent_id,))
+        conn.commit()
+        
+        # 2. Run the self-healing hook
+        database.auto_create_and_link_hedge_children(conn)
+        
+        # 3. Verify parent is updated and child is created and linked
+        cursor.execute("SELECT hedge_child_bot_id, hedge_trigger_step FROM bots WHERE id = ?", (parent_id,))
+        child_id, trigger_step = cursor.fetchone()
+        self.assertIsNotNone(child_id)
+        self.assertEqual(trigger_step, 7)
+        
+        # Verify child bot attributes
+        cursor.execute("SELECT name, pair, direction, bot_type, parent_bot_id, is_active, status FROM bots WHERE id = ?", (child_id,))
+        c_name, c_pair, c_direction, c_type, c_parent, c_active, c_status = cursor.fetchone()
+        self.assertEqual(c_name, 'parent_bot_hedge')
+        self.assertEqual(c_pair, 'BTC/USDC:USDC')
+        self.assertEqual(c_direction, 'SHORT')
+        self.assertEqual(c_type, 'hedge_child')
+        self.assertEqual(c_parent, parent_id)
+        self.assertEqual(c_active, 1)
+        
+        # Verify child bot trades row is created
+        cursor.execute("SELECT bot_id, open_qty, cycle_id, position_side, cycle_phase FROM trades WHERE bot_id = ?", (child_id,))
+        t_bot_id, t_qty, t_cycle, t_side, t_phase = cursor.fetchone()
+        self.assertEqual(t_bot_id, child_id)
+        self.assertEqual(t_qty, 0.0)
+        self.assertEqual(t_cycle, 1)
+        self.assertEqual(t_side, 'SHORT')
+        self.assertEqual(t_phase, 'IDLE')
+
+
+    def test_reconcile_with_db_blocks_wipe_on_recomputed_qty(self):
+        """Test that reconcile_with_db blocks ledger wipe if bot_orders has filled qty, and permits it if empty."""
+        database.init_db()
+        conn = database.get_connection()
+        cursor = conn.cursor()
+        
+        bot_id = database.add_bot("WipeGuardBot", "BTC/USDT", "LONG", 30.0, 1.5, 10.0)
+        
+        # Simulate active trade state in database
+        database.update_martingale_step(bot_id, 1, 100.0, 50000.0, 51000.0)
+        
+        # Get target cycle_id from trades
+        cursor.execute("SELECT cycle_id FROM trades WHERE bot_id = ?", (bot_id,))
+        cycle_id = cursor.fetchone()[0] or 1
+        
+        # Scenario 1: bot_orders has non-zero recomputed_qty (e.g. entry filled)
+        # We insert a filled order in bot_orders so recompute returns qty > 0
+        cursor.execute(
+            "INSERT INTO bot_orders (bot_id, order_id, client_order_id, order_type, price, amount, filled_amount, status, created_at, updated_at, cycle_id, position_side) "
+            "VALUES (?, 'order_recon_1', 'CQB_WGB_ENTRY_1', 'entry', 50000.0, 0.05, 0.05, 'filled', 1000, 1000, ?, 'LONG')",
+            (bot_id, cycle_id)
+        )
+        conn.commit()
+        
+        # Call reconcile_with_db with no exchange position
+        res = database.reconcile_with_db(bot_id, current_price=50000.0, open_orders=[], exchange_position=None)
+        
+        self.assertTrue(res['success'])
+        
+        # Assert the bot was NOT wiped because of the recomputed_qty guard
+        status = database.get_bot_status(bot_id)
+        self.assertEqual(status['total_invested'], 100.0, "Wipe must be blocked when recomputed qty is non-zero")
+        self.assertEqual(status['current_step'], 1, "Wipe must be blocked when recomputed qty is non-zero")
+        
+        # Scenario 2: bot_orders has no filled orders (recomputed_qty = 0)
+        # Delete the order to simulate zero recomputed_qty
+        cursor.execute("DELETE FROM bot_orders WHERE bot_id = ?", (bot_id,))
+        conn.commit()
+        
+        # Call reconcile_with_db again
+        res2 = database.reconcile_with_db(bot_id, current_price=50000.0, open_orders=[], exchange_position=None)
+        
+        self.assertTrue(res2['success'])
+        
+        # Assert the bot was wiped since physical and virtual nets are both flat
+        status_after = database.get_bot_status(bot_id)
+        self.assertEqual(status_after['total_invested'], 0.0, "Wipe must proceed when recomputed qty is zero")
+        self.assertEqual(status_after['current_step'], 0, "Wipe must proceed when recomputed qty is zero")
+
+    def test_canonical_subselect_priorities(self):
+        """Verify the canonical subselect prioritization matches expected rules:
+        1. auto_closed with filled_amount > 0 beats partially_filled with filled_amount = 0 (v3.5.8 scenario).
+        2. partially_filled with filled_amount > 0 beats auto_closed with filled_amount = 0 (Scenario B).
+        3. partially_filled with filled_amount > 0 and auto_closed with filled_amount > 0 ties on status score, newer wins.
+        """
+        database.init_db()
+        conn = database.get_connection()
+        cursor = conn.cursor()
+
+        # Insert a bot
+        bot_id = database.add_bot("CanonicalTestBot", "BTC/USDT", "LONG", 30.0, 1.5, 10.0)
+
+        from engine.database import _canonical_bot_orders_from
+
+        # Case 1: v3.5.8 scenario: auto_closed (230.7) vs partially_filled (0.0, newer)
+        cursor.execute(
+            "INSERT INTO bot_orders (id, bot_id, client_order_id, order_type, price, amount, filled_amount, status, created_at, updated_at) "
+            "VALUES (1001, ?, 'CID_CASE_1', 'entry', 50000.0, 230.7, 230.7, 'auto_closed', 1000, 1000)", (bot_id,)
+        )
+        cursor.execute(
+            "INSERT INTO bot_orders (id, bot_id, client_order_id, order_type, price, amount, filled_amount, status, created_at, updated_at) "
+            "VALUES (1002, ?, 'CID_CASE_1', 'entry', 50000.0, 230.7, 0.0, 'partially_filled', 1001, 1001)", (bot_id,)
+        )
+        row1 = cursor.execute(f"SELECT bo.id, bo.status, bo.filled_amount {_canonical_bot_orders_from('bo')} AND bo.client_order_id = 'CID_CASE_1'").fetchone()
+        self.assertEqual(row1[0], 1001, "Auto_closed with real fill must beat partially_filled zero-fill")
+
+        # Case 2: Zero-fill auto_closed (older) vs Zero-fill partially_filled (newer)
+        cursor.execute(
+            "INSERT INTO bot_orders (id, bot_id, client_order_id, order_type, price, amount, filled_amount, status, created_at, updated_at) "
+            "VALUES (2001, ?, 'CID_CASE_2', 'entry', 50000.0, 230.7, 0.0, 'auto_closed', 1000, 1000)", (bot_id,)
+        )
+        cursor.execute(
+            "INSERT INTO bot_orders (id, bot_id, client_order_id, order_type, price, amount, filled_amount, status, created_at, updated_at) "
+            "VALUES (2002, ?, 'CID_CASE_2', 'entry', 50000.0, 230.7, 0.0, 'partially_filled', 1001, 1001)", (bot_id,)
+        )
+        row2 = cursor.execute(f"SELECT bo.id, bo.status, bo.filled_amount {_canonical_bot_orders_from('bo')} AND bo.client_order_id = 'CID_CASE_2'").fetchone()
+        self.assertEqual(row2[0], 2001, "Auto_closed zero-fill must beat partially_filled zero-fill")
+
+        # Case 3: Real fill auto_closed (older) vs Real fill partially_filled (newer)
+        cursor.execute(
+            "INSERT INTO bot_orders (id, bot_id, client_order_id, order_type, price, amount, filled_amount, status, created_at, updated_at) "
+            "VALUES (3001, ?, 'CID_CASE_3', 'entry', 50000.0, 230.7, 230.7, 'auto_closed', 1000, 1000)", (bot_id,)
+        )
+        cursor.execute(
+            "INSERT INTO bot_orders (id, bot_id, client_order_id, order_type, price, amount, filled_amount, status, created_at, updated_at) "
+            "VALUES (3002, ?, 'CID_CASE_3', 'entry', 50000.0, 230.7, 230.7, 'partially_filled', 1001, 1001)", (bot_id,)
+        )
+        row3 = cursor.execute(f"SELECT bo.id, bo.status, bo.filled_amount {_canonical_bot_orders_from('bo')} AND bo.client_order_id = 'CID_CASE_3'").fetchone()
+        self.assertEqual(row3[0], 3002, "Real fill partially_filled (newer) must beat auto_closed (older) when both are real fills")
+
 
 if __name__ == '__main__':
     unittest.main()
+

@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 class Config:
-    VERSION = "3.5.7"  # OWAY_REPAIR downward trim detection (Fix B) & repair qty guard (Fix C)
+    VERSION = "3.6.5"  # Invariant 3.22: proof gate recency guard (60s fill window)
     ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
     def __init__(self):

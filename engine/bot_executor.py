@@ -214,12 +214,38 @@ class BotExecutor:
 
         logger.debug(f"[NET-REDUCE] {pair} bot={bot_id} siblings={sibling_count} side={side} qty={qty}")
 
-        # Sole-bot path: bot's virtual exit IS a physical reduction
+        # Sole-bot path: bot's virtual exit IS a physical reduction —
+        # but ONLY if the physical net confirms this bot owns the position.
+        # v3.6.2: Guard against stale sibling count (sibling just reset,
+        # physical net hasn't updated yet). Verify physical side matches.
         if sibling_count == 0 and bot_id and bot_direction:
             bot_is_long = bot_direction.upper() == 'LONG'
             order_is_sell = side.lower() == 'sell'
-            if (bot_is_long and order_is_sell) or (not bot_is_long and not order_is_sell):
-                return True
+            is_closing = (bot_is_long and order_is_sell) or (not bot_is_long and not order_is_sell)
+            if is_closing:
+                # Verify physical net direction matches before using reduceOnly
+                try:
+                    from engine.exchange_interface import normalize_symbol
+                    from engine.database import get_connection as _gc_sv
+                    with _gc_sv() as _c_sv:
+                        _sv_rows = _c_sv.execute(
+                            "SELECT side, size FROM active_positions WHERE pair=?",
+                            (normalize_symbol(pair),)
+                        ).fetchall()
+                    _sv_net = sum(r[1] if str(r[0]).upper()=='LONG' else -r[1] for r in _sv_rows)
+                    # Physical net must be on the same side as the bot's position
+                    _phys_matches = (_sv_net > 0.0001 and bot_is_long) or \
+                                    (_sv_net < -0.0001 and not bot_is_long)
+                    if _phys_matches:
+                        return True
+                    else:
+                        logger.warning(
+                            f"[NET-REDUCE] Sole-bot override suppressed: "
+                            f"bot={bot_direction} but phys_net={_sv_net:.6f} "
+                            f"(opposite side). Using account-net path."
+                        )
+                except Exception:
+                    pass  # Fall through to account-net path below
 
         # Multi-bot: use TOTAL account net, not bot-owned slice
         try:
@@ -381,33 +407,85 @@ class BotExecutor:
         prec = exchange.get_symbol_precision(pair)
         tp_qty = exchange.round_to_step(bot_virtual_open_qty, prec['step_size'])
 
-        # v3.1.6: Clip tp_qty to live physical capacity to prevent -4118.
-        # In multi-bot pairs, physical net < each bot's virtual qty.
-        # A full-size reduceOnly TP exceeds physical capacity and is rejected.
+        # v3.6.2: Direction-aware TP capacity clip to prevent -4118.
+        # A LONG bot's SELL TP requires LONG-side physical capacity.
+        # A SHORT bot's BUY TP requires SHORT-side physical capacity.
+        # If the physical net is on the OPPOSITE side, capacity = 0
+        # and the order must use GTX (non-reduceOnly) instead.
+        force_no_reduce = False
         try:
-            _live_pos = self._get_phys_pos(pair, direction=direction)
-            if _live_pos and _live_pos['size'] > 0:
+            # v3.6.4: Use actual exchange net position, not per-bot virtual record.
+            # active_positions stores gross per-bot splits; exchange enforces the net.
+            # Capacity must be computed from net to match what the exchange enforces.
+            from engine.database import get_connection as _gc_net
+            with _gc_net() as _cn:
+                _net_rows = _cn.execute(
+                    "SELECT side, size FROM active_positions "
+                    "WHERE pair = ? OR pair = ?",
+                    (pair, norm_pair)
+                ).fetchall()
+            _exchange_net = sum(
+                r[1] if str(r[0]).upper() == 'LONG' else -r[1]
+                for r in _net_rows
+            )
+        except Exception:
+            _exchange_net = 0.0
+
+        # For a LONG bot SELL TP: need positive net (LONG capacity)
+        # For a SHORT bot BUY TP: need negative net (SHORT capacity)
+        _required_sign = 1 if direction.upper() == 'LONG' else -1
+        _net_on_correct_side = _exchange_net * _required_sign  # positive if correct side
+
+        if _net_on_correct_side <= 0.0001:
+            # Physical net is on wrong side or flat — zero capacity, use GTX
+            logger.warning(
+                f"[TP-CLIP] {name}: Exchange net {_exchange_net:.6f} has no "
+                f"{direction} capacity. Setting force_no_reduce=True."
+            )
+            force_no_reduce = True
+        else:
+            # Subtract same-side open orders from the real net
+            # (existing _other_open_tp calculation stays exactly as-is)
+            try:
                 from engine.database import get_connection as _gc_clip
                 with _gc_clip() as _cc:
-                    _other_open_tp = float(_cc.cursor().execute(
-                        "SELECT COALESCE(SUM(amount), 0) FROM bot_orders "
-                        "WHERE status IN ('open','new') AND order_type IN ('tp','dust_close') "
-                        "AND bot_id != ? AND pair = ?",
-                        (bot_id, pair)
-                    ).fetchone()[0] or 0.0)
-                _phys_capacity = exchange.round_to_step(
-                    max(0.0, _live_pos['size'] - _other_open_tp),
-                    prec['step_size']
+                    _open_orders = _cc.cursor().execute(
+                        "SELECT bo.bot_id, bo.amount, bo.order_type, b.direction "
+                        "FROM bot_orders bo "
+                        "JOIN bots b ON bo.bot_id = b.id "
+                        "WHERE bo.status IN ('open', 'new') AND (b.pair = ? OR b.normalized_pair = ?)",
+                        (pair, norm_pair)
+                    ).fetchall()
+                
+                _other_open_tp = 0.0
+                for _o_bot_id, _o_amount, _o_type, _o_dir in _open_orders:
+                    if _o_bot_id == bot_id and _o_type in ('tp', 'dust_close'):
+                        continue
+                    _is_long_bot = (_o_dir.upper() == 'LONG')
+                    _is_entry = _o_type in ('entry', 'grid', 'adoption_add', 'adoption', 'carry')
+                    _o_side = 'buy' if (_is_long_bot and _is_entry) or (not _is_long_bot and not _is_entry) else 'sell'
+                    if _o_side == side.lower():
+                        _other_open_tp += float(_o_amount)
+            except Exception:
+                _other_open_tp = 0.0
+
+            _phys_capacity = exchange.round_to_step(
+                max(0.0, _net_on_correct_side - _other_open_tp),
+                prec['step_size']
+            )
+            if _phys_capacity <= 0.0001:
+                logger.warning(
+                    f"[TP-CLIP] {name}: Net capacity exhausted by sibling orders "
+                    f"(net={_net_on_correct_side:.6f}, other_open={_other_open_tp:.6f}). "
+                    f"Setting force_no_reduce=True."
                 )
-                if _phys_capacity > 0 and tp_qty > _phys_capacity:
-                    logger.warning(
-                        f"[TP-CLIP] {name}: tp_qty {tp_qty:.6f} > physical capacity "
-                        f"{_phys_capacity:.6f} (phys={_live_pos['size']:.6f}, "
-                        f"other_tp={_other_open_tp:.6f}). Clipping to prevent -4118."
-                    )
-                    tp_qty = _phys_capacity
-        except Exception as _clip_err:
-            logger.debug(f"[TP-CLIP] {name}: capacity clip check failed (non-blocking): {_clip_err}")
+                force_no_reduce = True
+            elif tp_qty > _phys_capacity:
+                logger.warning(
+                    f"[TP-CLIP] {name}: tp_qty {tp_qty:.6f} > net capacity "
+                    f"{_phys_capacity:.6f}. Clipping."
+                )
+                tp_qty = _phys_capacity
 
 
         if tp_qty <= 0:
@@ -425,13 +503,26 @@ class BotExecutor:
         # reduceOnly orders never require margin — they can only reduce an existing position.
         # Bot-aware: a LONG bot selling is ALWAYS reducing for that bot (v3.1.5 override).
         # The clip above ensures tp_qty never exceeds physical capacity, so reduceOnly is safe.
-        is_reducing = self._is_order_net_reducing(pair, side, tp_qty, bot_id=bot_id, bot_direction=direction)
+        is_reducing = False if force_no_reduce else self._is_order_net_reducing(pair, side, tp_qty, bot_id=bot_id, bot_direction=direction)
         if is_reducing:
             ccxt_params = {'reduceOnly': True, 'timeInForce': 'GTC'}
             logger.debug(f"✅ {name}: TP is net-reducing — using reduceOnly GTC to bypass margin reservation.")
         else:
-            logger.warning(f"⚠️ {name}: TP order {side.upper()} {tp_qty} increases account NET exposure (multi-bot hedge). Using GTX.")
-            ccxt_params = {'postOnly': True, 'timeInForce': 'GTX'}
+            # Check if this is a hedge child bot — if so, use GTC (not postOnly GTX)
+            # postOnly GTX is cancelled if it crosses the spread; hedge child TPs must fill
+            from engine.database import get_connection as _gc_bt
+            with _gc_bt() as _bc:
+                _bt_row = _bc.execute(
+                    "SELECT bot_type FROM bots WHERE id=?", (bot_id,)
+                ).fetchone()
+            _is_hedge_child = _bt_row and _bt_row[0] == 'hedge_child'
+
+            if _is_hedge_child:
+                ccxt_params = {'timeInForce': 'GTC'}  # No reduceOnly, no postOnly — must fill
+                logger.info(f"✅ {name}: Hedge child TP — using GTC (no reduceOnly, no postOnly). Order will fill at limit price.")
+            else:
+                ccxt_params = {'postOnly': True, 'timeInForce': 'GTX'}
+                logger.warning(f"⚠️ {name}: TP order {side.upper()} {tp_qty} increases account NET exposure (multi-bot hedge) — using GTX postOnly.")
 
         # 5. Dust check: if notional is below minimum, trigger dust close path
         _min_notional = prec.get('min_notional')
@@ -678,7 +769,8 @@ class BotExecutor:
                 try:
                     from engine.ws_cache import get_ws_cache
                     get_ws_cache().remove_order(tp_order_id)
-                except: pass
+                except Exception as _e:
+                    logger.debug(f'[CACHE] remove_order after cancel: {_e}')
             except Exception as e:
                 logger.warning(f"[TP-SYNC] {name}: Cancel failed ({e}). Attempting to fetch order status...")
                 try:
@@ -784,6 +876,8 @@ class BotExecutor:
             # 🚀 HARDENED: Use cycle_id for strict idempotency
             cycle_id = bot_status.get('cycle_id', 0)
             client_order_id = self._generate_deterministic_id(bot_id, 'TP', cycle_id, bot_status['current_step'])
+            # 🚀 UNIQUE REPLACEMENT ID: Append unique replacement suffix to prevent duplicate client ID collisions in ledger recomputations
+            client_order_id = f"{client_order_id}_R{int(time.time())}"
             tp_params = {'clientOrderId': client_order_id, 'postOnly': True, 'timeInForce': 'GTX'}
 
             logger.info(f"🔄 [TP-SYNC] {name}: Placing IDEMPOTENT TP {client_order_id} @ {db_tp:.4f}...")
@@ -802,7 +896,8 @@ class BotExecutor:
                 try:
                     from engine.ws_cache import get_ws_cache as _gwsc
                     _gwsc().update_order(str(order['id']), order)
-                except Exception: pass
+                except Exception as _e:
+                    logger.debug(f'[CACHE] update_order (snapshot heal): {_e}')
                 logger.info(f"✅ [SYNC] {name}: Re-placed TP @ {db_tp:.4f} Qty {db_qty:.4f}")
             else:
                 # 🚀 ATOMIC RESTORE: GTX was rejected (e.g. EE-decayed price crossed below market bid).
@@ -886,6 +981,19 @@ class BotExecutor:
             bot_config['martingale_multiplier'] = martingale_multiplier
             bot_config['rsi_limit'] = rsi_limit
 
+            # Get bot_type from config or DB
+            bot_type = bot_config.get('bot_type')
+            if not bot_type:
+                try:
+                    from engine.database import get_connection as _gc_type
+                    with _gc_type() as _conn:
+                        _res = _conn.execute("SELECT bot_type FROM bots WHERE id=?", (bot_id,)).fetchone()
+                        bot_type = _res[0] if _res else 'standard'
+                except Exception as _e:
+                    logger.debug(f'[BOT-TYPE-LOOKUP] DB fallback to standard: {_e}')
+                    bot_type = 'standard'
+            bot_config['bot_type'] = bot_type
+
             exchange = self._get_thread_exchange(market_type) # Use thread-specific exchange
             
             # v2.0: TP cascade is now exclusively drained by runner.run_cycle() via
@@ -919,7 +1027,7 @@ class BotExecutor:
                 exchange_min_notional = prec.get('min_notional', None)
                 if exchange_min_notional is None:
                     exchange_min_notional = 100.0 if (getattr(config, 'TESTNET', False) or getattr(config, 'DEMO_TRADING', False)) else 5.0
-                if bot_config.get('base_size', 0) < exchange_min_notional:
+                if bot_config.get('bot_type') != 'hedge_child' and bot_config.get('base_size', 0) < exchange_min_notional:
                     logger.error(f"⛔ CONFIG ERROR [{pair}]: Configured base_size=${bot_config.get('base_size',0):.2f} is below exchange minimum ${exchange_min_notional:.2f}. Halting bot. Please update config.")
                     update_bot_error(bot_id, "Config Error")
                     return None, None
@@ -1205,7 +1313,8 @@ class BotExecutor:
                     try:
                         from engine.database import update_bot_state
                         update_bot_state(bot_id, is_active=0)
-                    except: pass
+                    except Exception as _e:
+                        logger.warning(f'[HAMMER-SHIELD] DB deactivation write failed for {name}: {_e}', exc_info=True)
                     tracker['count'] = 0
                 else:
                     tracker['count'] = 1
@@ -1846,8 +1955,18 @@ class BotExecutor:
             from engine.database import get_bot_order_ids
             local_db_ids = get_bot_order_ids(bot_id)
             local_tp_id = local_db_ids.get('tp_order_id')
+            # 🛡️ Never treat synthetic PENDING_BE* placeholders as real exchange IDs
+            if local_tp_id and str(local_tp_id).startswith('PENDING_BE_'):
+                logger.debug(f"[HEDGE-CHILD] {name}: clearing placeholder tp_order_id={local_tp_id}")
+                _hc_conn.execute("UPDATE trades SET tp_order_id = NULL WHERE bot_id = ?", (bot_id,))
+                _hc_conn.commit()
+                local_tp_id = None
 
             if not existing_tp_order:
+                if local_tp_id and (str(local_tp_id).startswith('PENDING_') or str(local_tp_id).startswith('PLACING_')):
+                    logger.info(f"⏳ [HEDGE-MAINTAIN] {name}: local_tp_id {local_tp_id} is a placeholder. Treating as None.")
+                    local_tp_id = None
+
                 if local_tp_id:
                     # Stalemate check on local_tp_id
                     logger.warning(f"⏳ [HEDGE-MAINTAIN] {name}: CCXT says TP is missing, but DB has {local_tp_id}. Verifying status...")
@@ -1888,7 +2007,8 @@ class BotExecutor:
                             logger.warning(f"⏳ [HEDGE-MAINTAIN] Stored TP {local_tp_id} status is {status_str}, unrecognised. Evicting.")
                             try:
                                 exchange.cancel_order(local_tp_id, pair)
-                            except: pass
+                            except Exception as _e:
+                                logger.debug(f'[EXPECTED] cancel unrecognised TP status (hedge-maintain): {_e}')
                             from engine.database import update_order_status as _uos
                             _uos(local_tp_id, 'cancelled', bot_id=bot_id)
                             _hc_conn.execute("UPDATE trades SET tp_order_id = NULL WHERE bot_id = ?", (bot_id,))
@@ -1920,6 +2040,62 @@ class BotExecutor:
                     (bot_id,)
                 ).fetchone()
 
+                # 🛡️ [HEDGE-BE-FALLBACK] (v3.6.7)
+                # If no pending_placement row exists but the child has an open position,
+                # handle_tp_completion fired before the child ledger seal wrote open_qty
+                # (race condition), so the pending_placement write was silently skipped.
+                # Compute and register the BE TP intent here rather than returning unprotected.
+                if not pending_tp:
+                    child_trade = _hc_conn.execute(
+                        "SELECT open_qty, avg_entry_price, cycle_id FROM trades WHERE bot_id = ?",
+                        (bot_id,)
+                    ).fetchone()
+                    if child_trade:
+                        _fallback_qty = float(child_trade[0] or 0)
+                        _fallback_avg = float(child_trade[1] or 0)
+                        _fallback_cycle = int(child_trade[2] or 0)
+                        if _fallback_qty > 0.0001 and _fallback_avg > 0:
+                            _fallback_cid = f"CQB_{bot_id}_TP_{_fallback_cycle}_BE_FB"
+                            _already = _hc_conn.execute(
+                                "SELECT id FROM bot_orders WHERE bot_id=? AND client_order_id LIKE ? "
+                                "AND status IN ('pending_placement', 'open', 'new', 'partially_filled', 'pending', 'placing')",
+                                (bot_id, f"{_fallback_cid}%")
+                            ).fetchone()
+                            if not _already:
+                                from engine.database import save_bot_order as _sbo_fb
+                                _sbo_fb(
+                                    bot_id, 'tp', f'PENDING_BE_{bot_id}_{_fallback_cycle}_FB',
+                                    _fallback_avg, _fallback_qty, step=0,
+                                    status='pending_placement',
+                                    client_order_id=_fallback_cid,
+                                    notes=(
+                                        f"[HEDGE-BE-FALLBACK] BE TP self-registered by maintain_orders "
+                                        f"(handle_tp_completion missed due to ledger race). "
+                                        f"qty={_fallback_qty}, avg={_fallback_avg:.4f}"
+                                    ),
+                                    cycle_id=_fallback_cycle,
+                                )
+                                logger.warning(
+                                    f"🛡️ [HEDGE-BE-FALLBACK] {name} ({bot_id}): no pending_placement found "
+                                    f"but open_qty={_fallback_qty} avg={_fallback_avg:.4f}. "
+                                    f"Registered fallback BE TP intent {_fallback_cid}. "
+                                    f"Will be placed on next cycle."
+                                )
+                                # Ensure placeholder never leaks into trades.tp_order_id
+                                _hc_conn.execute(
+                                    "UPDATE trades SET tp_order_id = NULL WHERE bot_id = ? "
+                                    "AND (tp_order_id IS NULL OR tp_order_id LIKE 'PENDING_BE_%')",
+                                    (bot_id,)
+                                )
+                                _hc_conn.commit()
+                                # Re-query so the placement block below picks it up this cycle
+                                pending_tp = _hc_conn.execute(
+                                    "SELECT price, amount, cycle_id, client_order_id FROM bot_orders "
+                                    "WHERE bot_id = ? AND order_type = 'tp' AND status = 'pending_placement' "
+                                    "ORDER BY id DESC LIMIT 1",
+                                    (bot_id,)
+                                ).fetchone()
+
                 if pending_tp:
                     tp_price, tp_amount, child_cycle, be_cid = pending_tp
                     tp_price = float(tp_price)
@@ -1942,9 +2118,24 @@ class BotExecutor:
                         _hc_conn.execute("UPDATE trades SET tp_order_id = ? WHERE bot_id = ?", (resting['id'], bot_id))
                         _hc_conn.commit()
                     else:
-                        # Place on exchange as GTC reduceOnly
-                        params = {'reduceOnly': True, 'timeInForce': 'GTC', 'newClientOrderId': be_cid}
+                        # Determine if reduceOnly is allowed or if we should use GTC fallback
+                        is_reducing = self._is_order_net_reducing(pair, tp_side, tp_amount, bot_id=bot_id, bot_direction=child_direction)
+
+                        unique_cid = f"{be_cid}_{int(time.time())}"
+                        params = {
+                            'timeInForce': 'GTC',
+                            'postOnly': False,
+                            'post_only': False,
+                            'newClientOrderId': unique_cid
+                        }
+                        if is_reducing:
+                            params['reduceOnly'] = True
+                            logger.info(f"✅ {name}: Placing child BE TP using GTC reduceOnly.")
+                        else:
+                            logger.info(f"✅ {name}: Placing child BE TP using GTC fallback (no reduceOnly).")
+
                         is_testnet = getattr(config, 'TESTNET', False) or getattr(config, 'DEMO_TRADING', False)
+                        params = self._resolve_position_side_param(params, is_testnet)
                         if is_testnet:
                             params['positionSide'] = child_direction
 
@@ -1952,12 +2143,11 @@ class BotExecutor:
                             # Validate the order
                             valid, tp_amount, tp_price, msg = exchange.validate_order(pair, tp_side, tp_amount, tp_price, is_closing=True)
                             if valid:
-                                order = self._place_gtx_order_with_retry(
-                                    exchange, pair, tp_side, tp_amount, tp_price,
-                                    params=params, label=f"HEDGE-BE-TP-{name}", position_side=child_direction
+                                order = exchange.create_order(
+                                    pair, 'limit', tp_side, tp_amount, tp_price, params=params
                                 )
                                 if order:
-                                    actual_cid = order.get('_fallback_cid') or be_cid
+                                    actual_cid = order.get('_fallback_cid') or order.get('clientOrderId') or unique_cid
                                     _hc_conn.execute(
                                         "UPDATE bot_orders SET order_id = ?, status = ?, client_order_id = ?, updated_at = ? "
                                         "WHERE bot_id = ? AND client_order_id = ? AND status = 'pending_placement'",
@@ -2087,7 +2277,8 @@ class BotExecutor:
                 try:
                     exchange.cancel_order(stale_grid['id'], pair)
                     update_order_status(stale_grid['id'], 'cancelled', bot_id=bot_id)
-                except: pass
+                except Exception as _e:
+                    logger.debug(f'[EXPECTED] stale grid cancel (scanning): {_e}')
             grid_orders = [] # Clear local list
             
             for stale_tp in tp_orders:
@@ -2095,7 +2286,8 @@ class BotExecutor:
                 try:
                     exchange.cancel_order(stale_tp['id'], pair)
                     update_order_status(stale_tp['id'], 'cancelled', bot_id=bot_id)
-                except: pass
+                except Exception as _e:
+                    logger.debug(f'[EXPECTED] stale TP cancel (scanning): {_e}')
             tp_orders = [] # Clear local list
 
             for stale_dust in dust_orders:
@@ -2103,7 +2295,8 @@ class BotExecutor:
                 try:
                     exchange.cancel_order(stale_dust['id'], pair)
                     update_order_status(stale_dust['id'], 'cancelled', bot_id=bot_id)
-                except: pass
+                except Exception as _e:
+                    logger.debug(f'[EXPECTED] stale dust cancel (scanning): {_e}')
             dust_orders = []
 
             return None # Exit early for truly empty bots
@@ -2148,7 +2341,8 @@ class BotExecutor:
                         cycle_id = int(remainder[0])
                         step_num = int(remainder[1].replace('R','').replace('F',''))
                         return cycle_id, step_num
-            except: pass
+            except Exception as _e:
+                logger.debug(f'[CID-PARSE] Failed to parse cycle/step from CID "{cid}": {_e}')
             return -1, -1
 
         stored_tp_id = str(bot_status.get('tp_order_id', '') or '')
@@ -2216,7 +2410,8 @@ class BotExecutor:
                     exchange.cancel_order(o['id'], pair)
                     filled_qty = float(o.get('filled', 0) or 0)
                     update_order_status(o['id'], 'cancelled', bot_id=bot_id, filled_qty=filled_qty)
-                except: pass
+                except Exception as _e:
+                    logger.debug(f'[EXPECTED] excess grid cancel: {_e}')
             valid_grid_orders = [grid_orders[0]] if get_step_from_cid(grid_orders[0].get('clientOrderId',''), 'GRID') == expected_grid_step else []
             existing_grid_order = grid_orders[0]
         else:
@@ -2243,7 +2438,8 @@ class BotExecutor:
                     exchange.cancel_order(o['id'], pair)
                     filled_qty = float(o.get('filled', 0) or 0)
                     update_order_status(o['id'], 'cancelled', bot_id=bot_id, filled_qty=filled_qty)
-                except: pass
+                except Exception as _e:
+                    logger.debug(f'[EXPECTED] excess TP cancel: {_e}')
             
             # Re-verify that the chosen winner actually matches the target step
             best_order = tp_orders[0]
@@ -2262,7 +2458,8 @@ class BotExecutor:
                     exchange.cancel_order(o['id'], pair)
                     filled_qty = float(o.get('filled', 0) or 0)
                     update_order_status(o['id'], 'cancelled', bot_id=bot_id, filled_qty=filled_qty)
-                except: pass
+                except Exception as _e:
+                    logger.debug(f'[EXPECTED] excess dust cancel: {_e}')
             existing_dust_order = dust_orders[0]
         else:
             existing_dust_order = dust_orders[0] if dust_orders else None
@@ -2276,6 +2473,10 @@ class BotExecutor:
 
         # 2. Check for missing / filled TP order
         if not existing_tp_order:
+            if local_tp_id and (str(local_tp_id).startswith('PENDING_') or str(local_tp_id).startswith('PLACING_')):
+                logger.info(f"⏳ {name}: local_tp_id {local_tp_id} is a placeholder. Treating as None.")
+                local_tp_id = None
+
             if local_tp_id:
                 # 🚀 STALEMATE EVICTOR:
                 # CCXT indicates missing TP, but DB confirms local_tp_id exists.
@@ -2300,6 +2501,21 @@ class BotExecutor:
                             filled_amount = float(order_status.get('filled', 0) or order_status.get('amount', 0))
                             logger.info(f"✅ {name}: Stored TP ID {local_tp_id} is FILLED at {actual_exit} (Qty: {filled_amount}). Triggering reset.")
                             
+                            # Check if the bot_orders row for local_tp_id already has status='reset_cleared' or status='filled'
+                            try:
+                                from engine.database import get_connection as _gc
+                                _c = _gc()
+                                _order_row = _c.execute("SELECT status FROM bot_orders WHERE order_id = ? OR id = ? LIMIT 1", (str(local_tp_id), str(local_tp_id))).fetchone()
+                                _c.close()
+                                if _order_row and _order_row[0] in ['reset_cleared', 'filled']:
+                                    logger.info(f"⏭️ {name}: Stored TP ID {local_tp_id} already has status '{_order_row[0]}' in DB. Skipping credit and cascade entirely.")
+                                    _c = _gc()
+                                    _c.execute("UPDATE trades SET tp_order_id = NULL WHERE bot_id = ?", (bot_id,))
+                                    _c.commit(); _c.close()
+                                    return None
+                            except Exception as e_check:
+                                logger.warning(f"⚠️ {name}: Failed to check order status for {local_tp_id}: {e_check}")
+
                             # 🚀 CRITICAL DB FIX: Record the TP fill in bot_orders BEFROE resetting!
                             # If the REST API caught this fill before the WebSocket did, the database doesn't
                             # know the TP filled. If we call 'reset_bot_after_tp' now, the old cycle math
@@ -2356,7 +2572,8 @@ class BotExecutor:
                          logger.warning(f"⏳ {name}: Stored TP {local_tp_id} status is {status_str}, unrecognised. Forcing CANCEL and Eviction.")
                          try:
                              exchange.cancel_order(local_tp_id, pair)
-                         except: pass
+                         except Exception as _e:
+                             logger.debug(f'[EXPECTED] cancel unrecognised TP status: {_e}')
                          from engine.database import get_connection as _gc
                          from engine.database import update_order_status as _uos
                          _uos(local_tp_id, 'cancelled', bot_id=bot_id)
@@ -2442,7 +2659,8 @@ class BotExecutor:
                 try:
                     prec = exchange.get_symbol_precision(pair)
                     tp_price = exchange.round_to_step(tp_price, prec['tick_size'])
-                except: pass
+                except Exception as _e:
+                    logger.debug(f'[TP-ROUND] round_to_step failed for TP price: {_e}')
 
                 logger.info(f"🔍 [TP-MAINTENANCE] Checking TP for {name}: tp_price={tp_price}, amount={tp_amount}")
                 if bot_id == 10000:
@@ -2790,7 +3008,8 @@ class BotExecutor:
                                  )
                                  _csp.commit()
                                  bot_status['entry_confirmed'] = 1
-                             except Exception: pass
+                             except Exception as _e:
+                                 logger.error(f"[PROOF-T2] Failed to promote entry_confirmed: {_e}")
 
                          elif _invested > 0.01 and _avg > 0:
                              # ── Tier 3: Math proof — auto-heal ────────────
@@ -2929,8 +3148,9 @@ class BotExecutor:
                       else:
                           logger.warning(f"⏳ {name}: Stored Grid {latest_grid_id} status is {status_str}, but missing from open_orders! Forcing CANCEL and Eviction.")
                           try:
-                              exchange.cancel_order(latest_grid_id, pair)
-                          except: pass
+                               exchange.cancel_order(latest_grid_id, pair)
+                          except Exception as _e:
+                              logger.debug(f'[EXPECTED] cancel unrecognised grid status: {_e}')
                           from engine.database import update_order_status as _uos
                           _uos(latest_grid_id, 'cancelled', bot_id=bot_id)
                           local_grid_ids = []  # Clear to allow grid logic below to immediately fire
@@ -3012,7 +3232,8 @@ class BotExecutor:
                             logger.critical(f"🛑 FAT FINGER BLOCK: {name} Grid Amount {grid_amount} drastically exceeds strategy bounds ({abs_max_qty:.4f} max limit). Cancelling Grid placement.")
                             update_bot_error(bot_id, "FAT FINGER GUARD: Grid size exceeds strategy absolutes.")
                             return None
-                    except: pass
+                    except Exception as _e:
+                        logger.debug(f'[FAT-FINGER] bounds calc failed (guard skipped): {_e}')
                     
                     # Check grid retry backoff
                     if bot_id in self._grid_backoff:
@@ -3122,7 +3343,8 @@ class BotExecutor:
                      exchange.cancel_order(existing_grid_order['id'], pair)
                      from engine.database import update_order_status as _uos
                      _uos(existing_grid_order['id'], 'cancelled', bot_id=bot_id)
-                 except: pass
+                 except Exception as _e:
+                     logger.debug(f'[EXPECTED] max-step ghost grid cancel: {_e}')
              
              if len(local_grid_ids) > 0:
                  logger.warning(f"🧹 {name}: Max steps reached but DB lists Grid ghosts {local_grid_ids}. Sweeping DB cleanly.")
@@ -3203,8 +3425,17 @@ class BotExecutor:
             if hedge_child_id and hedge_trigger > 0:
                 current_step = int(bot_status.get('current_step', 0))
                 if current_step >= hedge_trigger:
-                    # Signal child for this step if not already done
-                    step_qty = float(bot_status.get('open_qty', 0))  # filled qty this step
+                    # Get the qty that actually filled on this specific step
+                    _step_row = _conn_hcs.execute(
+                        """SELECT COALESCE(SUM(filled_amount), 0)
+                        FROM bot_orders
+                        WHERE bot_id = ? AND step = ? AND cycle_id = ?
+                        AND order_type IN ('entry', 'grid')
+                        AND status IN ('filled', 'partially_filled', 'closed')
+                        AND filled_amount > 0""",
+                        (bot_id, current_step, int(bot_status.get('cycle_id', 1)))
+                    ).fetchone()
+                    step_qty = float(_step_row[0] or 0) if _step_row else 0.0
                     self._signal_hedge_child_entry(
                         parent_bot_id=bot_id,
                         parent_name=name,
@@ -3244,9 +3475,9 @@ class BotExecutor:
 
         conn = get_connection()
 
-        # Fetch hedge child bot id
+        # Fetch hedge child bot id and trigger step
         row = conn.execute(
-            "SELECT hedge_child_bot_id FROM bots WHERE id = ?", (parent_bot_id,)
+            "SELECT hedge_child_bot_id, hedge_trigger_step FROM bots WHERE id = ?", (parent_bot_id,)
         ).fetchone()
         if not row or not row[0]:
             logger.warning(
@@ -3256,16 +3487,44 @@ class BotExecutor:
             return False
 
         child_bot_id = row[0]
+        parent_trigger = int(row[1] or 0) if row[1] else 0
+        child_step = max(1, parent_step - parent_trigger + 1)
+
+        # Synchronize child bot's trades cycle_id with the parent's cycle_id
+        # Carry forward unfilled/open orders from old cycle if position is still active
+        child_info = conn.execute(
+            "SELECT cycle_id, open_qty FROM trades WHERE bot_id = ?",
+            (child_bot_id,)
+        ).fetchone()
+        if child_info:
+            old_child_cycle = child_info[0]
+            child_open_qty = float(child_info[1] or 0)
+            if old_child_cycle and old_child_cycle != cycle_id and child_open_qty > 0.0001:
+                updated_count = conn.execute(
+                    "UPDATE bot_orders SET cycle_id = ? WHERE bot_id = ? AND cycle_id = ?",
+                    (cycle_id, child_bot_id, old_child_cycle)
+                ).rowcount
+                logger.warning(
+                    f"⚠️ [HEDGE-CYCLE-CARRY] Child {child_bot_id} trades.cycle_id updated {old_child_cycle} → {cycle_id} "
+                    f"while holding active position open_qty={child_open_qty:.6f}. "
+                    f"Carried forward {updated_count} orders to new cycle to prevent virtual net mismatch."
+                )
+
+        conn.execute(
+            "UPDATE trades SET cycle_id = ? WHERE bot_id = ?",
+            (cycle_id, child_bot_id)
+        )
+        conn.commit()
 
         # Idempotency: check if this step already has a hedge entry for this cycle
         existing = conn.execute(
             "SELECT id FROM bot_orders WHERE bot_id=? AND step=? AND cycle_id=? "
-            "AND order_type='entry' AND status NOT IN ('cancelled','failed','reset_cleared')",
-            (child_bot_id, parent_step, cycle_id)
+            "AND order_type='entry' AND status NOT IN ('cancelled','failed','reset_cleared','auto_closed','rejected')",
+            (child_bot_id, child_step, cycle_id)
         ).fetchone()
         if existing:
             logger.debug(
-                f"[HEDGE-SIGNAL] Child {child_bot_id}: entry for step {parent_step} "
+                f"[HEDGE-SIGNAL] Child {child_bot_id}: entry for step {parent_step} (child step {child_step}) "
                 f"cycle {cycle_id} already exists. Skipping."
             )
             return True
@@ -3307,16 +3566,56 @@ class BotExecutor:
 
         save_bot_order(
             child_bot_id, 'entry', exchange_order_id, step_fill_price, entry_qty,
-            step=parent_step, status=order.get('status', 'open'),
+            step=child_step, status=order.get('status', 'open'),
             client_order_id=actual_cid,
             notes=f"Hedge entry mirroring parent {parent_bot_id} step {parent_step}",
             cycle_id=cycle_id,
         )
 
+        # INVARIANT: child trades.cycle_id MUST match the cycle_id used in
+        # its bot_orders rows. Without this, recompute_invested_from_orders
+        # filters by the wrong cycle and returns qty=0, causing seal_trade_state
+        # to overwrite the correct open_qty with 0.
+        # This is the permanent fix for the SUI/XRP/SOL hedge desync bug.
+        try:
+            from engine.database import get_connection as _gc_sync
+            with _gc_sync() as _sc:
+                # Carry forward unfilled/open orders from old cycle if position is still active
+                child_info = _sc.execute(
+                    "SELECT cycle_id, open_qty FROM trades WHERE bot_id = ?",
+                    (child_bot_id,)
+                ).fetchone()
+                if child_info:
+                    old_child_cycle = child_info[0]
+                    child_open_qty = float(child_info[1] or 0)
+                    if old_child_cycle and old_child_cycle != cycle_id and child_open_qty > 0.0001:
+                        updated_count = _sc.execute(
+                            "UPDATE bot_orders SET cycle_id = ? WHERE bot_id = ? AND cycle_id = ?",
+                            (cycle_id, child_bot_id, old_child_cycle)
+                        ).rowcount
+                        logger.warning(
+                            f"⚠️ [HEDGE-CYCLE-CARRY] Child {child_bot_id} trades.cycle_id updated {old_child_cycle} → {cycle_id} "
+                            f"during post-entry sync while holding active position open_qty={child_open_qty:.6f}. "
+                            f"Carried forward {updated_count} orders to new cycle."
+                        )
+                _sc.execute(
+                    "UPDATE trades SET cycle_id = ? WHERE bot_id = ?",
+                    (cycle_id, child_bot_id)
+                )
+            logger.info(
+                f"[HEDGE-CYCLE-SYNC] Child {child_bot_id} trades.cycle_id "
+                f"synced to parent cycle {cycle_id}"
+            )
+        except Exception as _sync_err:
+            logger.error(
+                f"[HEDGE-CYCLE-SYNC] FAILED for child {child_bot_id}: {_sync_err}. "
+                f"open_qty WILL be wrong after next seal. Manual fix required."
+            )
+
         logger.info(
             f"✅ [HEDGE-SIGNAL] Child {child_bot_id}: entry placed "
             f"{entry_qty:.6f} {child_direction} @ {step_fill_price:.4f} "
-            f"(parent step {parent_step}, cid={actual_cid})"
+            f"(parent step {parent_step}, child step {child_step}, cid={actual_cid})"
         )
         return True
 

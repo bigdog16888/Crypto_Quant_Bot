@@ -195,8 +195,8 @@ class TestBotLifecycle(unittest.TestCase):
                 bot_id, current_step, total_invested, avg_entry_price, target_tp_price,
                 last_exit_price, last_exit_time, basket_start_time, entry_confirmed,
                 entry_order_id, tp_order_id, bot_position_id, close_type, cycle_id,
-                cycle_phase, open_qty, wipe_wall_ts, position_side, cycle_start_time, hedge_qty
-            ) VALUES (?, 0, 0.0, 0.0, 0.0, 0.0, 0, 0, 0, NULL, NULL, NULL, NULL, 1, 'SCANNING', 0.0, 0, ?, 0, 0.0)
+                cycle_phase, open_qty, wipe_wall_ts, position_side, cycle_start_time
+            ) VALUES (?, 0, 0.0, 0.0, 0.0, 0.0, 0, 0, 0, NULL, NULL, NULL, NULL, 1, 'SCANNING', 0.0, 0, ?, 0)
         """, (bot_id, direction))
         self.conn.commit()
 

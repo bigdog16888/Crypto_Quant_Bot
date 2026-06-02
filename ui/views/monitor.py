@@ -181,12 +181,41 @@ def render_monitor_view():
                            t.target_tp_price AS target_tp_price, b.is_active AS is_active, b.status AS status, 
                            b.error AS error, t.basket_start_time AS basket_start_time, 
                            t.cycle_start_time AS cycle_start_time, t.cycle_phase AS cycle_phase, 
-                           t.open_qty AS open_qty, b.bot_type AS bot_type
+                           t.open_qty AS open_qty, b.bot_type AS bot_type, b.parent_bot_id AS parent_bot_id,
+                           b.hedge_child_bot_id AS hedge_child_bot_id,
+                           (SELECT pb.name FROM bots pb WHERE pb.id = b.parent_bot_id) AS parent_name,
+                           (SELECT pb.hedge_trigger_step FROM bots pb WHERE pb.id = b.parent_bot_id) AS parent_hedge_trigger_step
                     FROM bots b
                     LEFT JOIN trades t ON b.id = t.bot_id
                     WHERE b.is_active = 1
                 """
                 df_p = pd.read_sql(query_all, conn_fresh)
+                
+                # Filter out hedge standby bots that shouldn't be shown
+                if not df_p.empty:
+                    keep_mask = []
+                    for idx, row in df_p.iterrows():
+                        if row.get('bot_type') != 'hedge_child':
+                            keep_mask.append(True)
+                            continue
+                        
+                        # It is a hedge child — keep only if active
+                        inv = float(row.get('total_invested', 0) or 0)
+                        phase = str(row.get('cycle_phase', '')).upper()
+                        has_active_trade = (inv > 0.01) or (phase == 'ACTIVE')
+                        
+                        if has_active_trade:
+                            keep_mask.append(True)
+                        else:
+                            keep_mask.append(False)
+                    
+                    df_p = df_p[keep_mask].reset_index(drop=True)
+                    
+                    # Add indicator to parent bots
+                    df_p['name'] = df_p.apply(
+                        lambda r: f"{r['name']} 🛡️ Hedge armed" if pd.notna(r.get('hedge_child_bot_id')) and r.get('hedge_child_bot_id') else r['name'],
+                        axis=1
+                    )
                 
                 # 2. Fetch Physical Positions
                 try:
@@ -210,7 +239,7 @@ def render_monitor_view():
                 # Removing the wipe_wall_ts filter here ensures:
                 #   1. hedged_bot_ids correctly includes bots with pre-reset hedges
                 #   2. hedge_amounts correctly sums all outstanding hedge exposure
-                #   3. MISSING CRITICAL ORDERS alert is not falsely fired for HEDGED bots
+                #   3. MISSING CRITICAL ORDERS alert is not falsely fired for hedge child bots
                 # ───────────────────────────────────────────────────────────────────────
                 query_h = """
                     SELECT bo.bot_id, bo.order_type, bo.filled_amount, bo.status, bo.created_at
@@ -511,7 +540,15 @@ def render_monitor_view():
                     # Consistent threshold for 'In Trade'
                     if c_phase == 'ACTIVE' or invested > 0.01:
                         if invested > 0 and invested <= 5.0: return "🟡 DUST/PARTIAL"
+                        if row.get('bot_type') == 'hedge_child':
+                            return f"🔴 HEDGE ACTIVE | Step {c_step}"
                         return f"🔴 IN TRADE | Step {c_step}"
+                    
+                    if row.get('bot_type') == 'hedge_child':
+                        trigger_step = row.get('parent_hedge_trigger_step')
+                        if pd.notna(trigger_step) and trigger_step is not None:
+                            return f"🟢 HEDGE STANDBY (Step {int(trigger_step)})"
+                        return "🟢 HEDGE STANDBY"
                     
                     return "🟢 SCANNING"
 
@@ -523,12 +560,23 @@ def render_monitor_view():
                     bid, inv = int(row['id']), float(row['total_invested'] or 0)
                     ord_count = physical_order_counts.get(bid, 0)
                     status = str(row['status'])
-                    if "IN TRADE" in status and ord_count == 0 and "CARRY" not in str(row.get('cycle_phase','')):
+                    if ("IN TRADE" in status or "HEDGE ACTIVE" in status) and ord_count == 0 and "CARRY" not in str(row.get('cycle_phase','')):
+                        if row.get('bot_type') == 'hedge_child':
+                            parent_id = row.get('parent_bot_id')
+                            if parent_id:
+                                parent_rows = df_pos_f[df_pos_f['id'] == parent_id]
+                                if not parent_rows.empty:
+                                    parent_status = str(parent_rows.iloc[0]['status'])
+                                    if "IN TRADE" in parent_status:
+                                        return status
                         return f"⚠️ {status}"
                     return status
                 
                 df_pos_f['status'] = df_pos_f.apply(highlight_health, axis=1)
-                df_pos_f['sort_priority'] = df_pos_f['status'].apply(lambda x: 1 if ("IN TRADE" in x or "HEDGED" in x) else (2 if "SCANNING" in x else 3))
+                df_pos_f['sort_priority'] = df_pos_f['status'].apply(
+                    lambda x: 1 if ("IN TRADE" in x or "HEDGE ACTIVE" in x or "DUST" in x)
+                    else (2 if ("SCANNING" in x or "HEDGE STANDBY" in x) else 3)
+                )
                 df_pos_f.sort_values(by=['sort_priority', 'name'], ascending=[True, True], inplace=True)
 
                 # ═══════════════════════════════════════════════════════════════════════
@@ -674,23 +722,39 @@ def render_monitor_view():
                         # Show as orange warning, not red critical.
                         bots_with_margin_held.append(f"{row['name']}")
                     else:
-                        # Stricter health: Step 1+ bots should generally have 2 orders (TP + Grid)
-                        # We flag as MISSING CRITICAL if they have 0 orders but are in trade
-                        if actual_ph == 0 and bot_inv > 0.01 and cycle_phase not in ('CARRY_PENDING', 'HEDGED'):
+                        is_missing = False
+                        if actual_ph == 0 and bot_inv > 0.01 and cycle_phase != 'CARRY_PENDING':
+                            is_missing = True
+                            if row.get('bot_type') == 'hedge_child':
+                                parent_id = row.get('parent_bot_id')
+                                if parent_id:
+                                    parent_rows = df_pos_f[df_pos_f['id'] == parent_id]
+                                    if not parent_rows.empty:
+                                        parent_status = str(parent_rows.iloc[0]['status'])
+                                        if "IN TRADE" in parent_status:
+                                            is_missing = False
+                        if is_missing:
                             bots_with_missing_orders.append(row['name'])
-                        elif actual_ph == 0 and cycle_phase in ('CARRY_PENDING', 'HEDGED'):
+                        elif actual_ph == 0 and cycle_phase == 'CARRY_PENDING':
                             pass # Engine is intentionally holding without orders
                         # We flag as MISSING GRIDS if they have only 1 order but are mid-cycle (Step 1+)
+                        # and have not reached max_steps.
                         elif actual_ph < 2 and c_step >= 1 and bot_inv > 0.01 and row.get('bot_type', 'standard') == 'standard':
-                            # 🚀 NETTING GATE GUARD: Suppress alert if grid is legitimately blocked by one-way netting opposite entry block
-                            gow_ok = True
                             try:
-                                from engine.oneway_netting import gate_oneway_opposite_entry
-                                gow_ok, _ = gate_oneway_opposite_entry(bid, row['pair'], row['direction'])
-                            except Exception:
-                                pass
-                            if gow_ok:
-                                bots_with_partial_orders.append(f"{row['name']} ({actual_ph}/2)")
+                                cfg_dict = json.loads(row.get('config') or '{}')
+                                max_steps = int(cfg_dict.get('max_steps', 8))
+                            except:
+                                max_steps = 8
+                            if c_step < max_steps:
+                                # 🚀 NETTING GATE GUARD: Suppress alert if grid is legitimately blocked by one-way netting opposite entry block
+                                gow_ok = True
+                                try:
+                                    from engine.oneway_netting import gate_oneway_opposite_entry
+                                    gow_ok, _ = gate_oneway_opposite_entry(bid, row['pair'], row['direction'])
+                                except Exception:
+                                    pass
+                                if gow_ok:
+                                    bots_with_partial_orders.append(f"{row['name']} ({actual_ph}/2)")
 
                 if bots_with_missing_orders:
                     order_health_msg, order_status_color = f"⚠️ MISSING CRITICAL ORDERS: {', '.join(bots_with_missing_orders)}!", "red"
@@ -914,6 +978,20 @@ def render_monitor_view():
                         pair_key = _norm_universal(row.get('pair', ''))
                         current_price = _clean(pair_prices.get(pair_key, 0.0))
                         
+                        inv = _clean(row.get('total_invested'))
+                        is_in_trade = inv > 0.01 or str(row.get('cycle_phase', '')).upper() == 'ACTIVE'
+
+                        if row.get('bot_type') == 'hedge_child' and not is_in_trade:
+                            parent_name = row.get('parent_name')
+                            if not parent_name or pd.isna(parent_name):
+                                parent_name = 'parent'
+                            trigger_step = row.get('parent_hedge_trigger_step')
+                            if pd.notna(trigger_step) and trigger_step is not None:
+                                res['Trigger'] = f"Awaiting parent '{parent_name}' step {int(trigger_step)}"
+                            else:
+                                res['Trigger'] = f"Awaiting parent '{parent_name}' signal"
+                            return res
+                        
                         # Helper for Indicators (Cached per fragment run)
                         def get_indicator_val(p, tf, itype, period=14):
                             cache_key = (p, tf, itype, period)
@@ -1109,7 +1187,23 @@ def render_monitor_view():
                             if parts:
                                 res['Trigger'] = " | ".join(parts)
                             else:
-                                res['Trigger'] = "⚠️ NO ORDERS"
+                                if row.get('bot_type') == 'hedge_child':
+                                    parent_id = row.get('parent_bot_id')
+                                    parent_name = row.get('parent_name') or "parent"
+                                    if parent_id:
+                                        parent_rows = df_pos_f[df_pos_f['id'] == parent_id]
+                                        if not parent_rows.empty:
+                                            parent_status = str(parent_rows.iloc[0]['status'])
+                                            if "IN TRADE" in parent_status:
+                                                res['Trigger'] = f"Awaiting parent '{parent_name}' exit"
+                                            else:
+                                                res['Trigger'] = "⚠️ NO ORDERS"
+                                        else:
+                                            res['Trigger'] = "⚠️ NO ORDERS"
+                                    else:
+                                        res['Trigger'] = "⚠️ NO ORDERS"
+                                else:
+                                    res['Trigger'] = "⚠️ NO ORDERS"
                         
                         # 3. Expected Profit
                         o_qty = _clean(row.get('open_qty'))
@@ -1214,7 +1308,7 @@ def render_monitor_view():
 
                 # Entry trigger (only meaningful for scanning bots)
                 df_pos_f['Entry Trigger'] = info_df['Trigger'].where(
-                    ~df_pos_f['status'].str.contains('IN TRADE|HEDGED|DUST', na=False),
+                    ~df_pos_f['status'].str.contains('IN TRADE|DUST|HEDGE ACTIVE', na=False),
                     other=""
                 )
 

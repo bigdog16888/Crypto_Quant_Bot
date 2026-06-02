@@ -232,4 +232,144 @@ def test_b4_forensic_proof_prevents_flatten(memory_db):
         mock_create_order.assert_not_called()
 
 
+def test_adopt_from_physical_positions_rejects_pre_wall_fills(memory_db):
+    import time
+    # Seed bot
+    _seed_bot(
+        memory_db,
+        bot_id=10019,
+        name="test bot",
+        pair="SOL/USDC:USDC",
+        direction="LONG",
+        total_invested=0.0,
+        open_qty=0.0,
+        status="IN TRADE"
+    )
+    now = int(time.time())
+    # Set wipe_wall_ts to NOW
+    memory_db.execute("UPDATE trades SET wipe_wall_ts = ? WHERE bot_id = 10019", (now,))
+    memory_db.commit()
+
+    # Mock exchange returns a physical position of 0.1 (so it tries to reconcile)
+    mock_exchange = MagicMock()
+    mock_exchange.fetch_positions.return_value = [
+        {'symbol': 'SOL/USDC:USDC', 'contracts': 0.1, 'side': 'long', 'entryPrice': 1.0}
+    ]
+    # Trade history has a mock fill with timestamp = NOW - 3600 (1 hour before wall)
+    mock_exchange.fetch_my_trades.return_value = [
+        {
+            'id': 999991,
+            'order': 'ord_999991',
+            'orderId': 999991,
+            'symbol': 'SOLUSDC',
+            'side': 'buy',
+            'price': 1.0,
+            'amount': 0.1,
+            'clientOrderId': 'CQB_10019_GRID_1_1',
+            'timestamp': (now - 3600) * 1000
+        }
+    ]
+    
+    exchanges = {'future': mock_exchange}
+    reconciler = StateReconciler(exchanges)
+
+    # Run adopt_from_physical_positions
+    reconciler.adopt_from_physical_positions()
+
+    # Assert NO adoption order was written to bot_orders
+    row = memory_db.execute("SELECT id FROM bot_orders WHERE bot_id = 10019").fetchone()
+    assert row is None
+
+
+def test_adopt_from_physical_positions_accepts_post_wall_fills(memory_db):
+    import time
+    # Seed bot
+    _seed_bot(
+        memory_db,
+        bot_id=10020,
+        name="test bot 2",
+        pair="SOL/USDC:USDC",
+        direction="LONG",
+        total_invested=0.0,
+        open_qty=0.0,
+        status="IN TRADE"
+    )
+    now = int(time.time())
+    # Set wipe_wall_ts to NOW - 3600
+    memory_db.execute("UPDATE trades SET wipe_wall_ts = ? WHERE bot_id = 10020", (now - 3600,))
+    memory_db.commit()
+
+    # Mock exchange returns a physical position of 0.1
+    mock_exchange = MagicMock()
+    mock_exchange.fetch_positions.return_value = [
+        {'symbol': 'SOL/USDC:USDC', 'contracts': 0.1, 'side': 'long', 'entryPrice': 1.0}
+    ]
+    # Trade history has a mock fill with timestamp = NOW (after wall)
+    mock_exchange.fetch_my_trades.return_value = [
+        {
+            'id': 999992,
+            'order': 'ord_999992',
+            'orderId': 999992,
+            'symbol': 'SOLUSDC',
+            'side': 'buy',
+            'price': 1.0,
+            'amount': 0.1,
+            'clientOrderId': 'CQB_10020_GRID_1_1',
+            'timestamp': now * 1000
+        }
+    ]
+    
+    exchanges = {'future': mock_exchange}
+    reconciler = StateReconciler(exchanges)
+
+    # Run adopt_from_physical_positions
+    reconciler.adopt_from_physical_positions()
+
+    # Assert adoption order WAS written to bot_orders
+    row = memory_db.execute("SELECT order_id, status FROM bot_orders WHERE bot_id = 10020").fetchone()
+    assert row is not None
+    assert row[0] == 'ord_999992'
+
+
+def test_adopt_from_physical_positions_skips_on_recent_tp_grace(memory_db):
+    import time
+    # Seed a bot
+    _seed_bot(
+        memory_db,
+        bot_id=10025,
+        name="eth test bot",
+        pair="ETH/USDC:USDC",
+        direction="LONG",
+        total_invested=1000.0,
+        open_qty=0.5,
+        status="IN TRADE"
+    )
+    
+    # Insert a recent TP fill (within 600s)
+    now = int(time.time())
+    memory_db.execute(
+        "INSERT INTO bot_orders (bot_id, step, order_type, order_id, price, amount, filled_amount, status, cycle_id, position_side, created_at) "
+        "VALUES (10025, 0, 'tp', 'CQB_10025_TP_1_1', 2000.0, 0.5, 0.5, 'filled', 1, 'LONG', ?)",
+        (now - 100,)
+    )
+    memory_db.commit()
+
+    # Mock exchange returns flat physical position
+    mock_exchange = MagicMock()
+    mock_exchange.fetch_positions.return_value = []
+    # Mock exchange fetch_my_trades has no post-wall/new fills to adopt
+    mock_exchange.fetch_my_trades.return_value = []
+    
+    exchanges = {'future': mock_exchange}
+    reconciler = StateReconciler(exchanges)
+
+    # Run adopt_from_physical_positions
+    reconciler.adopt_from_physical_positions()
+
+    # Verify that the bot status was NOT changed to REQUIRE_MANUAL_PROOF
+    status = database.get_bot_status(10025)
+    assert status['status'] == "IN TRADE"
+
+
+
 

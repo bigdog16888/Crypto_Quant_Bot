@@ -220,6 +220,8 @@ class BotState:
 
     bot_status: str = ''  # Raw DB status string (e.g. 'IN TRADE', 'REQUIRE_MANUAL_PROOF', 'Scanning')
 
+    cycle_phase: str = 'IDLE'
+
 
 
 
@@ -349,6 +351,7 @@ class StateReconciler:
         # Prevents the 3-API-call race condition that caused ghost detections on cold start.
 
         self._startup_snapshot: Dict[str, list] = {}  # {market_type: [positions]}
+        self._flat_snapshots_counts: Dict[str, int] = {}
 
         
 
@@ -363,6 +366,105 @@ class StateReconciler:
             return None
 
         return list(self.exchanges.values())[0]
+
+    def _audit_pending_exits(self) -> None:
+        """
+        Continuous Fill Audit:
+        Runs every cycle to check for active bots with TP orders that filled on the exchange
+        but were missed by the WebSocket.
+        """
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT b.id, b.pair, b.name, t.tp_order_id, t.open_qty, b.config, t.cycle_id
+                FROM bots b
+                JOIN trades t ON b.id = t.bot_id
+                WHERE t.tp_order_id IS NOT NULL 
+                  AND t.open_qty > 0 
+                  AND t.entry_confirmed = 1
+                  AND b.is_active = 1
+            """)
+            rows = cursor.fetchall()
+            if not rows:
+                return
+
+            for row in rows:
+                bot_id, pair, name, tp_order_id, open_qty, config_json, cycle_id = row
+                if not tp_order_id:
+                    continue
+
+                # Check in local DB if this order already has a filled status
+                order_row = cursor.execute(
+                    "SELECT status, filled_amount FROM bot_orders WHERE (order_id = ? OR client_order_id = ?) AND bot_id = ?",
+                    (tp_order_id, tp_order_id, bot_id)
+                ).fetchone()
+
+                if order_row and order_row[0] == 'filled':
+                    continue
+
+                try:
+                    import json
+                    from config.settings import config as app_config
+                    from engine.exchange_interface import normalize_market_type
+                    
+                    cfg = json.loads(config_json) if config_json else {}
+                    mt = normalize_market_type(cfg.get('market_type', app_config.MARKET_TYPE))
+                    exchange = self.exchanges.get(mt)
+                    if not exchange:
+                        logger.warning(f"[_audit_pending_exits] No exchange instance for market_type '{mt}' (bot={bot_id})")
+                        continue
+
+                    logger.info(f"🔎 [_audit_pending_exits] Fetching TP {tp_order_id} status via REST for Bot {bot_id} ({pair})...")
+                    order = exchange.fetch_order(tp_order_id, pair)
+                    if not order:
+                        logger.warning(f"[_audit_pending_exits] Fetch order returned None for order {tp_order_id} bot {bot_id}")
+                        continue
+
+                    # If exchange returns status='filled'
+                    if order.get('status') == 'filled':
+                        fill_price = float(order.get('average') or order.get('price') or 0)
+                        fill_qty = float(order.get('filled') or 0)
+                        fill_ts_ms = order.get('lastTradeTimestamp') or order.get('timestamp') or 0
+                        fill_ts = int(fill_ts_ms // 1000) if fill_ts_ms else int(time.time())
+
+                        if fill_qty <= 0 or fill_price <= 0:
+                            logger.warning(f"[_audit_pending_exits] Order {tp_order_id} filled but filled_qty/avg_price invalid: qty={fill_qty}, price={fill_price}")
+                            continue
+
+                        from engine.ledger import credit_fill, seal_trade_state, register_tp_cascade
+                        
+                        logger.info(
+                            f"🚨 [FILL-AUDIT-RECOVERY] Bot {bot_id}: TP {tp_order_id} confirmed filled on exchange, "
+                            f"crediting missed fill (qty={fill_qty} @ price={fill_price})."
+                        )
+                        
+                        credited = credit_fill(
+                            bot_id=bot_id,
+                            order_id=tp_order_id,
+                            cumulative_qty=fill_qty,
+                            avg_price=fill_price,
+                            order_type='tp',
+                            is_cumulative=True,
+                            fill_ts=fill_ts
+                        )
+                        
+                        if credited:
+                            # Register cascade to trigger runner's cancel-and-reset flow
+                            register_tp_cascade(bot_id, pair, fill_price, exit_fill_ts=fill_ts)
+                            # After crediting, call seal_trade_state(bot_id)
+                            seal_trade_state(bot_id)
+                        else:
+                            logger.warning(
+                                f"⚠️ [FILL-AUDIT-RECOVERY] credit_fill returned False for TP {tp_order_id} bot {bot_id}. "
+                                f"No matching row found in bot_orders."
+                            )
+                except Exception as ex_err:
+                    logger.error(f"[_audit_pending_exits] Failed checking order {tp_order_id} for bot {bot_id}: {ex_err}")
+
+        except Exception as err:
+            logger.error(f"Error in continuous fill audit: {err}")
+
 
 
 
@@ -724,11 +826,7 @@ class StateReconciler:
 
         #    went offline BEFORE the WebSocket fill event arrived. This means filled_amount=0 in DB even
 
-        #    though Binance fully executed the entry order.
-
-        #
-
-        # 🚀 DNA-GUARD v3.0: FULL-SPECTRUM ID RESOLUTION
+        #    though Binance fully executed the entry order.        # 🚀 DNA-GUARD v3.0: FULL-SPECTRUM ID RESOLUTION
 
         # We resolve ALL unresolved orders (placing, new, open) across ALL types.
 
@@ -790,15 +888,33 @@ class StateReconciler:
 
                         try:
 
-                            candids = (ex.fetch_closed_orders(pair, limit=50) or []) + (ex.fetch_open_orders(pair) or [])
+                            # Prioritize open orders first, then closed orders to avoid matching stale/expired history
+                            candids = (ex.fetch_open_orders(pair) or []) + (ex.fetch_closed_orders(pair, limit=50) or [])
+
+                            matches = []
 
                             for o in candids:
 
                                 if o.get('clientOrderId') == cid or (o.get('info') or {}).get('clientOrderId') == cid:
 
-                                    exch_order = o; break
+                                    matches.append(o)
 
-                        except Exception: pass
+                            if matches:
+
+                                # Prefer active/open orders if they exist
+
+                                active_matches = [o for o in matches if (o.get('status') or '').lower() in ('open', 'new', 'partially_filled', 'partiallyfilled')]
+
+                                if active_matches:
+
+                                    exch_order = max(active_matches, key=lambda x: (x.get('timestamp') or 0, int(x.get('id') or 0) if str(x.get('id', '')).isdigit() else 0))
+
+                                else:
+
+                                    exch_order = max(matches, key=lambda x: (x.get('timestamp') or 0, int(x.get('id') or 0) if str(x.get('id', '')).isdigit() else 0))
+
+                        except Exception as _e:
+                            logger.debug(f'[ORDER-LOOKUP] fetch_open/closed_orders failed (transient): {_e}')
 
 
 
@@ -809,6 +925,10 @@ class StateReconciler:
                         o_id = exch_order.get('id')
 
                         o_filled = float(exch_order.get('filled', exch_order.get('filled_amount', 0.0)))
+
+                        # Fallback if status is filled/closed but CCXT returned 0.0 filled amount
+                        if o_status in ('filled', 'closed') and o_filled <= 0:
+                            o_filled = float(exch_order.get('amount') or amount or 0.0)
 
                         o_price = float(exch_order.get('average', exch_order.get('price', price)))
 
@@ -1339,17 +1459,38 @@ class StateReconciler:
 
                             if cr:
 
-                                cyc   = cr[0] or 1
+                                cyc_db = cr[0] or 1
 
-                                bst   = cr[1] or 0  # engine-operation timestamp (EE timer)
+                                bst    = cr[1] or 0  # engine-operation timestamp (EE timer)
 
-                                cst   = cr[2] or 0  # exchange-event-anchored cycle boundary (v2.1.0)
+                                cst    = cr[2] or 0  # exchange-event-anchored cycle boundary (v2.1.0)
 
                             else:
 
-                                cyc, bst, cst = 1, 0, 0
+                                cyc_db, bst, cst = 1, 0, 0
 
-                                
+                            # Extract cycle_id and step from clientOrderId if possible (CQB_{bot_id}_{type}_{cycle_id}_{step})
+                            is_legacy_cid = True
+                            cyc_from_cid = None
+                            step_from_cid = None
+
+                            if len(parts) >= 5 and parts[2].upper() in ('ENTRY', 'GRID', 'TP', 'HEDGE', 'HEDGETP', 'SL', 'CLOSE'):
+                                if parts[3].isdigit():
+                                    cyc_from_cid = int(parts[3])
+                                    step_str = parts[4]
+                                    import re
+                                    m = re.match(r'^(\d+)', step_str)
+                                    if m:
+                                        step_from_cid = int(m.group(1))
+                                        is_legacy_cid = False
+
+                            if not is_legacy_cid:
+                                cyc = cyc_from_cid
+                                step_g = step_from_cid
+                            else:
+                                cyc = cyc_db
+                                step_g = int(parts[3]) if len(parts)>3 and parts[3].isdigit() else 1
+
 
                             # ── CYCLE POISONING GUARD (v2.1.0) ──────────────────────────────────
 
@@ -1357,11 +1498,7 @@ class StateReconciler:
 
                             # exact exchange fill timestamp that ended the previous cycle.
 
-                            # Falls back to basket_start_time (BST) if CST is not yet available.
-
-                            #
-
-                            # RULE: A fill that predates the cycle boundary by >60s belongs to
+                            # Falls back to basket_start_time (BST) if CST is not yet available.                            # RULE: A fill that predates the cycle boundary by >60s belongs to
 
                             # a PAST cycle and must be demoted (cycle_id - 1).
 
@@ -1391,25 +1528,25 @@ class StateReconciler:
 
                                     
 
-                                    # Fill is clearly older than the authoritative cycle boundary — demote it.
+                                    # Fill is clearly older than the authoritative cycle boundary.
+                                    # Only demote if it's a legacy CID where we had to guess the cycle.
+                                    if is_legacy_cid:
 
-                                    cyc = max(0, cyc - 1)
+                                        cyc = max(0, cyc - 1)
 
-                                    logger.debug(
+                                        logger.debug(
 
-                                        f"[CYCLE-GUARD] Bot {attributed_bot_id}: fill ts={o_ts}ms is "
+                                            f"[CYCLE-GUARD] Bot {attributed_bot_id}: fill ts={o_ts}ms is "
 
-                                        f"{(effective_boundary*1000 - o_ts)/1000:.0f}s before boundary "
+                                            f"{(effective_boundary*1000 - o_ts)/1000:.0f}s before boundary "
 
-                                        f"({'CST' if cst > 0 else 'BST'} ts={effective_boundary}). "
+                                            f"({'CST' if cst > 0 else 'BST'} ts={effective_boundary}). "
 
-                                        f"Demoting to cycle {cyc}."
+                                            f"Demoting legacy CID to cycle {cyc}."
 
-                                    )
+                                        )
 
                                 # effective_boundary==0 → no boundary yet → fill stays in current cycle
-
-                            step_g = int(parts[3]) if len(parts)>3 and parts[3].isdigit() else 1
 
                             
 
@@ -1441,9 +1578,7 @@ class StateReconciler:
 
                                 # cancelled one as a history-orphan would DOUBLE-COUNT the position qty.
 
-                                #
-
-                                # Guard: if any existing row with the same (bot_id, cycle_id, CID,
+                                            # Guard: if any existing row with the same (bot_id, cycle_id, CID,
 
                                 # entry-type) already has filled_amount > 0, this fill was already
 
@@ -2358,7 +2493,37 @@ class StateReconciler:
 
                     # genuinely IN TRADE but no orders on exchange. Defer to Global Net Resolution.
 
+                    # 🛡️ [RECON-HEDGE-CHILD-NO-TP] (v3.6.7)
+                    # Give a targeted warning for hedge children specifically —
+                    # the generic "IN TRADE but has NO orders" message doesn't
+                    # distinguish between a standard zombie and a hedge child
+                    # that lost its BE TP due to a handle_tp_completion race.
+                    try:
+                        from engine.database import get_connection as _gc_recon
+                        _recon_conn = _gc_recon()
+                        _hc_info = _recon_conn.execute(
+                            "SELECT b.bot_type, t.open_qty, t.tp_order_id "
+                            "FROM bots b LEFT JOIN trades t ON t.bot_id = b.id "
+                            "WHERE b.id = ?",
+                            (bot.bot_id,)
+                        ).fetchone()
+                        if _hc_info and _hc_info[0] == 'hedge_child':
+                            _hc_open_qty = float(_hc_info[1] or 0)
+                            _hc_tp_id = _hc_info[2]
+                            if _hc_open_qty > 0.0001 and not _hc_tp_id:
+                                logger.warning(
+                                    f"⚠️ [RECON-HEDGE-CHILD-NO-TP] Bot {bot.bot_id} ({bot.name}) "
+                                    f"is a hedge_child IN TRADE with open_qty={_hc_open_qty:.6f} "
+                                    f"but tp_order_id is NULL and no live TP order found. "
+                                    f"handle_tp_completion may have failed silently — "
+                                    f"check logs for [HANDLE-TP-COMPLETION] warnings. "
+                                    f"maintain_orders fallback [HEDGE-BE-FALLBACK] will self-heal on next cycle."
+                                )
+                    except Exception as _hc_recon_err:
+                        logger.debug(f"[RECON-HEDGE-CHILD-NO-TP] check failed (non-fatal): {_hc_recon_err}")
+
                     logger.warning(f"⚠️ [RECON] Bot {bot.name} (ID {bot.bot_id}) is IN TRADE but has NO orders. Deferring to Global Net Resolution.")
+
 
 
 
@@ -3739,6 +3904,37 @@ class StateReconciler:
 
                   if abs(physical_net_qty) < QTY_EPSILON:
 
+                      # Guard B: Verify snapshot freshness (< 60 seconds old) before acting
+                      bypass_guards = False
+                      try:
+                          db_conn = get_connection()
+                          max_checked_row = db_conn.execute("SELECT MAX(last_checked) FROM active_positions").fetchone()
+                          max_checked = max_checked_row[0] if max_checked_row else None
+                      except Exception as db_err:
+                          logger.warning(f"Error checking active_positions freshness: {db_err}")
+                          max_checked = None
+                          bypass_guards = True
+
+                      if not bypass_guards:
+                          current_ts = int(time.time())
+                          if not max_checked or (current_ts - max_checked) > 60:
+                              logger.warning(
+                                  f"🛑 [GLOBAL-FLATTEN-DEFERRED] Snapshot too old to confirm flat position on {pair}. "
+                                  f"last_checked={max_checked}, age={current_ts - (max_checked or 0)}s"
+                              )
+                              continue  # Skip global flatten action this cycle
+
+                          # Guard A: Require 3 consecutive flat snapshots before acting
+                          if not hasattr(self, '_flat_snapshots_counts'):
+                              self._flat_snapshots_counts = {}
+                          self._flat_snapshots_counts[pair] = self._flat_snapshots_counts.get(pair, 0) + 1
+                          if self._flat_snapshots_counts[pair] < 3:
+                              logger.warning(
+                                  f"⏳ [GLOBAL-FLATTEN-DEFERRED] {pair} is flat but waiting for 3 consecutive flat snapshots. "
+                                  f"Current consecutive count: {self._flat_snapshots_counts[pair]}/3."
+                              )
+                              continue  # Skip global flatten action this cycle
+
 
 
                       for b in bots:
@@ -3833,9 +4029,13 @@ class StateReconciler:
 
                                   details=f"Global Flatten: Reset bot using verified proof of exit.", requires_manual_intervention=False
 
-                              ))
+                               ))
 
                       continue # Skip following check as bot state handled
+                  else:
+                      if not hasattr(self, '_flat_snapshots_counts'):
+                          self._flat_snapshots_counts = {}
+                      self._flat_snapshots_counts[pair] = 0
 
                   
 
@@ -4669,7 +4869,8 @@ class StateReconciler:
 
                                             _closed = True
 
-                                        except Exception: pass
+                                        except Exception as _e:
+                                            logger.debug(f'[EXPECTED] [RESIDUAL-ORPHAN-CLOSE-RETRY] positionSide-stripped retry failed: {_e}')
 
                                     if not _closed:
 
@@ -5066,7 +5267,8 @@ class StateReconciler:
 
                                         flatten_executed = True
 
-                                    except Exception: pass
+                                    except Exception as _e:
+                                        logger.debug(f'[EXPECTED] [MARKET-FLATTEN-RETRY] positionSide-stripped retry failed: {_e}')
 
                                 if not flatten_executed:
 
@@ -5358,6 +5560,42 @@ class StateReconciler:
                                     db_cycle, db_status = row[0], row[1]
 
                                     if db_cycle == expected_cycle and db_status not in ['reset_cleared', 'auto_closed']:
+
+                                        # Get the latest entry/grid fill timestamp for this bot and cycle
+
+                                        cur.execute(
+
+                                            "SELECT MAX(COALESCE(filled_at, updated_at, created_at)) FROM bot_orders "
+
+                                            "WHERE bot_id = ? AND cycle_id = ? AND order_type IN ('entry', 'grid') AND status IN ('filled', 'reset_cleared')",
+
+                                            (bot.bot_id, expected_cycle)
+
+                                        )
+
+                                        max_entry_ts = cur.fetchone()[0] or 0
+
+
+
+                                        # Convert closed order fill timestamp from exchange (ms) to seconds
+
+                                        order_fill_ts = int((order.get('lastTradeTimestamp') or order.get('timestamp') or 0) / 1000)
+
+
+
+                                        if max_entry_ts > 0 and order_fill_ts > 0 and order_fill_ts < max_entry_ts:
+
+                                            logger.warning(
+
+                                                f"[PROOF-WALL-GUARD] Skipping exit proof order {order.get('id')} (CID: {cid}) "
+
+                                                f"for bot {bot.bot_id}: order filled at {order_fill_ts} is BEFORE latest entry/grid fill {max_entry_ts}."
+
+                                            )
+
+                                            continue
+
+
 
                                         pass # conn.close() disabled for singleton safety
 
@@ -6071,7 +6309,8 @@ class StateReconciler:
 
                         ))
 
-                except: pass
+                except Exception as _e:
+                    logger.warning(f'[GET-OPEN-ORDERS] {pair} fetch failed (skipping pair): {_e}')
 
         return orders_by_pair
 
@@ -6172,6 +6411,8 @@ class StateReconciler:
                 martingale_multiplier=mart_mult,
 
                 bot_status=status.get('status', ''),
+
+                cycle_phase=status.get('cycle_phase', 'IDLE'),
 
             ))
 
@@ -6974,96 +7215,57 @@ class StateReconciler:
                         if existing_row:
                             db_row_id, db_cycle, db_status = existing_row
                             if db_cycle != bot_info['cycle_id']:
+                                fill_ts = int(g_data.get('ts') or 0)
+                                if wipe_wall > 0 and fill_ts < wipe_wall:
+                                    logger.warning(
+                                        f"[ADOPT-WALL-GUARD] Skipping cycle realignment for order {fill_oid} "
+                                        f"on bot {bot_id}: fill_ts={fill_ts} < wipe_wall={wipe_wall}. "
+                                        f"This fill belongs to a previous cycle."
+                                    )
+                                    continue
                                 cursor.execute("UPDATE bot_orders SET cycle_id = ?, status = 'filled' WHERE id = ?", (bot_info['cycle_id'], db_row_id))
                                 logger.info(f"🔄 [ADOPT-CYCLE-ALIGN] Moved order {fill_oid} from cycle {db_cycle} (status={db_status}) to active cycle {bot_info['cycle_id']} with status='filled' to align with open physical position.")
                             continue
 
                         if fill_oid not in existing_oids:
+                            fill_ts = int(g_data.get('ts') or 0)
+                            if wipe_wall > 0 and fill_ts < wipe_wall:
+                                logger.warning(
+                                    f"[ADOPT-WALL-GUARD] Skipping adoption of order {fill_oid} "
+                                    f"on bot {bot_id}: fill_ts={fill_ts} < wipe_wall={wipe_wall}. "
+                                    f"Pre-cycle fill cannot be adopted into current cycle."
+                                )
+                                continue
                             # 🚀 HEDGE-MODE FIX: ensure adoption rows carry the correct side for the bot
                             cursor.execute("INSERT OR IGNORE INTO bot_orders (bot_id, order_id, client_order_id, order_type, price, amount, filled_amount, status, step, cycle_id, created_at, position_side) VALUES (?, ?, ?, 'adoption', ?, ?, ?, 'filled', 0, ?, ?, ?)", (bot_id, fill_oid, g_data['cid'], g_data['cost']/g_data['qty'], g_data['qty'], g_data['qty'], bot_info['cycle_id'], g_data['ts'], bot_dir))
 
                     conn.commit()
-
-                    
-
                     from engine.database import recompute_invested_from_orders, sync_trades_from_orders
-
                     _, _, true_qty, _ = recompute_invested_from_orders(bot_id)
-
-
-
-                    # Signed contribution to net sum:
-
+                    # Signed contribution to net sum.
                     # 🛡️ ARCHITECT'S GUARD: true_qty from recompute_invested_from_orders already
-
                     # accounts for entry/grid vs tp/close vs hedge. No manual subtraction needed.
-
                     total_net_proved_qty += (true_qty if bot_dir == 'LONG' else -true_qty)
 
-
-
                     # 🔬 HISTORICAL NET: cross-cycle cumulative sum for PASS 3 Tier-2 check.
-
                     # DNA-GUARD v3.0: If current-cycle mismatches, historical net explains whether
-
                     # prior-cycle accumulation accounts for the difference.
 
-                    #
-
-                    # [v3.3.1 DOUBLE-HEDGE-FIX]:
-
-                    # The previous hist_closed SQL included order_type='hedge' AND then separately
-
-                    # subtracted bot_hedge_qty — double-counting every hedge fill. Additionally,
-
-                    # bot_hedge_qty was never assigned in this scope (h_qty was the returned var
-
-                    # from recompute_invested_from_orders at line above) — causing a NameError
-
-                    # on every bot with a hist_closed > 0.
-
-                    #
-
-                    # Correct accounting:
-
-                    #   hist_opened = all entry/grid/adoption fills (all cycles, no wall filter)
-
-                    #   hist_closed = all tp/close/exit/adoption_reduce fills (NO 'hedge' — handled below)
-
-                    #   hist_net    = hist_opened - hist_closed - h_qty (single hedge deduction via proof)
-
-                    #
-
-                    # h_qty is already the net hedge qty from recompute_invested_from_orders.
-
-                    # It is the ONLY hedge deduction needed.
-
                     hist_opened = cursor.execute("""
-
                         SELECT COALESCE(SUM(filled_amount), 0.0)
-
                         FROM bot_orders
-
                         WHERE bot_id=? AND filled_amount > 0
-
                         AND order_type IN ('entry','grid','adoption','adoption_add')
-
                     """, (bot_id,)).fetchone()[0] or 0.0
 
 
 
-                    # ⚠️ 'hedge' intentionally REMOVED from this list — h_qty handles it below
-
+                    # 'hedge' order_type intentionally excluded — no hedge orders exist post ADR-002
                     hist_closed = cursor.execute("""
-
                         SELECT COALESCE(SUM(filled_amount), 0.0)
-
                         FROM bot_orders
-
                         WHERE bot_id=? AND filled_amount > 0
-
                         AND order_type IN ('tp','close','exit','adoption_reduce','dust_close','sl')
-
                     """, (bot_id,)).fetchone()[0] or 0.0
 
 
@@ -7130,7 +7332,8 @@ class StateReconciler:
 
                     if _p_row and _p_row[0]: ref_price = float(_p_row[0])
 
-                except: pass
+                except Exception as _e:
+                    logger.debug(f'[REF-PRICE] Failed to fetch avg_entry_price for threshold scaling: {_e}')
 
 
 
@@ -7143,6 +7346,28 @@ class StateReconciler:
                 # Dynamic USD tolerance: 2% or $0.05 minimum (aligns with UI monitor mismatch triggers)
 
                 if diff_usd > max(abs(net_phys_qty * ref_price) * 0.02, 0.05):
+
+                    # Guard C: If the pair physical position is flat, but we are deferring global flatten
+                    # due to freshness (Guard B) or waiting for 3 consecutive flat snapshots (Guard A),
+                    # do NOT escalate to REQUIRE_MANUAL_PROOF.
+                    try:
+                        if abs(net_phys_qty) < 0.0001:
+                            db_conn = get_connection()
+                            max_checked_row = db_conn.execute("SELECT MAX(last_checked) FROM active_positions").fetchone()
+                            max_checked = max_checked_row[0] if max_checked_row else None
+                            current_ts = int(time.time())
+                            is_stale = not max_checked or (current_ts - max_checked) > 60
+
+                            flat_count = getattr(self, '_flat_snapshots_counts', {}).get(symbol, 0)
+
+                            if is_stale or flat_count < 3:
+                                logger.info(
+                                    f"⏳ [PASS3-DEFER] Ticker {symbol}: Physical is flat, but deferring "
+                                    f"REQUIRE_MANUAL_PROOF due to global-flatten guards (stale={is_stale}, count={flat_count}/3)."
+                                )
+                                continue  # Skip to next ticker, do NOT gate as REQUIRE_MANUAL_PROOF
+                    except Exception as _defer_err:
+                        logger.debug(f"[PASS3-DEFER] Defer check failed: {_defer_err}")
 
 
 
@@ -7274,6 +7499,79 @@ class StateReconciler:
 
                     else:
 
+                        # ─── 🛡️ INVARIANT 3.22: PROOF GRACE — RECENT FILL WINDOW ─────────────
+                        # WS fill crediting is asynchronous. A confirmed fill on the exchange
+                        # may be visible in bot_orders (filled_amount > 0, status='filled')
+                        # but open_qty in trades has not yet been updated by seal_trade_state
+                        # or sync_trades_from_orders. This creates a transient mismatch that
+                        # is NOT a proof failure — it is a normal DB commit race.
+                        #
+                        # Rule: If ANY fill with filled_amount > 0 AND status='filled' landed
+                        # on this pair in the last 60 seconds, do NOT set REQUIRE_MANUAL_PROOF.
+                        # Log [PROOF-GRACE] and skip to the next ticker. The following cycle
+                        # will see a clean ledger.
+                        #
+                        # Only if the mismatch PERSISTS beyond 60s with no recent fills does
+                        # the forensic scan and potential gate fire.
+                        # ─────────────────────────────────────────────────────────────────────
+
+                        try:
+
+                            _bot_ids_grace2 = [b['bot_id'] for b in bots_on_ticker]
+
+                            _ph2 = ','.join('?' * len(_bot_ids_grace2))
+
+                            _grace2_cutoff = int(time.time()) - 60
+
+                            _recent_confirmed_fill = cursor.execute(
+
+                                f"SELECT COUNT(*) FROM bot_orders "
+                                f"WHERE bot_id IN ({_ph2}) "
+                                f"AND filled_amount > 0 "
+                                f"AND status = 'filled' "
+                                f"AND created_at >= ?",
+
+                                (*_bot_ids_grace2, _grace2_cutoff)
+
+                            ).fetchone()[0]
+
+                            # TP/close fills within last 600 seconds specifically to guard seal lag
+                            _tp_close_cutoff = int(time.time()) - 600
+                            _recent_tp_close = cursor.execute(
+                                f"SELECT COUNT(*) FROM bot_orders "
+                                f"WHERE bot_id IN ({_ph2}) "
+                                f"AND filled_amount > 0 "
+                                f"AND order_type IN ('tp', 'close') "
+                                f"AND status = 'filled' "
+                                f"AND created_at >= ?",
+                                (*_bot_ids_grace2, _tp_close_cutoff)
+                            ).fetchone()[0]
+
+                            if _recent_confirmed_fill > 0 or _recent_tp_close > 0:
+                                defer_reason = (
+                                    f"{_recent_confirmed_fill} confirmed fill(s) in last 60s"
+                                    if _recent_confirmed_fill > 0
+                                    else f"{_recent_tp_close} TP/close fill(s) in last 600s"
+                                )
+
+                                logger.info(
+
+                                    f"⏳ [PROOF-GRACE] {symbol}: mismatch of "
+                                    f"{abs(total_net_proved_qty - net_phys_qty):.6f} units "
+                                    f"but {defer_reason} — "
+                                    f"deferring proof gate by 1 reconciler cycle. "
+                                    f"(Proved={total_net_proved_qty:.6f}, Phys={net_phys_qty:.6f})"
+
+                                )
+
+                                continue  # Skip to next ticker — do NOT set REQUIRE_MANUAL_PROOF
+
+                        except Exception as _grace2_err:
+
+                            logger.debug(f"[PROOF-GRACE] Secondary recency check failed (non-blocking): {_grace2_err}")
+
+                        # ─────────────────────────────────────────────────────────────────────
+
                         # ─── 🩹 AUTONOMOUS SELF-HEAL (before giving up) ──────────────────────
 
                         # Both current-cycle AND historical nets don't match physical.
@@ -7281,6 +7579,7 @@ class StateReconciler:
                         # Attempt a targeted 48h forensic scan to recover truly missing fills.
 
                         logger.warning(
+
 
                             f"⚠️ [PROOF-FAILED] Ticker {symbol} NET Mismatch: "
 

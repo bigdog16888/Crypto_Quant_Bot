@@ -2,6 +2,54 @@
 
 All notable **architecture** changes are documented here. Version numbers match `CODEBASE_GUIDE.md` and `docs/ARCHITECTURE_v3.x.md`.
 
+## v3.6.2 — 2026-05-28 — Direction-Aware TP Capacity Clip & Stale Sibling Guard
+
+- **engine/bot_executor.py**:
+  - **Fix 1 (`_prepare_tp_order_params`)**: Clip now checks physical position SIDE against bot's closing direction. SHORT bot BUY TP on net-LONG pair correctly gets capacity=0 and falls to GTX instead of firing reduceOnly into a -4118 rejection.
+  - **Fix 2 (`_is_order_net_reducing`)**: Sole-bot override now verifies physical net direction matches before returning True, preventing stale sibling count (sibling just reset) from triggering false reduceOnly on opposite-side physical net.
+- **CODEBASE_GUIDE.md**:
+  - Added invariant 3.21 (TP Capacity is Direction-Aware).
+
+## v3.6.1 — 2026-05-28 — Permanent fix for hedge child cycle_id desync
+
+- **engine/bot_executor.py** (`_signal_hedge_child_entry`):
+  - Added invariant sync: immediately after `save_bot_order` for the child bot, update `trades.cycle_id = parent_cycle_id` for the child bot so that subsequent cost/open_qty recomputations filter by the correct cycle ID.
+  - Added `[HEDGE-CYCLE-SYNC]` log on success, ERROR log on failure.
+- **engine/database.py** (`heal_zombie_bots`):
+  - **Scenario 1 Guard**: Query for open/placing orders in `bot_orders` before wiping the cycle_id/step. If open orders exist, skip wiping to avoid deleting cycle information of resting orders.
+- **CODEBASE_GUIDE.md**:
+  - Incremented version to `3.6.1`.
+  - Added invariant `3.20. Hedge Child cycle_id Sync`.
+- **One-off DB recovery (2026-05-28)**:
+  - sol_hedge (`100315`): trades.cycle_id updated from `1` to `48`.
+  - Executed `seal_all_active_bots()` to sync trades from orders.
+
+## v3.6.0 — 2026-05-27 — Global Flatten safety guards, forensic proof gate fix, audit fill receipts, and manual database repairs
+
+- **engine/reconciler.py** (`resolve_net_mismatch`):
+  - **Candidate Gating Check**: Filter candidate bots (`suspects`) to exclude those with status `REQUIRE_MANUAL_PROOF`, `MANUAL_GATE`, `FLATTENING`, `HEDGE_STANDBY`, or `STOPPED`, and inactive bots (`is_active = 0`). If all suspects are gated, the reconciler blocks the global flatten order, flags all candidate bots as `REQUIRE_MANUAL_PROOF`, and continues to the next pair.
+  - **Forensic DNA Gate Fix**: Added missing `b4_ran = True` assignment at the end of the B.4 claimant block. This prevents the reconciler from incorrectly falling through to the Aggressive Market Flatten protocol when valid forensic DNA/TP proofs exist.
+  - **Auditable Close Fill Receipts**: Captured the CCXT market order result and wrote a closing order receipt to `bot_orders` + called `credit_fill` to cleanly decrement `open_qty` before resetting the bot's virtual state, preventing post-flatten ledger corruption.
+- **tests/test_reconciler_manual_gate.py**: Added integration tests `test_global_flatten_skips_gated_bots` and `test_b4_forensic_proof_prevents_flatten` to verify these safety behaviors.
+- **tests/test_global_flatten_writes_bot_orders_row.py**: Added tests for verifying the flatten fill receipt creation.
+- **One-off DB recovery (2026-05-27)**:
+  - Recovered BTC bot `10016` (status `IN TRADE`, `open_qty = 0.006`, `total_invested = 455.097`) and ETH bot `10011` (removed stale `tp_order_id` block).
+
+## v3.5.8 — 2026-05-26 — Canonical dedup ranking fix, consolidate post-seal expansion, one-way netting inactive-bot guard, and surgical DB repairs
+
+- **engine/database.py** (`_BOT_ORDERS_CANONICAL_SUBSELECT`):
+  - **Canonical Ranking for Canceled+Filled Rows**: `canceled`/`cancelled` rows with `filled_amount > 0` now rank equally to `filled`/`auto_closed` rows in the dedup ORDER BY. Previously, a canceled TP with a real fill (e.g., `fill=0.97` for SOL, `fill=22.4` for SUI) lost rank to an `auto_closed` zero-fill duplicate. `recompute_invested_from_orders` then selected the zero-fill canonical row, making `sold_qty=0` → `open_qty` never decremented after the TP. This was the single root cause of all SOL/SUI persistent open_qty inflation.
+- **engine/database.py** (`consolidate_duplicate_bot_orders`):
+  - **Remove 'filled' from status NOT IN**: Consolidator now catches groups where the WS already set one duplicate to `'filled'` while partial/open retries remain.
+  - **All-row seal detection**: Seal check now inspects all rows in a consolidated group (including the keeper, which is typically the canonical filled TP row) rather than only non-keepers. Extended EXIT_TYPES to include `'forensic_adoption_reduce'`.
+  - **Improved seal logging**: Single `logger.warning` reports how many bots were sealed after the commit, rather than per-bot `logger.info`.
+- **engine/oneway_netting.py** (`apply_oneway_entry_cross_reduction`):
+  - **Inactive-bot status guard**: Fetches `b.status` in the neighbors SQL query. `SCANNING`/`Scanning`/`REQUIRE_MANUAL_PROOF`/`STOPPED` bots are skipped. A bot with a stale `open_qty` residual that is not actively in trade would otherwise receive phantom `virtual_netting` reductions, creating a false impression that the SHORT bot's cross-reduction was consumed by an already-flat sibling.
+- **One-off DB recovery (2026-05-26)**:
+  - Fixed `short sui` (100000) and `short sol` (100001) MANUAL_PROOF gates: returned to `Scanning` after confirming `open_qty=0` and `total_invested=0`.
+  - `sui long` (10018) `open_qty` force-corrected `580.3 → 557.9` (accumulator was stale; recompute after Fix 5 confirmed `557.9` = exchange physical).
+  - `sol` (10008) `open_qty` sealed to `0.42` via `seal_trade_state` (was `1.39`; Fix 5 correctly accounted for the 0.97 canceled TP fill).
+
 ## v3.5.6 — 2026-05-26 — Drift check, OWAY_REPAIR ledger-neutral rows, and exponential grid placement backoff
 
 - **engine/bot_executor.py**:

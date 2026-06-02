@@ -71,12 +71,18 @@ def gate_oneway_opposite_entry(
 
     from engine.database import get_connection
 
+    conn = get_connection()
+    try:
+        b_row = conn.execute("SELECT bot_type FROM bots WHERE id = ?", (bot_id,)).fetchone()
+        if b_row and b_row[0] == 'hedge_child':
+            return True, ''
+    except Exception as e:
+        logger.warning(f"Failed to check bot_type for gate bypass on bot {bot_id}: {e}")
+
     norm = _pair_norm(pair)
     my_dir = str(direction).upper()
     opp_dir = 'SHORT' if my_dir == 'LONG' else 'LONG'
     tol = _qty_tol()
-
-    conn = get_connection()
 
     # Bypass condition: if this is a fresh entry (total_invested == 0 and current_step == 0),
     # allow the entry regardless of sibling bot positions.
@@ -98,7 +104,7 @@ def gate_oneway_opposite_entry(
         SELECT b.id, b.direction, b.pair, b.normalized_pair, COALESCE(t.open_qty, 0)
         FROM bots b
         JOIN trades t ON t.bot_id = b.id
-        WHERE b.is_active = 1 
+        WHERE b.is_active = 1 AND b.bot_type != 'hedge_child'
           AND b.id != ?
           AND b.id != COALESCE((SELECT hedge_child_bot_id FROM bots WHERE id = ?), -1)
           AND b.id != COALESCE((SELECT parent_bot_id FROM bots WHERE id = ?), -1)
@@ -157,7 +163,7 @@ def apply_oneway_entry_cross_reduction(
                COALESCE(t.open_qty, 0), b.status
         FROM bots b
         JOIN trades t ON t.bot_id = b.id
-        WHERE b.is_active = 1 
+        WHERE b.is_active = 1 AND b.bot_type != 'hedge_child'
           AND b.id != ?
           AND b.id != COALESCE((SELECT hedge_child_bot_id FROM bots WHERE id = ?), -1)
           AND b.id != COALESCE((SELECT parent_bot_id FROM bots WHERE id = ?), -1)
@@ -264,7 +270,7 @@ def reconcile_oneway_pair_open_qty(
             for bid, bdir, raw_pair, bot_norm, oq in conn.execute(
                 """
                 SELECT b.id, b.direction, b.pair, b.normalized_pair, COALESCE(t.open_qty, 0)
-                FROM bots b JOIN trades t ON t.bot_id = b.id WHERE b.is_active = 1
+                FROM bots b JOIN trades t ON t.bot_id = b.id WHERE b.is_active = 1 AND b.bot_type != 'hedge_child'
                 """
             ).fetchall():
                 if (bot_norm or normalize_symbol(raw_pair)).upper() != norm:

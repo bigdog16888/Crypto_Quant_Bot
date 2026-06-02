@@ -464,4 +464,81 @@ def test_duplicate_entry_same_cid_not_double_counted(memory_db):
     assert net == 1.0
 
 
+def test_stalemate_evictor_skips_already_processed_tp(memory_db):
+    from unittest.mock import MagicMock, patch
+    from engine.bot_executor import BotExecutor
+    from engine.exchange_interface import ExchangeInterface
+    
+    setup_bot_fixture(memory_db, 1, 'Stalemate Bot', 'BTC/USDC:USDC', 'LONG')
+    cursor = memory_db.cursor()
+    
+    # 1. Setup bot state with open_qty and local_tp_id
+    cursor.execute("UPDATE trades SET open_qty = 10.0, total_invested = 500000.0, tp_order_id = 'tp_stalemate_1' WHERE bot_id = 1")
+    
+    # 2. Insert entry order of 10.0
+    cursor.execute("""
+        INSERT INTO bot_orders (bot_id, order_type, order_id, price, amount, filled_amount, status, cycle_id, step)
+        VALUES (1, 'entry', 'order_entry_1', 50000.0, 10.0, 10.0, 'filled', 1, 1)
+    """)
+    # 3. Insert TP order of 10.0 that has status = 'reset_cleared' in DB
+    cursor.execute("""
+        INSERT INTO bot_orders (bot_id, order_type, order_id, price, amount, filled_amount, status, cycle_id, step)
+        VALUES (1, 'tp', 'tp_stalemate_1', 55000.0, 10.0, 10.0, 'reset_cleared', 1, 2)
+    """)
+    memory_db.commit()
+    
+    # 4. Instantiate BotExecutor and mock exchange.fetch_order to return FILLED
+    executor = BotExecutor(runner=None)
+    mock_exchange = MagicMock(spec=ExchangeInterface)
+    
+    # fetch_order returns a filled order
+    mock_exchange.fetch_order.return_value = {
+        'id': 'tp_stalemate_1',
+        'status': 'filled',
+        'filled': 10.0,
+        'amount': 10.0,
+        'average': 55000.0,
+        'price': 55000.0,
+        'lastTradeTimestamp': 123456789000
+    }
+    
+    bot_status = {
+        'id': 1,
+        'name': 'Stalemate Bot',
+        'pair': 'BTC/USDC:USDC',
+        'current_step': 1,
+        'total_invested': 500000.0,
+        'avg_entry_price': 50000.0,
+        'target_tp_price': 0.0,
+        'cycle_id': 1,
+        'open_qty': 10.0
+    }
+    
+    with patch('engine.ledger.register_tp_cascade') as mock_cascade, \
+         patch('engine.ledger.credit_fill') as mock_credit:
+         
+        res = executor.maintain_orders(
+            bot_id=1,
+            name='Stalemate Bot',
+            pair='BTC/USDC:USDC',
+            direction='LONG',
+            bot_status=bot_status,
+            current_price=55000.0,
+            exchange=mock_exchange,
+            market_snapshot={'open_orders': []}, # empty open_orders forces STALEMATE check
+            bot_config={'market_type': 'swap'}
+        )
+        
+        # Verify it returns None
+        assert res is None
+        # Verify cascade and credit were skipped
+        mock_cascade.assert_not_called()
+        mock_credit.assert_not_called()
+        
+    # 5. Verify that tp_order_id was cleared to NULL in the trades table
+    from engine.database import get_connection as _gc
+    fresh_conn = _gc()
+    fresh_cursor = fresh_conn.cursor()
+    row = fresh_cursor.execute("SELECT tp_order_id FROM trades WHERE bot_id = 1").fetchone()
+    assert row[0] is None
 

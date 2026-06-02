@@ -87,7 +87,6 @@ def _make_db(bot_qtys, active_positions=None, unconfirmed_bots=None):
             wipe_wall_ts INTEGER DEFAULT 0,
             open_qty REAL DEFAULT 0,
             cycle_phase TEXT DEFAULT 'ACTIVE',
-            hedge_qty REAL DEFAULT 0,
             cycle_start_time INTEGER DEFAULT 0,
             last_exit_price REAL DEFAULT 0,
             last_exit_time INTEGER DEFAULT 0,
