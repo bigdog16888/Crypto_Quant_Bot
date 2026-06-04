@@ -766,7 +766,24 @@ def render_monitor_view():
                                     except Exception:
                                         pass
                                     if gow_ok:
-                                        bots_with_partial_orders.append(f"{row['name']} ({actual_ph}/2)")
+                                        # Grace period: suppress warning if engine just acted on this bot
+                                        last_order_time = 0.0
+                                        try:
+                                            last_order = conn_local.execute(
+                                                "SELECT MAX(created_at) FROM bot_orders WHERE bot_id = ?",
+                                                (bid,)
+                                            ).fetchone()
+                                            if last_order and last_order[0] is not None:
+                                                last_order_time = float(last_order[0])
+                                        except Exception:
+                                            pass
+                                        last_order_age = time.time() - last_order_time
+                                        if last_order_age < 60:
+                                            # Engine just placed orders — grid may be in-flight
+                                            pass  # suppress warning
+                                        else:
+                                            # Genuinely missing grid — emit warning
+                                            bots_with_partial_orders.append(f"{row['name']} ({actual_ph}/2)")
 
                 if bots_with_missing_orders:
                     order_health_msg, order_status_color = f"⚠️ MISSING CRITICAL ORDERS: {', '.join(bots_with_missing_orders)}!", "red"

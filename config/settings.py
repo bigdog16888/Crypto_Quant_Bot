@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 class Config:
-    VERSION = "3.9.3"  # v3.9.3: Fix UI MISSING GRIDS step N+1 logic and max step suppression
+    VERSION = "3.9.6"  # v3.9.6: Missed exit orders trigger reset/flatten lifecycle
     ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
     def __init__(self):

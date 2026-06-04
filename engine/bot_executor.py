@@ -65,6 +65,175 @@ def _to_ccxt_pair(normalized_or_ccxt: str, all_bot_pairs: list = None) -> str:
     return s  # Fallback: return as-is
 
 
+def sync_stale_open_orders(bot_id: int, exchange: ExchangeInterface, conn, max_age_seconds: int = 120) -> int:
+    """
+    Detect and recover from missed WebSocket fill events by periodically
+    fetching the true status of open orders directly from the exchange.
+    """
+    from engine.ledger import credit_fill, seal_trade_state
+
+    # 1. Fetch bot's CCXT symbol/pair and name
+    pair_row = conn.execute("SELECT pair, name FROM bots WHERE id = ?", (bot_id,)).fetchone()
+    if not pair_row:
+        logger.warning(f"[ORDER-SYNC] Bot {bot_id} not found in bots table.")
+        return 0
+    symbol, bot_name = pair_row
+    if not symbol:
+        logger.warning(f"[ORDER-SYNC] Bot {bot_id} has no pair symbol configured.")
+        return 0
+
+    cutoff_time = int(time.time()) - max_age_seconds
+    
+    # Query bot_orders for rows where:
+    # - bot_id = given bot_id
+    # - status IN ('open', 'new', 'partially_filled', 'placing')
+    # - created_at < (now - max_age_seconds)
+    # - order_id IS NOT NULL AND order_id NOT LIKE 'PENDING_%'
+    rows = conn.execute(
+        "SELECT id, order_id, client_order_id, order_type, amount, filled_amount, status, price, step, cycle_id "
+        "FROM bot_orders "
+        "WHERE bot_id = ? "
+        "AND status IN ('open', 'new', 'partially_filled', 'placing') "
+        "AND created_at < ? "
+        "AND order_id IS NOT NULL "
+        "AND order_id != '' "
+        "AND order_id NOT LIKE 'PENDING_%'",
+        (bot_id, cutoff_time)
+    ).fetchall()
+
+    if not rows:
+        return 0
+
+    logger.debug(f"[ORDER-SYNC] Bot {bot_name}: scanning {len(rows)} stale open orders older than {max_age_seconds}s.")
+    synced_count = 0
+    fills_synced = False
+
+    for row in rows:
+        row_id, order_id, client_order_id, order_type, amount, filled_amount, status, price, step, cycle_id = row
+        try:
+            order_info = exchange.fetch_order(order_id, symbol)
+            if not order_info:
+                logger.warning(f"[ORDER-SYNC] Bot {bot_name}: fetch_order returned None for order {order_id} ({client_order_id}).")
+                continue
+
+            ex_status = order_info.get('status')
+            ex_filled = float(order_info.get('filled', 0) or 0)
+            ex_avg_price = float(order_info.get('average') or order_info.get('price') or 0)
+            db_filled = float(filled_amount or 0)
+
+            # b. If exchange status = 'filled' and DB filled_amount < exchange filled:
+            if ex_status in ('filled', 'closed') and db_filled < ex_filled:
+                # First credit the fill to update open_qty in trades table
+                credit_fill(
+                    bot_id=bot_id,
+                    order_id=order_id,
+                    cumulative_qty=ex_filled,
+                    avg_price=ex_avg_price,
+                    order_type=order_type,
+                    is_cumulative=True,
+                    sync_to_exchange=True
+                )
+                # Then update bot_orders status explicitly to filled
+                conn.execute(
+                    "UPDATE bot_orders SET status = 'filled', filled_amount = ?, price = ?, updated_at = ? WHERE id = ?",
+                    (ex_filled, ex_avg_price, int(time.time()), row_id)
+                )
+                conn.commit()
+
+                logger.warning(
+                    f"[ORDER-SYNC] Bot {bot_name}: order {client_order_id} was filled on exchange "
+                    f"but WS event missed. Credited {ex_filled - db_filled} @ {ex_avg_price}. open_qty updated."
+                )
+                fills_synced = True
+                synced_count += 1
+
+                # 🚀 v3.9.6 Closed the TP cascade gap in stale order sync
+                _EXIT_TRIGGER_TYPES = frozenset({'tp', 'hedge_tp', 'close', 'sl'})
+                fully_filled = amount > 0 and (ex_filled / amount) >= 0.99
+                if order_type in _EXIT_TRIGGER_TYPES and fully_filled:
+                    if order_type in ('tp', 'hedge_tp'):
+                        try:
+                            from engine.ledger import handle_tp_completion
+                            logger.warning(
+                                f"[ORDER-SYNC] Bot {bot_id}: TP/exit order {client_order_id} fully filled "
+                                f"(missed WS cascade). Triggering handle_tp_completion."
+                            )
+                            handle_tp_completion(
+                                bot_id=bot_id,
+                                exit_price=ex_avg_price,
+                                pair=symbol,
+                                exchange=exchange
+                            )
+                        except Exception as _cascade_err:
+                            logger.error(
+                                f"[ORDER-SYNC] Bot {bot_id}: handle_tp_completion failed "
+                                f"after sync: {_cascade_err}. Bot may need manual reset."
+                            )
+                    elif order_type in ('sl', 'close'):
+                        try:
+                            from engine.ledger import handle_flatten
+                            logger.warning(
+                                f"[ORDER-SYNC] Bot {bot_id}: SL/close order {client_order_id} fully filled "
+                                f"(missed WS cascade). Triggering handle_flatten."
+                            )
+                            handle_flatten(
+                                bot_id=bot_id,
+                                pair=symbol,
+                                exchange=exchange,
+                                close_price=ex_avg_price,
+                                close_qty=ex_filled,
+                                reason=f"sync_{order_type}_fill"
+                            )
+                        except Exception as _cascade_err:
+                            logger.error(
+                                f"[ORDER-SYNC] Bot {bot_id}: handle_flatten failed "
+                                f"after sync: {_cascade_err}. Bot may need manual reset."
+                            )
+
+            # c. If exchange status = 'cancelled' and DB says open:
+            elif ex_status in ('canceled', 'cancelled', 'expired') and status in ('open', 'new', 'partially_filled', 'placing'):
+                conn.execute(
+                    "UPDATE bot_orders SET status = 'cancelled', updated_at = ? WHERE id = ?",
+                    (int(time.time()), row_id)
+                )
+                conn.commit()
+                logger.warning(
+                    f"[ORDER-SYNC] Bot {bot_name}: order {client_order_id} cancelled on exchange "
+                    f"but DB still shows open. Corrected."
+                )
+                synced_count += 1
+
+        except Exception as e:
+            err_name = type(e).__name__
+            err_str = str(e).lower()
+            if ("notfound" in err_name.lower() or 
+                "order_not_found" in err_str or 
+                "not found" in err_str or 
+                "-2013" in err_str or 
+                "invalidorder" in err_str or
+                "order does not exist" in err_str):
+                
+                # d. If exchange.fetch_order raises NotFound: Mark as cancelled in DB
+                conn.execute(
+                    "UPDATE bot_orders SET status = 'cancelled', updated_at = ? WHERE id = ?",
+                    (int(time.time()), row_id)
+                )
+                conn.commit()
+                logger.warning(
+                    f"[ORDER-SYNC] Bot {bot_name}: order {client_order_id} not found on exchange "
+                    f"(treated as cancelled). Corrected in DB."
+                )
+                synced_count += 1
+            else:
+                logger.error(f"❌ [ORDER-SYNC] Failed to fetch order status from exchange for order {order_id} bot {bot_name}: {e}")
+
+    # 3. After processing any fills, call seal_trade_state(bot_id) once
+    if fills_synced:
+        seal_trade_state(bot_id)
+
+    return synced_count
+
+
 def enforce_hedge_child_state(child_bot_id: int, conn) -> str:
     """
     Enforces state boundaries between parent and child hedge bots.
@@ -2195,6 +2364,16 @@ class BotExecutor:
 
         from engine.database import get_connection as _gc_hc
         _hc_conn = _gc_hc()
+
+        # 🚀 Periodic Stale Order Sync (Layer 2 Fill Reliability)
+        try:
+            synced = sync_stale_open_orders(bot_id, exchange, _hc_conn)
+            if synced > 0:
+                from engine.database import get_bot_status
+                bot_status = get_bot_status(bot_id)
+        except Exception as e_sync:
+            logger.error(f"❌ [ORDER-SYNC] Failed to run stale order sync for bot {name}: {e_sync}")
+
         _bot_type_row = _hc_conn.execute("SELECT bot_type FROM bots WHERE id = ?", (bot_id,)).fetchone()
         bot_type = _bot_type_row[0] if _bot_type_row else 'standard'
 

@@ -487,6 +487,14 @@ Implementation: diagnose_pair_orphans(exchange, pair) and close_unattributed_pos
 
 ---
 
+### 3.38. Stale Open Order Exchange Verification (INV-17) (v3.9.6)
+
+INVARIANT (INV-17): Any `bot_orders` row older than 120 seconds with status in `('open', 'new', 'partially_filled', 'placing')` must have its exchange status verified via CCXT before the engine acts on it or makes placement decisions. Furthermore, `sync_stale_open_orders` must trigger the full lifecycle cascade (`handle_tp_completion`, `reset_bot_after_tp`, or `handle_flatten`) when a missed fill completes an exit order, not just credit the fill amount.
+
+Implementation: `sync_stale_open_orders(bot_id, exchange, conn, max_age_seconds=120)` in `engine/bot_executor.py`.
+
+---
+
 ## 4. Reconciler Architecture
 
 ### Startup Sequence (in order)
@@ -571,6 +579,26 @@ After restart, watch for:
 ---
 
 ## 7. Version History (Change Log)
+
+### v3.9.6 — 2026-06-04
+**TP/exit order cascade reset trigger on stale open order missed fills.**
+- **engine/bot_executor.py** (`sync_stale_open_orders`): Trigger `handle_tp_completion` or `handle_flatten` immediately when exit orders (e.g. `'tp'`, `'hedge_tp'`, `'sl'`, `'close'`) are verified as filled from the exchange to prevent bots from staying stuck in older steps/cycles.
+- **tests/test_order_sync.py**: Added new unit tests covering exit order cascade reset triggering, partial exit order fill checks, and stop loss handler triggers.
+- **config/settings.py**: Bumped version to `3.9.6`.
+- **CODEBASE_GUIDE.md**: Updated invariant `INV-17` to detail completion cascades.
+
+### v3.9.5 — 2026-06-04
+**UI MISSING GRIDS grace period check to prevent false warning flashes during placement.**
+- **ui/views/monitor.py**: Added a 60-second grace period check to the missing grid warning detection logic based on the bot's most recent order created time. Suppresses warning if the engine has acted within the last 60 seconds.
+- **tests/test_ui_netting_suppression.py**: Added unit test `test_ui_missing_grids_grace_period` to verify grace period warning suppression and correct timing thresholds.
+- **config/settings.py**: Bumped config version to `3.9.5`.
+
+### v3.9.4 — 2026-06-04
+**Stale open order periodic synchronization to resolve WebSocket fill reliability gaps.**
+- **engine/bot_executor.py**: Added `sync_stale_open_orders(bot_id, exchange, conn, max_age_seconds=120)` function which queries DB for open/new/placing/partially_filled orders older than 120s, verifies status with the exchange, handles NotFound exceptions (marking cancelled), updates DB statuses, and runs `credit_fill` + `seal_trade_state` for missed fills. Also called it at the top of `maintain_orders`.
+- **config/settings.py**: Bumped config version to `3.9.4`.
+- **CODEBASE_GUIDE.md**: Documented version `3.9.4` and added invariant `INV-17`.
+- **tests/test_order_sync.py**: Created unit tests verifying fill/cancel/recent/NotFound sync behavior.
 
 ### v3.9.3 — 2026-06-04
 **Fix UI MISSING GRIDS health check step logic and max step edge case suppression.**
