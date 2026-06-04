@@ -120,6 +120,33 @@ class TestDatabase(unittest.TestCase):
         self.assertTrue(len(history) > 0)
         self.assertEqual(history[0][3], 'TP_HIT')  # action column index in trade_history
 
+    def test_reset_bot_after_tp_by_bot_type(self):
+        """Test that reset_bot_after_tp resets status to 'hedge_standby' for hedge_child bots and 'Scanning' for standard bots."""
+        database.init_db()
+        
+        # 1. Create standard bot and verify it resets to 'Scanning'
+        std_bot_id = database.add_bot("StdBot", "BTC/USDT", "LONG", 30.0, 1.5, 10.0)
+        database.update_martingale_step(std_bot_id, 1, 100.0, 50000.0, 51000.0)
+        
+        class _FlatEx:
+            def fetch_positions(self):
+                return []
+                
+        database.reset_bot_after_tp(std_bot_id, exit_price=51000.0, exchange=_FlatEx())
+        std_status = database.get_bot_status(std_bot_id)
+        self.assertEqual(std_status['status'], 'Scanning')
+        
+        # 2. Create hedge child bot and verify it resets to 'hedge_standby'
+        child_bot_id = database.add_bot("ChildBot", "BTC/USDT", "LONG", 30.0, 1.5, 10.0)
+        conn = database.get_connection()
+        conn.execute("UPDATE bots SET bot_type = 'hedge_child' WHERE id = ?", (child_bot_id,))
+        conn.commit()
+        
+        database.update_martingale_step(child_bot_id, 1, 100.0, 50000.0, 51000.0)
+        database.reset_bot_after_tp(child_bot_id, exit_price=51000.0, exchange=_FlatEx())
+        child_status = database.get_bot_status(child_bot_id)
+        self.assertEqual(child_status['status'], 'hedge_standby')
+
     def test_bot_position_management(self):
         """Test bot position close works correctly."""
         database.init_db()

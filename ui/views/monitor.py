@@ -737,24 +737,36 @@ def render_monitor_view():
                             bots_with_missing_orders.append(row['name'])
                         elif actual_ph == 0 and cycle_phase == 'CARRY_PENDING':
                             pass # Engine is intentionally holding without orders
-                        # We flag as MISSING GRIDS if they have only 1 order but are mid-cycle (Step 1+)
-                        # and have not reached max_steps.
-                        elif actual_ph < 2 and c_step >= 1 and bot_inv > 0.01 and row.get('bot_type', 'standard') == 'standard':
+                        elif c_step >= 1 and bot_inv > 0.01 and row.get('bot_type', 'standard') == 'standard':
                             try:
                                 cfg_dict = json.loads(row.get('config') or '{}')
                                 max_steps = int(cfg_dict.get('max_steps', 8))
                             except:
                                 max_steps = 8
                             if c_step < max_steps:
-                                # 🚀 NETTING GATE GUARD: Suppress alert if grid is legitimately blocked by one-way netting opposite entry block
-                                gow_ok = True
+                                # Query database to check if there is an active grid order for step = c_step + 1
+                                has_grid = False
                                 try:
-                                    from engine.oneway_netting import gate_oneway_opposite_entry
-                                    gow_ok, _ = gate_oneway_opposite_entry(bid, row['pair'], row['direction'])
+                                    conn_local = get_connection()
+                                    has_grid = conn_local.execute(
+                                        "SELECT COUNT(*) FROM bot_orders "
+                                        "WHERE bot_id = ? AND step = ? AND order_type = 'grid' "
+                                        "AND status IN ('open', 'new')",
+                                        (bid, c_step + 1)
+                                    ).fetchone()[0] > 0
                                 except Exception:
                                     pass
-                                if gow_ok:
-                                    bots_with_partial_orders.append(f"{row['name']} ({actual_ph}/2)")
+
+                                if not has_grid:
+                                    # 🚀 NETTING GATE GUARD: Suppress alert if grid is legitimately blocked by one-way netting opposite entry block
+                                    gow_ok = True
+                                    try:
+                                        from engine.oneway_netting import gate_oneway_opposite_entry
+                                        gow_ok, _ = gate_oneway_opposite_entry(bid, row['pair'], row['direction'])
+                                    except Exception:
+                                        pass
+                                    if gow_ok:
+                                        bots_with_partial_orders.append(f"{row['name']} ({actual_ph}/2)")
 
                 if bots_with_missing_orders:
                     order_health_msg, order_status_color = f"⚠️ MISSING CRITICAL ORDERS: {', '.join(bots_with_missing_orders)}!", "red"
@@ -1215,27 +1227,30 @@ def render_monitor_view():
                             else: res['Expected_Profit'] = (tp_p - avg_p) * o_qty
                         
                         # 4. Early Exit (EE) Status — compact format
-                        b_start = _clean(row.get('basket_start_time'))
-                        if is_in_trade and cfg.get('UseEarlyExit') and b_start > 0:
-                            ee_start_h = _clean(cfg.get('EEStartHours'))
-                            elapsed_h = (time.time() - b_start) / 3600
-                            if elapsed_h > ee_start_h:
-                                decay_mins = _clean(cfg.get('DecayIntervalMins', 15))
-                                decay_pct = _clean(cfg.get('DecayPercentPerInterval', 10))
-                                intervals = (elapsed_h - ee_start_h) * 60 / decay_mins
-                                total_decay = min(100.0, intervals * decay_pct)
-                                if total_decay >= 100.0:
-                                    res['EE_Status'] = "🔥100%"
+                        if row.get('bot_type') == 'hedge_child':
+                            res['EE_Status'] = "⏳ Parent TP pending"
+                        else:
+                            b_start = _clean(row.get('basket_start_time'))
+                            if is_in_trade and cfg.get('UseEarlyExit') and b_start > 0:
+                                ee_start_h = _clean(cfg.get('EEStartHours'))
+                                elapsed_h = (time.time() - b_start) / 3600
+                                if elapsed_h > ee_start_h:
+                                    decay_mins = _clean(cfg.get('DecayIntervalMins', 15))
+                                    decay_pct = _clean(cfg.get('DecayPercentPerInterval', 10))
+                                    intervals = (elapsed_h - ee_start_h) * 60 / decay_mins
+                                    total_decay = min(100.0, intervals * decay_pct)
+                                    if total_decay >= 100.0:
+                                        res['EE_Status'] = "🔥100%"
+                                    else:
+                                        intervals_to_full = (100.0 - total_decay) / decay_pct
+                                        mins_to_full = intervals_to_full * decay_mins
+                                        h_to_full = mins_to_full / 60
+                                        ttf = f"{mins_to_full:.0f}m" if h_to_full < 1.0 else f"{h_to_full:.1f}h"
+                                        res['EE_Status'] = f"🔥{total_decay:.0f}%▸{ttf}"
                                 else:
-                                    intervals_to_full = (100.0 - total_decay) / decay_pct
-                                    mins_to_full = intervals_to_full * decay_mins
-                                    h_to_full = mins_to_full / 60
-                                    ttf = f"{mins_to_full:.0f}m" if h_to_full < 1.0 else f"{h_to_full:.1f}h"
-                                    res['EE_Status'] = f"🔥{total_decay:.0f}%▸{ttf}"
-                            else:
-                                wait_h = ee_start_h - elapsed_h
-                                wait_str = f"{wait_h*60:.0f}m" if wait_h < 1.0 else f"{wait_h:.1f}h"
-                                res['EE_Status'] = f"⏳{wait_str}"
+                                    wait_h = ee_start_h - elapsed_h
+                                    wait_str = f"{wait_h*60:.0f}m" if wait_h < 1.0 else f"{wait_h:.1f}h"
+                                    res['EE_Status'] = f"⏳{wait_str}"
 
                         # 5+6. Ages — merge pos age / cycle age into one field
                         b_start = _clean(row.get('basket_start_time'))

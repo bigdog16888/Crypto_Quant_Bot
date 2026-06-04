@@ -1,5 +1,5 @@
 # Crypto Quant Bot — AI Agent Codebase Guide
-**Version: 3.8.0 | Last Updated: 2026-06-02**
+**Version: 3.8.4 | Last Updated: 2026-06-04**
 
 > **READ THIS FIRST** before touching any code. This is the single authoritative guide.
 > It supersedes `UNIFIED_BOT_DOCUMENTATION.md` and all older session notes.
@@ -438,6 +438,53 @@ INVARIANT (INV-11): Hedge child TP orders in One-Way mode cannot use `reduceOnly
 
 INVARIANT (INV-12): The wipe-proof safety guard in `reset_bot_after_tp` uses the pair-level virtual-to-physical net drift check instead of individual bot active_positions ownership (which is unreliable in One-Way mode). The reset wipe is blocked only if wiping the bot's virtual position would increase the overall pair-level drift. Additionally, the hedge child's break-even TP is always registered in `bot_orders` before the parent bot is reset/wiped, ensuring the child is protected even if the parent reset is blocked.
 
+### 3.34. Pair-Level Proof Netting Gating (INV-13) (v3.8.3)
+
+INVARIANT (INV-13): The proof gate in `engine/parity_gates.py` (`_set_bot_require_manual_proof`) bypasses gating a bot as `REQUIRE_MANUAL_PROOF` if the pair-level virtual netting (sum of parent and hedge child bot quantities) matches the physical exchange net within the configured tolerance. Pair netting is evaluated as a whole, ensuring parent/child contributions are correctly aggregated before imposing individual bot proof locks.
+
+### 3.35. Hedge Child Cycle Sync Invariant (INV-14) (v3.8.5)
+
+INVARIANT (INV-14): A hedge child bot's `cycle_id` must always equal its parent bot's `cycle_id`. Any divergence is an invalid state corrected by `enforce_hedge_child_state()` at the start of every `maintain_orders` cycle for `hedge_child` bots.
+
+---
+
+
+### 3.36. Two-Phase Atomic Reset Protocol (INV-15) (v3.9.0)
+
+INVARIANT (INV-15): No bot DB state (trades.open_qty, bots.status) may be set to flat/standby before the exchange position attributed to that bot is verified flat or explicitly closed with a tracked order.
+
+Phase 1 - Exchange Settlement (mandatory prerequisite):
+  1. Read trades.open_qty (what the system claims is on exchange).
+  2. Cancel all CQB_{bot_id}_ open orders on the pair.
+  3. If open_qty > 0.0001, place a reduceOnly market order for exactly open_qty.
+  4. Write a reset_close bot_orders row with CQB_ prefix BEFORE the exchange call (WAL). Update with real order_id after success.
+  5. If exchange call fails: update receipt to status=failed, set bots.status=REQUIRE_MANUAL_PROOF, and raise. Phase 2 must NOT run.
+
+Phase 2 - DB Update (only after Phase 1 completes or open_qty was 0):
+  Zero trades.open_qty, set bots.status=hedge_standby, write audit drift_note.
+
+Violation: resetting DB without closing exchange position creates an unattributed orphan position that causes persistent mismatch and incorrect get_pair_virtual_net() output.
+
+Implementation: _reset_to_hedge_standby(child_bot_id, conn, parent_cycle_id, exchange) in engine/bot_executor.py.
+
+---
+
+### 3.37. No Autonomous Position Close (INV-16) (v3.9.0)
+
+INVARIANT (INV-16): The system never autonomously closes a position without a complete, provable, bot-attributed decision chain. This applies regardless of position size.
+
+Partial fill vs. true orphan - always diagnose before acting:
+  PARTIAL FILL: TP order partially filled. Remaining qty STILL HAS an open limit order on exchange at the original price. It will fill naturally. DO NOTHING. Market-selling a partial fill with open order creates a double-sell and a fabricated untracked position change.
+  TRUE ORPHAN: No open order covers the gap. Only then may a close proceed, via close_unattributed_position() which re-confirms the orphan, writes exchange_order_audit WAL receipt before the order, uses emergency=True path, and never modifies bot_orders/trades/bots.
+
+Prohibited patterns:
+  - Bare market-sell scripts without a bot_orders or exchange_order_audit receipt.
+  - Auto-closing below arbitrary USD threshold - size is irrelevant, correct to the cent applies universally.
+  - UPDATE trades SET open_qty=0 without verifying exchange position is flat.
+  - cancel_orders_by_bot_id without checking for partially-closed residuals.
+
+Implementation: diagnose_pair_orphans(exchange, pair) and close_unattributed_position(exchange, pair, qty, side, reason, human_approved=True) in engine/parity_gates.py.
+
 ---
 
 ## 4. Reconciler Architecture
@@ -498,6 +545,8 @@ INVARIANT (INV-12): The wipe-proof safety guard in `reset_bot_after_tp` uses the
 | False [DRIFT-ALERT] on shared pairs (e.g. ETH, SUI) | Drift-check compared individual bot's virtual net to full-pair physical net | [v3.5.6] Sibling check: suppress bot-level drift warnings if active sibling bots exist on the same pair |
 | OWAY_REPAIR fakes exit fills in ledger, corrupting it | `reconcile_oneway_pair_open_qty` wrote `virtual_netting` rows with `status='filled'` to database | [v3.5.6] Ledger-neutral: OWAY_REPAIR writes `drift_note` (zero ledger impact) instead of fake fills |
 | 408/Network timeouts hammer Binance every cycle | Engine did not implement backoff on grid placement errors, retrying immediately | [v3.5.6] Grid backoff: exponential retry backoff up to 60s for grid placement network errors |
+| [HEDGE-BE-FALLBACK] fires immediately after child entry fills | Guard condition ordering bug: fallback designed for "parent TP fired but ledger race missed it" ran on every child entry because the parent active check was missing entirely. Fix is a precondition check on the triggering entity's state (parent), not a logic change. | [v3.8.4] Added parent-active precondition guard check checking parent `open_qty > 0.0001` in `trades` table. |
+| Hedge child bot cycle_id drifts/desyncs from parent | Hedge child bot's `cycle_id` drifted independently from parent, causing `_signal_hedge_child_entry` idempotency checks to miss previous entries or place entries prematurely. | [v3.8.5] Added authoritative `enforce_hedge_child_state()` hook checking parent state at the start of every cycle, syncing `cycle_id` across trades/orders, and resetting to standby with drift audit note if parent step is below trigger. |
 
 ---
 
@@ -522,7 +571,63 @@ After restart, watch for:
 ---
 
 ## 7. Version History (Change Log)
- 
+
+### v3.9.3 — 2026-06-04
+**Fix UI MISSING GRIDS health check step logic and max step edge case suppression.**
+- **ui/views/monitor.py**: Modified missing grid order health check to query the database `bot_orders` table for an active grid order at step = `current_step + 1` (the resting grid) instead of using the raw exchange physical order count against `current_step`. Also suppressed the alert entirely when the bot is at its deepest martingale step (`current_step == max_steps`).
+- **tests/test_ui_netting_suppression.py**: Modified simulated health check assertions to use the database-driven step check. Added a new unit test `test_ui_missing_grids_step_offset` to verify correct behavior of step N vs step N+1 grids and max step warning suppression.
+
+### v3.9.2 — 2026-06-04
+**Full position hedge at trigger.**
+- **v3.9.2 — Full position hedge at trigger**: hedge child now enters with parent's complete `open_qty` on the first entry of each cycle, ensuring 100% position coverage from trigger step onward. Subsequent steps continue to mirror their individual increment only.
+- **engine/bot_executor.py** (`_signal_hedge_child_entry`): Added `prior_entries` database check, quantity resolution, logging, and rounding modifications. Also updated the idempotency check query to check by `client_order_id` instead of just `cycle_id` to allow subsequent steps.
+- **tests/test_hedge_lifecycle.py**: Added tests covering full position hedge on first entry, subsequent step_qty increments, and idempotency behavior.
+
+### v3.9.1 — 2026-06-04
+**Emergency global wipe detection and automatic phantom ledger purge.**
+- **engine/parity_gates.py** (`detect_and_repair_global_wipe`): Added check to detect if the exchange is completely flat while the database has at least 2 active bots claiming positions. If triggered, it automatically purges phantom state across all pairs. Added config guard `ENABLE_GLOBAL_WIPE_DETECTION`.
+- **engine/runner.py** (`startup_sync`): Runs `detect_and_repair_global_wipe` at the very beginning of the startup sync process, before pairwise mismatch repair is evaluated.
+- **config/settings.py**: Bumped config version to `3.9.1` and added `ENABLE_GLOBAL_WIPE_DETECTION` config toggle.
+- **tests/test_v391_global_wipe.py**: Created unit tests covering flat exchange detection, db active count threshold, config toggle, and successful emergency purge.
+
+### v3.9.0 — 2026-06-04
+**Two-Phase reset atomic exchange settlement and phantom ledger purge order cancellation.**
+- **engine/oneway_netting.py**: Added `get_authoritative_close_qty()` to compute the correct close quantity based on actual exchange positions (INV-15), ensuring the exchange is authoritative for close quantity and DB is a hint only.
+- **engine/bot_executor.py** (`_reset_to_hedge_standby`): Updated Phase 1 to use `get_authoritative_close_qty()`. Added skip_phase1 logic if exchange is already flat. Added an idempotency guard check for in-flight `reset_close` orders in the current cycle.
+- **engine/parity_gates.py** (`purge_phantom_ledger_when_exchange_flat`): Cancels open orders on exchange and logs a `ghost_order_cancel` audit row before executing `safe_wipe_bot()`.
+- **CODEBASE_GUIDE.md**: Updated to version `3.9.0`, documented `INV-15` (Two-Phase Atomic Reset Protocol) and `INV-16` (No Autonomous Position Close).
+- **tests/test_v390_fixes.py**: Created new test suite to cover authoritative close quantity logic, skip_phase1, idempotency guard, and phantom ledger purge cancel and audit logging.
+
+### v3.8.5 — 2026-06-04
+**Authoritative hedge child lifecycle state enforcer and cycle alignment.**
+- **engine/bot_executor.py**: Added `enforce_hedge_child_state()` and `_reset_to_hedge_standby()` to authoritatively govern the lifecycle of hedge child bots at the top of the maintenance loop. Modified `_signal_hedge_child_entry()` signature and call site to pass `parent_cycle_id`, and updated the idempotency query to enforce cycle-isolated entry checking.
+- **engine/database.py** (`reset_bot_after_tp`): Synced the child's `cycle_id` to match the parent's `cycle_id` after normal reset completes.
+- **CODEBASE_GUIDE.md**: Updated to version `3.8.5`, added invariant `INV-14` to Section 3, and documented the lifecycle enforcer/desync pattern.
+- **tests/test_hedge_lifecycle.py**: Created new test suite to cover all lifecycle states, sync behavior, and signal idempotency.
+
+### v3.8.4 — 2026-06-04
+**Hedge child break-even TP fallback parent-active guard implementation.**
+- **engine/bot_executor.py** (`maintain_orders`): Added a parent-active guard check for the `[HEDGE-BE-FALLBACK]` block to skip registering a fallback BE TP order if the parent bot is still active in trade (`open_qty > 0.0001` in the `trades` table).
+- **CODEBASE_GUIDE.md**: Updated to version `3.8.4`.
+- **tests/test_ledger_integrity.py**: Added `test_hedge_be_fallback_parent_active_guard` to verify fallback suppression when the parent is active versus inactive.
+
+### v3.8.3 — 2026-06-04
+**Multi-bot pair proof gate netting bypass implementation.**
+- **engine/parity_gates.py** (`_set_bot_require_manual_proof`): Bypasses setting bot status to `REQUIRE_MANUAL_PROOF` if the pair-level virtual net matches the physical exchange net within tolerance.
+- **CODEBASE_GUIDE.md**: Updated to version `3.8.3` and added invariant `INV-13`.
+- **tests/test_parity_gates.py**: Added `test_set_bot_require_manual_proof_bypass_when_pair_balanced`.
+
+### v3.8.2 — 2026-06-03
+**FIFO-based average entry price recomputation and fallback TP seal optimization.**
+- **engine/database.py** (`recompute_invested_from_orders`): Chronologically matches filled entries against exit/reduction orders to derive true remaining quantities, step levels, and weighted average entry prices.
+- **engine/bot_executor.py** (`maintain_orders`): Forces `seal_trade_state(bot_id)` inside the `[HEDGE-BE-FALLBACK]` branch prior to querying `trades` table parameters to prevent timing races.
+- **engine/ledger.py** (`seal_trade_state`): Updates large drift overwrite trigger to avoid false positives on rounding/fractional fills.
+
+### v3.8.1 — 2026-06-03
+**Reset hedge child status after TP hit.**
+- **engine/database.py** (`_reset_bot_after_tp_internal`): Resets status of `hedge_child` bots to `'hedge_standby'` instead of `'Scanning'` after a TP cycle completes.
+- **engine/oneway_netting.py** (`apply_oneway_entry_cross_reduction`): Skips bots with status `'hedge_standby'` in the opposite-direction netting cross-reduction guard.
+
 ### v3.8.0 — 2026-06-02
 **Database standardization (v4.0.0 column cleanup), silent exception audit, check_state.py diagnostics upgrade, and test suite refactoring.**
 
@@ -538,6 +643,43 @@ After restart, watch for:
 
 **tests/**:
 - **Test Suite Refactoring**: Updated `tests/test_hedge_lifecycle.py`, `tests/test_database.py`, `tests/test_entry_dedup.py`, `tests/test_netsum_ghost.py`, and `tests/test_reconciler_cid_parsing.py` to remove `hedge_qty` references and mock schemas. Marked obsolete one-time migration tests as skipped. Verified 100% of the test suite passes.
+
+### v3.7.2 — 2026-05-29
+**Cross-reduction suppression extension.**
+- **engine/oneway_netting.py**: INV-3 suppression extended to `apply_oneway_entry_cross_reduction`, `reconcile_oneway_pair_open_qty`, and `gate_oneway_opposite_entry`, fully insulating hedge child bots from netting modifications.
+
+### v3.7.0 — 2026-05-29
+**Wipe-proof drift check and TP registration sequence optimization.**
+- **engine/database.py** (`reset_bot_after_tp`): Modified to check pair-level drift rather than individual positions before wiping.
+- **engine/bot_executor.py**: Ensures child GTC break-even TP is registered in database before parent bot reset.
+
+### v3.6.8 — 2026-05-28
+**Hedge cycle carry forward sync and child GTC routing.**
+- **engine/bot_executor.py**: Implements INV-10 (syncing historic orders cycle ID with new cycle if active position remains) and INV-11 (hedge child TP routes as GTC without postOnly).
+
+### v3.6.7 — 2026-05-28
+**Hedge child qty limits, active position ownership mapping, and recompute contract verification.**
+- **engine/database.py**: Restricts hedge child `open_qty` updates to `credit_fill` and `seal_trade_state` (INV-7), maps active positions correctly (INV-8), and validates the 4-tuple return contract (INV-6).
+
+### v3.6.6 — 2026-05-28
+**Continuous exit audits, global flattening overrides, and single fill crediting path enforcement.**
+- **engine/reconciler.py**: Runs `_audit_pending_exits` every cycle using REST prices (INV-X), implements global flatten Freshness and count guards (INV-X+1), and channels all credits through `credit_fill` (INV-X+2).
+
+### v3.6.5 — 2026-05-29
+**Proof gate credit grace window.**
+- **engine/reconciler.py**: Added a 60-second grace window after confirmed fills to prevent the proof gate from firing before async WS crediting completes.
+
+### v3.6.4 — 2026-05-28
+**Hedge child base size config bypass.**
+- **engine/bot_executor.py** (`process_bot`): Bypasses the minimum notional check for hedge child bots (where `base_size = 0` by design).
+
+### v3.6.2 — 2026-05-28
+**Direction-aware TP capacity clip and stale sibling guard.**
+- **engine/bot_executor.py**: TP capacity is clipped against physical side (LONG vs SHORT bots) to prevent CCXT reduceOnly rejections.
+
+### v3.6.1 — 2026-05-28
+**Permanent fix for hedge child cycle_id desync.**
+- **engine/bot_executor.py** (`_signal_hedge_child_entry`): Updates child `trades.cycle_id` immediately upon fill registration to prevent subsequent seals from resetting open_qty.
 
 ### v3.6.0 — 2026-05-27
 **Global Flatten safety guards, forensic proof gate fix, audit fill receipts, and manual database repairs.**
@@ -916,7 +1058,7 @@ After restart, watch for:
 Run before every restart:
 ```powershell
 python -m pytest tests/ -x -q --tb=short
-# Expected: 71 passed, 6 skipped, 0 failed (including tests/test_hedge_loop.py)
+# Expected: 179 passed, 0 skipped, 0 failed (including tests/test_hedge_loop.py)
 ```
 
 Then verify in logs:

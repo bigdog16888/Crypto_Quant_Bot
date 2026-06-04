@@ -82,6 +82,10 @@ def ok(msg):
     return f'{GREEN}{msg}{RESET}'
 
 
+def info(msg):
+    return f'{CYAN}{msg}{RESET}'
+
+
 def header(msg):
     return f'{BOLD}{CYAN}{msg}{RESET}'
 
@@ -217,30 +221,44 @@ def main():
         print(header("── HEDGE NETTING TABLE ──────────────────────────────────────────────────"))
         print()
         hdr2 = (
-            col("PARENT_ID", 10) + col("PARENT_NAME", 28) + col("LONG_QTY", 12) +
-            col("CHILD_ID", 10) + col("CHILD_NAME", 28) + col("SHORT_QTY", 12) +
-            col("NET_QTY", 12) + col("NOTE", 20)
+            col("PARENT_ID", 10) + col("PARENT_NAME", 28) + col("PARENT_QTY", 12) +
+            col("CHILD_ID", 10) + col("CHILD_NAME", 28) + col("CHILD_QTY", 12) +
+            col("NET_QTY", 12) + col("STATUS", 20)
         )
         print(BOLD + hdr2 + RESET)
         print("─" * 110)
 
         for parent, child in hedge_pairs:
-            long_qty  = float(parent['open_qty']) if parent['direction'] == 'LONG' else 0.0
-            short_qty = float(child['open_qty'])  if child['direction'] == 'SHORT' else float(child['open_qty'])
-            net = long_qty - short_qty
-
+            p_dir = parent['direction'].upper()
+            c_dir = child['direction'].upper()
+            
+            p_qty = float(parent['open_qty'] or 0)
+            c_qty = float(child['open_qty'] or 0)
+            
+            p_sign = 1 if p_dir == 'LONG' else -1
+            c_sign = 1 if c_dir == 'LONG' else -1
+            
+            net = (p_qty * p_sign) + (c_qty * c_sign)
+            
+            p_status = (parent['status'] or 'Stopped').upper()
+            c_status = (child['status'] or 'Stopped').upper()
+            
             note = ''
-            if abs(net) > 0.01:
-                note = warn(f'UNBALANCED Δ={net:+.4f}')
-                issues.append(
-                    f"Hedge pair {parent['id']}↔{child['id']}: LONG={long_qty:.4f} SHORT={short_qty:.4f} NET={net:+.4f}"
-                )
+            if p_status in ('IN TRADE', 'IN_TRADE', 'ACTIVE') and c_status in ('IN TRADE', 'IN_TRADE', 'ACTIVE'):
+                if abs(net) < 0.01:
+                    note = ok('BALANCED')
+                else:
+                    note = warn(f'HEDGING Δ={net:+.4f}')
+            elif p_status in ('SCANNING', 'IDLE') and c_status in ('IN TRADE', 'IN_TRADE', 'ACTIVE'):
+                note = info('CHILD_CARRY')
+            elif p_status in ('IN TRADE', 'IN_TRADE', 'ACTIVE') and c_status in ('HEDGE_STANDBY', 'STANDBY', 'SCANNING', 'IDLE'):
+                note = info('STANDBY')
             else:
-                note = ok('BALANCED')
+                note = ok('INACTIVE')
 
             line = (
-                col(parent['id'], 10) + col(parent['name'], 28) + col(fmt(long_qty), 12) +
-                col(child['id'], 10) + col(child['name'], 28) + col(fmt(short_qty), 12) +
+                col(parent['id'], 10) + col(parent['name'], 28) + col(fmt(p_qty), 12) +
+                col(child['id'], 10) + col(child['name'], 28) + col(fmt(c_qty), 12) +
                 col(fmt(net), 12) + str(note)
             )
             print(line)

@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 class Config:
-    VERSION = "3.6.5"  # Invariant 3.22: proof gate recency guard (60s fill window)
+    VERSION = "3.9.3"  # v3.9.3: Fix UI MISSING GRIDS step N+1 logic and max step suppression
     ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
     def __init__(self):
@@ -50,6 +50,9 @@ class Config:
 
         # 🛡️ SAFETY TOGGLE: Block autonomous execution in production (requires human approval)
         self.REQUIRE_HUMAN_APPROVAL = os.getenv("REQUIRE_HUMAN_APPROVAL", "False").lower() == "true"
+        
+        # 🛡️ SAFETY TOGGLE: Auto-detect and repair global position wipe (e.g. testnet reset)
+        self.ENABLE_GLOBAL_WIPE_DETECTION = os.getenv("ENABLE_GLOBAL_WIPE_DETECTION", "True").lower() == "true"
 
         # Pair parity: max |virtual - exchange| qty before blocking trade / cycle reset
         self.PAIR_PARITY_QTY_TOLERANCE = float(os.getenv("PAIR_PARITY_QTY_TOLERANCE", "0.002"))

@@ -15,12 +15,29 @@ sys.path.append(os.getcwd())
 
 from engine.bot_executor import BotExecutor
 
+import tempfile
+import shutil
+import engine.database as database
+from engine.database import init_db
+
 class TestPartialFill(unittest.TestCase):
     def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.test_dir, 'test_partial_fill.db')
+        self.orig_db_path = database.DB_PATH
+        database.DB_PATH = self.db_path
+        database._local = database.threading.local()
+        init_db()
+
         self.runner = MagicMock()
         self.bot_executor = BotExecutor(self.runner)
         self.mock_exchange = MagicMock()
         self.mock_strategy = MagicMock()
+
+    def tearDown(self):
+        database.DB_PATH = self.orig_db_path
+        database._local = database.threading.local()
+        shutil.rmtree(self.test_dir, ignore_errors=True)
 
     @patch('engine.bot_executor.logger')
     @patch('engine.bot_executor.get_bot_status')

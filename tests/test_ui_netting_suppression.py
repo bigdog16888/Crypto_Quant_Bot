@@ -2,6 +2,7 @@
 import pytest
 import sqlite3
 import uuid
+import json
 import pandas as pd
 from engine import database
 from engine import oneway_netting
@@ -83,15 +84,27 @@ def test_ui_missing_grids_suppression(memory_db):
         actual_ph = physical_order_counts.get(bid, 0)
 
         # The logic we modified in monitor.py:
-        if actual_ph < 2 and c_step >= 1 and bot_inv > 0.01:
-            gow_ok = True
+        if c_step >= 1 and bot_inv > 0.01:
+            has_grid = False
             try:
-                from engine.oneway_netting import gate_oneway_opposite_entry
-                gow_ok, _ = gate_oneway_opposite_entry(bid, row['pair'], row['direction'])
+                has_grid = memory_db.execute(
+                    "SELECT COUNT(*) FROM bot_orders "
+                    "WHERE bot_id = ? AND step = ? AND order_type = 'grid' "
+                    "AND status IN ('open', 'new')",
+                    (bid, c_step + 1)
+                ).fetchone()[0] > 0
             except Exception:
                 pass
-            if gow_ok:
-                bots_with_partial_orders.append(f"{row['name']} ({actual_ph}/2)")
+
+            if not has_grid:
+                gow_ok = True
+                try:
+                    from engine.oneway_netting import gate_oneway_opposite_entry
+                    gow_ok, _ = gate_oneway_opposite_entry(bid, row['pair'], row['direction'])
+                except Exception:
+                    pass
+                if gow_ok:
+                    bots_with_partial_orders.append(f"{row['name']} ({actual_ph}/2)")
 
     # Assert that the alert for Bot_SHORT is suppressed because it was blocked by the netting gate
     assert len(bots_with_partial_orders) == 0, f"Expected alert to be suppressed, but got: {bots_with_partial_orders}"
@@ -113,16 +126,93 @@ def test_ui_missing_grids_suppression(memory_db):
         c_step = int(row.get('current_step', 0))
         actual_ph = physical_order_counts.get(bid, 0)
 
-        if actual_ph < 2 and c_step >= 1 and bot_inv > 0.01:
-            gow_ok = True
+        if c_step >= 1 and bot_inv > 0.01:
+            has_grid = False
             try:
-                from engine.oneway_netting import gate_oneway_opposite_entry
-                gow_ok, _ = gate_oneway_opposite_entry(bid, row['pair'], row['direction'])
+                has_grid = memory_db.execute(
+                    "SELECT COUNT(*) FROM bot_orders "
+                    "WHERE bot_id = ? AND step = ? AND order_type = 'grid' "
+                    "AND status IN ('open', 'new')",
+                    (bid, c_step + 1)
+                ).fetchone()[0] > 0
             except Exception:
                 pass
-            if gow_ok:
-                bots_with_partial_orders.append(f"{row['name']} ({actual_ph}/2)")
+
+            if not has_grid:
+                gow_ok = True
+                try:
+                    from engine.oneway_netting import gate_oneway_opposite_entry
+                    gow_ok, _ = gate_oneway_opposite_entry(bid, row['pair'], row['direction'])
+                except Exception:
+                    pass
+                if gow_ok:
+                    bots_with_partial_orders.append(f"{row['name']} ({actual_ph}/2)")
 
     # Assert that the alert is NOT suppressed now and shows up in the list
     assert len(bots_with_partial_orders) == 1
     assert bots_with_partial_orders[0] == "Bot_SHORT (1/2)"
+
+
+def test_ui_missing_grids_step_offset(memory_db):
+    # Setup: Standard LONG bot at step 2, max_steps 8, invested > 0.01
+    _seed_bot(memory_db, 10016, "Bot_LONG", 'BTC/USDC:USDC', 'LONG', open_qty=0.008, total_invested=100.0, current_step=2)
+
+    # Helper function to run the simulated UI logic
+    def check_bot_missing_grid(bid, current_step, max_steps):
+        df_pos_f = pd.DataFrame([{
+            'id': bid,
+            'name': "Bot_LONG",
+            'pair': 'BTC/USDC:USDC',
+            'direction': 'LONG',
+            'total_invested': 100.0,
+            'current_step': current_step,
+            'config': f'{{"max_steps": {max_steps}}}',
+            'bot_type': 'standard'
+        }])
+        
+        bots_with_partial_orders = []
+        for _, row in df_pos_f.iterrows():
+            bid_local = int(row['id'])
+            bot_inv = float(row['total_invested'] or 0)
+            c_step = int(row.get('current_step', 0))
+            
+            if c_step >= 1 and bot_inv > 0.01 and row.get('bot_type', 'standard') == 'standard':
+                try:
+                    cfg_dict = json.loads(row.get('config') or '{}')
+                    max_steps_cfg = int(cfg_dict.get('max_steps', 8))
+                except:
+                    max_steps_cfg = 8
+                    
+                if c_step < max_steps_cfg:
+                    has_grid = False
+                    try:
+                        has_grid = memory_db.execute(
+                            "SELECT COUNT(*) FROM bot_orders "
+                            "WHERE bot_id = ? AND step = ? AND order_type = 'grid' "
+                            "AND status IN ('open', 'new')",
+                            (bid_local, c_step + 1)
+                        ).fetchone()[0] > 0
+                    except Exception:
+                        pass
+                    
+                    if not has_grid:
+                        bots_with_partial_orders.append(row['name'])
+        return len(bots_with_partial_orders) > 0
+
+    # 1. Initially, bot has no step 3 grid in DB.
+    # MISSING GRIDS warning should fire.
+    assert check_bot_missing_grid(10016, current_step=2, max_steps=8) is True
+
+    # 2. Insert step 3 grid in bot_orders (status = 'open')
+    memory_db.execute(
+        "INSERT INTO bot_orders (bot_id, order_type, client_order_id, price, amount, filled_amount, status, step) "
+        "VALUES (10016, 'grid', 'CQB_10016_GRID_25_3', 60000.0, 0.005, 0.0, 'open', 3)"
+    )
+    memory_db.commit()
+
+    # Now with open step 3 grid, MISSING GRIDS warning should NOT fire.
+    assert check_bot_missing_grid(10016, current_step=2, max_steps=8) is False
+
+    # 3. If bot is at max step (current_step = 8, max_steps = 8)
+    # The warning should be suppressed entirely (returns False) even if no step 9 grid exists.
+    assert check_bot_missing_grid(10016, current_step=8, max_steps=8) is False

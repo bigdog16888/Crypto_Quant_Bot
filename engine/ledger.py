@@ -448,11 +448,11 @@ def seal_trade_state(bot_id: int) -> Dict[str, Any]:
                 drift = abs(accumulator_qty - main_open_qty)
                 drift_base = max(abs(accumulator_qty), abs(main_open_qty), 1e-8)
                 drift_pct = drift / drift_base
-                if drift_pct > 0.05:
+                if drift > max(0.5, accumulator_qty * 0.05):
                     # ── LARGE-DRIFT SELF-HEAL [v2.3.2] ─────────────────────────
                     logger.warning(
                         f"[QTY-DRIFT-HEAL] Bot {bot_id}: accumulator={accumulator_qty:.8f} "
-                        f"vs basket_open={main_open_qty:.8f} (drift={drift_pct:.2%} > 5%). "
+                        f"vs basket_open={main_open_qty:.8f} (drift={drift:.8f} > {max(0.5, accumulator_qty * 0.05):.8f}). "
                         f"Overwriting open_qty with recomputed basket truth."
                     )
                     conn.execute(
@@ -521,11 +521,46 @@ def seal_trade_state(bot_id: int) -> Dict[str, Any]:
             step = 1
             logger.info(f"[SEAL] Bot {bot_id}: clamped step 0→1 (basket_qty={main_open_qty:.6f} > 0, position is active)")
 
+        # Recalculate target_tp_price based on the new avg_entry_price
+        new_tp = 0.0
+        if main_open_qty > 1e-8 and avg > 0:
+            try:
+                row_bot = conn.execute("SELECT config, direction FROM bots WHERE id = ?", (bot_id,)).fetchone()
+                if row_bot:
+                    config_json, direction = row_bot
+                    from engine.runner import BotRunner
+                    runner_instance = BotRunner.get_instance()
+                    
+                    row_t = conn.execute("SELECT cycle_id FROM trades WHERE bot_id = ?", (bot_id,)).fetchone()
+                    cycle_id = row_t[0] if row_t else 1
+                    
+                    bot_status = {
+                        'avg_entry_price': avg,
+                        'total_invested': cost,
+                        'current_step': step,
+                        'cycle_id': cycle_id,
+                        'direction': direction,
+                        'open_qty': main_open_qty
+                    }
+                    
+                    if runner_instance:
+                        import json
+                        bot_params = json.loads(config_json) if config_json else {}
+                        strategy = runner_instance.get_strategy(bot_id, bot_params)
+                        new_tp = strategy.calculate_take_profit_price(bot_status, avg)
+                    else:
+                        new_tp = avg * 1.015 if str(direction).upper() == 'LONG' else avg * 0.985
+            except Exception as e_tp:
+                logger.warning(f"[SEAL] Recalculate TP price failed for bot {bot_id}: {e_tp}")
+                row_curr = conn.execute("SELECT target_tp_price FROM trades WHERE bot_id = ?", (bot_id,)).fetchone()
+                new_tp = float(row_curr[0] or 0) if row_curr else 0.0
+
         # Write to trades
         conn.execute("""
             UPDATE trades SET
                 total_invested   = ?,
                 avg_entry_price  = ?,
+                target_tp_price  = ?,
                 current_step     = ?,
                 open_qty         = ?,
                 entry_confirmed  = CASE WHEN ? > 0.01 THEN 1 ELSE 0 END,
@@ -538,7 +573,7 @@ def seal_trade_state(bot_id: int) -> Dict[str, Any]:
                     ELSE cycle_phase 
                 END
             WHERE bot_id = ?
-        """, (cost, avg, step, main_open_qty, cost, basket_time_update, basket_time_update, cost, bot_id))
+        """, (cost, avg, new_tp, step, main_open_qty, cost, basket_time_update, basket_time_update, cost, bot_id))
 
 
         # Derive and update bot status

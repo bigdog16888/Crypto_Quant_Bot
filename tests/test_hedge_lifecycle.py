@@ -56,152 +56,6 @@ def _insert_trades(conn, bot_id, open_qty=0.0,
 
 
 # ---------------------------------------------------------------------------
-# TICKET-2: Migration script tests (using temp DB, not production)
-# ---------------------------------------------------------------------------
-
-@unittest.skip("One-time migration is obsolete and hedge_qty has been dropped from trades table")
-class TestTicket2Migration(unittest.TestCase):
-
-    def setUp(self):
-        self.test_dir, self.db_path = _make_temp_db()
-        self.conn = get_connection()
-        # Simulate a parent bot with hedge_qty > 0
-        _insert_bot(self.conn, 10017, 'xrp long', 'XRP/USDC:USDC', 'XRPUSDC', 'LONG')
-        _insert_trades(self.conn, 10017, open_qty=0.0, hedge_qty=44.7,
-                       position_side='LONG', avg_entry_price=0.0)
-
-    def tearDown(self):
-        shutil.rmtree(self.test_dir, ignore_errors=True)
-
-    def _run_migration(self):
-        """Import and run the migration function."""
-        # Re-import to pick up temp DB path
-        from scripts.migrate_hedge_to_child_bot import migrate
-        migrate(dry_run=False)
-
-    def test_ticket2_child_bot_created(self):
-        """Migration creates a hedge_child bot linked to parent."""
-        self._run_migration()
-        conn = get_connection()
-        child = conn.execute(
-            "SELECT id, direction, bot_type, status FROM bots "
-            "WHERE parent_bot_id=10017 AND bot_type='hedge_child'"
-        ).fetchone()
-        self.assertIsNotNone(child, "Hedge child bot must be created")
-        child_id, direction, bot_type, status = child
-        self.assertEqual(direction, 'SHORT', "Child must be SHORT when parent is LONG")
-        self.assertEqual(bot_type, 'hedge_child')
-        self.assertEqual(status, 'IN TRADE')
-
-    def test_ticket2_parent_hedge_qty_zeroed(self):
-        """After migration parent's hedge_qty is 0 (INV-5)."""
-        self._run_migration()
-        conn = get_connection()
-        row = conn.execute("SELECT hedge_qty FROM trades WHERE bot_id=10017").fetchone()
-        self.assertIsNotNone(row)
-        self.assertAlmostEqual(float(row[0] or 0), 0.0, places=4,
-                               msg="Parent hedge_qty must be 0 after migration")
-
-    def test_ticket2_child_open_qty_matches_former_hedge(self):
-        """Child bot's open_qty == former parent hedge_qty."""
-        self._run_migration()
-        conn = get_connection()
-        row = conn.execute(
-            "SELECT t.open_qty FROM trades t "
-            "JOIN bots b ON b.id=t.bot_id "
-            "WHERE b.parent_bot_id=10017 AND b.bot_type='hedge_child'"
-        ).fetchone()
-        self.assertIsNotNone(row)
-        self.assertAlmostEqual(float(row[0]), 44.7, places=2,
-                               msg="Child open_qty must match former hedge_qty")
-
-    def test_ticket2_parent_linked_to_child(self):
-        """Parent bot's hedge_child_bot_id is set to child bot's id."""
-        self._run_migration()
-        conn = get_connection()
-        parent_row = conn.execute(
-            "SELECT hedge_child_bot_id FROM bots WHERE id=10017"
-        ).fetchone()
-        self.assertIsNotNone(parent_row)
-        child_id = parent_row[0]
-        self.assertIsNotNone(child_id, "hedge_child_bot_id must be set on parent")
-
-        # Verify cross-reference
-        child_row = conn.execute(
-            "SELECT parent_bot_id FROM bots WHERE id=?", (child_id,)
-        ).fetchone()
-        self.assertEqual(child_row[0], 10017, "Child parent_bot_id must point back to 10017")
-
-    def test_ticket2_migration_idempotent(self):
-        """Running migration twice produces identical state (no duplicate child)."""
-        self._run_migration()
-        conn = get_connection()
-        child_count_1 = conn.execute(
-            "SELECT COUNT(*) FROM bots WHERE parent_bot_id=10017 AND bot_type='hedge_child'"
-        ).fetchone()[0]
-
-        self._run_migration()  # second run
-        child_count_2 = conn.execute(
-            "SELECT COUNT(*) FROM bots WHERE parent_bot_id=10017 AND bot_type='hedge_child'"
-        ).fetchone()[0]
-
-        self.assertEqual(child_count_1, 1, "Exactly one child after first migration")
-        self.assertEqual(child_count_2, 1, "Still exactly one child after second migration")
-
-    def test_ticket2_audit_order_created(self):
-        """Migration inserts an audit bot_orders entry for the inherited position."""
-        self._run_migration()
-        conn = get_connection()
-        child_id = conn.execute(
-            "SELECT id FROM bots WHERE parent_bot_id=10017 AND bot_type='hedge_child'"
-        ).fetchone()[0]
-        order = conn.execute(
-            "SELECT order_type, filled_amount, status FROM bot_orders WHERE bot_id=?",
-            (child_id,)
-        ).fetchone()
-        self.assertIsNotNone(order, "Audit bot_orders row must exist for child")
-        otype, filled, status = order
-        self.assertEqual(otype, 'entry')
-        self.assertAlmostEqual(float(filled), 44.7, places=2)
-        self.assertEqual(status, 'filled')
-
-    def test_ticket2_active_positions_reassigned(self):
-        """Orphan active_positions row (bot_id=0) is reassigned to child bot."""
-        # active_positions table is created by init_db() in setUp; insert orphan now
-        conn = get_connection()
-        conn.execute("""
-            INSERT INTO active_positions (bot_id, pair, side, size, entry_price, last_checked)
-            VALUES (0, 'XRPUSDC', 'SHORT', 44.7, 2.2, ?)
-        """, (int(time.time()),))
-        conn.commit()
-
-        # Verify orphan is there before migration
-        pre = conn.execute(
-            "SELECT COUNT(*) FROM active_positions WHERE bot_id=0"
-        ).fetchone()[0]
-        self.assertEqual(pre, 1, "Orphan must exist before migration")
-
-        # Run migration WITHOUT calling init_db again (which would wipe active_positions)
-        from scripts.migrate_hedge_to_child_bot import migrate
-        migrate(dry_run=False)
-
-        child_id = get_connection().execute(
-            "SELECT id FROM bots WHERE parent_bot_id=10017 AND bot_type='hedge_child'"
-        ).fetchone()[0]
-
-        orphan_count = get_connection().execute(
-            "SELECT COUNT(*) FROM active_positions WHERE bot_id=0 AND pair='XRPUSDC'"
-        ).fetchone()[0]
-        self.assertEqual(orphan_count, 0, "No orphan rows should remain after migration")
-
-        assigned = get_connection().execute(
-            "SELECT COUNT(*) FROM active_positions WHERE bot_id=? AND pair='XRPUSDC'",
-            (child_id,)
-        ).fetchone()[0]
-        self.assertEqual(assigned, 1, "active_positions must be assigned to child bot")
-
-
-# ---------------------------------------------------------------------------
 # TICKET-6: One-way netting suppression (parent/child)
 # Tests run against the actual oneway_netting module but with mock DB state
 # ---------------------------------------------------------------------------
@@ -278,56 +132,8 @@ class TestTicket6OnewayNettingSuppression(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# SCENARIO-6: Migration idempotency (integrated)
+# SCENARIO-6: Migration idempotency (integrated) — DELETED (obsolete)
 # ---------------------------------------------------------------------------
-
-@unittest.skip("One-time migration is obsolete and hedge_qty has been dropped from trades table")
-class TestScenario6MigrationIdempotency(unittest.TestCase):
-
-    def setUp(self):
-        self.test_dir, self.db_path = _make_temp_db()
-        conn = get_connection()
-        _insert_bot(conn, 10017, 'xrp long', 'XRP/USDC:USDC', 'XRPUSDC', 'LONG')
-        _insert_trades(conn, 10017, open_qty=0.0)
-
-    def tearDown(self):
-        shutil.rmtree(self.test_dir, ignore_errors=True)
-
-    def test_scenario6_full_migration_state(self):
-        """Full scenario: migrate, verify all invariants, run twice (idempotent)."""
-        from scripts.migrate_hedge_to_child_bot import migrate
-
-        migrate(dry_run=False)
-
-        conn = get_connection()
-        child = conn.execute(
-            "SELECT id, direction, open_qty FROM bots b "
-            "JOIN trades t ON t.bot_id=b.id "
-            "WHERE b.parent_bot_id=10017 AND b.bot_type='hedge_child'"
-        ).fetchone()
-        self.assertIsNotNone(child)
-        child_id, direction, open_qty = child
-        self.assertEqual(direction, 'SHORT')
-        self.assertAlmostEqual(float(open_qty), 44.7, places=2)
-
-        parent_hedge = float(conn.execute(
-            "SELECT hedge_qty FROM trades WHERE bot_id=10017"
-        ).fetchone()[0] or 0)
-        self.assertAlmostEqual(parent_hedge, 0.0, places=4)
-
-        # Run again — idempotent
-        migrate(dry_run=False)
-
-        child_count = conn.execute(
-            "SELECT COUNT(*) FROM bots WHERE parent_bot_id=10017"
-        ).fetchone()[0]
-        self.assertEqual(child_count, 1, "Must be exactly one child after two migrations")
-
-        child_qty_after = float(conn.execute(
-            "SELECT open_qty FROM trades WHERE bot_id=?", (child_id,)
-        ).fetchone()[0] or 0)
-        self.assertAlmostEqual(child_qty_after, 44.7, places=2,
-                               msg="Child open_qty must not be doubled on second run")
 
 
 # ---------------------------------------------------------------------------
@@ -509,7 +315,7 @@ class TestTicket7BotExecutor(unittest.TestCase):
                 step_qty=5.5,
                 step_fill_price=2.2,
                 exchange=mock_exchange,
-                cycle_id=1
+                parent_cycle_id=1
             )
             self.assertTrue(res)
             mock_place.assert_called_once()
@@ -521,7 +327,7 @@ class TestTicket7BotExecutor(unittest.TestCase):
             self.assertIsNotNone(row)
             self.assertEqual(row[0], 'EX_CHILD_ENTRY_123')
             self.assertEqual(float(row[1]), 2.2)
-            self.assertEqual(float(row[2]), 5.5)
+            self.assertEqual(float(row[2]), 10.0)
             self.assertEqual(row[3], 'open')
 
     def test_ticket7_signal_hedge_child_entry_calculates_relative_step(self):
@@ -554,7 +360,7 @@ class TestTicket7BotExecutor(unittest.TestCase):
                 step_qty=5.5,
                 step_fill_price=2.2,
                 exchange=mock_exchange,
-                cycle_id=1
+                parent_cycle_id=1
             )
             self.assertTrue(res)
 
@@ -592,7 +398,7 @@ class TestTicket7BotExecutor(unittest.TestCase):
                 step_qty=5.5,
                 step_fill_price=2.2,
                 exchange=mock_exchange,
-                cycle_id=1
+                parent_cycle_id=1
             )
             self.assertTrue(res1)
             
@@ -606,7 +412,7 @@ class TestTicket7BotExecutor(unittest.TestCase):
                 step_qty=5.5,
                 step_fill_price=2.2,
                 exchange=mock_exchange,
-                cycle_id=1
+                parent_cycle_id=1
             )
             self.assertTrue(res2)
             
@@ -644,6 +450,12 @@ class TestTicket7BotExecutor(unittest.TestCase):
         self.conn.execute("""
             INSERT INTO bot_orders (bot_id, order_type, order_id, client_order_id, price, amount, filled_amount, status, step, cycle_id, created_at)
             VALUES (10017, 'grid', 'EX_PARENT_GRID_8', 'CQB_10017_GRID_1_8', 2.2, 0.030, 0.030, 'filled', 8, 1, 12346)
+        """)
+        
+        # Seed one prior child entry to simulate subsequent step
+        self.conn.execute("""
+            INSERT INTO bot_orders (bot_id, order_type, client_order_id, price, amount, filled_amount, status, cycle_id, step)
+            VALUES (99001, 'entry', 'CQB_99001_ENTRY_1_7', 2.2, 0.267, 0.267, 'filled', 1, 7)
         """)
         
         # Update parent trigger step to 8
@@ -728,7 +540,7 @@ class TestTicket8HedgeTP(unittest.TestCase):
         self.test_dir, self.db_path = _make_temp_db()
         self.conn = get_connection()
         # Set up parent bot (10017)
-        _insert_bot(self.conn, 10017, 'xrp long', 'XRP/USDC:USDC', 'XRPUSDC', 'LONG', hedge_child_bot_id=99001)
+        _insert_bot(self.conn, 10017, 'xrp long', 'XRP/USDC:USDC', 'XRPUSDC', 'LONG', hedge_child_bot_id=99001, hedge_trigger_step=1)
         _insert_trades(self.conn, 10017, open_qty=10.0)
 
         # Set up child bot (99001)
@@ -993,7 +805,7 @@ class TestHedgeChildTPGtc(unittest.TestCase):
         self.test_dir, self.db_path = _make_temp_db()
         self.conn = get_connection()
         # Set up parent bot (10017)
-        _insert_bot(self.conn, 10017, 'xrp long', 'XRP/USDC:USDC', 'XRPUSDC', 'LONG', hedge_child_bot_id=99001)
+        _insert_bot(self.conn, 10017, 'xrp long', 'XRP/USDC:USDC', 'XRPUSDC', 'LONG', hedge_child_bot_id=99001, hedge_trigger_step=1)
         _insert_trades(self.conn, 10017, open_qty=10.0)
 
         # Set up child bot (99001)
@@ -1135,7 +947,7 @@ class TestHedgeCycleCarryForward(unittest.TestCase):
                 step_qty=2.0,
                 step_fill_price=2.10,
                 exchange=mock_exchange,
-                cycle_id=2,  # Parent is now on cycle 2
+                parent_cycle_id=2,  # Parent is now on cycle 2
             )
 
         # Check if the child bot's trades.cycle_id is updated to 2
@@ -1433,6 +1245,380 @@ class TestOnewayHedgeInsulation(unittest.TestCase):
         # The child bot is placing SHORT entry. Even though parent holds LONG position, it should not block the child
         allowed, msg = gate_oneway_opposite_entry(100318, 'SUI/USDC:USDC', 'SHORT')
         self.assertTrue(allowed, f"Hedge child should be allowed to enter, but was blocked: {msg}")
+
+class TestHedgeLifecycleEnforcement(unittest.TestCase):
+
+    def setUp(self):
+        self.test_dir, self.db_path = _make_temp_db()
+        self.conn = get_connection()
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_enforce_dormant(self):
+        """parent_step < trigger, child open_qty=0 -> 'dormant'"""
+        from engine.bot_executor import enforce_hedge_child_state
+        # Setup parent (trigger=7, step=6, cycle=1)
+        _insert_bot(self.conn, 10016, 'btc long', 'BTC/USDT:USDT', 'BTCUSDT', 'LONG', hedge_child_bot_id=100317, hedge_trigger_step=7)
+        _insert_trades(self.conn, 10016, open_qty=1.0, cycle_id=1)
+        self.conn.execute("UPDATE trades SET current_step = 6 WHERE bot_id = 10016")
+        self.conn.commit()
+
+        # Setup child
+        _insert_bot(self.conn, 100317, 'btc long_hedge', 'BTC/USDT:USDT', 'BTCUSDT', 'SHORT', bot_type='hedge_child', parent_bot_id=10016, status='HEDGE_STANDBY')
+        _insert_trades(self.conn, 100317, open_qty=0.0, cycle_id=1)
+
+        state = enforce_hedge_child_state(100317, self.conn)
+        self.assertEqual(state, 'dormant')
+
+    def test_enforce_should_close(self):
+        """parent_step < trigger, child open_qty=0.5 -> 'should_close'"""
+        from engine.bot_executor import enforce_hedge_child_state
+        # Setup parent (trigger=7, step=6, cycle=1)
+        _insert_bot(self.conn, 10016, 'btc long', 'BTC/USDT:USDT', 'BTCUSDT', 'LONG', hedge_child_bot_id=100317, hedge_trigger_step=7)
+        _insert_trades(self.conn, 10016, open_qty=1.0, cycle_id=1)
+        self.conn.execute("UPDATE trades SET current_step = 6 WHERE bot_id = 10016")
+        self.conn.commit()
+
+        # Setup child holding some quantity
+        _insert_bot(self.conn, 100317, 'btc long_hedge', 'BTC/USDT:USDT', 'BTCUSDT', 'SHORT', bot_type='hedge_child', parent_bot_id=10016, status='IN TRADE')
+        _insert_trades(self.conn, 100317, open_qty=0.5, cycle_id=1)
+
+        state = enforce_hedge_child_state(100317, self.conn)
+        self.assertEqual(state, 'should_close')
+
+    def test_enforce_active(self):
+        """parent_step >= trigger, parent open_qty > 0 -> 'active'"""
+        from engine.bot_executor import enforce_hedge_child_state
+        # Setup parent (trigger=7, step=7, cycle=1)
+        _insert_bot(self.conn, 10016, 'btc long', 'BTC/USDT:USDT', 'BTCUSDT', 'LONG', hedge_child_bot_id=100317, hedge_trigger_step=7)
+        _insert_trades(self.conn, 10016, open_qty=1.0, cycle_id=1)
+        self.conn.execute("UPDATE trades SET current_step = 7 WHERE bot_id = 10016")
+        self.conn.commit()
+
+        # Setup child
+        _insert_bot(self.conn, 100317, 'btc long_hedge', 'BTC/USDT:USDT', 'BTCUSDT', 'SHORT', bot_type='hedge_child', parent_bot_id=10016, status='IN TRADE')
+        _insert_trades(self.conn, 100317, open_qty=0.0, cycle_id=1)
+
+        state = enforce_hedge_child_state(100317, self.conn)
+        self.assertEqual(state, 'active')
+
+    def test_enforce_syncs_cycle_id(self):
+        """child cycle=5, parent cycle=10 -> child cycle updated to 10"""
+        from engine.bot_executor import enforce_hedge_child_state
+        # Setup parent cycle=10
+        _insert_bot(self.conn, 10016, 'btc long', 'BTC/USDT:USDT', 'BTCUSDT', 'LONG', hedge_child_bot_id=100317, hedge_trigger_step=7)
+        _insert_trades(self.conn, 10016, open_qty=1.0, cycle_id=10)
+        self.conn.execute("UPDATE trades SET current_step = 7 WHERE bot_id = 10016")
+        self.conn.commit()
+
+        # Setup child cycle=5
+        _insert_bot(self.conn, 100317, 'btc long_hedge', 'BTC/USDT:USDT', 'BTCUSDT', 'SHORT', bot_type='hedge_child', parent_bot_id=10016, status='IN TRADE')
+        _insert_trades(self.conn, 100317, open_qty=0.0, cycle_id=5)
+
+        # Place some active orders on child cycle=5
+        self.conn.execute("""
+            INSERT INTO bot_orders (bot_id, order_type, order_id, client_order_id, price, amount, status, step, cycle_id, created_at)
+            VALUES (100317, 'entry', 'EX_ENTRY_1', 'CQB_100317_ENTRY_1', 50000.0, 0.1, 'open', 1, 5, 12345)
+        """)
+        self.conn.commit()
+
+        state = enforce_hedge_child_state(100317, self.conn)
+        self.assertEqual(state, 'active')
+
+        # Check child trades.cycle_id updated to 10
+        child_trade = self.conn.execute("SELECT cycle_id FROM trades WHERE bot_id = 100317").fetchone()
+        self.assertEqual(child_trade[0], 10)
+
+        # Check child bot_orders cycle_id updated to 10
+        child_order = self.conn.execute("SELECT cycle_id FROM bot_orders WHERE order_id = 'EX_ENTRY_1'").fetchone()
+        self.assertEqual(child_order[0], 10)
+
+    def test_enforce_does_not_rewrite_filled_orders(self):
+        """filled bot_orders rows retain original cycle_id after sync"""
+        from engine.bot_executor import enforce_hedge_child_state
+        # Setup parent cycle=10
+        _insert_bot(self.conn, 10016, 'btc long', 'BTC/USDT:USDT', 'BTCUSDT', 'LONG', hedge_child_bot_id=100317, hedge_trigger_step=7)
+        _insert_trades(self.conn, 10016, open_qty=1.0, cycle_id=10)
+        self.conn.execute("UPDATE trades SET current_step = 7 WHERE bot_id = 10016")
+        self.conn.commit()
+
+        # Setup child cycle=5
+        _insert_bot(self.conn, 100317, 'btc long_hedge', 'BTC/USDT:USDT', 'BTCUSDT', 'SHORT', bot_type='hedge_child', parent_bot_id=10016, status='IN TRADE')
+        _insert_trades(self.conn, 100317, open_qty=0.0, cycle_id=5)
+
+        # Place filled/cancelled/auto_closed/reset_cleared orders on child cycle=5
+        self.conn.execute("""
+            INSERT INTO bot_orders (bot_id, order_type, order_id, client_order_id, price, amount, status, step, cycle_id, created_at)
+            VALUES (100317, 'entry', 'EX_FILLED_1', 'CQB_100317_FILLED_1', 50000.0, 0.1, 'filled', 1, 5, 12345)
+        """)
+        self.conn.execute("""
+            INSERT INTO bot_orders (bot_id, order_type, order_id, client_order_id, price, amount, status, step, cycle_id, created_at)
+            VALUES (100317, 'entry', 'EX_CANCELLED_1', 'CQB_100317_CANCELLED_1', 50000.0, 0.1, 'cancelled', 1, 5, 12345)
+        """)
+        self.conn.execute("""
+            INSERT INTO bot_orders (bot_id, order_type, order_id, client_order_id, price, amount, status, step, cycle_id, created_at)
+            VALUES (100317, 'entry', 'EX_AUTO_CLOSED_1', 'CQB_100317_AUTO_CLOSED_1', 50000.0, 0.1, 'auto_closed', 1, 5, 12345)
+        """)
+        self.conn.execute("""
+            INSERT INTO bot_orders (bot_id, order_type, order_id, client_order_id, price, amount, status, step, cycle_id, created_at)
+            VALUES (100317, 'entry', 'EX_RESET_CLEARED_1', 'CQB_100317_RESET_CLEARED_1', 50000.0, 0.1, 'reset_cleared', 1, 5, 12345)
+        """)
+        self.conn.commit()
+
+        state = enforce_hedge_child_state(100317, self.conn)
+        self.assertEqual(state, 'active')
+
+        # Check child trades.cycle_id updated to 10
+        child_trade = self.conn.execute("SELECT cycle_id FROM trades WHERE bot_id = 100317").fetchone()
+        self.assertEqual(child_trade[0], 10)
+
+        # Check child historical orders cycle_id DID NOT update (should remain 5)
+        for order_id in ['EX_FILLED_1', 'EX_CANCELLED_1', 'EX_AUTO_CLOSED_1', 'EX_RESET_CLEARED_1']:
+            cid = self.conn.execute("SELECT cycle_id FROM bot_orders WHERE order_id = ?", (order_id,)).fetchone()
+            self.assertEqual(cid[0], 5, f"Order {order_id} cycle_id updated incorrectly!")
+
+    def test_signal_entry_idempotent_same_cycle(self):
+        """calling _signal_hedge_child_entry twice same parent_cycle -> only one entry placed"""
+        from engine.bot_executor import BotExecutor
+        from engine.exchange_interface import ExchangeInterface
+
+        # Setup parent (trigger=7, step=7, cycle=10)
+        _insert_bot(self.conn, 10016, 'btc long', 'BTC/USDT:USDT', 'BTCUSDT', 'LONG', hedge_child_bot_id=100317, hedge_trigger_step=7)
+        _insert_trades(self.conn, 10016, open_qty=1.0, cycle_id=10)
+        self.conn.execute("UPDATE trades SET current_step = 7 WHERE bot_id = 10016")
+        self.conn.commit()
+
+        # Setup child
+        _insert_bot(self.conn, 100317, 'btc long_hedge', 'BTC/USDT:USDT', 'BTCUSDT', 'SHORT', bot_type='hedge_child', parent_bot_id=10016, status='HEDGE_STANDBY')
+        _insert_trades(self.conn, 100317, open_qty=0.0, cycle_id=10)
+
+        executor = BotExecutor(runner=None)
+        mock_exchange = MagicMock(spec=ExchangeInterface)
+        mock_exchange.get_symbol_precision.return_value = {'step_size': 0.001}
+        mock_exchange.round_to_step.side_effect = lambda qty, step: round(qty, 3)
+
+        mock_order = {
+            'id': 'EX_CHILD_ENTRY_123',
+            'status': 'open',
+            'clientOrderId': 'CQB_100317_ENTRY_10_7'
+        }
+
+        with patch.object(executor, '_place_gtx_order_with_retry', return_value=mock_order) as mock_place:
+            # First call
+            res1 = executor._signal_hedge_child_entry(
+                parent_bot_id=10016,
+                parent_name='btc long',
+                parent_step=7,
+                pair='BTC/USDT:USDT',
+                direction='LONG',
+                step_qty=0.1,
+                step_fill_price=50000.0,
+                exchange=mock_exchange,
+                parent_cycle_id=10
+            )
+            self.assertTrue(res1)
+
+            # Second call
+            res2 = executor._signal_hedge_child_entry(
+                parent_bot_id=10016,
+                parent_name='btc long',
+                parent_step=7,
+                pair='BTC/USDT:USDT',
+                direction='LONG',
+                step_qty=0.1,
+                step_fill_price=50000.0,
+                exchange=mock_exchange,
+                parent_cycle_id=10
+            )
+            self.assertTrue(res2)
+
+            # Should only be called once
+            self.assertEqual(mock_place.call_count, 1)
+
+    def test_reset_to_hedge_standby_writes_audit_row(self):
+        """_reset_to_hedge_standby -> drift_note row exists in bot_orders"""
+        from engine.bot_executor import _reset_to_hedge_standby
+        
+        # Setup parent
+        _insert_bot(self.conn, 10016, 'btc long', 'BTC/USDT:USDT', 'BTCUSDT', 'LONG', hedge_child_bot_id=100317, hedge_trigger_step=7)
+        _insert_trades(self.conn, 10016, open_qty=1.0, cycle_id=10)
+        self.conn.execute("UPDATE trades SET current_step = 6 WHERE bot_id = 10016")
+        self.conn.commit()
+
+        # Setup child
+        _insert_bot(self.conn, 100317, 'btc long_hedge', 'BTC/USDT:USDT', 'BTCUSDT', 'SHORT', bot_type='hedge_child', parent_bot_id=10016, status='IN TRADE')
+        _insert_trades(self.conn, 100317, open_qty=0.5, cycle_id=5)
+
+        _reset_to_hedge_standby(100317, self.conn, 10)
+
+        # Check status and open_qty updated
+        child_bot = self.conn.execute("SELECT status FROM bots WHERE id = 100317").fetchone()
+        self.assertEqual(child_bot[0], 'hedge_standby')
+
+        child_trade = self.conn.execute("SELECT open_qty, cycle_id FROM trades WHERE bot_id = 100317").fetchone()
+        self.assertEqual(child_trade[0], 0.0)
+        self.assertEqual(child_trade[1], 10)
+
+        # Check drift_note audit order exists
+        audit_row = self.conn.execute(
+            "SELECT order_type, status, notes, cycle_id FROM bot_orders WHERE bot_id = 100317 AND order_type = 'drift_note'"
+        ).fetchone()
+        self.assertIsNotNone(audit_row)
+        self.assertEqual(audit_row[0], 'drift_note')
+        self.assertEqual(audit_row[1], 'audit')
+        self.assertIn("Parent state:", audit_row[2])
+        self.assertEqual(audit_row[3], 10)
+
+    def test_signal_first_entry_uses_full_parent_qty(self):
+        """Parent has open_qty=693.8, trigger at step 7, current step=7. First child entry uses parent open_qty."""
+        from engine.bot_executor import BotExecutor
+        from engine.exchange_interface import ExchangeInterface
+        executor = BotExecutor(runner=None)
+        
+        # Setup parent
+        _insert_bot(self.conn, 10016, 'btc long', 'BTC/USDT:USDT', 'BTCUSDT', 'LONG', hedge_child_bot_id=100317, hedge_trigger_step=7)
+        _insert_trades(self.conn, 10016, open_qty=693.8, cycle_id=10)
+        
+        # Setup child
+        _insert_bot(self.conn, 100317, 'btc long_hedge', 'BTC/USDT:USDT', 'BTCUSDT', 'SHORT', bot_type='hedge_child', parent_bot_id=10016, status='Scanning')
+        _insert_trades(self.conn, 100317, open_qty=0.0, cycle_id=10)
+
+        mock_exchange = MagicMock(spec=ExchangeInterface)
+        mock_exchange.get_symbol_precision.return_value = {'step_size': 0.1}
+        mock_exchange.round_to_step.side_effect = lambda qty, step: round(qty, 1)
+
+        mock_order = {
+            'id': 'EX_CHILD_ENTRY_123',
+            'status': 'open',
+            'clientOrderId': 'CQB_100317_ENTRY_10_7'
+        }
+
+        with patch.object(executor, '_place_gtx_order_with_retry', return_value=mock_order) as mock_place:
+            res = executor._signal_hedge_child_entry(
+                parent_bot_id=10016,
+                parent_name='btc long',
+                parent_step=7,
+                pair='BTC/USDT:USDT',
+                direction='LONG',
+                step_qty=56.2,  # Trigger increment is small, but full qty is 693.8
+                step_fill_price=50000.0,
+                exchange=mock_exchange,
+                parent_cycle_id=10
+            )
+            self.assertTrue(res)
+            # Verify placed order has the full parent qty (693.8) instead of step_qty (56.2)
+            mock_place.assert_called_once()
+            args, kwargs = mock_place.call_args
+            placed_qty = args[3]
+            self.assertEqual(placed_qty, 693.8)
+
+    def test_signal_subsequent_entry_uses_step_qty(self):
+        """Parent has open_qty=750.0, trigger at step 7, current step=8. Subsequent entries use step_qty increment."""
+        from engine.bot_executor import BotExecutor
+        from engine.exchange_interface import ExchangeInterface
+        executor = BotExecutor(runner=None)
+        
+        # Setup parent
+        _insert_bot(self.conn, 10016, 'btc long', 'BTC/USDT:USDT', 'BTCUSDT', 'LONG', hedge_child_bot_id=100317, hedge_trigger_step=7)
+        _insert_trades(self.conn, 10016, open_qty=750.0, cycle_id=10)
+        
+        # Setup child
+        _insert_bot(self.conn, 100317, 'btc long_hedge', 'BTC/USDT:USDT', 'BTCUSDT', 'SHORT', bot_type='hedge_child', parent_bot_id=10016, status='IN TRADE')
+        _insert_trades(self.conn, 100317, open_qty=693.8, cycle_id=10)
+
+        # Seed one prior filled entry in bot_orders for this cycle to simulate subsequent step
+        conn = get_connection()
+        conn.execute("""
+            INSERT INTO bot_orders (bot_id, order_type, client_order_id, price, amount, filled_amount, status, cycle_id, step)
+            VALUES (100317, 'entry', 'CQB_100317_ENTRY_10_7', 50000.0, 693.8, 693.8, 'filled', 10, 1)
+        """)
+        conn.commit()
+
+        mock_exchange = MagicMock(spec=ExchangeInterface)
+        mock_exchange.get_symbol_precision.return_value = {'step_size': 0.1}
+        mock_exchange.round_to_step.side_effect = lambda qty, step: round(qty, 1)
+
+        mock_order = {
+            'id': 'EX_CHILD_ENTRY_124',
+            'status': 'open',
+            'clientOrderId': 'CQB_100317_ENTRY_10_8'
+        }
+
+        with patch.object(executor, '_place_gtx_order_with_retry', return_value=mock_order) as mock_place:
+            res = executor._signal_hedge_child_entry(
+                parent_bot_id=10016,
+                parent_name='btc long',
+                parent_step=8,
+                pair='BTC/USDT:USDT',
+                direction='LONG',
+                step_qty=56.2,  # Increment qty for step 8
+                step_fill_price=51000.0,
+                exchange=mock_exchange,
+                parent_cycle_id=10
+            )
+            self.assertTrue(res)
+            # Verify placed order has step_qty (56.2) instead of full parent position (750.0)
+            mock_place.assert_called_once()
+            args, kwargs = mock_place.call_args
+            placed_qty = args[3]
+            self.assertEqual(placed_qty, 56.2)
+
+    def test_signal_full_hedge_idempotent(self):
+        """Call _signal_hedge_child_entry twice, second call is ignored (idempotent)."""
+        from engine.bot_executor import BotExecutor
+        from engine.exchange_interface import ExchangeInterface
+        executor = BotExecutor(runner=None)
+        
+        # Setup parent
+        _insert_bot(self.conn, 10016, 'btc long', 'BTC/USDT:USDT', 'BTCUSDT', 'LONG', hedge_child_bot_id=100317, hedge_trigger_step=7)
+        _insert_trades(self.conn, 10016, open_qty=693.8, cycle_id=10)
+        
+        # Setup child
+        _insert_bot(self.conn, 100317, 'btc long_hedge', 'BTC/USDT:USDT', 'BTCUSDT', 'SHORT', bot_type='hedge_child', parent_bot_id=10016, status='Scanning')
+        _insert_trades(self.conn, 100317, open_qty=0.0, cycle_id=10)
+
+        mock_exchange = MagicMock(spec=ExchangeInterface)
+        mock_exchange.get_symbol_precision.return_value = {'step_size': 0.1}
+        mock_exchange.round_to_step.side_effect = lambda qty, step: round(qty, 1)
+
+        mock_order = {
+            'id': 'EX_CHILD_ENTRY_123',
+            'status': 'open',
+            'clientOrderId': 'CQB_100317_ENTRY_10_7'
+        }
+
+        with patch.object(executor, '_place_gtx_order_with_retry', return_value=mock_order) as mock_place:
+            # 1. First call triggers entry placement
+            res1 = executor._signal_hedge_child_entry(
+                parent_bot_id=10016,
+                parent_name='btc long',
+                parent_step=7,
+                pair='BTC/USDT:USDT',
+                direction='LONG',
+                step_qty=56.2,
+                step_fill_price=50000.0,
+                exchange=mock_exchange,
+                parent_cycle_id=10
+            )
+            self.assertTrue(res1)
+
+            # 2. Second call should be ignored due to existing order
+            res2 = executor._signal_hedge_child_entry(
+                parent_bot_id=10016,
+                parent_name='btc long',
+                parent_step=7,
+                pair='BTC/USDT:USDT',
+                direction='LONG',
+                step_qty=56.2,
+                step_fill_price=50000.0,
+                exchange=mock_exchange,
+                parent_cycle_id=10
+            )
+            self.assertTrue(res2)
+
+            # Only one place call should have been made
+            self.assertEqual(mock_place.call_count, 1)
 
 
 if __name__ == '__main__':

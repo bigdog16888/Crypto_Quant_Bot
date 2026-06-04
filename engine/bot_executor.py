@@ -64,6 +64,270 @@ def _to_ccxt_pair(normalized_or_ccxt: str, all_bot_pairs: list = None) -> str:
                 return candidate
     return s  # Fallback: return as-is
 
+
+def enforce_hedge_child_state(child_bot_id: int, conn) -> str:
+    """
+    Enforces state boundaries between parent and child hedge bots.
+    Returns: 'dormant', 'should_close', or 'active'.
+    Also synchronizes child trades.cycle_id to match parent trades.cycle_id.
+    """
+    # 1. Fetch parent bot ID
+    parent_row = conn.execute(
+        "SELECT parent_bot_id FROM bots WHERE id = ?", (child_bot_id,)
+    ).fetchone()
+    if not parent_row or not parent_row[0]:
+        return 'dormant'
+    parent_bot_id = parent_row[0]
+
+    # 2. Fetch parent trade and bot configuration
+    parent_trade = conn.execute(
+        "SELECT current_step, COALESCE(open_qty, 0), cycle_id FROM trades WHERE bot_id = ?",
+        (parent_bot_id,)
+    ).fetchone()
+    parent_bot = conn.execute(
+        "SELECT hedge_trigger_step FROM bots WHERE id = ?",
+        (parent_bot_id,)
+    ).fetchone()
+
+    if not parent_trade or not parent_bot:
+        return 'dormant'
+
+    parent_step = int(parent_trade[0] or 0)
+    parent_qty = float(parent_trade[1] or 0)
+    parent_cycle_id = int(parent_trade[2] or 1)
+    hedge_trigger_step = int(parent_bot[0]) if parent_bot[0] is not None else None
+
+    # 3. Fetch child trade details
+    child_trade = conn.execute(
+        "SELECT COALESCE(open_qty, 0), cycle_id FROM trades WHERE bot_id = ?",
+        (child_bot_id,)
+    ).fetchone()
+    if not child_trade:
+        return 'dormant'
+    child_qty = float(child_trade[0] or 0)
+    child_cycle_id = int(child_trade[1] or 1)
+
+    # 4. Sync cycle_id if diverged
+    if child_cycle_id != parent_cycle_id:
+        conn.execute(
+            "UPDATE trades SET cycle_id = ? WHERE bot_id = ?",
+            (parent_cycle_id, child_bot_id)
+        )
+        conn.execute(
+            "UPDATE bot_orders SET cycle_id = ? "
+            "WHERE bot_id = ? AND cycle_id = ? "
+            "AND status NOT IN ('reset_cleared', 'auto_closed', 'filled', 'cancelled')",
+            (parent_cycle_id, child_bot_id, child_cycle_id)
+        )
+        conn.commit()
+        logger.warning(
+            f"[HEDGE-ALIGN] Synced child {child_bot_id} cycle_id {child_cycle_id} -> {parent_cycle_id} "
+            f"to match parent {parent_bot_id}."
+        )
+
+    # 5. Determine child state
+    if hedge_trigger_step is None or parent_step < hedge_trigger_step:
+        if child_qty > 0.0001:
+            return 'should_close'
+        return 'dormant'
+    
+    return 'active'
+
+
+def _reset_to_hedge_standby(child_bot_id: int, conn, parent_cycle_id: int, exchange=None):
+    """
+    Two-Phase Atomic Reset Protocol (INV-15).
+
+    Phase 1 — Exchange Settlement (must complete before any DB write):
+      1a. Read the DB-attributed qty (trades.open_qty) — what we claim is on exchange.
+      1b. Cancel all CQB_ open orders for this bot on the pair.
+      1c. If attributed_qty > 0, place a reduceOnly market order to close it.
+          The close order is written as a 'reset_close' bot_orders receipt BEFORE
+          the exchange call, and updated after — guaranteeing an audit trail even if
+          the process crashes mid-flight.
+      1d. If Phase 1 fails for any reason, set the bot to REQUIRE_MANUAL_PROOF
+          and raise — the DB is NOT modified.
+
+    Phase 2 — DB Update (only after exchange is confirmed settled):
+      Zero open_qty / avg_entry_price, set status='hedge_standby', log audit row.
+    """
+    from engine.database import save_bot_order, get_connection as _db_conn
+
+    # ── Resolve parent info for audit note ───────────────────────────────────
+    parent_row = conn.execute(
+        "SELECT parent_bot_id FROM bots WHERE id = ?", (child_bot_id,)
+    ).fetchone()
+    parent_bot_id = parent_row[0] if parent_row else None
+
+    parent_info_str = "unknown"
+    if parent_bot_id:
+        parent_trade = conn.execute(
+            "SELECT current_step, COALESCE(open_qty, 0) FROM trades WHERE bot_id = ?",
+            (parent_bot_id,)
+        ).fetchone()
+        if parent_trade:
+            parent_info_str = (
+                f"parent_id={parent_bot_id}, parent_step={parent_trade[0]}, "
+                f"parent_qty={parent_trade[1]}"
+            )
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # PHASE 1 — EXCHANGE SETTLEMENT
+    # ═════════════════════════════════════════════════════════════════════════
+    if exchange is not None:
+        # 1a. Read current attributed qty from DB (our claim of what is on exchange)
+        child_trade_row = conn.execute(
+            "SELECT COALESCE(open_qty, 0), pair FROM trades t "
+            "JOIN bots b ON b.id = t.bot_id WHERE t.bot_id = ?",
+            (child_bot_id,)
+        ).fetchone()
+        attributed_qty = float(child_trade_row[0]) if child_trade_row else 0.0
+        pair = child_trade_row[1] if child_trade_row else None
+
+        if not pair:
+            pair_row = conn.execute("SELECT pair FROM bots WHERE id = ?", (child_bot_id,)).fetchone()
+            pair = pair_row[0] if pair_row else None
+
+        skip_phase1 = False
+        if attributed_qty > 0.0001 and pair:
+            # FIX 3: idempotency guard check for in-flight reset_close order in current cycle
+            now_ts = int(time.time())
+            in_flight = conn.execute(
+                "SELECT id FROM bot_orders WHERE bot_id = ? AND order_type = 'reset_close' "
+                "AND status IN ('pending', 'open') AND cycle_id = ? AND created_at >= ?",
+                (child_bot_id, parent_cycle_id, now_ts - 30)
+            ).fetchone()
+            if in_flight:
+                logger.warning(
+                    f"[RESET-P1] Found in-flight reset_close order (ID: {in_flight[0]}) "
+                    f"for bot {child_bot_id} cycle {parent_cycle_id} less than 30s old. Skipping Phase 1."
+                )
+                skip_phase1 = True
+
+            if not skip_phase1:
+                # Get bot's direction
+                dir_row = conn.execute(
+                    "SELECT direction FROM bots WHERE id = ?", (child_bot_id,)
+                ).fetchone()
+                direction = (dir_row[0] or 'LONG').upper() if dir_row else 'LONG'
+
+                # FIX 1: get exchange-authoritative close qty
+                from engine.oneway_netting import get_authoritative_close_qty
+                close_qty = get_authoritative_close_qty(exchange, pair, direction, attributed_qty)
+
+                if close_qty <= 0.0001:
+                    logger.warning(
+                        f"[RESET-P1] Exchange already flat (close_qty={close_qty:.6f}) "
+                        f"for bot {child_bot_id} on {pair}. Skipping Phase 1 settlement."
+                    )
+                    skip_phase1 = True
+                else:
+                    # 1b. Cancel open orders for this bot
+                    try:
+                        cancelled = exchange.cancel_orders_by_bot_id(child_bot_id, pair)
+                        logger.info(
+                            f"[RESET-P1] Cancelled {cancelled} open order(s) for bot {child_bot_id} on {pair}."
+                        )
+                    except Exception as _ce:
+                        logger.warning(
+                            f"[RESET-P1] cancel_orders_by_bot_id failed for bot {child_bot_id}: {_ce}. Continuing."
+                        )
+
+                    # 1c. Close position using close_qty instead of attributed_qty
+                    close_side = 'sell' if direction == 'LONG' else 'buy'
+                    close_cid = f"CQB_{child_bot_id}_RESET_CLOSE_{int(time.time())}"
+
+                    # Write pending receipt BEFORE touching exchange (WAL pattern)
+                    _receipt_conn = _db_conn()
+                    _receipt_cursor = _receipt_conn.cursor()
+                    _receipt_cursor.execute("""
+                        INSERT INTO bot_orders (
+                            bot_id, order_type, client_order_id, price, amount,
+                            filled_amount, status, cycle_id, created_at, updated_at, notes
+                        ) VALUES (?, 'reset_close', ?, 0, ?, 0, 'pending', ?, ?, ?, ?)
+                    """, (
+                        child_bot_id, close_cid, close_qty, parent_cycle_id,
+                        int(time.time()), int(time.time()),
+                        f"[RESET-P1] Two-phase close: {close_qty} {pair} {close_side.upper()} reduceOnly"
+                    ))
+                    _receipt_conn.commit()
+                    _pending_row_id = _receipt_cursor.lastrowid
+
+                    try:
+                        close_result = exchange.create_order(
+                            symbol=pair,
+                            type='market',
+                            side=close_side,
+                            amount=close_qty,
+                            params={
+                                'newClientOrderId': close_cid,
+                                'reduceOnly': True,
+                            },
+                            human_approved=True,
+                            _call_site='bot_executor:_reset_to_hedge_standby',
+                        )
+                        real_order_id = str(close_result.get('id', ''))
+                        # Update receipt with real exchange order_id → open
+                        _receipt_conn.execute(
+                            "UPDATE bot_orders SET order_id=?, status='open', updated_at=? WHERE id=?",
+                            (real_order_id, int(time.time()), _pending_row_id)
+                        )
+                        _receipt_conn.commit()
+                        logger.warning(
+                            f"✅ [RESET-P1] Phase 1 complete: bot {child_bot_id} closed "
+                            f"{close_qty} {pair} {close_side.upper()} → exchange order_id={real_order_id}"
+                        )
+
+                    except Exception as _close_err:
+                        # Phase 1 failed → update receipt to 'failed', block Phase 2
+                        _receipt_conn.execute(
+                            "UPDATE bot_orders SET status='failed', updated_at=?, notes=? WHERE id=?",
+                            (int(time.time()), f"[RESET-P1] Exchange close failed: {_close_err}", _pending_row_id)
+                        )
+                        _receipt_conn.commit()
+                        # Lock bot to REQUIRE_MANUAL_PROOF — do NOT write DB reset
+                        conn.execute(
+                            "UPDATE bots SET status='REQUIRE_MANUAL_PROOF' WHERE id=?",
+                            (child_bot_id,)
+                        )
+                        conn.commit()
+                        logger.error(
+                            f"❌ [RESET-P1] Phase 1 FAILED for bot {child_bot_id}: {_close_err}. "
+                            f"Bot locked to REQUIRE_MANUAL_PROOF. DB NOT modified. "
+                            f"Manually close {close_qty} {pair} on exchange before retrying."
+                        )
+                        raise RuntimeError(
+                            f"[INV-15] Two-phase reset Phase 1 failed for bot {child_bot_id}: {_close_err}"
+                        )
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # PHASE 2 — DB UPDATE (only reached after exchange is settled or qty was 0)
+    # ═════════════════════════════════════════════════════════════════════════
+    conn.execute(
+        "UPDATE trades SET open_qty = 0, avg_entry_price = 0, cycle_id = ? WHERE bot_id = ?",
+        (parent_cycle_id, child_bot_id)
+    )
+    conn.execute(
+        "UPDATE bots SET status = 'hedge_standby' WHERE id = ?",
+        (child_bot_id,)
+    )
+    conn.commit()
+
+    # Audit row (always written, Phase 1 or not)
+    drift_cid = f"CQB_{child_bot_id}_DRIFT_ENFORCE_RESET_{int(time.time())}"
+    save_bot_order(
+        child_bot_id, 'drift_note', f'ENFORCE_RESET_{child_bot_id}',
+        price=0.0, amount=0.0, step=0, status='audit',
+        client_order_id=drift_cid,
+        notes=f"[HEDGE-ENFORCE][INV-15] Two-phase reset complete. Parent state: {parent_info_str}",
+        cycle_id=parent_cycle_id
+    )
+    logger.warning(
+        f"🛡️ [HEDGE-ENFORCE] Child bot {child_bot_id} reset to hedge_standby (cycle_id={parent_cycle_id}). "
+        f"Parent state: {parent_info_str}"
+    )
+
+
 class BotExecutor:
     # 🛡️ Binance margin and position limit rejection signals
     _MARGIN_SIGNALS = [
@@ -1936,6 +2200,34 @@ class BotExecutor:
 
         if bot_type == 'hedge_child':
             # --- HEDGE CHILD SIMPLE PATH ---
+            _hc_enforce_conn = _gc_hc()
+            _hc_state = enforce_hedge_child_state(bot_id, _hc_enforce_conn)
+            if _hc_state == 'dormant':
+                return None
+            if _hc_state == 'should_close':
+                # INV-15: Two-phase atomic reset.
+                # _reset_to_hedge_standby now owns Phase 1 (exchange cancel + reduceOnly
+                # market close with full bot_orders receipt) and Phase 2 (DB zero).
+                # Do NOT pre-cancel here — the function handles it atomically.
+                _parent_cycle_for_reset = _hc_enforce_conn.execute(
+                    "SELECT cycle_id FROM trades WHERE bot_id = ("
+                    "SELECT parent_bot_id FROM bots WHERE id = ?)", (bot_id,)
+                ).fetchone()
+                _parent_cycle_id_val = _parent_cycle_for_reset[0] if _parent_cycle_for_reset else 1
+                try:
+                    _reset_to_hedge_standby(
+                        bot_id, _hc_enforce_conn, _parent_cycle_id_val,
+                        exchange=exchange  # Phase 1: close exchange position first
+                    )
+                except RuntimeError as _reset_err:
+                    # Phase 1 failed — bot is locked to REQUIRE_MANUAL_PROOF.
+                    # Log and return; do not proceed with this bot's cycle.
+                    logger.error(
+                        f"❌ [HEDGE-ENFORCE] Reset failed for bot {bot_id}: {_reset_err}. "
+                        f"Bot locked pending manual exchange closure."
+                    )
+                return None
+
             # 1. Get current open orders
             open_orders = None
             if market_snapshot:
@@ -2046,55 +2338,91 @@ class BotExecutor:
                 # (race condition), so the pending_placement write was silently skipped.
                 # Compute and register the BE TP intent here rather than returning unprotected.
                 if not pending_tp:
-                    child_trade = _hc_conn.execute(
-                        "SELECT open_qty, avg_entry_price, cycle_id FROM trades WHERE bot_id = ?",
-                        (bot_id,)
-                    ).fetchone()
-                    if child_trade:
-                        _fallback_qty = float(child_trade[0] or 0)
-                        _fallback_avg = float(child_trade[1] or 0)
-                        _fallback_cycle = int(child_trade[2] or 0)
-                        if _fallback_qty > 0.0001 and _fallback_avg > 0:
-                            _fallback_cid = f"CQB_{bot_id}_TP_{_fallback_cycle}_BE_FB"
-                            _already = _hc_conn.execute(
-                                "SELECT id FROM bot_orders WHERE bot_id=? AND client_order_id LIKE ? "
-                                "AND status IN ('pending_placement', 'open', 'new', 'partially_filled', 'pending', 'placing')",
-                                (bot_id, f"{_fallback_cid}%")
+                    # Check if parent is still active before assuming a missed TP cascade
+                    _parent_should_skip = False
+                    try:
+                        _parent_row = _hc_conn.execute(
+                            "SELECT parent_bot_id FROM bots WHERE id = ?", (bot_id,)
+                        ).fetchone()
+                        _parent_id = _parent_row[0] if _parent_row else None
+                        if _parent_id:
+                            _parent_qty = _hc_conn.execute(
+                                "SELECT COALESCE(open_qty, 0) FROM trades WHERE bot_id = ?",
+                                (_parent_id,)
                             ).fetchone()
-                            if not _already:
-                                from engine.database import save_bot_order as _sbo_fb
-                                _sbo_fb(
-                                    bot_id, 'tp', f'PENDING_BE_{bot_id}_{_fallback_cycle}_FB',
-                                    _fallback_avg, _fallback_qty, step=0,
-                                    status='pending_placement',
-                                    client_order_id=_fallback_cid,
-                                    notes=(
-                                        f"[HEDGE-BE-FALLBACK] BE TP self-registered by maintain_orders "
-                                        f"(handle_tp_completion missed due to ledger race). "
-                                        f"qty={_fallback_qty}, avg={_fallback_avg:.4f}"
-                                    ),
-                                    cycle_id=_fallback_cycle,
+                            if _parent_qty and float(_parent_qty[0]) > 0.0001:
+                                _parent_should_skip = True
+                                logger.debug(
+                                    f"[HEDGE-BE-FALLBACK] {name} ({bot_id}): parent bot "
+                                    f"{_parent_id} still active (open_qty={float(_parent_qty[0]):.6f}). "
+                                    f"Skipping fallback BE TP registration."
                                 )
-                                logger.warning(
-                                    f"🛡️ [HEDGE-BE-FALLBACK] {name} ({bot_id}): no pending_placement found "
-                                    f"but open_qty={_fallback_qty} avg={_fallback_avg:.4f}. "
-                                    f"Registered fallback BE TP intent {_fallback_cid}. "
-                                    f"Will be placed on next cycle."
-                                )
-                                # Ensure placeholder never leaks into trades.tp_order_id
-                                _hc_conn.execute(
-                                    "UPDATE trades SET tp_order_id = NULL WHERE bot_id = ? "
-                                    "AND (tp_order_id IS NULL OR tp_order_id LIKE 'PENDING_BE_%')",
-                                    (bot_id,)
-                                )
-                                _hc_conn.commit()
-                                # Re-query so the placement block below picks it up this cycle
-                                pending_tp = _hc_conn.execute(
-                                    "SELECT price, amount, cycle_id, client_order_id FROM bot_orders "
-                                    "WHERE bot_id = ? AND order_type = 'tp' AND status = 'pending_placement' "
-                                    "ORDER BY id DESC LIMIT 1",
-                                    (bot_id,)
+                    except Exception as _pg_err:
+                        logger.warning(
+                            f"[HEDGE-BE-FALLBACK] {name} ({bot_id}): parent guard check "
+                            f"failed ({_pg_err}). Proceeding with fallback to be safe."
+                        )
+                        _parent_should_skip = False
+
+                    if not _parent_should_skip:
+                        # 🚀 [v3.8.2 HEDGE-BE-FALLBACK SEAL GUARD]
+                        # Seal the bot trade state to ensure open_qty and avg_entry_price reflect the ground truth
+                        # (e.g. if additional fills arrived after the parent's TP completed/before fallback registration).
+                        try:
+                            from engine.ledger import seal_trade_state as _sts_fb
+                            _sts_fb(bot_id)
+                        except Exception as _sts_fb_err:
+                            logger.warning(f"🛡️ [HEDGE-BE-FALLBACK] seal_trade_state failed for bot {bot_id} (non-fatal): {_sts_fb_err}")
+
+                        child_trade = _hc_conn.execute(
+                            "SELECT open_qty, avg_entry_price, cycle_id FROM trades WHERE bot_id = ?",
+                            (bot_id,)
+                        ).fetchone()
+                        if child_trade:
+                            _fallback_qty = float(child_trade[0] or 0)
+                            _fallback_avg = float(child_trade[1] or 0)
+                            _fallback_cycle = int(child_trade[2] or 0)
+                            if _fallback_qty > 0.0001 and _fallback_avg > 0:
+                                _fallback_cid = f"CQB_{bot_id}_TP_{_fallback_cycle}_BE_FB"
+                                _already = _hc_conn.execute(
+                                    "SELECT id FROM bot_orders WHERE bot_id=? AND client_order_id LIKE ? "
+                                    "AND status IN ('pending_placement', 'open', 'new', 'partially_filled', 'pending', 'placing')",
+                                    (bot_id, f"{_fallback_cid}%")
                                 ).fetchone()
+                                if not _already:
+                                    from engine.database import save_bot_order as _sbo_fb
+                                    _sbo_fb(
+                                        bot_id, 'tp', f'PENDING_BE_{bot_id}_{_fallback_cycle}_FB',
+                                        _fallback_avg, _fallback_qty, step=0,
+                                        status='pending_placement',
+                                        client_order_id=_fallback_cid,
+                                        notes=(
+                                            f"[HEDGE-BE-FALLBACK] BE TP self-registered by maintain_orders "
+                                            f"(handle_tp_completion missed due to ledger race). "
+                                            f"qty={_fallback_qty}, avg={_fallback_avg:.4f}"
+                                        ),
+                                        cycle_id=_fallback_cycle,
+                                    )
+                                    logger.warning(
+                                        f"🛡️ [HEDGE-BE-FALLBACK] {name} ({bot_id}): no pending_placement found "
+                                        f"but open_qty={_fallback_qty} avg={_fallback_avg:.4f}. "
+                                        f"Registered fallback BE TP intent {_fallback_cid}. "
+                                        f"Will be placed on next cycle."
+                                    )
+                                    # Ensure placeholder never leaks into trades.tp_order_id
+                                    _hc_conn.execute(
+                                        "UPDATE trades SET tp_order_id = NULL WHERE bot_id = ? "
+                                        "AND (tp_order_id IS NULL OR tp_order_id LIKE 'PENDING_BE_%')",
+                                        (bot_id,)
+                                    )
+                                    _hc_conn.commit()
+                                    # Re-query so the placement block below picks it up this cycle
+                                    pending_tp = _hc_conn.execute(
+                                        "SELECT price, amount, cycle_id, client_order_id FROM bot_orders "
+                                        "WHERE bot_id = ? AND order_type = 'tp' AND status = 'pending_placement' "
+                                        "ORDER BY id DESC LIMIT 1",
+                                        (bot_id,)
+                                    ).fetchone()
 
                 if pending_tp:
                     tp_price, tp_amount, child_cycle, be_cid = pending_tp
@@ -3445,7 +3773,7 @@ class BotExecutor:
                         step_qty=step_qty,
                         step_fill_price=current_price,
                         exchange=exchange,
-                        cycle_id=int(bot_status.get('cycle_id', 1)),
+                        parent_cycle_id=int(bot_status.get('cycle_id', 1)),
                     )
         except Exception as e_hedge_eval:
              logger.error(f"❌ {name}: Failed to evaluate hedge child signal in maintain_orders: {e_hedge_eval}")
@@ -3462,7 +3790,7 @@ class BotExecutor:
         step_qty: float,       # qty that filled on this step
         step_fill_price: float,
         exchange: ExchangeInterface,
-        cycle_id: int,
+        parent_cycle_id: int,
     ) -> bool:
         """
         Signal the hedge child bot to place a SHORT entry mirroring the parent's
@@ -3499,35 +3827,68 @@ class BotExecutor:
         if child_info:
             old_child_cycle = child_info[0]
             child_open_qty = float(child_info[1] or 0)
-            if old_child_cycle and old_child_cycle != cycle_id and child_open_qty > 0.0001:
+            if old_child_cycle and old_child_cycle != parent_cycle_id and child_open_qty > 0.0001:
                 updated_count = conn.execute(
                     "UPDATE bot_orders SET cycle_id = ? WHERE bot_id = ? AND cycle_id = ?",
-                    (cycle_id, child_bot_id, old_child_cycle)
+                    (parent_cycle_id, child_bot_id, old_child_cycle)
                 ).rowcount
                 logger.warning(
-                    f"⚠️ [HEDGE-CYCLE-CARRY] Child {child_bot_id} trades.cycle_id updated {old_child_cycle} → {cycle_id} "
+                    f"⚠️ [HEDGE-CYCLE-CARRY] Child {child_bot_id} trades.cycle_id updated {old_child_cycle} → {parent_cycle_id} "
                     f"while holding active position open_qty={child_open_qty:.6f}. "
                     f"Carried forward {updated_count} orders to new cycle to prevent virtual net mismatch."
                 )
 
         conn.execute(
             "UPDATE trades SET cycle_id = ? WHERE bot_id = ?",
-            (cycle_id, child_bot_id)
+            (parent_cycle_id, child_bot_id)
         )
         conn.commit()
 
-        # Idempotency: check if this step already has a hedge entry for this cycle
+        # Determine target clientOrderId to use for idempotency check and placement
+        cid = f"CQB_{child_bot_id}_ENTRY_{parent_cycle_id}_{parent_step}"
+
+        # Idempotency: check if this cycle and step already has a hedge entry for this parent cycle
         existing = conn.execute(
-            "SELECT id FROM bot_orders WHERE bot_id=? AND step=? AND cycle_id=? "
-            "AND order_type='entry' AND status NOT IN ('cancelled','failed','reset_cleared','auto_closed','rejected')",
-            (child_bot_id, child_step, cycle_id)
+            "SELECT id FROM bot_orders WHERE bot_id=? AND client_order_id=? "
+            "AND status NOT IN ('reset_cleared','auto_closed','cancelled','failed')",
+            (child_bot_id, cid)
         ).fetchone()
         if existing:
             logger.debug(
-                f"[HEDGE-SIGNAL] Child {child_bot_id}: entry for step {parent_step} (child step {child_step}) "
-                f"cycle {cycle_id} already exists. Skipping."
+                f"[HEDGE-SIGNAL] Child {child_bot_id}: entry for cycle {parent_cycle_id} step {parent_step} "
+                f"already exists. Skipping."
             )
             return True
+
+        # Determine if this is the first hedge entry for this cycle
+        # If yes: use parent's full open_qty to hedge entire accumulated position
+        # If no: use step_qty (the increment for this step only)
+        prior_entries = conn.execute(
+            "SELECT COUNT(*) FROM bot_orders "
+            "WHERE bot_id=? AND cycle_id=? AND order_type='entry' "
+            "AND status NOT IN ('cancelled','failed','reset_cleared','auto_closed','rejected')",
+            (child_bot_id, parent_cycle_id)
+        ).fetchone()[0]
+
+        if prior_entries == 0:
+            # First entry this cycle — hedge the full parent position
+            parent_open_qty = conn.execute(
+                "SELECT COALESCE(open_qty, 0) FROM trades WHERE bot_id = ?",
+                (parent_bot_id,)
+            ).fetchone()
+            full_hedge_qty = float(parent_open_qty[0] or 0) if parent_open_qty else step_qty
+            if full_hedge_qty > 0.0001:
+                entry_qty_raw = full_hedge_qty
+                logger.info(
+                    f"[HEDGE-SIGNAL] Child {child_bot_id}: FIRST entry this cycle — "
+                    f"hedging full parent position {full_hedge_qty:.6f} "
+                    f"(step_qty was {step_qty:.6f})"
+                )
+            else:
+                entry_qty_raw = step_qty
+        else:
+            # Subsequent entry — hedge only this step's increment
+            entry_qty_raw = step_qty
 
         # Determine child direction (opposite to parent)
         child_direction = 'SHORT' if direction.upper() == 'LONG' else 'LONG'
@@ -3536,13 +3897,13 @@ class BotExecutor:
         # Round qty to exchange precision
         prec = exchange.get_symbol_precision(pair)
         qty_step = float(prec.get('step_size', 0.001) or 0.001)
-        entry_qty = exchange.round_to_step(step_qty, qty_step)
+        entry_qty = exchange.round_to_step(entry_qty_raw, qty_step)
         if entry_qty <= 0:
             logger.warning(f"[HEDGE-SIGNAL] Entry qty rounded to 0 for step {parent_step}. Skipping.")
             return False
 
         # Place limit order on exchange at parent's fill price (post-only GTX)
-        cid = f"CQB_{child_bot_id}_ENTRY_{cycle_id}_{parent_step}"
+        cid = f"CQB_{child_bot_id}_ENTRY_{parent_cycle_id}_{parent_step}"
         is_testnet = getattr(config, 'TESTNET', False) or getattr(config, 'DEMO_TRADING', False)
         params = {'postOnly': True, 'timeInForce': 'GTX', 'newClientOrderId': cid}
         if is_testnet:
@@ -3569,7 +3930,7 @@ class BotExecutor:
             step=child_step, status=order.get('status', 'open'),
             client_order_id=actual_cid,
             notes=f"Hedge entry mirroring parent {parent_bot_id} step {parent_step}",
-            cycle_id=cycle_id,
+            cycle_id=parent_cycle_id,
         )
 
         # INVARIANT: child trades.cycle_id MUST match the cycle_id used in
@@ -3588,23 +3949,23 @@ class BotExecutor:
                 if child_info:
                     old_child_cycle = child_info[0]
                     child_open_qty = float(child_info[1] or 0)
-                    if old_child_cycle and old_child_cycle != cycle_id and child_open_qty > 0.0001:
+                    if old_child_cycle and old_child_cycle != parent_cycle_id and child_open_qty > 0.0001:
                         updated_count = _sc.execute(
                             "UPDATE bot_orders SET cycle_id = ? WHERE bot_id = ? AND cycle_id = ?",
-                            (cycle_id, child_bot_id, old_child_cycle)
+                            (parent_cycle_id, child_bot_id, old_child_cycle)
                         ).rowcount
                         logger.warning(
-                            f"⚠️ [HEDGE-CYCLE-CARRY] Child {child_bot_id} trades.cycle_id updated {old_child_cycle} → {cycle_id} "
+                            f"⚠️ [HEDGE-CYCLE-CARRY] Child {child_bot_id} trades.cycle_id updated {old_child_cycle} → {parent_cycle_id} "
                             f"during post-entry sync while holding active position open_qty={child_open_qty:.6f}. "
                             f"Carried forward {updated_count} orders to new cycle."
                         )
                 _sc.execute(
                     "UPDATE trades SET cycle_id = ? WHERE bot_id = ?",
-                    (cycle_id, child_bot_id)
+                    (parent_cycle_id, child_bot_id)
                 )
             logger.info(
                 f"[HEDGE-CYCLE-SYNC] Child {child_bot_id} trades.cycle_id "
-                f"synced to parent cycle {cycle_id}"
+                f"synced to parent cycle {parent_cycle_id}"
             )
         except Exception as _sync_err:
             logger.error(

@@ -542,3 +542,279 @@ def test_stalemate_evictor_skips_already_processed_tp(memory_db):
     row = fresh_cursor.execute("SELECT tp_order_id FROM trades WHERE bot_id = 1").fetchone()
     assert row[0] is None
 
+
+def test_fifo_partial_exit_avg_price(memory_db):
+    setup_bot_fixture(memory_db, 100, 'FIFO Bot', 'BTC/USDT:USDT', 'LONG')
+    cursor = memory_db.cursor()
+    cursor.execute("""
+        INSERT INTO bot_orders (bot_id, order_type, order_id, price, amount, filled_amount, status, cycle_id, step, position_side)
+        VALUES 
+        (100, 'entry', 'e1', 600.0, 0.05, 0.05, 'filled', 1, 1, 'LONG'),
+        (100, 'grid', 'e2', 650.0, 0.05, 0.05, 'filled', 1, 2, 'LONG'),
+        (100, 'grid', 'e3', 700.0, 0.05, 0.05, 'filled', 1, 3, 'LONG'),
+        (100, 'tp', 'exit1', 660.0, 0.05, 0.05, 'filled', 1, 4, 'LONG')
+    """)
+    memory_db.commit()
+    
+    total_invested, avg_price, open_qty, max_step = database.recompute_invested_from_orders(100, 1)
+    
+    assert pytest.approx(open_qty) == 0.10
+    assert pytest.approx(avg_price) == 675.0
+    assert pytest.approx(total_invested) == 67.5
+    assert max_step == 3
+
+
+def test_fifo_hedge_child_short_partial_exit(memory_db):
+    setup_bot_fixture(memory_db, 200, 'Hedge Child', 'BTC/USDT:USDT', 'SHORT')
+    cursor = memory_db.cursor()
+    cursor.execute("UPDATE bots SET bot_type = 'hedge_child' WHERE id = 200")
+    cursor.execute("""
+        INSERT INTO bot_orders (bot_id, order_type, order_id, price, amount, filled_amount, status, cycle_id, step, position_side)
+        VALUES 
+        (200, 'entry', 'e1', 694.61, 0.11, 0.11, 'filled', 1, 1, 'SHORT'),
+        (200, 'grid', 'e2', 694.66, 0.11, 0.11, 'filled', 1, 2, 'SHORT'),
+        (200, 'tp', 'exit1', 694.61, 0.11, 0.11, 'filled', 1, 3, 'SHORT')
+    """)
+    memory_db.commit()
+    
+    total_invested, avg_price, open_qty, max_step = database.recompute_invested_from_orders(200, 1)
+    
+    assert pytest.approx(open_qty) == 0.11
+    assert pytest.approx(avg_price) == 694.66
+    assert pytest.approx(total_invested) == 0.11 * 694.66
+    assert max_step == 2
+
+
+def test_fifo_full_exit_returns_zero(memory_db):
+    setup_bot_fixture(memory_db, 300, 'Full Exit Bot', 'BTC/USDT:USDT', 'LONG')
+    cursor = memory_db.cursor()
+    cursor.execute("""
+        INSERT INTO bot_orders (bot_id, order_type, order_id, price, amount, filled_amount, status, cycle_id, step, position_side)
+        VALUES 
+        (300, 'entry', 'e1', 600.0, 0.10, 0.10, 'filled', 1, 1, 'LONG'),
+        (300, 'grid', 'e2', 650.0, 0.05, 0.05, 'filled', 1, 2, 'LONG'),
+        (300, 'tp', 'exit1', 660.0, 0.15, 0.15, 'filled', 1, 3, 'LONG')
+    """)
+    memory_db.commit()
+    
+    res = database.recompute_invested_from_orders(300, 1)
+    assert res == (0.0, 0.0, 0.0, 0)
+
+
+def test_fifo_bnb_scenario_check(memory_db):
+    setup_bot_fixture(memory_db, 10007, 'BNB Bot', 'BNB/USDC:USDC', 'SHORT')
+    cursor = memory_db.cursor()
+    
+    cursor.execute("""
+        INSERT INTO bot_orders (bot_id, order_type, order_id, price, amount, filled_amount, status, cycle_id, step, position_side)
+        VALUES 
+        (10007, 'entry', 'order_1', 635.96, 0.01, 0.01, 'filled', 50, 1, 'SHORT'),
+        (10007, 'grid', 'order_2', 636.89, 0.01, 0.01, 'filled', 50, 2, 'SHORT'),
+        (10007, 'grid', 'order_3', 637.45, 0.02, 0.02, 'filled', 50, 3, 'SHORT'),
+        (10007, 'grid', 'order_4', 638.15, 0.03, 0.03, 'filled', 50, 4, 'SHORT'),
+        (10007, 'grid', 'order_5', 638.96, 0.05, 0.05, 'filled', 50, 5, 'SHORT'),
+        (10007, 'grid', 'order_6', 639.74, 0.07, 0.07, 'filled', 50, 6, 'SHORT'),
+        (10007, 'grid', 'order_7', 714.13, 0.11, 0.11, 'filled', 50, 7, 'SHORT'),
+        (10007, 'tp', 'order_tp_5', 637.25, 0.12, 0.12, 'filled', 50, 5, 'SHORT')
+    """)
+    cursor.execute("UPDATE trades SET cycle_id = 50, position_side = 'SHORT' WHERE bot_id = 10007")
+    memory_db.commit()
+    
+    total_invested, avg_price, open_qty, max_step = database.recompute_invested_from_orders(10007, 50)
+    
+    assert pytest.approx(open_qty) == 0.18
+    assert pytest.approx(avg_price) == 685.2005555555556
+    assert pytest.approx(total_invested) == 123.3361
+    assert max_step == 7
+
+
+def test_seal_trade_state_recalculates_target_tp_price(memory_db):
+    setup_bot_fixture(memory_db, 500, 'TP Recalc Bot', 'BTC/USDT:USDT', 'LONG')
+    cursor = memory_db.cursor()
+    cursor.execute("""
+        INSERT INTO bot_orders (bot_id, order_type, order_id, price, amount, filled_amount, status, cycle_id, step, position_side)
+        VALUES (500, 'entry', 'e1', 50000.0, 1.0, 1.0, 'filled', 1, 1, 'LONG')
+    """)
+    cursor.execute("UPDATE trades SET target_tp_price = 45000.0 WHERE bot_id = 500")
+    memory_db.commit()
+
+    from engine.ledger import seal_trade_state
+    seal_trade_state(500)
+
+    row = cursor.execute("SELECT target_tp_price, avg_entry_price FROM trades WHERE bot_id = 500").fetchone()
+    assert row[0] == pytest.approx(50000.0 * 1.015)
+
+
+def test_hedge_be_fallback_seals_before_registering_tp(memory_db):
+    from unittest.mock import MagicMock, patch
+    from engine.bot_executor import BotExecutor
+    from engine.exchange_interface import ExchangeInterface
+
+    # Setup parent bot and hedge child bot
+    setup_bot_fixture(memory_db, 100, 'Parent Bot', 'BTC/USDT:USDT', 'LONG')
+    setup_bot_fixture(memory_db, 101, 'Hedge Child', 'BTC/USDT:USDT', 'SHORT')
+    
+    cursor = memory_db.cursor()
+    cursor.execute("UPDATE bots SET hedge_child_bot_id = 101 WHERE id = 100")
+    cursor.execute("UPDATE bots SET parent_bot_id = 100, bot_type = 'hedge_child' WHERE id = 101")
+    cursor.execute("UPDATE bots SET hedge_trigger_step = 1 WHERE id = 100")
+    cursor.execute("UPDATE trades SET current_step = 1 WHERE bot_id = 100")
+    
+    # Setup trade state: set trades.open_qty = 0.0 (stale accumulator) but avg_entry_price = 600.0, cycle_id = 1
+    cursor.execute("""
+        UPDATE trades 
+        SET open_qty = 0.0, avg_entry_price = 600.0, cycle_id = 1, current_step = 1, entry_confirmed = 1
+        WHERE bot_id = 101
+    """)
+    
+    # Insert a filled entry order in bot_orders so recomputed qty is 0.6
+    cursor.execute("""
+        INSERT INTO bot_orders (bot_id, order_type, order_id, price, amount, filled_amount, status, cycle_id, step, position_side)
+        VALUES (101, 'entry', 'e1', 600.0, 0.6, 0.6, 'filled', 1, 1, 'SHORT')
+    """)
+    memory_db.commit()
+
+    executor = BotExecutor(runner=None)
+    mock_exchange = MagicMock(spec=ExchangeInterface)
+    mock_exchange.fetch_open_orders.return_value = [] # no open orders on exchange
+    mock_exchange.get_symbol_precision.return_value = {'step_size': 0.001, 'price_precision': 2}
+    mock_exchange.round_to_step.side_effect = lambda qty, step: qty
+    
+    bot_status = {
+        'id': 101,
+        'name': 'Hedge Child',
+        'pair': 'BTC/USDT:USDT',
+        'current_step': 1,
+        'total_invested': 0.0,
+        'avg_entry_price': 600.0,
+        'target_tp_price': 0.0,
+        'cycle_id': 1,
+        'open_qty': 0.0 # Stale accumulator passed in status
+    }
+    
+    # Run maintain_orders for the child bot
+    with patch('engine.parity_gates.gate_maintain_orders_allowed', return_value=(True, '')):
+        executor.maintain_orders(
+            bot_id=101,
+            name='Hedge Child',
+            pair='BTC/USDT:USDT',
+            direction='SHORT',
+            bot_status=bot_status,
+            current_price=600.0,
+            exchange=mock_exchange,
+            market_snapshot={'open_orders': []},
+            bot_config={'market_type': 'swap'}
+        )
+    
+    # Check if fallback TP order was registered with the corrected amount 0.6 in bot_orders
+    row = cursor.execute("""
+        SELECT price, amount, status, client_order_id, order_type 
+        FROM bot_orders 
+        WHERE bot_id = 101 AND status = 'pending_placement' AND order_type = 'tp'
+    """).fetchone()
+    
+    assert row is not None, "Fallback TP order should be registered in bot_orders"
+    assert row[1] == pytest.approx(0.6), f"Registered TP amount should be 0.6, got {row[1]}"
+    assert row[3] == "CQB_101_TP_1_BE_FB", f"client_order_id should be CQB_101_TP_1_BE_FB, got {row[3]}"
+
+
+def test_hedge_be_fallback_parent_active_guard(memory_db):
+    from unittest.mock import MagicMock, patch
+    from engine.bot_executor import BotExecutor
+    from engine.exchange_interface import ExchangeInterface
+
+    # Setup parent bot and hedge child bot
+    setup_bot_fixture(memory_db, 100, 'Parent Bot', 'BTC/USDT:USDT', 'LONG')
+    setup_bot_fixture(memory_db, 101, 'Hedge Child', 'BTC/USDT:USDT', 'SHORT')
+    
+    cursor = memory_db.cursor()
+    cursor.execute("UPDATE bots SET hedge_child_bot_id = 101 WHERE id = 100")
+    cursor.execute("UPDATE bots SET parent_bot_id = 100, bot_type = 'hedge_child' WHERE id = 101")
+    cursor.execute("UPDATE bots SET hedge_trigger_step = 1 WHERE id = 100")
+    cursor.execute("UPDATE trades SET current_step = 1 WHERE bot_id = 100")
+    
+    # 1. Parent is ACTIVE (open_qty = 0.25)
+    cursor.execute("UPDATE trades SET open_qty = 0.25 WHERE bot_id = 100")
+    
+    # Setup child trade state
+    cursor.execute("""
+        UPDATE trades 
+        SET open_qty = 0.5, avg_entry_price = 600.0, cycle_id = 1, current_step = 1, entry_confirmed = 1
+        WHERE bot_id = 101
+    """)
+    # Insert entry order for child bot (SHORT)
+    cursor.execute("""
+        INSERT INTO bot_orders (bot_id, order_type, order_id, price, amount, filled_amount, status, cycle_id, step, position_side)
+        VALUES (101, 'entry', 'e1', 600.0, 0.5, 0.5, 'filled', 1, 1, 'SHORT')
+    """)
+    memory_db.commit()
+
+    executor = BotExecutor(runner=None)
+    mock_exchange = MagicMock(spec=ExchangeInterface)
+    mock_exchange.fetch_open_orders.return_value = [] # no open orders on exchange
+    mock_exchange.get_symbol_precision.return_value = {'step_size': 0.001, 'price_precision': 2}
+    mock_exchange.round_to_step.side_effect = lambda qty, step: qty
+
+    bot_status = {
+        'id': 101,
+        'name': 'Hedge Child',
+        'pair': 'BTC/USDT:USDT',
+        'current_step': 1,
+        'total_invested': 0.0,
+        'avg_entry_price': 600.0,
+        'target_tp_price': 0.0,
+        'cycle_id': 1,
+        'open_qty': 0.5
+    }
+
+    # Run maintain_orders for child bot with Parent ACTIVE
+    with patch('engine.parity_gates.gate_maintain_orders_allowed', return_value=(True, '')):
+        executor.maintain_orders(
+            bot_id=101,
+            name='Hedge Child',
+            pair='BTC/USDT:USDT',
+            direction='SHORT',
+            bot_status=bot_status,
+            current_price=600.0,
+            exchange=mock_exchange,
+            market_snapshot={'open_orders': []},
+            bot_config={'market_type': 'swap'}
+        )
+
+    # Check that NO fallback TP order was registered
+    row = cursor.execute("""
+        SELECT id FROM bot_orders 
+        WHERE bot_id = 101 AND status = 'pending_placement' AND order_type = 'tp'
+    """).fetchone()
+    assert row is None, "Should not register fallback TP when parent is active"
+
+    # 2. Parent is INACTIVE (open_qty = 0.0)
+    cursor.execute("UPDATE trades SET open_qty = 0.0 WHERE bot_id = 100")
+    memory_db.commit()
+
+    # Run maintain_orders for child bot with Parent INACTIVE
+    with patch('engine.parity_gates.gate_maintain_orders_allowed', return_value=(True, '')):
+        executor.maintain_orders(
+            bot_id=101,
+            name='Hedge Child',
+            pair='BTC/USDT:USDT',
+            direction='SHORT',
+            bot_status=bot_status,
+            current_price=600.0,
+            exchange=mock_exchange,
+            market_snapshot={'open_orders': []},
+            bot_config={'market_type': 'swap'}
+        )
+
+    # Check that fallback TP order was registered
+    row = cursor.execute("""
+        SELECT price, amount, status, client_order_id, order_type 
+        FROM bot_orders 
+        WHERE bot_id = 101 AND status = 'pending_placement' AND order_type = 'tp'
+    """).fetchone()
+    assert row is not None, "Fallback TP order should be registered when parent is inactive"
+    assert row[1] == pytest.approx(0.5)
+
+
+
+

@@ -136,3 +136,42 @@ def test_reconcile_oneway_max_repair_qty_guard(memory_db):
     finally:
         config.MAX_OWAY_REPAIR_QTY = original_max
 
+
+def test_get_authoritative_close_qty_success():
+    from engine.oneway_netting import get_authoritative_close_qty
+
+    class MockExchange:
+        def __init__(self, signed_net):
+            self.signed_net = signed_net
+
+        def fetch_positions(self):
+            return [{'symbol': 'BTC/USDC:USDC', 'contracts': self.signed_net, 'net_qty': self.signed_net, 'side': 'long' if self.signed_net > 0 else 'short'}]
+
+    # Case 1: Long direction, physical net positive, db_qty = 0.5, physical = 0.3
+    ex = MockExchange(0.3)
+    qty = get_authoritative_close_qty(ex, 'BTC/USDC:USDC', 'LONG', 0.5)
+    assert qty == pytest.approx(0.3)
+
+    # Case 2: Long direction, physical net positive, db_qty = 0.2, physical = 0.3
+    qty = get_authoritative_close_qty(ex, 'BTC/USDC:USDC', 'LONG', 0.2)
+    assert qty == pytest.approx(0.2)
+
+    # Case 3: Long direction, physical net negative (short), db_qty = 0.5
+    ex2 = MockExchange(-0.3)
+    qty = get_authoritative_close_qty(ex2, 'BTC/USDC:USDC', 'LONG', 0.5)
+    assert qty == pytest.approx(0.0)
+
+    # Case 4: Short direction, physical net negative (short), db_qty = 0.5, physical = -0.3
+    qty = get_authoritative_close_qty(ex2, 'BTC/USDC:USDC', 'SHORT', 0.5)
+    assert qty == pytest.approx(0.3)
+
+    # Case 5: Exchange fetch_positions fails (returns None)
+    class MockExchangeFail:
+        def fetch_positions(self):
+            return None
+
+    ex_fail = MockExchangeFail()
+    qty = get_authoritative_close_qty(ex_fail, 'BTC/USDC:USDC', 'LONG', 0.5)
+    assert qty == pytest.approx(0.5)
+
+

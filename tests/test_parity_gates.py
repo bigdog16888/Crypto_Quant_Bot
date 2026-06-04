@@ -307,3 +307,60 @@ def test_proof_flatten_matching_direction(memory_db):
     res = proof_flatten_pair(ex, 'LINK/USDC:USDC', human_approved=True)
     assert res['success'] is True
     assert ex.created_order['side'] == 'sell'
+
+
+def test_set_bot_require_manual_proof_bypass_when_pair_balanced(memory_db):
+    """
+    Bot-level proof gate bypass: if the overall pair-level net matches the exchange net,
+    no individual bot on that pair should be gated as REQUIRE_MANUAL_PROOF.
+    """
+    from engine.parity_gates import _set_bot_require_manual_proof
+    from engine.exchange_interface import ExchangeInterface
+    from unittest.mock import patch, MagicMock
+
+    # Setup parent bot (LONG, open_qty=2.19)
+    memory_db.execute(
+        "INSERT INTO bots (id, name, pair, direction, is_active, normalized_pair, status) "
+        "VALUES (10008, 'sol', 'SOL/USDC:USDC', 'LONG', 1, 'SOLUSDC', 'IN TRADE')"
+    )
+    memory_db.execute(
+        "INSERT INTO trades (bot_id, cycle_id, current_step, open_qty, total_invested, "
+        "avg_entry_price, cycle_phase, wipe_wall_ts, position_side) "
+        "VALUES (10008, 1, 1, 2.19, 150, 75.0, 'ACTIVE', 0, 'LONG')"
+    )
+    memory_db.execute(
+        "INSERT INTO bot_orders (bot_id, order_type, order_id, price, amount, filled_amount, "
+        "status, cycle_id, step, position_side) "
+        "VALUES (10008, 'entry', 'sol_e1', 75.0, 2.19, 2.19, 'filled', 1, 1, 'LONG')"
+    )
+
+    # Setup hedge child bot (SHORT, open_qty=0.16)
+    memory_db.execute(
+        "INSERT INTO bots (id, name, pair, direction, is_active, normalized_pair, status) "
+        "VALUES (100315, 'sol_hedge', 'SOL/USDC:USDC', 'SHORT', 1, 'SOLUSDC', 'Scanning')"
+    )
+    memory_db.execute(
+        "INSERT INTO trades (bot_id, cycle_id, current_step, open_qty, total_invested, "
+        "avg_entry_price, cycle_phase, wipe_wall_ts, position_side) "
+        "VALUES (100315, 1, 1, 0.16, 11.45, 71.56, 'ACTIVE', 0, 'SHORT')"
+    )
+    memory_db.execute(
+        "INSERT INTO bot_orders (bot_id, order_type, order_id, price, amount, filled_amount, "
+        "status, cycle_id, step, position_side) "
+        "VALUES (100315, 'entry', 'sol_h1', 71.56, 0.16, 0.16, 'filled', 1, 1, 'SHORT')"
+    )
+    memory_db.commit()
+
+    # Pair virtual net is 2.19 - 0.16 = 2.03.
+    # We mock ExchangeInterface to return physical net = 2.03.
+    mock_ex = MagicMock()
+    mock_ex.fetch_positions.return_value = [
+        {'symbol': 'SOL/USDC:USDC', 'net_qty': 2.03, 'contracts': 2.03}
+    ]
+
+    with patch('engine.exchange_interface.ExchangeInterface', return_value=mock_ex):
+        _set_bot_require_manual_proof(10008, "test individual bot gating bypass")
+
+    # Check that bot 10008 was NOT gated (status should still be 'IN TRADE', not 'REQUIRE_MANUAL_PROOF')
+    status = memory_db.execute("SELECT status FROM bots WHERE id = 10008").fetchone()[0]
+    assert status == 'IN TRADE'

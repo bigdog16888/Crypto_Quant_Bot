@@ -299,10 +299,31 @@ def gate_maintain_orders_allowed(
 
 
 def _set_bot_require_manual_proof(bot_id: int, reason: str) -> None:
-    from engine.database import get_connection
+    from engine.database import get_connection, get_pair_virtual_net
+    from engine.exchange_interface import ExchangeInterface, normalize_symbol
 
     try:
         conn = get_connection()
+        row = conn.execute("SELECT pair FROM bots WHERE id = ?", (bot_id,)).fetchone()
+        if row:
+            pair = row[0]
+            # Before gating: verify pair-level net first
+            try:
+                ex = ExchangeInterface(market_type='future')
+                pair_virtual_net = get_pair_virtual_net(pair)
+                pair_physical_net = get_exchange_signed_net(ex, pair)
+                
+                if pair_physical_net is not None:
+                    tol = qty_tolerance()
+                    if abs(pair_virtual_net - pair_physical_net) <= tol:
+                        logger.info(
+                            f"🛡️ [BYPASS-GATE] Bot {bot_id} on {pair}: Pair-level virtual net ({pair_virtual_net:.6f}) "
+                            f"matches physical ({pair_physical_net:.6f}) within tolerance ({tol:.6f}). Bypassing REQUIRE_MANUAL_PROOF."
+                        )
+                        return
+            except Exception as e_gate:
+                logger.error(f"Error checking pair net in _set_bot_require_manual_proof for bot {bot_id}: {e_gate}")
+
         conn.execute(
             "UPDATE bots SET status='REQUIRE_MANUAL_PROOF' WHERE id=? AND status NOT IN ('STOPPED')",
             (bot_id,),
@@ -356,7 +377,7 @@ def purge_phantom_ledger_when_exchange_flat(
     if abs(virtual) <= tol:
         return False, 'virtual already flat'
 
-    from engine.database import get_connection, safe_wipe_bot
+    from engine.database import get_connection, safe_wipe_bot, save_bot_order
 
     conn = get_connection()
     norm = normalize_symbol(pair).upper()
@@ -367,6 +388,50 @@ def purge_phantom_ledger_when_exchange_flat(
     for bot_id, raw_pair, direction in bots:
         if normalize_symbol(raw_pair).upper() != norm:
             continue
+
+        # Collect open orders for this bot before canceling to list their CIDs
+        cancelled_cids = []
+        if exchange:
+            try:
+                prefix = f"CQB_{bot_id}_"
+                for order in exchange.fetch_open_orders(raw_pair):
+                    cid = order.get('clientOrderId', '')
+                    if cid.startswith(prefix):
+                        cancelled_cids.append(cid)
+            except Exception as e:
+                logger.warning(f"Failed to fetch open orders to audit cancellation for bot {bot_id}: {e}")
+
+            # Cancel open orders for this bot
+            try:
+                cancelled_count = exchange.cancel_orders_by_bot_id(bot_id, raw_pair)
+                logger.info(
+                    f"🧹 [PHANTOM-PURGE] Cancelled {cancelled_count} open order(s) "
+                    f"for bot {bot_id} on {raw_pair} before ledger purge."
+                )
+            except Exception as e:
+                logger.warning(f"Failed to cancel open orders for bot {bot_id} on {raw_pair}: {e}")
+
+        # Write ghost_order_cancel audit row
+        try:
+            cycle_row = conn.execute("SELECT cycle_id FROM trades WHERE bot_id = ?", (bot_id,)).fetchone()
+            cycle_id = int(cycle_row[0]) if cycle_row and cycle_row[0] is not None else 1
+            cid_str = ", ".join(cancelled_cids) if cancelled_cids else "None"
+            audit_cid = f"CQB_{bot_id}_GHOST_CANCEL_{int(time.time())}"
+            save_bot_order(
+                bot_id,
+                'ghost_order_cancel',
+                audit_cid,
+                price=0.0,
+                amount=0.0,
+                step=0,
+                status='filled',
+                client_order_id=audit_cid,
+                notes=f"Purged phantom ledger. Cancelled CIDs: {cid_str}",
+                cycle_id=cycle_id,
+            )
+        except Exception as e:
+            logger.error(f"Failed to save ghost_order_cancel audit row for bot {bot_id}: {e}")
+
         ok = safe_wipe_bot(
             bot_id,
             raw_pair,
@@ -697,6 +762,108 @@ def reconcile_pair_to_exchange(exchange, pair: str) -> Optional[str]:
     return None
 
 
+def detect_and_repair_global_wipe(exchange) -> Dict[str, Any]:
+    """
+    Check if the exchange is completely flat (no active non-zero physical positions),
+    but the database claims we have at least 2 active trades (open_qty > 0.0001).
+    If so, automatically run purge_phantom_ledger_when_exchange_flat across all pairs.
+    """
+    summary = {
+        'triggered': False,
+        'reason': '',
+        'pairs_purged': [],
+        'bots_affected': 0,
+        'skipped_reason': ''
+    }
+    
+    # 1. Config guard
+    if not getattr(config, 'ENABLE_GLOBAL_WIPE_DETECTION', True):
+        summary['skipped_reason'] = 'disabled by config'
+        summary['reason'] = 'Skipped: global wipe detection is disabled by config.'
+        return summary
+
+    if not exchange:
+        summary['skipped_reason'] = 'exchange instance is None'
+        summary['reason'] = 'Skipped: exchange instance is None.'
+        return summary
+
+    # 2. Fetch live physical positions from the exchange
+    try:
+        positions = exchange.fetch_positions() or []
+    except Exception as e:
+        logger.error(f"[WIPE-DETECT] Failed to fetch positions from exchange: {e}")
+        summary['skipped_reason'] = f'fetch_positions failed: {e}'
+        summary['reason'] = f'Skipped: fetch_positions failed.'
+        return summary
+
+    tol = qty_tolerance()
+    has_physical = False
+    for pos in positions:
+        qty = abs(float(pos.get('contracts', pos.get('net_qty', pos.get('size', 0))) or 0))
+        if qty > tol:
+            has_physical = True
+            break
+
+    if has_physical:
+        summary['skipped_reason'] = 'exchange has active positions'
+        summary['reason'] = 'Skipped: exchange has active physical positions.'
+        return summary
+
+    # 3. Check if the database has at least 2 active bots claiming positions (open_qty > 0.0001)
+    from engine.database import get_connection, get_pair_virtual_net
+    conn = get_connection()
+    rows = conn.execute("""
+        SELECT b.id, b.pair, b.direction FROM bots b
+        JOIN trades t ON t.bot_id = b.id
+        WHERE b.is_active = 1 AND t.open_qty > 0.0001
+    """).fetchall()
+
+    db_active_bots_count = len(rows)
+    if db_active_bots_count < 2:
+        summary['skipped_reason'] = f'only {db_active_bots_count} bot(s) claim positions'
+        summary['reason'] = f'Skipped: database only has {db_active_bots_count} active bot(s) with open_qty > 0.0001 (requires >= 2).'
+        return summary
+
+    # 4. Trigger emergency global purge
+    logger.critical(
+        f"[GLOBAL-WIPE-DETECTED] Exchange flat across all symbols but DB claims "
+        f"{db_active_bots_count} active positions. Running emergency purge across all pairs. "
+        f"If this is NOT a demo reset, investigate immediately."
+    )
+    summary['triggered'] = True
+    summary['reason'] = f'Triggered emergency purge: exchange is flat but DB has {db_active_bots_count} active bots.'
+    summary['skipped_reason'] = ''
+
+    # Get distinct pairs from the database to purge
+    pairs_rows = conn.execute("SELECT DISTINCT pair FROM bots").fetchall()
+    pairs = [r[0] for r in pairs_rows]
+
+    total_wiped_bots = 0
+    for pair in pairs:
+        virtual = get_pair_virtual_net(pair)
+        if abs(virtual) > tol:
+            logger.warning(
+                f"🧹 [GLOBAL-WIPE-PURGE] Purging phantom ledger for pair {pair} (virtual={virtual:.6f})."
+            )
+            # Run purge on the pair with physical net = 0.0
+            ok, msg = purge_phantom_ledger_when_exchange_flat(exchange, pair, virtual, 0.0)
+            if ok:
+                summary['pairs_purged'].append(pair)
+                # Parse number of wiped bots from msg
+                if 'purged bots' in msg:
+                    try:
+                        import re
+                        bots_list = re.findall(r'\d+', msg)
+                        total_wiped_bots += len(bots_list)
+                    except Exception:
+                        total_wiped_bots += 1
+                else:
+                    total_wiped_bots += 1
+
+    summary['bots_affected'] = total_wiped_bots
+    return summary
+
+
 def startup_repair_mismatched_pairs(exchange) -> Dict[str, Any]:
     """
     Run after CQB history scan: purge phantom ledgers (exchange flat), re-audit.
@@ -869,4 +1036,251 @@ def proof_flatten_pair(
         and abs(net_after) <= tol
         and not result['errors']
     )
+    return result
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ORPHAN POSITION DIAGNOSTICS AND CLOSE (INV-16)
+# ═══════════════════════════════════════════════════════════════════════════
+# Before touching any orphan position, ALWAYS distinguish:
+#
+#   PARTIAL FILL: open order at limit price still exists on exchange.
+#     The remaining qty WILL fill when price reaches it. DO NOTHING.
+#     Market-selling a partial fill creates a double-sell and untracked change.
+#
+#   TRUE ORPHAN: no open order covers the gap.
+#     Use close_unattributed_position() — full audit receipt, no DB mutation.
+# ═══════════════════════════════════════════════════════════════════════════
+
+def diagnose_pair_orphans(exchange, pair: str) -> Dict[str, Any]:
+    """
+    Check whether a pair gap is:
+      - A partial fill (open limit order exists on exchange — wait, it will fill)
+      - A true orphan (no open order, needs close_unattributed_position)
+
+    Returns dict:
+      recommendation: 'ok' | 'wait_for_fill' | 'close_orphan'
+      virtual_qty, physical_qty, delta
+      open_orders, pending_close_qty, true_orphan_qty
+    """
+    from engine.database import get_pair_virtual_net, get_connection as _gc
+
+    result: Dict[str, Any] = {
+        "pair": pair, "virtual_qty": 0.0, "physical_qty": 0.0, "delta": 0.0,
+        "open_orders": [], "pending_close_qty": 0.0, "true_orphan_qty": 0.0,
+        "recommendation": "ok", "errors": [],
+    }
+    norm_pair = normalize_symbol(pair).upper()
+
+    try:
+        result["virtual_qty"] = get_pair_virtual_net(pair)
+    except Exception as e:
+        result["errors"].append(f"get_pair_virtual_net: {e}")
+        return result
+
+    try:
+        phys_net = 0.0
+        for pos in exchange.fetch_positions() or []:
+            if normalize_symbol(pos.get("symbol", "")).upper() == norm_pair:
+                phys_net += float(pos.get("contracts", 0) or 0)
+        result["physical_qty"] = phys_net
+    except Exception as e:
+        result["errors"].append(f"fetch_positions: {e}")
+        return result
+
+    delta = result["physical_qty"] - result["virtual_qty"]
+    result["delta"] = round(delta, 8)
+
+    if abs(delta) <= qty_tolerance():
+        return result
+
+    try:
+        open_orders = exchange.fetch_open_orders(pair) or []
+        result["open_orders"] = [
+            {
+                "order_id": o.get("id"),
+                "client_order_id": o.get("clientOrderId", ""),
+                "side": o.get("side", ""),
+                "qty": float(o.get("amount", 0)),
+                "price": float(o.get("price", 0)),
+            }
+            for o in open_orders
+        ]
+    except Exception as e:
+        result["errors"].append(f"fetch_open_orders: {e}")
+
+    # Determine which side of orders would close the orphan
+    closing_side = "sell" if delta > 0 else "buy"
+    pending_close_qty = 0.0
+    _conn = _gc()
+    for o in result["open_orders"]:
+        if o["side"].lower() != closing_side:
+            continue
+        cid = o.get("client_order_id", "")
+        if not cid.startswith("CQB_"):
+            # Non-CQB (manual) closing order — counts as covering the orphan
+            pending_close_qty += o["qty"]
+            continue
+        # CQB order: include if its owning bot already shows open_qty=0 in DB
+        # (typical of a partial-fill TP — bot was zeroed but closing order remains)
+        parts = cid.split("_")
+        if len(parts) > 1:
+            try:
+                _bid = int(parts[1])
+                _r = _conn.execute(
+                    "SELECT COALESCE(t.open_qty,0) FROM trades t WHERE t.bot_id=?",
+                    (_bid,)
+                ).fetchone()
+                if _r and float(_r[0]) < 0.0001:
+                    pending_close_qty += o["qty"]
+            except Exception:
+                pass
+
+    result["pending_close_qty"] = round(pending_close_qty, 8)
+    true_orphan = abs(delta) - pending_close_qty
+    result["true_orphan_qty"] = round(max(0.0, true_orphan), 8)
+
+    if result["true_orphan_qty"] <= qty_tolerance():
+        result["recommendation"] = "wait_for_fill"
+        logger.info(
+            f"[ORPHAN-DIAG] {pair}: delta={delta:+.6f} COVERED by "
+            f"{pending_close_qty:.6f} pending order(s). Wait for natural fill."
+        )
+    else:
+        result["recommendation"] = "close_orphan"
+        logger.warning(
+            f"[ORPHAN-DIAG] {pair}: delta={delta:+.6f}, covered={pending_close_qty:.6f}, "
+            f"TRUE ORPHAN={result['true_orphan_qty']:.6f}. No open order will close this."
+        )
+
+    return result
+
+
+def close_unattributed_position(
+    exchange,
+    pair: str,
+    qty: float,
+    side: str,
+    audit_reason: str,
+    human_approved: bool = False,
+) -> Dict[str, Any]:
+    """
+    Close a position that no active bot claims AND that has no open limit order
+    that would close it naturally (confirmed via diagnose_pair_orphans).
+
+    INV-16 requirements enforced here:
+      1. human_approved=True must be passed by caller.
+      2. diagnose_pair_orphans() re-run to abort if it turns out a partial-fill
+         open order IS present — closing it would create a double-sell.
+      3. exchange_order_audit receipt written BEFORE the exchange call (WAL pattern).
+      4. No bot_orders / trades / bots rows are modified — this is an unowned
+         position; any DB mutation would fabricate false ledger history.
+      5. Pair is re-audited after close to confirm delta resolved.
+    """
+    from engine.database import get_connection as _gc
+
+    result: Dict[str, Any] = {
+        "success": False, "pair": pair, "qty": qty, "side": side,
+        "order_id": None, "delta_before": None, "delta_after": None, "errors": [],
+    }
+
+    if not human_approved:
+        result["errors"].append(
+            "[INV-16] human_approved=True required. "
+            "Run diagnose_pair_orphans() first to confirm no open order covers the gap."
+        )
+        return result
+
+    diag = diagnose_pair_orphans(exchange, pair)
+    result["delta_before"] = diag["delta"]
+
+    if diag["recommendation"] == "wait_for_fill":
+        result["errors"].append(
+            f"[INV-16] ABORTED: gap covered by {diag['pending_close_qty']:.6f} "
+            "pending limit order(s). Do NOT close — it will fill naturally. "
+            "Closing now creates a double-sell and an untracked position change."
+        )
+        return result
+
+    if diag["recommendation"] == "ok":
+        result["errors"].append("[INV-16] ABORTED: pair is within tolerance, no action needed.")
+        return result
+
+    if abs(qty - diag["true_orphan_qty"]) > qty_tolerance() * 5:
+        result["errors"].append(
+            f"[INV-16] ABORTED: qty={qty:.6f} does not match "
+            f"true_orphan_qty={diag['true_orphan_qty']:.6f}. "
+            "Re-run diagnose_pair_orphans() and use the exact reported qty."
+        )
+        return result
+
+    # Write WAL audit receipt BEFORE exchange call
+    _conn = _gc()
+    _cursor = _conn.cursor()
+    cid = f"CQB_ORPHAN_CLOSE_{normalize_symbol(pair)}_{int(time.time())}"
+
+    _cursor.execute(
+        """INSERT INTO exchange_order_audit
+               (order_id, client_order_id, symbol, side, qty, price,
+                call_site, context, placed_at, notes)
+           VALUES (?,?,?,?,?,0,?,?,?,?)""",
+        (
+            "PENDING", cid, pair, side, qty,
+            "parity_gates:close_unattributed_position", "orphan_close",
+            int(time.time()),
+            (
+                f"[INV-16] Unattributed position close. reason={audit_reason}. "
+                f"true_orphan={diag['true_orphan_qty']:.6f}. "
+                f"delta={diag['delta']:+.6f}. human_approved=True."
+            ),
+        )
+    )
+    _conn.commit()
+    _pending_id = _cursor.lastrowid
+
+    try:
+        res = exchange.create_order(
+            symbol=pair,
+            type="market",
+            side=side,
+            amount=qty,
+            params={"newClientOrderId": cid, "reduceOnly": True},
+            emergency=True,
+            _audit_cursor=_cursor,
+            _call_site="parity_gates:close_unattributed_position",
+            human_approved=True,
+        )
+        real_id = str(res.get("id", ""))
+        _cursor.execute(
+            "UPDATE exchange_order_audit SET order_id=? WHERE id=?",
+            (real_id, _pending_id)
+        )
+        _conn.commit()
+        result["order_id"] = real_id
+        logger.warning(
+            f"\u2705 [ORPHAN-CLOSE][INV-16] {pair}: {qty} {side.upper()} reduceOnly "
+            f"\u2192 exchange_order_id={real_id} | {audit_reason}"
+        )
+    except Exception as e:
+        _cursor.execute(
+            "UPDATE exchange_order_audit SET notes=notes||'|FAILED:'||? WHERE id=?",
+            (str(e), _pending_id)
+        )
+        _conn.commit()
+        result["errors"].append(f"Exchange order failed: {e}")
+        logger.error(
+            f"\u274c [ORPHAN-CLOSE][INV-16] {pair}: FAILED: {e}. "
+            f"Audit row id={_pending_id} preserved in exchange_order_audit."
+        )
+        return result
+
+    # Brief settle, then re-audit
+    time.sleep(1.5)
+    diag_after = diagnose_pair_orphans(exchange, pair)
+    result["delta_after"] = diag_after["delta"]
+    result["success"] = diag_after["recommendation"] == "ok"
+    if not result["success"]:
+        result["errors"].append(
+            f"Post-close delta={diag_after['delta']:+.6f}. "
+            "Re-run diagnose_pair_orphans() after exchange settles."
+        )
     return result

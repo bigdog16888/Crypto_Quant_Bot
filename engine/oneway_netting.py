@@ -156,6 +156,7 @@ def apply_oneway_entry_cross_reduction(
     _INACTIVE_STATUSES = frozenset({
         'scanning', '\U0001f7e2 scanning',   # 🟢 SCANNING
         'stopped', 'require_manual_proof',
+        'hedge_standby',
     })
     for bid, bdir, raw_pair, bot_norm, oq, b_status in conn.execute(
         """
@@ -335,3 +336,31 @@ def reconcile_oneway_pair_open_qty(
         return f"under-report gap {abs(diff):.6f} on {norm} — manual review"
 
     return None
+
+
+def get_authoritative_close_qty(exchange, pair: str, direction: str, db_qty: float) -> float:
+    """
+    Get the authoritative close quantity on the exchange.
+    Exchange is always authoritative for close qty — DB is a hint only (INV-15).
+    """
+    from engine.parity_gates import get_exchange_signed_net
+
+    physical_net = get_exchange_signed_net(exchange, pair)
+    if physical_net is None:
+        # Fallback to db_qty if exchange call failed, to be safe.
+        logger.warning(
+            f"[ONEWAY-NETTING] get_exchange_signed_net failed for {pair}. "
+            f"Fallback to db_qty={db_qty:.6f} as hint."
+        )
+        return db_qty
+
+    d = str(direction).upper()
+    if d == 'LONG':
+        exchange_qty = max(0.0, physical_net)
+    elif d == 'SHORT':
+        exchange_qty = max(0.0, -physical_net)
+    else:
+        exchange_qty = 0.0
+
+    return round(min(db_qty, exchange_qty), 8)
+

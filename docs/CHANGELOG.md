@@ -2,6 +2,13 @@
 
 All notable **architecture** changes are documented here. Version numbers match `CODEBASE_GUIDE.md` and `docs/ARCHITECTURE_v3.x.md`.
 
+## v3.6.1 — 2026-06-03 — Reset hedge child to hedge_standby after TP
+
+- **engine/database.py** (`_reset_bot_after_tp_internal`):
+  - Reset status of `hedge_child` bots to `'hedge_standby'` instead of `'Scanning'` after a TP cycle completes.
+- **engine/oneway_netting.py** (`apply_oneway_entry_cross_reduction`):
+  - Skip bots with status `'hedge_standby'` in the opposite-direction netting cross-reduction guard.
+
 ## v3.6.2 — 2026-05-28 — Direction-Aware TP Capacity Clip & Stale Sibling Guard
 
 - **engine/bot_executor.py**:

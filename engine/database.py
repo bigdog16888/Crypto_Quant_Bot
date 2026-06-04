@@ -1377,7 +1377,18 @@ def _reset_bot_after_tp_internal(cursor, bot_id, exit_price, direction=None, act
         logger.info(f"🛑 Bot {bot_name} paused due to 'Stop After Cycle' setting.")
         add_notification('warning', f"Bot {bot_name} paused after cycle completion (Stop After Cycle enabled).", bot_id)
     else:
-        cursor.execute("UPDATE bots SET status='Scanning' WHERE id = ?", (bot_id,))
+        try:
+            _bt_row = cursor.execute(
+                "SELECT bot_type FROM bots WHERE id = ?", (bot_id,)
+            ).fetchone()
+            _bot_type = _bt_row[0] if (_bt_row and _bt_row[0]) else 'standard'
+        except sqlite3.OperationalError as e_db:
+            if "no such column: bot_type" in str(e_db):
+                _bot_type = 'standard'
+            else:
+                raise
+        _resting_status = 'hedge_standby' if _bot_type == 'hedge_child' else 'Scanning'
+        cursor.execute("UPDATE bots SET status=? WHERE id = ?", (_resting_status, bot_id))
 
 
 def _fetch_position_snapshot(symbol: str) -> 'ExchangePositionSnapshot':
@@ -1436,6 +1447,18 @@ def reset_bot_after_tp(bot_id, exit_price, direction=None, action_label='TP_HIT'
             cursor, bot_id, exit_price, direction, action_label, notes,
             exit_fill_ts=exit_fill_ts, human_approved=human_approved, exchange=exchange,
         )
+        try:
+            parent_cycle = conn.execute(
+                "SELECT cycle_id FROM trades WHERE bot_id = ("
+                "SELECT parent_bot_id FROM bots WHERE id = ?)", (bot_id,)
+            ).fetchone()
+            if parent_cycle:
+                conn.execute("UPDATE trades SET cycle_id = ? WHERE bot_id = ?",
+                    (parent_cycle[0], bot_id))
+                conn.commit()
+        except sqlite3.OperationalError as _db_err:
+            if "no such column: parent_bot_id" not in str(_db_err):
+                raise
         conn.commit()
     except Exception as e:
         try: conn.rollback()
@@ -2932,6 +2955,7 @@ def _calculate_formula_step(bot_id: int, total_cost: float, fallback_step: int, 
                WHERE bot_id=? AND cycle_id=?
                AND filled_amount > 0
                AND status IN ('filled', 'closed', 'canceled', 'cancelled', 'partially_filled')
+               AND order_type IN ('entry', 'grid', 'adoption', 'adoption_add', 'carry')
                ORDER BY step DESC""",
             (bot_id, cycle_id)
         ).fetchall()
@@ -3424,7 +3448,7 @@ def verify_filled_orders_against_exchange(exchange, bot_id: int = None) -> int:
 def recompute_invested_from_orders(bot_id: int, cycle_id: int = None) -> tuple:
     """
     Derive (total_invested, avg_entry_price, current_step) from confirmed filled
-    bot_orders for the bot's current cycle.
+    bot_orders for the bot's current cycle using chronological FIFO matching.
 
     This is the ORDER-ID-ANCHORED ground truth.  The trades table is a cache;
     this function always reads the underlying confirmed fills directly.
@@ -3446,63 +3470,86 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None) -> tuple:
             return (0.0, 0.0, 0.0, 0)
             
         wall_ts = int(row_trade[2] or 0)
-        bot_side = row_trade[3] or 'LONG'
+        
+        # 🚀 [v3.8.1 HEDGE CHILD DIRECTION AWARENESS]
+        # Query bot's direction directly from bots table as the canonical source
+        row_bot = cursor.execute(
+            "SELECT direction FROM bots WHERE id = ?", (bot_id,)
+        ).fetchone()
+        bot_dir = row_bot[0].upper() if row_bot else 'LONG'
+        # For hedge children in One-Way mode, trades.position_side may be BOTH/None/LONG/SHORT.
+        # But we must filter by bot_dir (LONG/SHORT) because bot_orders rows are stamped with bot_direction at order creation.
+        bot_side = bot_dir if bot_dir in ('LONG', 'SHORT') else (row_trade[3] if (row_trade and row_trade[3]) else 'LONG')
+        bot_side = bot_side.upper()
 
-        # 🚀 THE SUPREME LEDGER TRUTH (v3.2)
+        # 1. Fetch all entry fills (increasing position)
         cursor.execute(f"""
-            SELECT 
-                ROUND(COALESCE(SUM(
-                    CASE WHEN bo.cycle_id = ? AND bo.status NOT IN ('auto_closed', 'reset_cleared') AND (? = 0 OR bo.created_at >= ?)
-                         AND bo.order_type IN ('entry', 'grid', 'adoption_add', 'adoption') 
-                    THEN (bo.filled_amount * bo.price) ELSE 0.0 END
-                ), 0.0), 8) AS bought_cost,
-                
-                ROUND(COALESCE(SUM(
-                    CASE 
-                        WHEN bo.cycle_id = ? AND bo.status NOT IN ('auto_closed', 'reset_cleared') AND (? = 0 OR bo.created_at >= ?)
-                             AND bo.order_type IN ('entry', 'grid', 'adoption', 'adoption_add', 'carry') 
-                        THEN bo.filled_amount ELSE 0.0 END
-                ), 0.0), 8) AS bought_qty,
-                
-                COALESCE(SUM(
-                    CASE 
-                        WHEN bo.cycle_id = ? AND bo.status NOT IN ('auto_closed', 'reset_cleared') AND (? = 0 OR bo.created_at >= ?)
-                             AND bo.order_type IN ('adoption_reduce', 'tp', 'close', 'dust_close', 'sl', 'virtual_netting') 
-                        THEN bo.filled_amount ELSE 0.0 END
-                ), 0.0) AS sold_qty,
-                
-                COALESCE(MAX(CASE WHEN bo.cycle_id = ? AND (bo.created_at >= ? OR ? = 0) THEN bo.step ELSE 0 END), 0) AS max_step
-                
+            SELECT bo.step, bo.price, bo.filled_amount
             {_canonical_bot_orders_from('bo')}
-              AND bo.bot_id = ?
-              AND (
-                  bo.position_side = ? 
-                  OR bo.position_side IS NULL 
-                  OR bo.position_side = 'BOTH' 
-                  OR bo.position_side = ''
-              )
-              -- 🚀 [v3.1.1 PARTIAL-CANCEL FIX]: Include 'cancelled' orders that have actual fills.
+            AND bo.bot_id = ?
+              AND bo.cycle_id = ?
+              AND (bo.position_side = ? OR bo.position_side IS NULL OR bo.position_side = 'BOTH' OR bo.position_side = '')
               AND (
                   bo.status IN ('filled', 'closed', 'auto_closed', 'hedge_exited', 'partially_filled')
                   OR (bo.status IN ('canceled', 'cancelled') AND bo.filled_amount > 0)
               )
               AND bo.filled_amount > 0
-        """, (
-            target_cycle, wall_ts, wall_ts, # bought_cost
-            target_cycle, wall_ts, wall_ts, # bought_qty
-            target_cycle, wall_ts, wall_ts, # sold_qty
-            target_cycle, wall_ts, wall_ts, # max_step
-            bot_id, bot_side
-        ))
+              AND bo.order_type IN ('entry', 'grid', 'adoption', 'adoption_add', 'carry')
+              AND (? = 0 OR bo.created_at >= ?)
+            ORDER BY bo.created_at ASC;
+        """, (bot_id, target_cycle, bot_side, wall_ts, wall_ts))
         
-        res = cursor.fetchone()
-        bought_cost, bought_qty, sold_qty, max_step = res
-        
-        total_qty = round(bought_qty - sold_qty, 8)
+        buys = [
+            {'step': r[0], 'price': float(r[1]), 'qty': float(r[2])}
+            for r in cursor.fetchall()
+        ]
 
+        # 2. Fetch all exit fills (decreasing position)
+        cursor.execute(f"""
+            SELECT bo.filled_amount
+            {_canonical_bot_orders_from('bo')}
+            AND bo.bot_id = ?
+              AND bo.cycle_id = ?
+              AND (bo.position_side = ? OR bo.position_side IS NULL OR bo.position_side = 'BOTH' OR bo.position_side = '')
+              AND (
+                  bo.status IN ('filled', 'closed', 'auto_closed', 'hedge_exited', 'partially_filled')
+                  OR (bo.status IN ('canceled', 'cancelled') AND bo.filled_amount > 0)
+              )
+              AND bo.filled_amount > 0
+              AND bo.order_type IN ('adoption_reduce', 'tp', 'close', 'dust_close', 'sl', 'virtual_netting')
+              AND (? = 0 OR bo.created_at >= ?)
+            ORDER BY bo.created_at ASC;
+        """, (bot_id, target_cycle, bot_side, wall_ts, wall_ts))
+        
+        sells = [float(r[0]) for r in cursor.fetchall()]
+        total_sold = sum(sells)
+
+        # 3. FIFO Match Exit volume against Entries chronologically
+        accum_sold = total_sold
+        active_buys = []
+        for b in buys:
+            if accum_sold > 0.0:
+                if b['qty'] <= accum_sold:
+                    accum_sold = round(accum_sold - b['qty'], 8)
+                else:
+                    part_qty = round(b['qty'] - accum_sold, 8)
+                    active_buys.append({
+                        'step': b['step'],
+                        'price': b['price'],
+                        'qty': part_qty
+                    })
+                    accum_sold = 0.0
+            else:
+                active_buys.append(b)
+
+        total_qty = round(sum(ab['qty'] for ab in active_buys), 8)
+        
+        # 4. Compute Weighted Average of active fills
         if total_qty > 1e-8:
-            avg_price = bought_cost / bought_qty if bought_qty > 1e-8 else 0.0
+            total_cost = sum(ab['qty'] * ab['price'] for ab in active_buys)
+            avg_price = total_cost / total_qty
             total_invested = total_qty * avg_price
+            max_step = max(ab['step'] for ab in active_buys) if active_buys else 0
             
             # Use formula to check if step needs refinement (e.g. carry trades)
             if total_invested > 0:

@@ -535,6 +535,15 @@ class BotRunner:
                         _parity_ex = _ex
                         break
                 if _parity_ex:
+                    # 1. Global wipe check FIRST — before anything else sees the mismatches
+                    try:
+                        from engine.parity_gates import detect_and_repair_global_wipe
+                        _wipe_result = detect_and_repair_global_wipe(_parity_ex)
+                        if _wipe_result['triggered']:
+                            logger.critical(f"[STARTUP] Global wipe repair complete: {_wipe_result}")
+                    except Exception as _w_err:
+                        logger.error(f"❌ [STARTUP-GLOBAL-WIPE-REPAIR] Failed: {_w_err}")
+
                     from engine.database import audit_pair_ledger_vs_exchange, flag_pair_ledger_mismatch
                     _mismatches = audit_pair_ledger_vs_exchange(_parity_ex)
                     if _mismatches:
