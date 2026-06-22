@@ -541,7 +541,7 @@ class TestTicket8HedgeTP(unittest.TestCase):
         self.conn = get_connection()
         # Set up parent bot (10017)
         _insert_bot(self.conn, 10017, 'xrp long', 'XRP/USDC:USDC', 'XRPUSDC', 'LONG', hedge_child_bot_id=99001, hedge_trigger_step=1)
-        _insert_trades(self.conn, 10017, open_qty=10.0)
+        _insert_trades(self.conn, 10017, open_qty=0.0)
 
         # Set up child bot (99001)
         _insert_bot(self.conn, 99001, 'xrp long_hedge', 'XRP/USDC:USDC', 'XRPUSDC', 'SHORT', bot_type='hedge_child', parent_bot_id=10017)
@@ -561,12 +561,14 @@ class TestTicket8HedgeTP(unittest.TestCase):
         from engine.ledger import handle_tp_completion
         from engine.exchange_interface import ExchangeInterface
 
+        mock_positions = [{'symbol': 'XRPUSDC', 'contracts': -5.0, 'qty': 5.0, 'net_qty': -5.0, 'side': 'short', 'unrealizedPnl': 0.0, 'entryPrice': 2.0}]
         mock_exchange = MagicMock(spec=ExchangeInterface)
-        mock_exchange.fetch_positions.return_value = []
+        mock_exchange.fetch_positions.return_value = mock_positions
         mock_exchange.fetch_open_orders.return_value = []
 
         # Run handle_tp_completion for parent (10017)
-        with patch('engine.database.reset_bot_after_tp') as mock_reset:
+        with patch('engine.database.reset_bot_after_tp') as mock_reset, \
+             patch('engine.exchange_interface.ExchangeInterface.fetch_positions', return_value=mock_positions):
             res = handle_tp_completion(
                 bot_id=10017,
                 exit_price=2.5,
@@ -665,14 +667,16 @@ class TestTicket8HedgeTP(unittest.TestCase):
         from engine.exchange_interface import ExchangeInterface
         import logging
 
+        mock_positions = [{'symbol': 'XRPUSDC', 'contracts': -5.0, 'qty': 5.0, 'net_qty': -5.0, 'side': 'short', 'unrealizedPnl': 0.0, 'entryPrice': 2.0}]
         mock_exchange = MagicMock(spec=ExchangeInterface)
-        mock_exchange.fetch_positions.return_value = []
+        mock_exchange.fetch_positions.return_value = mock_positions
         mock_exchange.fetch_open_orders.return_value = []
 
         sentinel_error = RuntimeError("injected-save_bot_order-failure")
 
         with patch('engine.database.reset_bot_after_tp'), \
              patch('engine.database.save_bot_order', side_effect=sentinel_error), \
+             patch('engine.exchange_interface.ExchangeInterface.fetch_positions', return_value=mock_positions), \
              patch('engine.ledger.logger') as mock_logger:
 
             result = handle_tp_completion(
@@ -1052,7 +1056,7 @@ class TestSafeWipeAndResetSequence(unittest.TestCase):
         """
         # Set up parent bot (10017) LONG
         _insert_bot(self.conn, 10017, 'xrp long', 'XRP/USDC:USDC', 'XRPUSDC', 'LONG', hedge_child_bot_id=99001)
-        _insert_trades(self.conn, 10017, open_qty=0.1, position_side='LONG')
+        _insert_trades(self.conn, 10017, open_qty=0.0, position_side='LONG')
 
         # Set up child bot (99001) SHORT
         _insert_bot(self.conn, 99001, 'xrp long_hedge', 'XRP/USDC:USDC', 'XRPUSDC', 'SHORT', bot_type='hedge_child', parent_bot_id=10017)
@@ -1104,6 +1108,12 @@ class TestSafeWipeAndResetSequence(unittest.TestCase):
         # Set up parent bot (10017) LONG
         _insert_bot(self.conn, 10017, 'xrp long', 'XRP/USDC:USDC', 'XRPUSDC', 'LONG', hedge_child_bot_id=99001)
         _insert_trades(self.conn, 10017, open_qty=0.1, position_side='LONG')
+        # Insert a filled entry order for parent in cycle 1 to support recompute truth
+        self.conn.execute("""
+            INSERT INTO bot_orders (bot_id, order_type, order_id, client_order_id, price, amount, filled_amount, status, step, cycle_id, created_at)
+            VALUES (10017, 'entry', 'EX_10017_ENTRY_C1', 'CQB_10017_ENTRY_1_1', 2.0, 0.1, 0.1, 'filled', 1, 1, 12345)
+        """)
+
 
         # Set up child bot (99001) SHORT with some position to trigger BE TP
         _insert_bot(self.conn, 99001, 'xrp long_hedge', 'XRP/USDC:USDC', 'XRPUSDC', 'SHORT', bot_type='hedge_child', parent_bot_id=10017)
@@ -1272,7 +1282,7 @@ class TestHedgeLifecycleEnforcement(unittest.TestCase):
         self.assertEqual(state, 'dormant')
 
     def test_enforce_should_close(self):
-        """parent_step < trigger, child open_qty=0.5 -> 'should_close'"""
+        """parent_step < trigger, child open_qty=0.5 -> returns 'active' under INV-22"""
         from engine.bot_executor import enforce_hedge_child_state
         # Setup parent (trigger=7, step=6, cycle=1)
         _insert_bot(self.conn, 10016, 'btc long', 'BTC/USDT:USDT', 'BTCUSDT', 'LONG', hedge_child_bot_id=100317, hedge_trigger_step=7)
@@ -1283,6 +1293,38 @@ class TestHedgeLifecycleEnforcement(unittest.TestCase):
         # Setup child holding some quantity
         _insert_bot(self.conn, 100317, 'btc long_hedge', 'BTC/USDT:USDT', 'BTCUSDT', 'SHORT', bot_type='hedge_child', parent_bot_id=10016, status='IN TRADE')
         _insert_trades(self.conn, 100317, open_qty=0.5, cycle_id=1)
+
+        state = enforce_hedge_child_state(100317, self.conn)
+        self.assertEqual(state, 'active')
+
+    def test_enforce_hedge_child_state_never_resets_with_open_qty(self):
+        """Verify _reset_to_hedge_standby is NOT called when child has open_qty > 0"""
+        from engine.bot_executor import enforce_hedge_child_state
+        # Setup parent (trigger=7, step=6, cycle=1)
+        _insert_bot(self.conn, 10016, 'btc long', 'BTC/USDT:USDT', 'BTCUSDT', 'LONG', hedge_child_bot_id=100317, hedge_trigger_step=7)
+        _insert_trades(self.conn, 10016, open_qty=1.0, cycle_id=1)
+        self.conn.execute("UPDATE trades SET current_step = 6 WHERE bot_id = 10016")
+        self.conn.commit()
+
+        # Setup child holding some quantity
+        _insert_bot(self.conn, 100317, 'btc long_hedge', 'BTC/USDT:USDT', 'BTCUSDT', 'SHORT', bot_type='hedge_child', parent_bot_id=10016, status='IN TRADE')
+        _insert_trades(self.conn, 100317, open_qty=0.5, cycle_id=1)
+
+        state = enforce_hedge_child_state(100317, self.conn)
+        self.assertEqual(state, 'active')
+
+    def test_enforce_hedge_child_state_resets_when_qty_zero(self):
+        """Verify should_close is returned when child has open_qty = 0 and status is not hedge_standby"""
+        from engine.bot_executor import enforce_hedge_child_state
+        # Setup parent (trigger=7, step=6, cycle=1)
+        _insert_bot(self.conn, 10016, 'btc long', 'BTC/USDT:USDT', 'BTCUSDT', 'LONG', hedge_child_bot_id=100317, hedge_trigger_step=7)
+        _insert_trades(self.conn, 10016, open_qty=1.0, cycle_id=1)
+        self.conn.execute("UPDATE trades SET current_step = 6 WHERE bot_id = 10016")
+        self.conn.commit()
+
+        # Setup child flat but still in IN TRADE status
+        _insert_bot(self.conn, 100317, 'btc long_hedge', 'BTC/USDT:USDT', 'BTCUSDT', 'SHORT', bot_type='hedge_child', parent_bot_id=10016, status='IN TRADE')
+        _insert_trades(self.conn, 100317, open_qty=0.0, cycle_id=1)
 
         state = enforce_hedge_child_state(100317, self.conn)
         self.assertEqual(state, 'should_close')
@@ -1619,6 +1661,593 @@ class TestHedgeLifecycleEnforcement(unittest.TestCase):
 
             # Only one place call should have been made
             self.assertEqual(mock_place.call_count, 1)
+
+
+# ---------------------------------------------------------------------------
+# Test Sync & Price Accuracy (Fix 1, 2, and 3)
+# ---------------------------------------------------------------------------
+
+class TestHedgeSyncAndPriceAccuracy(unittest.TestCase):
+
+    def setUp(self):
+        self.test_dir, self.db_path = _make_temp_db()
+        self.conn = get_connection()
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_signal_uses_actual_fill_price_not_current_price(self):
+        """Parent step 8 filled at 1.1609, current_price=1.19 (drifted). Assert hedge entry is placed at 1.1609, not 1.19."""
+        from engine.bot_executor import BotExecutor
+        from engine.exchange_interface import ExchangeInterface
+
+        # Setup parent
+        _insert_bot(self.conn, 10017, 'xrp long', 'XRP/USDC:USDC', 'XRPUSDC', 'LONG', hedge_child_bot_id=99001, hedge_trigger_step=8)
+        _insert_trades(self.conn, 10017, open_qty=0.297, cycle_id=10)
+
+        # Setup child
+        _insert_bot(self.conn, 99001, 'xrp long_hedge', 'XRP/USDC:USDC', 'XRPUSDC', 'SHORT', bot_type='hedge_child', parent_bot_id=10017, status='Scanning')
+        _insert_trades(self.conn, 99001, open_qty=0.0, cycle_id=10)
+
+        # Insert parent filled orders for Step 8 cycle 10
+        self.conn.execute("""
+            INSERT INTO bot_orders (bot_id, order_type, order_id, client_order_id, price, amount, filled_amount, status, step, cycle_id, created_at)
+            VALUES (10017, 'grid', 'EX_PARENT_GRID_8', 'CQB_10017_GRID_10_8', 1.1609, 0.030, 0.030, 'filled', 8, 10, 12346)
+        """)
+        self.conn.commit()
+
+        executor = BotExecutor(runner=None)
+        mock_exchange = MagicMock(spec=ExchangeInterface)
+        mock_exchange.get_symbol_precision.return_value = {'step_size': 0.001}
+        mock_exchange.round_to_step.side_effect = lambda qty, step: round(qty, 3)
+        mock_exchange.fetch_open_orders.return_value = []
+        mock_exchange.validate_order.side_effect = lambda pair, side, amt, price, *args, **kwargs: (True, amt, price, 'OK')
+
+        mock_order_parent = {
+            'id': 'EX_PARENT_GRID_9',
+            'status': 'open',
+            'clientOrderId': 'CQB_10017_GRID_10_9'
+        }
+        mock_order_child = {
+            'id': 'EX_CHILD_ENTRY_8',
+            'status': 'open',
+            'clientOrderId': 'CQB_99001_ENTRY_10_8'
+        }
+
+        parent_bot_config = {
+            'market_type': 'swap',
+            'hedge_child_bot_id': 99001,
+            'hedge_trigger_step': 8,
+            'martingale_multiplier': 2.0,
+            'base_size': 100.0,
+        }
+
+        parent_bot_status = {
+            'id': 10017,
+            'name': 'xrp long',
+            'pair': 'XRP/USDC:USDC',
+            'current_step': 8,
+            'total_invested': 100.0,
+            'avg_entry_price': 1.1609,
+            'target_tp_price': 1.25,
+            'cycle_id': 10,
+            'open_qty': 0.297,
+            'entry_confirmed': 1,
+            'basket_start_time': 12345
+        }
+
+        parent_open_orders = [
+            {
+                'id': 'EX_PARENT_TP_123',
+                'clientOrderId': 'CQB_10017_TP_10_8',
+                'status': 'open',
+                'price': 1.25,
+                'amount': 0.297,
+                'symbol': 'XRP/USDC:USDC'
+            }
+        ]
+
+        with patch.object(executor, '_place_gtx_order_with_retry', side_effect=[mock_order_parent, mock_order_child]) as mock_place, \
+             patch('engine.parity_gates.gate_maintain_orders_allowed', return_value=(True, '')):
+
+            executor.maintain_orders(
+                bot_id=10017,
+                name='xrp long',
+                pair='XRP/USDC:USDC',
+                direction='LONG',
+                bot_status=parent_bot_status,
+                current_price=1.19,  # Drifted price
+                exchange=mock_exchange,
+                market_snapshot={'open_orders': parent_open_orders},
+                bot_config=parent_bot_config
+            )
+
+            self.assertEqual(mock_place.call_count, 2)
+            args, kwargs = mock_place.call_args_list[1]
+            actual_price = args[4] if len(args) > 4 else kwargs.get('price')
+            self.assertAlmostEqual(actual_price, 1.1609, places=4, msg="Hedge entry should be placed at parent's actual fill price (1.1609), not current_price (1.19)")
+
+    def test_signal_gtx_rejection_falls_back_to_ioc(self):
+        """GTX placement raises rejection. Assert retry fires as IOC at current_price."""
+        from engine.bot_executor import BotExecutor
+        from engine.exchange_interface import ExchangeInterface
+        from engine.exceptions import GTXRejected
+
+        # Setup parent
+        _insert_bot(self.conn, 10017, 'xrp long', 'XRP/USDC:USDC', 'XRPUSDC', 'LONG', hedge_child_bot_id=99001, hedge_trigger_step=8)
+        _insert_trades(self.conn, 10017, open_qty=10.0, cycle_id=10)
+
+        # Setup child
+        _insert_bot(self.conn, 99001, 'xrp long_hedge', 'XRP/USDC:USDC', 'XRPUSDC', 'SHORT', bot_type='hedge_child', parent_bot_id=10017, status='Scanning')
+        _insert_trades(self.conn, 99001, open_qty=0.0, cycle_id=10)
+
+        executor = BotExecutor(runner=None)
+        mock_exchange = MagicMock(spec=ExchangeInterface)
+        mock_exchange.get_symbol_precision.return_value = {'step_size': 0.001}
+        mock_exchange.round_to_step.side_effect = lambda qty, step: round(qty, 3)
+
+        mock_ioc_order = {
+            'id': 'EX_CHILD_ENTRY_8_IOC',
+            'status': 'closed',
+            'price': 1.19,
+            'clientOrderId': 'CQB_99001_ENTRY_10_8_IOC'
+        }
+        mock_exchange.create_order.return_value = mock_ioc_order
+
+        # Force GTXRejected on first attempt
+        with patch.object(executor, '_place_gtx_order_with_retry', side_effect=GTXRejected("Post only failed")):
+            res = executor._signal_hedge_child_entry(
+                parent_bot_id=10017,
+                parent_name='xrp long',
+                parent_step=8,
+                pair='XRP/USDC:USDC',
+                direction='LONG',
+                step_qty=5.5,
+                step_fill_price=1.1609,
+                exchange=mock_exchange,
+                parent_cycle_id=10,
+                current_price=1.19
+            )
+            self.assertTrue(res)
+
+            # Assert create_order was called with params having timeInForce='IOC', postOnly deleted, at price 1.19
+            mock_exchange.create_order.assert_called_once()
+            args, kwargs = mock_exchange.create_order.call_args
+            
+            # verify arguments
+            called_pair, called_type, called_side, called_amount, called_price = args[:5]
+            self.assertEqual(called_pair, 'XRP/USDC:USDC')
+            self.assertEqual(called_type, 'limit')
+            self.assertEqual(called_side, 'sell')
+            self.assertEqual(called_price, 1.19)
+            
+            called_params = kwargs.get('params') or args[5]
+            self.assertEqual(called_params.get('timeInForce'), 'IOC')
+            self.assertNotIn('postOnly', called_params)
+
+            # Verify saved DB order has price 1.19 and status closed
+            row = self.conn.execute(
+                "SELECT price, status FROM bot_orders WHERE order_id='EX_CHILD_ENTRY_8_IOC'"
+            ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(row[0], 1.19)
+            self.assertEqual(row[1], 'closed')
+
+    def test_signal_fires_at_fill_time_not_poll_time(self):
+        """Verify _signal_hedge_child_entry is called from the fill event path."""
+        from engine.ledger import credit_fill
+        from engine.bot_executor import BotExecutor
+        from engine.exchange_interface import ExchangeInterface
+
+        # Setup parent
+        _insert_bot(self.conn, 10017, 'xrp long', 'XRP/USDC:USDC', 'XRPUSDC', 'LONG', hedge_child_bot_id=99001, hedge_trigger_step=8)
+        _insert_trades(self.conn, 10017, open_qty=0.0, cycle_id=10)
+
+        # Setup child
+        _insert_bot(self.conn, 99001, 'xrp long_hedge', 'XRP/USDC:USDC', 'XRPUSDC', 'SHORT', bot_type='hedge_child', parent_bot_id=10017, status='Scanning')
+        _insert_trades(self.conn, 99001, open_qty=0.0, cycle_id=10)
+
+        # Insert open parent grid order row in DB
+        self.conn.execute("""
+            INSERT INTO bot_orders (bot_id, step, order_type, order_id, price, amount, filled_amount, status, created_at, updated_at, client_order_id, cycle_id)
+            VALUES (10017, 8, 'grid', 'GRID_8_REALTIME', 1.1609, 10.0, 0.0, 'open', 1000, 1001, 'CQB_10017_GRID_10_8', 10)
+        """)
+        self.conn.commit()
+
+        mock_exchange = MagicMock(spec=ExchangeInterface)
+
+        # Patch _signal_hedge_child_entry
+        with patch.object(BotExecutor, '_signal_hedge_child_entry') as mock_signal:
+            credited = credit_fill(
+                bot_id=10017,
+                order_id='GRID_8_REALTIME',
+                cumulative_qty=10.0,
+                avg_price=1.1609,
+                order_type='grid',
+                is_cumulative=True,
+                fill_ts=12345,
+                exchange=mock_exchange
+            )
+            self.assertTrue(credited)
+            mock_signal.assert_called_once()
+            
+            # Verify correct arguments
+            kwargs = mock_signal.call_args.kwargs
+            self.assertEqual(kwargs.get('parent_bot_id'), 10017)
+            self.assertEqual(kwargs.get('parent_step'), 8)
+            self.assertEqual(kwargs.get('step_fill_price'), 1.1609)
+            self.assertEqual(kwargs.get('parent_cycle_id'), 10)
+
+    def test_offline_fill_reconstructor_signals_hedge_child(self):
+        """Verify reconstruct_offline_fills also signals hedge child using historical fill price."""
+        from engine.reconciler import StateReconciler
+        from engine.bot_executor import BotExecutor
+        from engine.exchange_interface import ExchangeInterface
+
+        # Setup parent
+        _insert_bot(self.conn, 10017, 'xrp long', 'XRP/USDC:USDC', 'XRPUSDC', 'LONG', hedge_child_bot_id=99001, hedge_trigger_step=8)
+        _insert_trades(self.conn, 10017, open_qty=0.0, cycle_id=10)
+
+        # Setup child
+        _insert_bot(self.conn, 99001, 'xrp long_hedge', 'XRP/USDC:USDC', 'XRPUSDC', 'SHORT', bot_type='hedge_child', parent_bot_id=10017, status='Scanning')
+        _insert_trades(self.conn, 99001, open_qty=0.0, cycle_id=10)
+
+        # Create state reconciler
+        mock_exchange = MagicMock(spec=ExchangeInterface)
+        # Mock active positions gap so reconciler scans history
+        # Physical XRP position = 10.0, Virtual XRP = 0.0 -> Gap detected
+        mock_exchange.fetch_positions.return_value = [
+            {'symbol': 'XRPUSDC', 'side': 'long', 'contracts': 10.0}
+        ]
+        from engine.database import update_active_positions_snapshot
+        update_active_positions_snapshot([
+            {'symbol': 'XRP/USDC:USDC', 'side': 'long', 'contracts': 10.0, 'entryPrice': 1.1609}
+        ])
+        
+        # Mock historical closed orders fetched from exchange
+        mock_exchange.fetch_closed_orders.return_value = [
+            {
+                'id': 'GRID_8_OFFLINE',
+                'symbol': 'XRP/USDC:USDC',
+                'side': 'buy',
+                'status': 'filled',
+                'filled': 10.0,
+                'amount': 10.0,
+                'price': 1.1609,
+                'average': 1.1609,
+                'clientOrderId': 'CQB_10017_GRID_10_8',
+                'timestamp': 2000000
+            }
+        ]
+        mock_exchange.fetch_open_orders.return_value = []
+
+        reconciler = StateReconciler(exchanges={'future': mock_exchange})
+        # Reset global cooldown to prevent skipping during full test suite run
+        StateReconciler._last_global_offline_scan = 0.0
+
+        with patch.object(BotExecutor, '_signal_hedge_child_entry') as mock_signal:
+            reconciler.reconstruct_offline_fills(since_hours=6)
+            
+            # Verify hedge signal was fired
+            mock_signal.assert_called_once()
+            kwargs = mock_signal.call_args.kwargs
+            self.assertEqual(kwargs.get('parent_bot_id'), 10017)
+            self.assertEqual(kwargs.get('parent_step'), 8)
+            self.assertEqual(kwargs.get('step_fill_price'), 1.1609)
+            self.assertEqual(kwargs.get('parent_cycle_id'), 10)
+
+
+class TestV3916ReconcilerFixes(unittest.TestCase):
+
+    def setUp(self):
+        self.test_dir, self.db_path = _make_temp_db()
+        self.conn = get_connection()
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_stale_cycle_id_repaired_from_bot_orders(self):
+        """
+        Child bot has cycle_id=3 in trades, but a filled entry in cycle 92.
+        enforce_hedge_child_state corrects trades.cycle_id to 92 and triggers reseal.
+        """
+        from engine.bot_executor import enforce_hedge_child_state
+        
+        # Setup parent (trigger=7, step=7, cycle=92)
+        _insert_bot(self.conn, 10018, 'sui long', 'SUI/USDC:USDC', 'SUIUSDC', 'LONG', hedge_child_bot_id=100318)
+        _insert_trades(self.conn, 10018, open_qty=145.6, cycle_id=92)
+        
+        # Setup child (parent=10018, cycle_id=3, flat in trades)
+        _insert_bot(self.conn, 100318, 'sui long_hedge', 'SUI/USDC:USDC', 'SUIUSDC', 'SHORT', bot_type='hedge_child', parent_bot_id=10018)
+        _insert_trades(self.conn, 100318, open_qty=0.0, cycle_id=3, position_side='SHORT')
+        
+        # Insert a filled entry in cycle 92 for child
+        self.conn.execute("""
+            INSERT INTO bot_orders (bot_id, order_type, client_order_id, price, amount, filled_amount, status, cycle_id, step)
+            VALUES (100318, 'entry', 'CQB_100318_ENTRY_92_1', 2.0, 13.1, 13.1, 'filled', 92, 1)
+        """)
+        self.conn.commit()
+        
+        # Call enforce_hedge_child_state with mocked fetch_positions to prevent live exchange queries
+        with patch('engine.exchange_interface.ExchangeInterface.fetch_positions', return_value=[
+            {'symbol': 'SUI/USDC:USDC', 'side': 'short', 'qty': 13.1}
+        ]):
+            res = enforce_hedge_child_state(100318, self.conn)
+        self.assertEqual(res, 'active')
+        
+        # Verify trades.cycle_id updated to 92
+        child_trade = self.conn.execute("SELECT cycle_id, open_qty FROM trades WHERE bot_id = 100318").fetchone()
+        self.assertEqual(child_trade[0], 92)
+        
+        # Verify open_qty has been resealed (should be 13.1 since it was sealed with correct cycle 92)
+        self.assertEqual(float(child_trade[1]), 13.1)
+
+    def test_unauthorized_loss_gate_skipped_for_hedged_parent(self):
+        """
+        Parent has hedge_child_bot_id set. Parent is LONG, child is SHORT.
+        Parent has open_qty = 10.0, child has open_qty = 4.0.
+        Exchange position is LONG 6.0.
+        The pair is balanced (10.0 - 4.0 = 6.0), so reconciler does not gate parent.
+        """
+        from engine.reconciler import StateReconciler, BotState
+        
+        # Setup bots in DB
+        _insert_bot(self.conn, 10018, 'sui long', 'SUI/USDC:USDC', 'SUIUSDC', 'LONG', hedge_child_bot_id=100318)
+        _insert_trades(self.conn, 10018, open_qty=10.0, cycle_id=92, position_side='LONG')
+        
+        _insert_bot(self.conn, 100318, 'sui long_hedge', 'SUI/USDC:USDC', 'SUIUSDC', 'SHORT', bot_type='hedge_child', parent_bot_id=10018)
+        _insert_trades(self.conn, 100318, open_qty=4.0, cycle_id=92, position_side='SHORT')
+        
+        # Seed entries in bot_orders so resolve_net_mismatch reads correct ledger values
+        self.conn.execute("""
+            INSERT INTO bot_orders (bot_id, order_type, client_order_id, price, amount, filled_amount, status, cycle_id, step)
+            VALUES (10018, 'entry', 'CQB_10018_ENTRY_92_1', 2.0, 10.0, 10.0, 'filled', 92, 1)
+        """)
+        self.conn.execute("""
+            INSERT INTO bot_orders (bot_id, order_type, client_order_id, price, amount, filled_amount, status, cycle_id, step)
+            VALUES (100318, 'entry', 'CQB_100318_ENTRY_92_1', 2.0, 4.0, 4.0, 'filled', 92, 1)
+        """)
+        self.conn.commit()
+        
+        mock_exchange = MagicMock()
+        reconciler = StateReconciler(exchanges={'future': mock_exchange})
+        
+        # Setup states
+        bot_states = reconciler.get_bot_states()
+        
+        # Setup positions
+        from engine.reconciler import ExchangePosition
+        positions = {
+            'SUIUSDC': [
+                ExchangePosition(symbol='SUIUSDC', side='LONG', size=6.0, entry_price=2.0, mark_price=2.0, unrealized_pnl=0.0)
+            ]
+        }
+        
+        results = reconciler.resolve_net_mismatch(bot_states, positions)
+        
+        # Verify no bot is gated as REQUIRE_MANUAL
+        gated = [r for r in results if r.requires_manual_intervention]
+        self.assertEqual(len(gated), 0, "No bot should be gated because pair is balanced")
+        
+        # Check bot status remains active
+        parent_status = self.conn.execute("SELECT status FROM bots WHERE id=10018").fetchone()[0]
+        self.assertEqual(parent_status, 'IN TRADE')
+
+    def test_inv13_runs_before_unauthorized_loss(self):
+        """
+        Hedged pair: parent LONG 10.0, child SHORT 12.0.
+        Exchange is SHORT 2.0.
+        The pair is balanced (10 - 12 = -2.0), so reconciler skips UNAUTHORIZED_LOSS entirely
+        and neither bot is gated.
+        """
+        from engine.reconciler import StateReconciler, BotState
+        
+        # Setup bots in DB
+        _insert_bot(self.conn, 10018, 'sui long', 'SUI/USDC:USDC', 'SUIUSDC', 'LONG', hedge_child_bot_id=100318)
+        _insert_trades(self.conn, 10018, open_qty=10.0, cycle_id=92, position_side='LONG')
+        
+        _insert_bot(self.conn, 100318, 'sui long_hedge', 'SUI/USDC:USDC', 'SUIUSDC', 'SHORT', bot_type='hedge_child', parent_bot_id=10018)
+        _insert_trades(self.conn, 100318, open_qty=12.0, cycle_id=92, position_side='SHORT')
+        
+        # Seed entries in bot_orders so resolve_net_mismatch reads correct ledger values
+        self.conn.execute("""
+            INSERT INTO bot_orders (bot_id, order_type, client_order_id, price, amount, filled_amount, status, cycle_id, step)
+            VALUES (10018, 'entry', 'CQB_10018_ENTRY_92_1', 2.0, 10.0, 10.0, 'filled', 92, 1)
+        """)
+        self.conn.execute("""
+            INSERT INTO bot_orders (bot_id, order_type, client_order_id, price, amount, filled_amount, status, cycle_id, step)
+            VALUES (100318, 'entry', 'CQB_100318_ENTRY_92_1', 2.0, 12.0, 12.0, 'filled', 92, 1)
+        """)
+        self.conn.commit()
+        
+        mock_exchange = MagicMock()
+        reconciler = StateReconciler(exchanges={'future': mock_exchange})
+        
+        # Setup states
+        bot_states = reconciler.get_bot_states()
+        
+        # Setup positions (SHORT 2.0)
+        from engine.reconciler import ExchangePosition
+        positions = {
+            'SUIUSDC': [
+                ExchangePosition(symbol='SUIUSDC', side='SHORT', size=2.0, entry_price=2.0, mark_price=2.0, unrealized_pnl=0.0)
+            ]
+        }
+        
+        results = reconciler.resolve_net_mismatch(bot_states, positions)
+        
+        # Verify no bot is gated as REQUIRE_MANUAL
+        gated = [r for r in results if r.requires_manual_intervention]
+        self.assertEqual(len(gated), 0, "No bot should be gated because pair matches exchange")
+
+
+# ---------------------------------------------------------------------------
+# INV-29: Hedge Gates & be_only state tests
+# ---------------------------------------------------------------------------
+
+class TestINV29HedgeGates(unittest.TestCase):
+
+    def setUp(self):
+        self.test_dir, self.db_path = _make_temp_db()
+        self.conn = get_connection()
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_pending_hedge_close_gate_holds_parent(self):
+        """child has open_qty>0 after BE TP registered -> parent status='pending_hedge_close', NOT 'Scanning', cycle_id unchanged"""
+        # Parent bot (LONG)
+        _insert_bot(self.conn, 10018, 'sui long', 'SUI/USDC:USDC', 'SUIUSDC', 'LONG', hedge_child_bot_id=100318)
+        _insert_trades(self.conn, 10018, open_qty=10.0, cycle_id=92, position_side='LONG', avg_entry_price=2.0)
+
+        # Hedge child bot (SHORT)
+        _insert_bot(self.conn, 100318, 'sui long_hedge', 'SUI/USDC:USDC', 'SUIUSDC', 'SHORT', bot_type='hedge_child', parent_bot_id=10018)
+        _insert_trades(self.conn, 100318, open_qty=5.0, cycle_id=92, position_side='SHORT', avg_entry_price=2.0)
+
+        mock_exchange = MagicMock()
+        mock_exchange.is_testnet = True
+
+        from engine.ledger import handle_tp_completion
+        # Call handle_tp_completion on parent (which has active child with qty > 0)
+        res = handle_tp_completion(10018, 2.1, 'SUI/USDC:USDC', exit_fill_ts=1700000000, exchange=mock_exchange)
+        self.assertTrue(res)
+
+        # Parent status must be pending_hedge_close
+        parent_bot = self.conn.execute("SELECT status FROM bots WHERE id=10018").fetchone()
+        self.assertEqual(parent_bot[0], 'pending_hedge_close')
+
+        # Parent cycle_id must be unchanged (92)
+        parent_trade = self.conn.execute("SELECT cycle_id, open_qty, cycle_phase FROM trades WHERE bot_id=10018").fetchone()
+        self.assertEqual(parent_trade[0], 92)
+        self.assertEqual(float(parent_trade[1] or 0), 0.0)
+        self.assertEqual(parent_trade[2], 'HEDGE_PENDING_CLOSE')
+
+    def test_complete_parent_cycle_after_hedge_unblocks(self):
+        """parent in pending_hedge_close -> child BE TP fills -> parent becomes 'Scanning', cycle_id incremented"""
+        _insert_bot(self.conn, 10018, 'sui long', 'SUI/USDC:USDC', 'SUIUSDC', 'LONG', status='pending_hedge_close', hedge_child_bot_id=100318)
+        _insert_trades(self.conn, 10018, open_qty=0.0, cycle_id=92, position_side='LONG', avg_entry_price=0.0)
+
+        _insert_bot(self.conn, 100318, 'sui long_hedge', 'SUI/USDC:USDC', 'SUIUSDC', 'SHORT', bot_type='hedge_child', parent_bot_id=10018)
+        _insert_trades(self.conn, 100318, open_qty=5.0, cycle_id=92, position_side='SHORT', avg_entry_price=2.0)
+
+        mock_exchange = MagicMock()
+
+        from engine.ledger import complete_parent_cycle_after_hedge
+        complete_parent_cycle_after_hedge(10018, exchange=mock_exchange)
+
+        # Parent status must be Scanning
+        parent_bot = self.conn.execute("SELECT status FROM bots WHERE id=10018").fetchone()
+        self.assertEqual(parent_bot[0], 'Scanning')
+
+        # Parent cycle_id must be incremented to 93
+        parent_trade = self.conn.execute("SELECT cycle_id, cycle_phase FROM trades WHERE bot_id=10018").fetchone()
+        self.assertEqual(parent_trade[0], 93)
+        self.assertEqual(parent_trade[1], 'IDLE')
+
+    def test_complete_parent_cycle_after_hedge_idempotent(self):
+        """called twice -> second call no-ops (parent status already changed)"""
+        _insert_bot(self.conn, 10018, 'sui long', 'SUI/USDC:USDC', 'SUIUSDC', 'LONG', status='Scanning', hedge_child_bot_id=100318)
+        _insert_trades(self.conn, 10018, open_qty=0.0, cycle_id=93, position_side='LONG')
+
+        mock_exchange = MagicMock()
+
+        from engine.ledger import complete_parent_cycle_after_hedge
+        # Second call to complete_parent_cycle_after_hedge when parent is already Scanning
+        complete_parent_cycle_after_hedge(10018, exchange=mock_exchange)
+
+        parent_bot = self.conn.execute("SELECT status FROM bots WHERE id=10018").fetchone()
+        self.assertEqual(parent_bot[0], 'Scanning')
+
+        parent_trade = self.conn.execute("SELECT cycle_id FROM trades WHERE bot_id=10018").fetchone()
+        self.assertEqual(parent_trade[0], 93) # Remains 93
+
+    def test_enforce_hedge_child_state_be_only(self):
+        """parent status in (Scanning, hedge_standby, pending_hedge_close) + child_qty>0 -> returns 'be_only'"""
+        # Test Scanning parent
+        _insert_bot(self.conn, 10018, 'sui long', 'SUI/USDC:USDC', 'SUIUSDC', 'LONG', status='Scanning', hedge_child_bot_id=100318)
+        _insert_trades(self.conn, 10018, open_qty=0.0, cycle_id=93, position_side='LONG')
+
+        _insert_bot(self.conn, 100318, 'sui long_hedge', 'SUI/USDC:USDC', 'SUIUSDC', 'SHORT', bot_type='hedge_child', parent_bot_id=10018)
+        _insert_trades(self.conn, 100318, open_qty=5.0, cycle_id=93, position_side='SHORT', avg_entry_price=2.0)
+
+        from engine.bot_executor import enforce_hedge_child_state
+        state = enforce_hedge_child_state(100318, self.conn)
+        self.assertEqual(state, 'be_only')
+
+        # Test pending_hedge_close parent
+        self.conn.execute("UPDATE bots SET status='pending_hedge_close' WHERE id=10018")
+        self.conn.commit()
+        state = enforce_hedge_child_state(100318, self.conn)
+        self.assertEqual(state, 'be_only')
+
+    def test_maintain_orders_be_only_cancels_grids_keeps_tp(self):
+        """be_only state -> _cancel_non_tp_orders called, no new grid/entry placed"""
+        _insert_bot(self.conn, 10018, 'sui long', 'SUI/USDC:USDC', 'SUIUSDC', 'LONG', status='pending_hedge_close', hedge_child_bot_id=100318)
+        _insert_trades(self.conn, 10018, open_qty=0.0, cycle_id=92, position_side='LONG')
+
+        _insert_bot(self.conn, 100318, 'sui long_hedge', 'SUI/USDC:USDC', 'SUIUSDC', 'SHORT', bot_type='hedge_child', parent_bot_id=10018)
+        _insert_trades(self.conn, 100318, open_qty=5.0, cycle_id=92, position_side='SHORT', avg_entry_price=2.0)
+
+        mock_exchange = MagicMock()
+        # Mock exchange open orders: has one TP order and one grid order
+        mock_exchange.fetch_open_orders.return_value = [
+            {'id': 'order_tp', 'clientOrderId': 'CQB_100318_TP_92_BE', 'status': 'open'},
+            {'id': 'order_grid', 'clientOrderId': 'CQB_100318_GRID_92_1', 'status': 'open'}
+        ]
+
+        from engine.bot_executor import BotExecutor
+        executor = BotExecutor(runner=None)
+        
+        # Call maintain_orders on child
+        res = executor.maintain_orders(
+            bot_id=100318,
+            name='sui long_hedge',
+            pair='SUI/USDC:USDC',
+            direction='SHORT',
+            bot_status={'open_qty': 5.0, 'avg_entry_price': 2.0, 'cycle_id': 92, 'current_step': 1},
+            current_price=2.0,
+            exchange=mock_exchange,
+            market_snapshot={'open_orders': [
+                {'id': 'order_tp', 'clientOrderId': 'CQB_100318_TP_92_BE', 'status': 'open'},
+                {'id': 'order_grid', 'clientOrderId': 'CQB_100318_GRID_92_1', 'status': 'open'}
+            ]},
+            bot_config={'max_position_limit': 10.0}
+        )
+        self.assertIsNone(res)
+
+        # Verify cancel_order was called on the grid order but NOT the TP order
+        mock_exchange.cancel_order.assert_any_call('order_grid', 'SUI/USDC:USDC')
+        # Check that cancel_order was not called for order_tp
+        for call in mock_exchange.cancel_order.call_args_list:
+            self.assertNotEqual(call[0][0], 'order_tp')
+
+    def test_runner_skips_pending_hedge_close_bots(self):
+        """bot in pending_hedge_close is excluded from ThreadPoolExecutor batch"""
+        # Insert a bot with status pending_hedge_close
+        _insert_bot(self.conn, 10099, 'sui long', 'SUI/USDC:USDC', 'SUIUSDC', 'LONG', status='pending_hedge_close')
+        _insert_trades(self.conn, 10099, open_qty=0.0)
+        # Seed a filled order to prevent DNA-WIPE
+        self.conn.execute("""
+            INSERT INTO bot_orders (bot_id, order_type, client_order_id, price, amount, filled_amount, status, cycle_id, step)
+            VALUES (10099, 'entry', 'CQB_10099_ENTRY_1_1', 2.0, 10.0, 10.0, 'filled', 1, 1)
+        """)
+        self.conn.commit()
+        
+        from engine.runner import BotRunner
+        with patch('engine.database.check_and_fix_integrity'), patch('engine.runner.BotRunner._post_init'):
+            runner = BotRunner()
+        runner.exchanges = {}
+        
+        # Get active bots via runner.get_active_bots()
+        active_bots = runner.get_active_bots()
+        bot_row = next((b for b in active_bots if b[0] == 10099), None)
+        self.assertIsNotNone(bot_row)
+        self.assertEqual(bot_row[12], 'pending_hedge_close')
+        
+        # Verify that filtering removes it
+        SKIP_STATUSES = {'pending_hedge_close'}
+        filtered_bots = [b for b in active_bots if b[12] not in SKIP_STATUSES]
+        self.assertFalse(any(b[0] == 10099 for b in filtered_bots))
 
 
 if __name__ == '__main__':

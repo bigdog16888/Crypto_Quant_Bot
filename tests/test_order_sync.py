@@ -98,7 +98,8 @@ class TestOrderSync(unittest.TestCase):
                 avg_price=1.2,
                 order_type='grid',
                 is_cumulative=True,
-                sync_to_exchange=True
+                sync_to_exchange=True,
+                caller='stale_sync',
             )
             mock_seal.assert_called_once_with(10018)
 
@@ -301,8 +302,17 @@ class TestOrderSync(unittest.TestCase):
              patch('engine.ledger.handle_tp_completion') as mock_tp_comp:
             
             synced = sync_stale_open_orders(10018, ex, self.conn, max_age_seconds=120)
-            self.assertEqual(synced, 0)
-            mock_credit_fill.assert_not_called()
+            self.assertEqual(synced, 1)
+            mock_credit_fill.assert_called_once_with(
+                bot_id=10018,
+                order_id='99992',
+                cumulative_qty=5.0,
+                avg_price=1.2,
+                order_type='tp',
+                is_cumulative=True,
+                sync_to_exchange=True,
+                caller='stale_sync',
+            )
             mock_tp_comp.assert_not_called()
 
     def test_sync_sl_fill_triggers_sl_handler(self):
@@ -337,6 +347,172 @@ class TestOrderSync(unittest.TestCase):
                 close_qty=10.0,
                 reason='sync_sl_fill'
             )
+
+    def test_inv18_tp_replace_accounts_for_partial_fill(self):
+        # Update trades.open_qty to 0.5 initially
+        self.conn.execute("UPDATE trades SET open_qty = 0.5 WHERE bot_id = 10018")
+        self.conn.commit()
+
+        # Insert a stale TP order with filled_amount=0.0 in DB
+        _insert_bot_order(
+            self.conn, 10018, 'tp_stale_123', 'CQB_10018_TP_88_1',
+            amount=0.5, filled_amount=0.0, status='open',
+            created_at=int(time.time()) - 150, order_type='tp', price=1.2, step=1, cycle_id=88
+        )
+
+        class MockExchange:
+            def __init__(self):
+                self.cancelled_order_id = None
+                self.placed_qty = None
+                self.placed_price = None
+
+            def cancel_order(self, order_id, symbol):
+                self.cancelled_order_id = order_id
+                # Return cancel response indicating a partial fill of 0.3
+                return {
+                    'id': order_id,
+                    'status': 'cancelled',
+                    'filled': 0.3,
+                    'amount': 0.5,
+                    'price': 1.2,
+                    'clientOrderId': 'CQB_10018_TP_88_1'
+                }
+
+            def fetch_order(self, order_id, symbol):
+                return {
+                    'id': order_id,
+                    'status': 'cancelled',
+                    'filled': 0.3,
+                    'amount': 0.5,
+                    'price': 1.2,
+                    'clientOrderId': 'CQB_10018_TP_88_1'
+                }
+
+            def get_symbol_precision(self, symbol):
+                return {'price_precision': 2, 'qty_precision': 3, 'tick_size': 0.01, 'step_size': 0.001}
+
+            def round_to_step(self, val, step):
+                return round(val / step) * step
+
+            def ceil_to_step(self, val, step):
+                import math
+                return math.ceil(val / step) * step
+
+            def get_best_bid_ask(self, symbol):
+                return 1.2, 1.21
+
+            def validate_order(self, symbol, side, amount, price, is_closing=False):
+                return True, amount, price, ""
+
+            def create_order(self, symbol, type, side, amount, price, params=None):
+                self.placed_qty = amount
+                self.placed_price = price
+                return {
+                    'id': 'tp_new_456',
+                    'status': 'open',
+                    'clientOrderId': params.get('clientOrderId', '') if params else ''
+                }
+
+        ex = MockExchange()
+        from engine.bot_executor import BotExecutor
+        executor = BotExecutor(runner=None)
+
+        import engine.ledger
+        with patch('engine.ledger.credit_fill', wraps=engine.ledger.credit_fill) as spy_credit_fill:
+            # Run _sync_replace_tp
+            new_order = executor._sync_replace_tp(
+                bot_id=10018,
+                name='sui long',
+                pair='SUI/USDC:USDC',
+                direction='LONG',
+                bot_status={'cycle_id': 88, 'current_step': 1, 'open_qty': 0.5},
+                exchange=ex,
+                db_tp=1.22,
+                db_qty=0.5,
+                existing_tp_order={'order_id': 'tp_stale_123', 'price': 1.2, 'amount': 0.5}
+            )
+
+            # Assertions
+            self.assertIsNotNone(new_order)
+            self.assertEqual(ex.cancelled_order_id, 'tp_stale_123')
+            spy_credit_fill.assert_called_once()
+            self.assertAlmostEqual(ex.placed_qty, 0.2)
+            self.assertAlmostEqual(ex.placed_price, 1.22)
+
+    @patch('engine.exchange_interface.ccxt.binance')
+    def test_inv18_cancel_sweep_credits_partial_fills(self, mock_ccxt_binance):
+        from engine.exchange_interface import ExchangeInterface
+        mock_ex_instance = MagicMock()
+        mock_ex_instance.urls = {'api': {}}
+        mock_ccxt_binance.return_value = mock_ex_instance
+
+        ex = ExchangeInterface(market_type='future')
+
+        # Insert a stale grid order with filled_amount=0.0 in DB
+        _insert_bot_order(
+            self.conn, 10018, 'grid_stale_789', 'CQB_10018_GRID_88_1',
+            amount=0.5, filled_amount=0.0, status='open',
+            created_at=int(time.time()) - 150, order_type='grid', price=1.2, step=1, cycle_id=88
+        )
+
+        ex.fetch_open_orders = MagicMock(return_value=[{
+            'id': 'grid_stale_789',
+            'clientOrderId': 'CQB_10018_GRID_88_1',
+            'symbol': 'SUI/USDC:USDC',
+            'filled': 0.0,
+            'amount': 0.5
+        }])
+
+        ex.fetch_order = MagicMock(return_value={
+            'id': 'grid_stale_789',
+            'status': 'open',
+            'filled': 0.3,
+            'amount': 0.5,
+            'average': 1.2,
+            'price': 1.2,
+            'clientOrderId': 'CQB_10018_GRID_88_1'
+        })
+
+        ex.cancel_order = MagicMock(return_value={'id': 'grid_stale_789', 'status': 'cancelled'})
+
+        import engine.ledger
+        import engine.database
+        
+        orig_credit_fill = engine.ledger.credit_fill
+        
+        with patch('engine.ledger.credit_fill', wraps=orig_credit_fill) as spy_credit_fill, \
+             patch('engine.database.update_order_status', wraps=engine.database.update_order_status) as spy_update_status:
+            
+            call_order = []
+            
+            def credit_side_effect(*args, **kwargs):
+                call_order.append('credit_fill')
+                return orig_credit_fill(*args, **kwargs)
+            
+            def cancel_side_effect(*args, **kwargs):
+                call_order.append('cancel_order')
+                return {'id': 'grid_stale_789', 'status': 'cancelled'}
+                
+            spy_credit_fill.side_effect = credit_side_effect
+            ex.cancel_order.side_effect = cancel_side_effect
+            
+            cancelled_count = ex.cancel_orders_by_bot_id(10018, 'SUI/USDC:USDC')
+            
+            self.assertEqual(cancelled_count, 1)
+            spy_credit_fill.assert_called_once_with(
+                bot_id=10018,
+                order_id='grid_stale_789',
+                cumulative_qty=0.3,
+                avg_price=1.2,
+                order_type='grid',
+                is_cumulative=True,
+                suppress_cascade=True
+            )
+            self.assertEqual(call_order, ['credit_fill', 'cancel_order'])
+            
+            order_row = self.conn.execute("SELECT status, filled_amount FROM bot_orders WHERE order_id = 'grid_stale_789'").fetchone()
+            self.assertEqual(order_row[0], 'cancelled')
+            self.assertEqual(order_row[1], 0.3)
 
 
 if __name__ == '__main__':

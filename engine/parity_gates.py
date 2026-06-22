@@ -44,7 +44,7 @@ def forensic_adopt_allowed() -> bool:
 
 def get_bot_signed_contribution(bot_id: int) -> float:
     """Signed virtual qty this bot contributes to pair netting."""
-    from engine.database import get_connection
+    from engine.database import get_connection, recompute_invested_from_orders
     conn = get_connection()
     row = conn.execute(
         "SELECT b.direction, COALESCE(t.open_qty, 0) FROM bots b "
@@ -55,8 +55,17 @@ def get_bot_signed_contribution(bot_id: int) -> float:
         return 0.0
     direction = str(row[0] or 'LONG').upper()
     open_qty = float(row[1] or 0)
-    # Hedge child bots have direction='SHORT' and their own open_qty.
-    # No special hedge_qty subtraction needed — they are proper bots.
+    
+    # Use recompute_invested_from_orders to get proof-based quantity
+    # Fallback to trades.open_qty if no orders exist for this bot
+    order_count = conn.execute(
+        "SELECT COUNT(*) FROM bot_orders WHERE bot_id = ?", (bot_id,)
+    ).fetchone()[0]
+    
+    if order_count > 0:
+        _, _, net_qty, _ = recompute_invested_from_orders(bot_id)
+        open_qty = net_qty
+
     return round(open_qty if direction == 'LONG' else -open_qty, 8)
 
 
@@ -216,6 +225,8 @@ def assert_cycle_reset_allowed(
     MANUAL_CLOSE / SYSTEM_WIPE with human_approved skip (caller must have flattened first).
     """
     label = (action_label or 'TP_HIT').upper()
+    if label == 'HEDGE_UNBLOCK':
+        return
     if label in CYCLE_RESET_CARRY_LABELS and human_approved:
         return
 
@@ -229,6 +240,25 @@ def assert_cycle_reset_allowed(
     tol = qty_tolerance()
     gap = abs(projected - physical)
     if gap > tol:
+        # 🚀 FIX 3 (v3.9.13): Re-fetch before blocking — TP fill may have arrived on exchange
+        # after the WS snapshot that populated 'physical' was taken (up to ~9s lag per cycle).
+        # This costs one REST call, but is only paid when a reset would be blocked — resets are
+        # rare and the API cost is far cheaper than leaving a closed bot stuck indefinitely.
+        physical_recheck = get_exchange_signed_net(exchange, pair)
+        if physical_recheck is not None:
+            gap_recheck = abs(projected - physical_recheck)
+            if gap_recheck <= tol:
+                logger.info(
+                    f"[CYCLE-RESET-UNBLOCKED] Bot {bot_id} {label} on {pair}: "
+                    f"Re-fetch confirmed position closed (projected={projected:.6f} "
+                    f"exchange_recheck={physical_recheck:.6f} gap={gap_recheck:.6f}). "
+                    f"Proceeding with reset."
+                )
+                return  # gap resolved — allow reset
+            # Use the fresher value for the error message
+            physical = physical_recheck
+            gap = gap_recheck
+
         from engine.database import get_pair_virtual_net
 
         virtual = get_pair_virtual_net(pair)
@@ -493,7 +523,9 @@ def deflate_pair_ledger_overcount(exchange, pair: str) -> Optional[str]:
         f"""
         SELECT bo.id, bo.bot_id, bo.filled_amount
         FROM bot_orders bo
+        JOIN trades t ON t.bot_id = bo.bot_id
         WHERE bo.bot_id IN ({placeholders})
+          AND bo.cycle_id = t.cycle_id
           AND bo.order_type IN ('entry','grid','adoption_add','adoption','carry')
           AND bo.status NOT IN ('reset_cleared','auto_closed')
           AND bo.filled_amount > 0

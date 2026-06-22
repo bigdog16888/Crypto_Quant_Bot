@@ -1,5 +1,5 @@
 # Crypto Quant Bot — AI Agent Codebase Guide
-**Version: 3.8.4 | Last Updated: 2026-06-04**
+**Version: 4.1.0 | Last Updated: 2026-06-22**
 
 > **READ THIS FIRST** before touching any code. This is the single authoritative guide.
 > It supersedes `UNIFIED_BOT_DOCUMENTATION.md` and all older session notes.
@@ -151,36 +151,333 @@ Append-only audit log for all reconciler actions. Never delete rows.
 
 ## 3. Critical Architectural Invariants
 
-**Every invariant below was added because someone violated it and the system broke.**
+### Invariant Index (Quick Reference)
 
-### 3.1. Proof-Only Consensus
+| Invariant ID | Name | Section | Description |
+|:---|:---|:---|:---|
+| **INV-1** | Hedge Child Bot Parent Constraint | §3.1 | Invariant mapping for INV-1 |
+| **INV-2** | Parent Bot Hedge Child Linkage | §3.2 | Invariant mapping for INV-2 |
+| **INV-3** | Cross-Reduction Suppression | §3.3 | Invariant mapping for INV-3 |
+| **INV-4** | Standard Bot Cross-Reduction | §3.4 | Invariant mapping for INV-4 |
+| **INV-5** | Deprecated hedge_qty Column | §3.5 | Invariant mapping for INV-5 |
+| **INV-6** | recompute_invested_from_orders 4-Tuple Contract | §3.6 | Invariant mapping for INV-6 |
+| **INV-7** | Hedge Child open_qty Modification Limits | §3.7 | Invariant mapping for INV-7 |
+| **INV-8** | Active Positions Ownership | §3.8 | Invariant mapping for INV-8 |
+| **INV-9** | Hedge Child TP Price | §3.9 | Invariant mapping for INV-9 |
+| **INV-10** | Hedge Child cycle_id Sync | §3.10 | Invariant mapping for INV-10 |
+| **INV-11** | Hedge Child TP Order Routing | §3.11 | Invariant mapping for INV-11 |
+| **INV-12** | Wipe-Proof Drift Check & TP Sequence Optimization | §3.12 | Invariant mapping for INV-12 |
+| **INV-13** | Pair-Level Proof Netting Gating | §3.13 | Invariant mapping for INV-13 |
+| **INV-14** | Hedge Child Cycle Sync Invariant | §3.14 | Invariant mapping for INV-14 |
+| **INV-15** | Two-Phase Atomic Reset Protocol | §3.15 | Invariant mapping for INV-15 |
+| **INV-16** | No Autonomous Position Close | §3.16 | Invariant mapping for INV-16 |
+| **INV-17** | Stale Open Order Exchange Verification | §3.17 | Invariant mapping for INV-17 |
+| **INV-18** | Pre-Commit Resolve Guard & Stale Cancel Buffer | §3.18 | Invariant mapping for INV-18 |
+| **INV-19** | Unique client_order_id Constraint | §3.19 | Invariant mapping for INV-19 |
+| **INV-20** | Fill Claims Singleton Guard | §3.20 | Invariant mapping for INV-20 |
+| **INV-21** | One-Way Cross-Reduction Idempotency | §3.21 | Invariant mapping for INV-21 |
+| **INV-22** | Hedge Child Position Protection Invariant | §3.22 | Invariant mapping for INV-22 |
+| **INV-23** | Hedge Child Cycle ID Ground Truth Invariant | §3.23 | Invariant mapping for INV-23 |
+| **INV-24** | Hedge-Aware Residue Bypass Invariant | §3.24 | Invariant mapping for INV-24 |
+| **INV-25** | DNA-WIPE Precise Wall Invariant | §3.25 | Invariant mapping for INV-25 |
+| **INV-26** | Missed BE TP Self-Healing Invariant | §3.26 | Invariant mapping for INV-26 |
+| **INV-27** | Write-Isolation Invariant | §3.27 | Invariant mapping for INV-27 |
+| **INV-28** | REQUIRE_MANUAL_PROOF Netting Participation Invariant | §3.28 | Invariant mapping for INV-28 |
+| **INV-28A** | Stale TP Cancellation Invariant | §3.29 | Invariant mapping for INV-28A |
+| **INV-28B** | Physical Orphan Detection Invariant | §3.30 | Invariant mapping for INV-28B |
+| **INV-29** | Hedge Child Lifecycle Gates | §3.31 | Invariant mapping for INV-29 |
+| **INV-30** | Dust Chaser Exchange Closure Invariant | §3.32 | Invariant mapping for INV-30 |
+| **INV-31** | Write Serialization | §3.33 | Invariant mapping for INV-31 |
+| — | Proof-Only Consensus | §3.34 | General architectural guideline |
+| — | Gross-Directional Tracking (not netted) | §3.35 | General architectural guideline |
+| — | Symbol Normalization | §3.36 | General architectural guideline |
+| — | Order Isolation (Multi-Bot Rule) | §3.37 | General architectural guideline |
+| — | reduceOnly is Pair-Level, Not Bot-Level | §3.38 | General architectural guideline |
+| — | safe_wipe_bot() is the ONLY Authorized Reset Path | §3.39 | General architectural guideline |
+| — | cycle_phase State Machine | §3.40 | General architectural guideline |
+| — | heal_cycle_fragmentation uses CQB Proof, Not Cycle Numbers | §3.41 | General architectural guideline |
+| — | Ledger Mathematics — Canonical Form | §3.42 | General architectural guideline |
+| — | position_side Filter Must Be NULL-Tolerant | §3.43 | General architectural guideline |
+| — | TP Reset Double-Execution Guard | §3.44 | General architectural guideline |
+| — | Early Exit (EE) Decay — Architecture (Correct) | §3.45 | General architectural guideline |
+| — | Carry-Over Ghost Mass Protection | §3.46 | General architectural guideline |
+| — | Decimal Precision Guardian | §3.47 | General architectural guideline |
+| — | Succession Proof — 99% Milestone Rule | §3.48 | General architectural guideline |
+| — | One-Way Mode Residue Consolidation (The "Finished State" Gate) | §3.49 | General architectural guideline |
+| — | Hedge Integrity & Gross-Exposure Gating | §3.50 | General architectural guideline |
+| — | Phase A — Pair Parity Gates & Proof Flatten | §3.51 | General architectural guideline |
+| — | Fractional Drift Sweeper — drift_note Protocol | §3.52 | General architectural guideline |
+| — | _is_order_net_reducing — Absolute Account-Net Logic | §3.53 | General architectural guideline |
+| — | TP Capacity is Direction-Aware | §3.54 | General architectural guideline |
+| — | Proof Gate Must Not Fire During WS Fill Credit Window | §3.55 | General architectural guideline |
+| — | Hedge Child base_size Config Bypass | §3.56 | General architectural guideline |
+| — | Continuous TP Fill Audit REST Pricing | §3.57 | General architectural guideline |
+| — | Global Flattening Safety Guards | §3.58 | General architectural guideline |
+| — | Single Crediting Path via credit_fill | §3.59 | General architectural guideline |
+| — | Hedge Cycle Carry Forward Sync | §3.60 | General architectural guideline |
+| — | Cross-Reduction Recency Guard | §3.61 | General architectural guideline |
+
+---
+
+### 3.1. Hedge Child Bot Parent Constraint (INV-1)
+INVARIANT (INV-1): Every row in `bots` where `bot_type='hedge_child'` has a non-null `parent_bot_id` pointing to an existing `standard` bot.
+Implementation: Enforced via foreign key constraint or application layer checks during bot creation and initialization.
+
+### 3.2. Parent Bot Hedge Child Linkage (INV-2)
+INVARIANT (INV-2): Every row in `bots` where `hedge_child_bot_id IS NOT NULL` has a corresponding `bot_type='hedge_child'` row with matching `parent_bot_id`.
+Implementation: Enforced during bot configuration and verified by runtime integrity checks.
+
+### 3.3. Cross-Reduction Suppression (INV-3) (v3.7.2)
+INVARIANT (INV-3): `apply_oneway_entry_cross_reduction()` never modifies `trades.open_qty` of a hedge child bot as a result of its parent bot's fills. Cross-reduction between parent and hedge child is permanently suppressed.
+
+**Extension (v3.7.2):** INV-3 applies to ALL three oneway_netting functions: apply_oneway_entry_cross_reduction, reconcile_oneway_pair_open_qty, and gate_oneway_opposite_entry. Hedge child bots are completely insulated from all one-way netting adjustments.
+
+### 3.4. Standard Bot Cross-Reduction (INV-4)
+INVARIANT (INV-4): `apply_oneway_entry_cross_reduction()` continues to apply normally between any two bots that are not in a parent/child hedge relationship.
+Implementation: Check sibling bot parent-child links in `apply_oneway_entry_cross_reduction()` and skip reduction only when a direct hedge relationship exists.
+
+### 3.5. Deprecated hedge_qty Column (INV-5) (v4.0.0)
+INVARIANT (INV-5): `trades.hedge_qty` is 0.0 for all bots after migration. It is never written again (fully deprecated and removed from database schema and code logic in version `v4.0.0`).
+
+### 3.6. recompute_invested_from_orders 4-Tuple Contract (INV-6) (v3.6.7)
+INVARIANT (INV-6): `recompute_invested_from_orders()` returns exactly a 4-tuple `(cost, avg, qty, step)`. The legacy fifth element `h_qty` has been completely deleted.
+* **Verification Note:** All call sites verified to match the 4-tuple contract on 2026-06-01.
+
+### 3.7. Hedge Child open_qty Modification Limits (INV-7) (v3.6.7)
+INVARIANT (INV-7): A hedge child's `open_qty` is modified only by: (a) `credit_fill()` when the child's own entry/TP/close orders fill, and (b) `seal_trade_state()` recompute. Never by cross-reduction from the parent bot.
+
+### 3.8. Active Positions Ownership (INV-8) (v3.6.7)
+INVARIANT (INV-8): `update_active_positions_snapshot()` assigns the hedge child's SHORT position to the hedge child bot's `bot_id`. `bot_id=0` (orphan) never occurs for positions owned by active hedge child bots.
+
+### 3.9. Hedge Child TP Price (INV-9)
+INVARIANT (INV-9): The hedge child TP price is: `current_price` if the position is already profitable at time of placement, otherwise `avg_entry_price` (break-even). A profitable SHORT child (`current < entry`) closes immediately at market. A losing SHORT child waits for price to recover to entry price.
+Implementation: Implemented in `_prepare_tp_order_params()` in `engine/bot_executor.py`.
+
+### 3.10. Hedge Child cycle_id Sync (INV-10) (v3.6.1)
+INVARIANT (INV-10): During the synchronization of the hedge child bot's `cycle_id` with its parent bot's `cycle_id` (pre-entry and post-entry), if the child bot still has an active position from a previous cycle (`trades.open_qty > 0.0001`), the engine automatically updates the `cycle_id` of all `bot_orders` belonging to that old cycle to the new `cycle_id`.
+Implementation: Handled during hedge child entry placement in `engine/bot_executor.py`.
+
+### 3.11. Hedge Child TP Order Routing (INV-11) (v3.6.8)
+INVARIANT (INV-11): Hedge child TP orders in One-Way mode cannot use `reduceOnly` (they increase account net exposure). They must use `GTC` without `postOnly`. `postOnly` GTX is forbidden for hedge child TPs because GTX cancels on spread-cross, causing silent non-fill.
+
+### 3.12. Wipe-Proof Drift Check & TP Sequence Optimization (INV-12) (v3.7.0)
+INVARIANT (INV-12): The wipe-proof safety guard in `reset_bot_after_tp` uses the pair-level virtual-to-physical net drift check instead of individual bot active_positions ownership (which is unreliable in One-Way mode). The reset wipe is blocked only if wiping the bot's virtual position would increase the overall pair-level drift. Additionally, the hedge child's break-even TP is always registered in `bot_orders` before the parent bot is reset/wiped, ensuring the child is protected even if the parent reset is blocked.
+
+### 3.13. Pair-Level Proof Netting Gating (INV-13) (v3.8.3)
+INVARIANT (INV-13): The proof gate in `engine/parity_gates.py` (`_set_bot_require_manual_proof`) bypasses gating a bot as `REQUIRE_MANUAL_PROOF` if the pair-level virtual netting (sum of parent and hedge child bot quantities) matches the physical exchange net within the configured tolerance. Pair netting is evaluated as a whole, ensuring parent/child contributions are correctly aggregated before imposing individual bot proof locks.
+
+### 3.14. Hedge Child Cycle Sync Invariant (INV-14) (v3.8.5)
+INVARIANT (INV-14): A hedge child bot's `cycle_id` must always equal its parent bot's `cycle_id`. Any divergence is an invalid state corrected by `enforce_hedge_child_state()` at the start of every `maintain_orders` cycle for `hedge_child` bots.
+
+---
+
+### 3.15. Two-Phase Atomic Reset Protocol (INV-15) (v3.9.0)
+INVARIANT (INV-15): No bot DB state (trades.open_qty, bots.status) may be set to flat/standby before the exchange position attributed to that bot is verified flat or explicitly closed with a tracked order.
+
+Phase 1 - Exchange Settlement (mandatory prerequisite):
+  1. Read trades.open_qty (what the system claims is on exchange).
+  2. Cancel all CQB_{bot_id}_ open orders on the pair.
+  3. If open_qty > 0.0001, place a reduceOnly market order for exactly open_qty.
+  4. Write a reset_close bot_orders row with CQB_ prefix BEFORE the exchange call (WAL). Update with real order_id after success.
+  5. If exchange call fails: update receipt to status=failed, set bots.status=REQUIRE_MANUAL_PROOF, and raise. Phase 2 must NOT run.
+
+Phase 2 - DB Update (only after Phase 1 completes or open_qty was 0):
+  Zero trades.open_qty, set bots.status=hedge_standby, write audit drift_note.
+
+Violation: resetting DB without closing exchange position creates an unattributed orphan position that causes persistent mismatch and incorrect get_pair_virtual_net() output.
+
+Implementation: _reset_to_hedge_standby(child_bot_id, conn, parent_cycle_id, exchange) in engine/bot_executor.py.
+
+---
+
+### 3.16. No Autonomous Position Close (INV-16) (v3.9.0)
+INVARIANT (INV-16): The system never autonomously closes a position without a complete, provable, bot-attributed decision chain. This applies regardless of position size.
+
+Partial fill vs. true orphan - always diagnose before acting:
+  PARTIAL FILL: TP order partially filled. Remaining qty STILL HAS an open limit order on exchange at the original price. It will fill naturally. DO NOTHING. Market-selling a partial fill with open order creates a double-sell and a fabricated untracked position change.
+  TRUE ORPHAN: No open order covers the gap. Only then may a close proceed, via close_unattributed_position() which re-confirms the orphan, writes exchange_order_audit WAL receipt before the order, uses emergency=True path, and never modifies bot_orders/trades/bots.
+
+Prohibited patterns:
+  - Bare market-sell scripts without a bot_orders or exchange_order_audit receipt.
+  - Auto-closing below arbitrary USD threshold - size is irrelevant, correct to the cent applies universally.
+  - UPDATE trades SET open_qty=0 without verifying exchange position is flat.
+  - cancel_orders_by_bot_id without checking for partially-closed residuals.
+
+Implementation: diagnose_pair_orphans(exchange, pair) and close_unattributed_position(exchange, pair, qty, side, reason, human_approved=True) in engine/parity_gates.py.
+
+---
+
+### 3.17. Stale Open Order Exchange Verification (INV-17) (v3.9.6)
+INVARIANT (INV-17): Any `bot_orders` row older than 120 seconds with status in `('open', 'new', 'partially_filled', 'placing')` must have its exchange status verified via CCXT before the engine acts on it or makes placement decisions. Furthermore, `sync_stale_open_orders` must trigger the full lifecycle cascade (`handle_tp_completion`, `reset_bot_after_tp`, or `handle_flatten`) when a missed fill completes an exit order, not just credit the fill amount.
+
+Implementation: `sync_stale_open_orders(bot_id, exchange, conn, max_age_seconds=120)` in `engine/bot_executor.py`.
+
+---
+
+### 3.18. Pre-Commit Resolve Guard & Stale Cancel Buffer (INV-18 Extension) (v3.9.10)
+**INV-18 Extension Part A — Pre-Commit Resolve Guard**: During `reconstruct_offline_fills`, when resolving `'placing'` status rows via the pre-commit sweep, an order intent row must **never be deleted** unless an API call to the exchange positively confirmed the order was not placed (i.e., `OrderNotFound` was raised or the closed-order scan returned empty). A transient network error, timeout, or any other exception during the lookup must leave the row intact to prevent false desync deletions.
+
+Implementation: `lookup_succeeded` flag in `reconstruct_offline_fills` in `engine/reconciler.py`. Row is only deleted via `elif lookup_succeeded:` branch (confirmed absence). A lookup exception routes to the `else:` branch which emits a warning and skips deletion.
+
+**INV-18 Extension Part B — Stale Cancel One-Cycle Buffer**: When a stale order is cancelled from the exchange, the DB row must **not** be deleted in the same cycle. Status is set to `'cancelling'` to create a one-cycle window that absorbs in-flight WS fill events. On the subsequent cycle: if `filled_amount > 0`, the fill is credited via `credit_fill` and status updated to `'filled'`; if `filled_amount == 0`, the row is deleted.
+
+Implementation: `update_order_status(o['id'], 'cancelling', bot_id=bot_id)` in `engine/bot_executor.py` stale cancel block. Buffer resolution logic queries `status='cancelling'` rows at the top of the next `maintain_orders` cycle.
+
+---
+
+### 3.19. Unique client_order_id Constraint (INV-19) (v3.9.10)
+INVARIANT (INV-19): Every `bot_orders` row must have a unique `(bot_id, client_order_id)` combination. Any attempt to write a duplicate client order ID for a bot is a database constraint violation, preventing ledger corruption and silent double-credits. Uniqueness is enforced by a hard SQLite unique index, failsafe check layers in exchange interface and reconciler history adoptions, and replacement-aware suffixing.
+
+Implementation: `CREATE UNIQUE INDEX idx_bot_orders_bot_cid ON bot_orders (bot_id, client_order_id)` in `engine/migrations/migration_002_unique_cid.py`.
+
+---
+
+### 3.20. Fill Claims Singleton Guard (INV-20) (v3.9.11)
+INVARIANT (INV-20): `credit_fill()` is a singleton per `(bot_id, order_id)`. The `fill_claims` table enforces an atomic `INSERT OR IGNORE` guard at the database layer. This prevents TOCTOU races where multiple concurrent processing loops (e.g. WebSocket fill streams, REST stale sync loops, and reconciler recovery checks) all observe `filled_amount = 0` on the same order and attempt to credit it concurrently.
+
+Implementation: `INSERT OR IGNORE INTO fill_claims (bot_id, order_id, caller, claimed_at)` check at the start of `credit_fill()` in `engine/ledger.py`. SQLite schema is created and initialized via `engine/migrations/migration_003_fill_claims.py`.
+
+---
+
+### 3.21. One-Way Cross-Reduction Idempotency (INV-21) (v4.0.2)
+INVARIANT (INV-21): `apply_oneway_entry_cross_reduction()` is a singleton per `(source_order_id, target_bot_id)`. The `cross_reduction_claims` table enforces an atomic `INSERT OR IGNORE` guard at the database layer. This prevents duplicate netting rows from being written when concurrent paths trigger cross-reduction.
+
+Implementation: `INSERT OR IGNORE INTO cross_reduction_claims (source_order_id, source_bot_id, target_bot_id, reduction_qty, claimed_at)` check inside the sibling loop of `apply_oneway_entry_cross_reduction()` in `engine/oneway_netting.py`. SQLite schema is created and initialized via `engine/migrations/migration_004_cross_reduction_claims.py`.
+
+---
+
+### 3.22. Hedge Child Position Protection Invariant (INV-22) (v3.9.14)
+INVARIANT (INV-22): `enforce_hedge_child_state` never initiates a position close on a hedge child. If `open_qty > 0.0001`, the child remains in its current state regardless of parent step position. Hedge child positions close only via break-even TP, `handle_tp_completion` signal, or manual close.
+
+Implementation: Guard check added to `enforce_hedge_child_state()` in `engine/bot_executor.py` to check `child_qty > 0.0001` and bypass reset/close path by returning `'active'`.
+
+---
+
+### 3.23. Hedge Child Cycle ID Ground Truth Invariant (INV-23) (v3.9.16)
+INVARIANT (INV-23): A hedge child bot's cycle_id is always determined by the most recent filled entry in bot_orders, not by the parent's cycle_id, when the child holds an active position. enforce_hedge_child_state detects and repairs stale cycle_id from bot_orders ground truth.
+
+Implementation: Guard check added to `enforce_hedge_child_state()` in `engine/bot_executor.py` to check for filled entry orders in `bot_orders`, update `trades.cycle_id` to the most recent filled entry's `cycle_id`, trigger `seal_trade_state()` and return `'active'`.
+
+---
+
+### 3.24. Hedge-Aware Residue Bypass Invariant (INV-24) (v3.9.17)
+INVARIANT (INV-24): Hedge child bots are exempt from wrong-side residue checks in the reconciler. Since they are designed to hold opposite positions to parents, they must not be flagged as trapped residues, preventing incorrect `REQUIRE_MANUAL_PROOF` lockouts on balanced hedge pairs.
+
+Implementation: Bypass check `is_hedged = (b.hedge_child_bot_id is not None) or (b.parent_bot_id is not None)` added to `resolve_net_mismatch()` wrong-side residue gate in `engine/reconciler.py`.
+
+---
+
+### 3.25. DNA-WIPE Precise Wall Invariant (INV-25) (v3.9.18)
+INVARIANT (INV-25): The `[DNA-WIPE]` self-healing routine must update `trades.wipe_wall_ts` and `trades.cycle_start_time` when resetting a bot's phantom state. The wall timestamp is set to the timestamp of the most recent filled order (`status IN ('filled','partially_filled') AND filled_amount > 0`) in the cycle. If no filled orders exist, it falls back to the current system time. Additionally, a `hedge_child` bot's resting status is set to `hedge_standby` instead of `Scanning` upon wipe.
+
+Implementation: Updated DNA-WIPE execution block in `sync_trades_from_orders` inside `engine/database.py` to query for the max filled/partially-filled order timestamp, set `wipe_wall_ts` and `cycle_start_time`, and route resting status by `bot_type`.
+
+---
+
+### 3.26. Missed BE TP Self-Healing Invariant (INV-26) (v3.9.19)
+INVARIANT (INV-26): A hedge child bot with open_qty > 0 whose parent has completed its cycle (status=Scanning or hedge_standby) must have an active break-even TP order. If none exists, maintain_orders places one immediately.
+
+### 3.27. Write-Isolation Invariant (INV-27) (v3.9.20)
+INVARIANT (INV-27): trades.open_qty has exactly two legitimate writers: credit_fill() (increment/decrement via accumulator) and seal_trade_state() (recompute override). All other direct SQL writes to trades.open_qty are prohibited. Any new code that needs to modify open_qty must route through bot_orders insertion followed by seal_trade_state(bot_id, force_recompute=True).
+
+---
+
+### 3.28. REQUIRE_MANUAL_PROOF Netting Participation Invariant (INV-28) (v3.9.22 / v4.0.1)
+INVARIANT (INV-28): Gated bots (bots in `REQUIRE_MANUAL_PROOF` or `require_manual_proof` status) still hold real physical positions on the exchange. Therefore, they must participate in one-way netting calculations to prevent position drift on opposite-direction sibling bots. They must not be excluded from the netting neighbors query in `oneway_netting.py`. Furthermore, synthetic `virtual_netting` rows are database-only entries and must be excluded from `verify_filled_orders_against_exchange` and `sync_stale_open_orders` queries to prevent CCXT exchange verification errors.
+
+---
+
+### 3.29. Stale TP Cancellation Invariant (INV-28A) (v4.0.3)
+INVARIANT (INV-28A): When `apply_oneway_entry_cross_reduction` reduces a sibling bot's virtual `open_qty`, any resting TP or dust_close order for that sibling on the exchange becomes oversized relative to its remaining physical position. The engine must immediately query and cancel the sibling's active TP orders on the exchange and update their DB status to `cancelled` with notes `[CROSS-REDUCE-CANCEL: stale TP after open_qty reduction]`.
+
+Implementation: Query `bot_orders` for the sibling (`nb_id`), invoke `exchange.cancel_order()` using the sibling's specific `bots.pair`, update DB status, and log the action in `apply_oneway_entry_cross_reduction()` inside `engine/oneway_netting.py`.
+
+---
+
+### 3.30. Physical Orphan Detection Invariant (INV-28B) (v4.0.3)
+INVARIANT (INV-28B): When `apply_oneway_entry_cross_reduction` writes a `virtual_netting` row that reduces the filling (source) bot's virtual `open_qty` to zero, and the bot possessed a non-zero virtual position prior to the reduction, the engine must verify the physical exchange position. If a physical position in the filling bot's direction remains, the bot status must be set to `pending_flatten` to trigger an async close flow.
+
+Implementation: Store the source bot's `open_qty` as `pre_reduction_source_qty` before sibling reductions. If `pre_reduction_source_qty > 1e-8` and its post-reduction `open_qty <= 1e-8`, call `get_exchange_signed_net()` and update `bots.status = 'pending_flatten'` if a physical orphan exists.
+
+---
+
+### 3.31. Hedge Child Lifecycle Gates (INV-29) (v4.0.5)
+**Root Cause**: The parent bot's TP cascade (`handle_tp_completion`) registered a BE TP intent for the hedge child and reset the parent to `Scanning` immediately, without waiting for the hedge child to actually exit.
+
+This caused two bugs:
+1. **Bug A (Parent re-entry)**: The parent resets to `Scanning` and re-enters a position on the same pair while the child hedge position is still active from the previous cycle. This can lead to multiple concurrent hedge children.
+2. **Bug B (Hedge accumulation)**: The child bot kept running grid/entry placement logic because it was in the `'active'` state, even though the parent had already exited.
+
+**The Fix — Two State Gates**:
+1. **Gate 1 (Parent Status `pending_hedge_close`)**: When parent TP fills, if `child_open_qty > 0.0001`, the parent's status transitions to `'pending_hedge_close'`, resetting parent trade quantities to 0 but **not** incrementing `cycle_id`. Parent remains gated until the child's BE TP fills, which triggers `complete_parent_cycle_after_hedge()` to increment `cycle_id` and transition parent to `'Scanning'`.
+2. **Gate 2 (Child State `'be_only'`)**: If the parent has exited (status is `'Scanning'`, `'hedge_standby'`, or `'pending_hedge_close'`) and the child has position (`child_qty > 0.0001`), the child transitions to `'be_only'` state. In `'be_only'`, all non-TP orders (grids, entries) are cancelled, no new orders are placed, and only the BE TP order is maintained.
+
+**Correct Lifecycle Diagram**:
+```
+Parent (LONG)
+  Entry → Step 1 → ... → Step hedge_trigger_step
+                                ↓ spawn hedge child
+                          Child (SHORT)
+                            accumulates grids normally
+
+  Parent TP fills
+    ├─ Register child BE TP intent
+    ├─ Cancel parent exchange orders (grids/TP)
+    ├─ Zero parent trade row (qty/invested)
+    ├─ Set parent → 'pending_hedge_close'
+    └─ cycle_id NOT incremented yet
+
+  Child now in 'be_only' mode:
+    ├─ Cancels all grid/entry orders
+    └─ Resting limit BE TP at avg_entry_price
+
+  Child BE TP fills:
+    ├─ handle_tp_completion(child_id) runs
+    ├─ Child → hedge_standby / reset
+    └─ complete_parent_cycle_after_hedge()
+         ├─ Increment parent cycle_id
+         └─ Parent → Scanning
+```
+
+---
+
+### 3.32. Dust Chaser Exchange Closure Invariant (INV-30) (v3.9.24)
+INVARIANT (INV-30): The dust chaser never executes a virtual ledger wipe while an exchange position is open. In multi-bot environments (Scenario B), a GTC limit close order is placed and the bot transitions to `PARTIAL_CLOSE_PENDING`. The virtual ledger is updated only after the close fills via the standard fill-credit path.
+
+---
+
+### 3.33. Write Serialization (INV-31) (v4.1.0)
+INVARIANT (INV-31): All database writes targeting the `trades` and `bot_orders` tables must run through the `WriteQueue` singleton to ensure single-threaded execution and prevent concurrent write race conditions. Direct conn.execute/commit calls for mutations are prohibited outside of the WriteQueue.
+Implementation: Handled via `WriteQueue().put_and_wait()` in `engine/write_queue.py` wrapping core ledger and database write functions.
+
+### 3.34. Proof-Only Consensus
 - The engine only credits fills that have a matching `CQB_` `clientOrderId` in `bot_orders`.
 - **No synthetic adoptions**: If a position exists on the exchange but cannot be matched to a
   `bot_orders` fill by CQB ID, it is an orphan. It gets `bot_id=0` in `active_positions` and
   surfaces in the monitor as a `[REALITY-ORPHAN]`. It is NOT automatically adopted.
 - The ONLY authorized exception is `DUST_CHASER` (sub-$5 positions) for Binance min-notional.
 
-### 3.2. Gross-Directional Tracking (not netted)
+### 3.35. Gross-Directional Tracking (not netted)
 - **NEVER** compute `Exchange_Net - Virtual_Net` across directions.
 - Compare LONG vs LONG, SHORT vs SHORT, independently.
 - Example: LONG +$100k and SHORT -$100k = $0 net. This is NOT a mismatch. Equal opposing bots.
 
-### 3.3. Symbol Normalization
+### 3.36. Symbol Normalization
 - Always use `normalize_symbol(sym)` from `exchange_interface.py`.
 - Binance REST/CCXT: `"BTC/USDC:USDC"` (slash + margin suffix).
 - Binance WebSocket: `"BTCUSDC"` (no slash, no suffix).
 - `ws_cache` normalizes all keys. Bypassing this creates phantom positions.
 
-### 3.4. Order Isolation (Multi-Bot Rule)
+### 3.37. Order Isolation (Multi-Bot Rule)
 - **NEVER call `cancel_all_orders(pair)`** in bot logic.
 - Always use `cancel_orders_by_bot_id(bot_id, pair)`.
 - Every order is tagged `CQB_{bot_id}_{type}_{step}_{uuid}` as `clientOrderId`.
 
-### 3.5. `reduceOnly` is Pair-Level, Not Bot-Level
+### 3.38. `reduceOnly` is Pair-Level, Not Bot-Level
 - `reduceOnly=True` on TP is ONLY safe when exactly **1 bot** is active on a pair.
 - With >1 bots on a pair, Binance returns `-2022 ReduceOnly Order is rejected`.
 
-### 3.6. `safe_wipe_bot()` is the ONLY Authorized Reset Path
+### 3.39. `safe_wipe_bot()` is the ONLY Authorized Reset Path
 - **NEVER** call `reset_bot_after_tp(bot_id, ..., action_label='SYSTEM_WIPE')` directly.
 - ALL destructive resets go through `safe_wipe_bot(bot_id, pair, direction, reason, exit_price)`.
 - 3 guards: `CARRY_PENDING` phase blocks wipe, physical qty > 0.0005 blocks wipe, ledger net qty > 0.0005 blocks wipe.
@@ -188,7 +485,7 @@ Append-only audit log for all reconciler actions. Never delete rows.
   the top of `reconciler.py`. Inline import makes Python treat it as a local variable for the
   ENTIRE enclosing function, causing `UnboundLocalError` at every earlier reference.
 
-### 3.7. `cycle_phase` State Machine
+### 3.40. `cycle_phase` State Machine
 Column `trades.cycle_phase`, default `'ACTIVE'`.
 Transitions:
 - `ACTIVE` → `CARRY_PENDING`: TP hit with residual carry quantity
@@ -200,7 +497,7 @@ Transitions:
 > `IDLE` bots with `entry_confirmed=1` AND zero ledger AND zero physical WILL be auto-reset by
 > `_align_memory_to_ledger` (v1.7.0 fix). Previously they accumulated as ghost positions forever.
 
-### 3.8. `heal_cycle_fragmentation` uses CQB Proof, Not Cycle Numbers
+### 3.41. `heal_cycle_fragmentation` uses CQB Proof, Not Cycle Numbers
 - Only migrate `bot_orders` rows where `cycle_id IS NULL` and `client_order_id LIKE 'CQB_%'`.
 - **NEVER** migrate rows where `status IN ('new', 'open')` — these are standing live exchange
   orders. Their `cycle_id` is ground truth. Moving them corrupts the cycle they belong to.
@@ -211,7 +508,7 @@ Transitions:
 - **WebSocket Position Streaming Delay**: Documented standard startup synchronization behavior. When starting the WebSocket monitor, initial exchange balances will momentarily read `0.0` until the first `position_update` event streams from the exchange.
 - **Standard Operating Procedure**: The documented startup flow is now explicitly defined as `Pre-Sync (REST pull to establish baseline)` -> `Start Monitor (WebSocket stream to maintain live delta)`.
 
-### 3.9. Ledger Mathematics — Canonical Form
+### 3.42. Ledger Mathematics — Canonical Form
 All position calculations MUST use:
 - **Entries** (add to position): `order_type IN ('entry', 'grid', 'adoption_add', 'adoption', 'carry')`
 - **Exits** (subtract from position): `order_type IN ('tp', 'close', 'exit', 'adoption_reduce', 'dust_close', 'sl', 'virtual_netting')`
@@ -224,7 +521,7 @@ Any deviation creates ghost balances or zero-out errors.
 > `drift_note` rows are always written with `filled_amount = 0`, so they fall through to `ELSE 0` in the accounting SQL.  
 > **NEVER use `adoption`, `adoption_add`, or any Entry/Exit type for reconciliation notes** — they will be counted as real fills on the next cycle and cause runaway ledger inflation (the XRP 1 063 → 17 M explosion, observed May 2026).
 
-### 3.10. `position_side` Filter Must Be NULL-Tolerant
+### 3.43. `position_side` Filter Must Be NULL-Tolerant
 ```sql
 AND (bo.position_side = ? OR bo.position_side IS NULL OR bo.position_side = 'BOTH' OR bo.position_side = '')
 ```
@@ -232,12 +529,11 @@ This handles pre-hedge-mode fills tagged with `'BOTH'` and fills from systems th
 Using strict `AND bo.position_side = ?` silently returns 0 fills for these rows, triggering incorrect
 CARRY fallback that reads stale `trades.avg_entry_price` values.
 
-### 3.11. TP Reset Double-Execution Guard
+### 3.44. TP Reset Double-Execution Guard
 Wrap all TP reset logic with `if total_invested > 0:`. Without this, the REST polling loop can
 race against the WS fill handler and fire twice, producing phantom `$0.00 TP_HIT` journal entries.
 
-### 3.12. Early Exit (EE) Decay — Architecture (Correct)
-
+### 3.45. Early Exit (EE) Decay — Architecture (Correct)
 EE decay is a **step function**, NOT continuous per-cycle drift.
 
 All production bots use `DecayIntervalMins` + `DecayPercentPerInterval` (configured in the bot UI).
@@ -256,35 +552,34 @@ per-cycle drift. Do not enable it without understanding the SYNC-DRIFT implicati
 limit fill (both entries AND grid averages). Without this, the decay anchors to the original
 cycle open time, crashing fresh grids toward break-even prematurely.
 
-### 3.13. Carry-Over Ghost Mass Protection
+### 3.46. Carry-Over Ghost Mass Protection
 Administrative exits (`SYSTEM_WIPE`, `MANUAL_CLOSE`, `STOP_LOSS_EXIT`) must NEVER trigger carry-over.
 `reset_bot_after_tp` uses `action_label` to detect admin exits and skip carry propagation.
 
-### 3.14. Decimal Precision Guardian (v1.9.4)
+### 3.47. Decimal Precision Guardian (v1.9.4)
 All trading mathematics, specifically price and quantity rounding, MUST use `decimal.Decimal` with fixed-point arithmetic. 
 - **Rule**: Initialize all decimals using string serialization: `Decimal(str(value))`. This strips absolute binary floating-point noise (e.g., `.699999999`) and restores the intended human-readable value.
 - **Rule**: `math.floor` and `math.ceil` are forbidden for lot-size and price calculations. Use `exchange.round_to_step()` and `exchange.ceil_to_step()` which encapsulate the Decimal quantize engine.
 
-### 3.15. Succession Proof — 99% Milestone Rule (v1.9.1)
+### 3.48. Succession Proof — 99% Milestone Rule (v1.9.1)
 To ensure the Virtual Ledger remains the "Absolute Ground Truth," bot steps only progress to the next grid level when the current step's fill probability is effectively certain.
 - **Rule**: `current_step` only advances if `filled_amount / target_amount >= 0.99`.
 - **Reasoning**: This prevents the bot from "calculating forward" on partial fills, ensuring that the ledger and exchange stay in locked parity.
 
-### 3.16. One-Way Mode Residue Consolidation (The "Finished State" Gate)
+### 3.49. One-Way Mode Residue Consolidation (The "Finished State" Gate)
 In One-Way mode, residues on the opposite side of the physical net cannot be closed via exchange orders (ReduceOnly rejection). These are neutralized via the **Consolidation Protocol**:
 1. **Dynamic Dust Gate**: A position is "Dust" ONLY if `abs(qty * price) < symbol_min_notional` OR `abs(qty) < symbol_min_qty` (queried from exchange metadata).
 2. **Phase Gate**: Only bots in `Scanning` status or `cycle_phase = 'IDLE'` are eligible. This ensures active trading bots are never wiped.
 3. **Action**: The trapped residue is neutralized via `safe_wipe_bot(reason='CONSOLIDATION')`.
 4. **Healing**: The Reconciler detects the resulting gap and executes an **Adoption-Reduce** on the primary (physical-side) bot.
 
-### 3.17. Hedge Integrity & Gross-Exposure Gating
+### 3.50. Hedge Integrity & Gross-Exposure Gating
 To protect fully hedged bots (net quantity = 0 but gross invested > 0), the system uses **Gross-Exposure Gating** for all state transitions:
 - **`seal_trade_state`**: Status is only flipped to `Scanning` if `total_invested` (gross) is effectively zero.
 - **`entry_confirmed`**: Remains `1` if any proven fill exists for the current cycle, regardless of whether it was later offset by a hedge.
 - **`sync_trades_from_orders`**: If a bot is fully hedged, the logic preserves the `HEDGED` phase and `entry_confirmed=1` status, ensuring the bot doesn't "DNA-WIPE" while physically active.
 
-### 3.19. Phase A — Pair Parity Gates & Proof Flatten (v3.4.0)
-
+### 3.51. Phase A — Pair Parity Gates & Proof Flatten (v3.4.0)
 **Problem solved:** Cycle reset could clear `bot_orders` while the exchange still held size (LINK/SOL 2× class). Forensic WS adopt could invent ledger rows without exchange proof.
 
 **Module:** `engine/parity_gates.py`
@@ -304,8 +599,7 @@ ALLOW_FORENSIC_ADOPT=False
 
 **Revert / soften (emergency only):** See `docs/OPERATOR_MISMATCH_RUNBOOK.md` § Revert.
 
-### 3.18. Fractional Drift Sweeper — `drift_note` Protocol (v3.1.4)
-
+### 3.52. Fractional Drift Sweeper — `drift_note` Protocol (v3.1.4)
 When the autonomous 48 h forensic fill scan (AUTONOMOUS-HEAL) still cannot close the gap between the system ledger and the physical exchange position, the engine applies a two-tier outcome:
 
 | Residual gap | Action |
@@ -325,7 +619,7 @@ client_order_id = CQB_{bot_id}_DRIFT_{symbol}_{ts}
 notes         = full diagnostic string for future audits
 ```
 
-## 3.19. `_is_order_net_reducing` — Absolute Account-Net Logic (v3.3.0)
+### 3.53. `_is_order_net_reducing` — Absolute Account-Net Logic (v3.3.0)
 To prevent Binance **`-2022 ReduceOnly Order is rejected`** errors in hedged (One-Way mode) configurations, the reduction-check engine uses **Absolute Account-Wide Netting**:
 - **Rule**: The system queries the `active_positions` table for the *entire* pair (summing LONG and SHORT) before flagging an order as `reduceOnly`.
 - **Reasoning**: In a hedged pair where Bot A is LONG 0.1 and Bot B is SHORT 0.2 (Net SHORT 0.1), Bot A's exit (a SELL order) would increase the account's absolute net exposure to 0.2 SHORT. Binance rejects `reduceOnly` in this case because the order objectively increases account-level risk.
@@ -337,24 +631,7 @@ To prevent Binance **`-2022 ReduceOnly Order is rejected`** errors in hedged (On
 - **Adopt-From-Physical Fix**: Resolved `NameError` in the reconciler deep-scan path caused by uninitialized cursors in the idempotency guard.
 - **Aesthetic Parity**: Aligned `SNAP-ALLOCATE` debug markers to fire correctly for hedged pairs, eliminating false-positive "System Mismatch" alerts.
 
-### 3.20. Hedge Child cycle_id Sync — MANDATORY (v3.6.1)
-
-INVARIANT: A hedge child bot's trades.cycle_id MUST always equal the cycle_id used in its bot_orders filled rows.
-
-Owner: _signal_hedge_child_entry (bot_executor.py) is the ONLY function that initializes a child's position. It MUST update trades.cycle_id immediately after saving the bot_orders row.
-
-Why: recompute_invested_from_orders filters by trades.cycle_id. If the child's trades.cycle_id differs from its bot_orders rows, recompute returns qty=0. seal_trade_state then overwrites the correct credit_fill increment with 0. open_qty becomes 0. get_pair_virtual_net sees 0. Mismatch alert fires.
-
-This was the root cause of SUI (v3.5.4), XRP (v3.5.5), and SOL (v3.6.1) hedge mismatch bugs.
-
-The idempotency check in _signal_hedge_child_entry must exclude auto_closed and rejected rows — these are consolidation artifacts, not real filled orders.
-
-NO other writer may change a child bot's cycle_id except:
-- _signal_hedge_child_entry (on entry)
-- safe_wipe_bot (on full wipe, sets to NULL)
-
-### 3.21. TP Capacity is Direction-Aware (v3.6.2)
-
+### 3.54. TP Capacity is Direction-Aware (v3.6.2)
 The TP capacity clip in _prepare_tp_order_params compares the physical position SIDE against the bot's closing direction:
 - LONG bot SELL TP: requires LONG-side physical capacity
 - SHORT bot BUY TP: requires SHORT-side physical capacity
@@ -365,8 +642,7 @@ The sole-bot override in _is_order_net_reducing also verifies physical net direc
 
 This is the permanent fix for MARGIN HELD on SHORT bots in net-LONG pairs (and vice versa).
 
-### 3.22. Proof Gate Must Not Fire During WS Fill Credit Window (v3.6.5)
-
+### 3.55. Proof Gate Must Not Fire During WS Fill Credit Window (v3.6.5)
 **"The proof gate must never fire within 60 seconds of a confirmed fill on the same pair. WS fill crediting is asynchronous — a mismatch during the credit window is expected, not a proof failure."**
 
 Root cause: The `StateReconciler.bidirectional_proof_reconciliation` compares the proved virtual net (`get_pair_virtual_net`) against the physical exchange position. A fill can be:
@@ -389,109 +665,27 @@ If count = 0 AND mismatch persists: proceed to forensic scan and potential gate.
 
 **Observed false positive (2026-05-29):** `short eth` TP fill of 0.119 ETH landed at engine restart. 19 seconds later `open_qty` was sealed. The reconciler's proof scan ran during that 19s window, found `System=-0.324 vs Physical=-0.301` (diff 0.023), and gated all 3 ETH hedge child bots with `REQUIRE_MANUAL_PROOF`. The ledger was correct — only the timing was wrong.
 
-### 3.23. Hedge Child base_size Config Bypass (v3.6.4)
-
+### 3.56. Hedge Child base_size Config Bypass (v3.6.4)
 INVARIANT: Hedge child bots have `base_size = 0` by design. They never place independent entries.
 
 The strict `base_size < exchange_min_notional` config check in `process_bot` (bot_executor.py) MUST be bypassed entirely for `bot_type = 'hedge_child'`. Bypassing this guard ensures that hedge child bots are not halted with `Config Error` at startup.
 
-### 3.24. Continuous TP Fill Audit REST Pricing (v3.6.6)
-
+### 3.57. Continuous TP Fill Audit REST Pricing (v3.6.6)
 INVARIANT (INV-X): `_audit_pending_exits()` runs every reconciler cycle. It is the authoritative catch for missed WebSocket TP fills. It uses exchange REST prices, never `avg_entry_price`.
 
-### 3.25. Global Flattening Safety Guards (v3.6.6)
-
+### 3.58. Global Flattening Safety Guards (v3.6.6)
 INVARIANT (INV-X+1): Global flattening override requires 3 consecutive flat snapshots (Guard A) and snapshot freshness < 60s (Guard B). A single flat snapshot never triggers a wipe.
 
-### 3.26. Single Crediting Path via credit_fill (v3.6.6)
-
+### 3.59. Single Crediting Path via credit_fill (v3.6.6)
 INVARIANT (INV-X+2): `credit_fill()` is the only path for crediting fills — WebSocket, REST audit, or otherwise. Manual `bot_orders` injection is a last-resort emergency procedure, not a normal recovery path.
 
-### 3.27. Cross-Reduction Suppression (INV-3) (v3.7.2)
-
-INVARIANT (INV-3): `apply_oneway_entry_cross_reduction()` never modifies `trades.open_qty` of a hedge child bot as a result of its parent bot's fills. Cross-reduction between parent and hedge child is permanently suppressed.
-
-**Extension (v3.7.2):** INV-3 applies to ALL three oneway_netting functions: apply_oneway_entry_cross_reduction, reconcile_oneway_pair_open_qty, and gate_oneway_opposite_entry. Hedge child bots are completely insulated from all one-way netting adjustments.
-
-### 3.28. Hedge Child open_qty Modification Limits (INV-7) (v3.6.7)
-
-INVARIANT (INV-7): A hedge child's `open_qty` is modified only by: (a) `credit_fill()` when the child's own entry/TP/close orders fill, and (b) `seal_trade_state()` recompute. Never by cross-reduction from the parent bot.
-
-### 3.29. Active Positions Ownership (INV-8) (v3.6.7)
-
-INVARIANT (INV-8): `update_active_positions_snapshot()` assigns the hedge child's SHORT position to the hedge child bot's `bot_id`. `bot_id=0` (orphan) never occurs for positions owned by active hedge child bots.
-
-### 3.30. recompute_invested_from_orders 4-Tuple Contract (INV-6) (v3.6.7)
-
-INVARIANT (INV-6): `recompute_invested_from_orders()` returns exactly a 4-tuple `(cost, avg, qty, step)`. The legacy fifth element `h_qty` has been completely deleted.
-* **Verification Note:** All call sites verified to match the 4-tuple contract on 2026-06-01.
-
-### 3.31. Hedge Cycle Carry Forward Sync (v3.6.8)
-
+### 3.60. Hedge Cycle Carry Forward Sync (v3.6.8)
 INVARIANT (INV-10): During the synchronization of the hedge child bot's `cycle_id` with its parent bot's `cycle_id` (pre-entry and post-entry), if the child bot still has an active position from a previous cycle (`trades.open_qty > 0.0001`), the engine automatically updates the `cycle_id` of all `bot_orders` belonging to that old cycle to the new `cycle_id`. This prevents active filled orders from being orphaned/ignored, avoiding virtual netting mismatches.
 
-### 3.32. Hedge Child TP Order Routing (INV-11) (v3.6.8)
+### 3.61. Cross-Reduction Recency Guard (v4.0.2)
+INVARIANT: `apply_oneway_entry_cross_reduction()` must query `bot_orders` for the target bot's max(filled_at) for entry-type orders (`entry`, `grid`) in the current cycle. If `time.time() - max_filled_at < 30`, the cross-reduction for that sibling is skipped to prevent race conditions during concurrent entry fills.
 
-INVARIANT (INV-11): Hedge child TP orders in One-Way mode cannot use `reduceOnly` (they increase account net exposure). They must use `GTC` without `postOnly`. `postOnly` GTX is forbidden for hedge child TPs because GTX cancels on spread-cross, causing silent non-fill.
-
-### 3.33. Wipe-Proof Drift Check & TP Sequence Optimization (INV-12) (v3.7.0)
-
-INVARIANT (INV-12): The wipe-proof safety guard in `reset_bot_after_tp` uses the pair-level virtual-to-physical net drift check instead of individual bot active_positions ownership (which is unreliable in One-Way mode). The reset wipe is blocked only if wiping the bot's virtual position would increase the overall pair-level drift. Additionally, the hedge child's break-even TP is always registered in `bot_orders` before the parent bot is reset/wiped, ensuring the child is protected even if the parent reset is blocked.
-
-### 3.34. Pair-Level Proof Netting Gating (INV-13) (v3.8.3)
-
-INVARIANT (INV-13): The proof gate in `engine/parity_gates.py` (`_set_bot_require_manual_proof`) bypasses gating a bot as `REQUIRE_MANUAL_PROOF` if the pair-level virtual netting (sum of parent and hedge child bot quantities) matches the physical exchange net within the configured tolerance. Pair netting is evaluated as a whole, ensuring parent/child contributions are correctly aggregated before imposing individual bot proof locks.
-
-### 3.35. Hedge Child Cycle Sync Invariant (INV-14) (v3.8.5)
-
-INVARIANT (INV-14): A hedge child bot's `cycle_id` must always equal its parent bot's `cycle_id`. Any divergence is an invalid state corrected by `enforce_hedge_child_state()` at the start of every `maintain_orders` cycle for `hedge_child` bots.
-
----
-
-
-### 3.36. Two-Phase Atomic Reset Protocol (INV-15) (v3.9.0)
-
-INVARIANT (INV-15): No bot DB state (trades.open_qty, bots.status) may be set to flat/standby before the exchange position attributed to that bot is verified flat or explicitly closed with a tracked order.
-
-Phase 1 - Exchange Settlement (mandatory prerequisite):
-  1. Read trades.open_qty (what the system claims is on exchange).
-  2. Cancel all CQB_{bot_id}_ open orders on the pair.
-  3. If open_qty > 0.0001, place a reduceOnly market order for exactly open_qty.
-  4. Write a reset_close bot_orders row with CQB_ prefix BEFORE the exchange call (WAL). Update with real order_id after success.
-  5. If exchange call fails: update receipt to status=failed, set bots.status=REQUIRE_MANUAL_PROOF, and raise. Phase 2 must NOT run.
-
-Phase 2 - DB Update (only after Phase 1 completes or open_qty was 0):
-  Zero trades.open_qty, set bots.status=hedge_standby, write audit drift_note.
-
-Violation: resetting DB without closing exchange position creates an unattributed orphan position that causes persistent mismatch and incorrect get_pair_virtual_net() output.
-
-Implementation: _reset_to_hedge_standby(child_bot_id, conn, parent_cycle_id, exchange) in engine/bot_executor.py.
-
----
-
-### 3.37. No Autonomous Position Close (INV-16) (v3.9.0)
-
-INVARIANT (INV-16): The system never autonomously closes a position without a complete, provable, bot-attributed decision chain. This applies regardless of position size.
-
-Partial fill vs. true orphan - always diagnose before acting:
-  PARTIAL FILL: TP order partially filled. Remaining qty STILL HAS an open limit order on exchange at the original price. It will fill naturally. DO NOTHING. Market-selling a partial fill with open order creates a double-sell and a fabricated untracked position change.
-  TRUE ORPHAN: No open order covers the gap. Only then may a close proceed, via close_unattributed_position() which re-confirms the orphan, writes exchange_order_audit WAL receipt before the order, uses emergency=True path, and never modifies bot_orders/trades/bots.
-
-Prohibited patterns:
-  - Bare market-sell scripts without a bot_orders or exchange_order_audit receipt.
-  - Auto-closing below arbitrary USD threshold - size is irrelevant, correct to the cent applies universally.
-  - UPDATE trades SET open_qty=0 without verifying exchange position is flat.
-  - cancel_orders_by_bot_id without checking for partially-closed residuals.
-
-Implementation: diagnose_pair_orphans(exchange, pair) and close_unattributed_position(exchange, pair, qty, side, reason, human_approved=True) in engine/parity_gates.py.
-
----
-
-### 3.38. Stale Open Order Exchange Verification (INV-17) (v3.9.6)
-
-INVARIANT (INV-17): Any `bot_orders` row older than 120 seconds with status in `('open', 'new', 'partially_filled', 'placing')` must have its exchange status verified via CCXT before the engine acts on it or makes placement decisions. Furthermore, `sync_stale_open_orders` must trigger the full lifecycle cascade (`handle_tp_completion`, `reset_bot_after_tp`, or `handle_flatten`) when a missed fill completes an exit order, not just credit the fill amount.
-
-Implementation: `sync_stale_open_orders(bot_id, exchange, conn, max_age_seconds=120)` in `engine/bot_executor.py`.
+Implementation: Recency check performed first in the sibling loop of `apply_oneway_entry_cross_reduction()` in `engine/oneway_netting.py` before inserting the claim or executing the netting reduction.
 
 ---
 
@@ -558,7 +752,18 @@ Implementation: `sync_stale_open_orders(bot_id, exchange, conn, max_age_seconds=
 
 ---
 
-## 6. How to Restart Safely
+## 6. Known Architectural Debt
+
+The following table documents active architectural debt items tracked in the codebase:
+
+| Debt ID | Feature / Component | Description | Status | Target |
+|:---|:---|:---|:---|:---|
+| **DEBT-001** | Virtual Netting | One-way mode virtual netting calculation layer. Prone to sign-flip and stale TP calculations. | Phase A/B in progress | Replace with Proportional Allocation (Doc 18 Phase 3) |
+| **DEBT-002** | Reconciler write paths | Reconciler write paths (reconstruct_offline_fills, _fix_ghost_bot, _align_memory_to_ledger, adopt_from_physical_positions, _cleanup_phantom_entries, resolve_net_mismatch) are NOT yet covered by WriteQueue serialization (Phase A only wraps credit_fill, seal_trade_state, reset_bot_after_tp, apply_oneway_entry_cross_reduction). These reconciler methods run within a single reconciliation pass and are not currently known to race against the four wrapped functions, but this has not been formally verified. Future phase: audit whether the reconciler's write timing can overlap with WS-driven credit_fill calls in a way that still races. | unverified, monitor for symptoms (drift right after a reconciler cycle coincides with a fill) | Audit reconciler write paths vs WS events |
+
+---
+
+## 7. How to Restart Safely
 
 ```powershell
 # Stop and restart engine
@@ -578,7 +783,115 @@ After restart, watch for:
 
 ---
 
-## 7. Version History (Change Log)
+## 8. Version History (Change Log)
+
+### v4.1.0 — 2026-06-22
+**INV-31: Write Serialization for trades and bot_orders tables.**
+- **engine/write_queue.py**: Implemented the thread-safe `WriteQueue` singleton class to serialize all writes targeting the `trades` and `bot_orders` tables to prevent race conditions from concurrent writers. Added a deadlock bypass when executed from the worker thread.
+- **engine/ledger.py**: Wrapped `credit_fill()` and `seal_trade_state()` to execute via the write queue.
+- **engine/database.py**: Wrapped `reset_bot_after_tp()` to execute via the write queue.
+- **engine/oneway_netting.py**: Wrapped `apply_oneway_entry_cross_reduction()` to execute via the write queue.
+- **config/settings.py**: Bumped version to `4.1.0`.
+- **CODEBASE_GUIDE.md**: Documented `INV-31` (Write Serialization), added the Known Architectural Debt section (DEBT-001), completed the changelog history, and audited all invariants.
+
+### v4.0.5 — 2026-06-22
+**INV-29: Parent-child handoff status gates & be_only child freeze state.**
+- **engine/ledger.py**: Implemented parent `pending_hedge_close` gate in `handle_tp_completion` when its child is active, and added parent unblock callback `complete_parent_cycle_after_hedge()` when the child closes.
+- **engine/bot_executor.py**: Added child `'be_only'` state to freeze grid order placement and cancel active grids when the parent has exited, leaving only the break-even TP.
+- **engine/runner.py**: Excluded bots in `'pending_hedge_close'` status from execution runs.
+- **ui/views/monitor.py**: Extracted notification rendering to an asynchronous `@st.fragment` (`_notifications_fragment`) to prevent full view load blocks.
+- **config/settings.py**: Bumped version to `4.0.5`.
+
+### v4.0.4 — 2026-06-12
+*Skipped / Consolidated release. Combined refinements directly into v4.0.5.*
+
+### v4.0.1 — 2026-06-12
+**INV-28A / INV-28B: Sibling TP cancel & physical orphan check.**
+- **engine/oneway_netting.py**: Implemented sibling TP order cancellation and filling bot physical orphan check to resolve netting race conditions.
+
+### v4.0.0 — 2026-06-11
+**ADR-004: Database Schema Standardization (Hedge Qty Deprecation).**
+- **engine/database.py**: Removed the deprecated `hedge_qty` column from `trades` table. All queries updated to use signed net virtual calculations.
+
+### v3.9.25 — 2026-06-09
+**Hedge child profitable TP pricing fix.**
+- **engine/bot_executor.py**: Corrected hedge child TP price logic to close at market if already profitable.
+
+### v3.9.24 — 2026-06-09
+**INV-30: Dust chaser exchange closure safety.**
+- **engine/database.py**: Prevent virtual ledger wipe if a physical position is active; place close order and transition to `PARTIAL_CLOSE_PENDING` instead.
+
+### v3.9.22 — 2026-06-08
+**INV-28: Gated bot netting participation.**
+- **engine/oneway_netting.py**: Included `REQUIRE_MANUAL_PROOF` bots in netting neighbor queries, and excluded `virtual_netting` rows from CCXT checks.
+
+### v3.9.20 — 2026-06-08
+**INV-27: Write-Isolation Invariant.**
+- **engine/ledger.py**: Strictly restricted updates to `trades.open_qty` to `credit_fill` and `seal_trade_state`.
+
+### v3.9.19 — 2026-06-08
+**INV-26: Missed BE TP self-healing.**
+- **engine/bot_executor.py**: Added active BE TP checks inside `maintain_orders` for orphaned hedge children.
+
+### v3.9.18 — 2026-06-08
+**INV-25: Precise DNA-wipe wall timestamping.**
+- **engine/database.py**: Set `wipe_wall_ts` to the last filled order timestamp in a wiped cycle to prevent historic forensic adoptions.
+
+### v3.9.17 — 2026-06-08
+**INV-24: Wrong-side residue bypass in reconciler.**
+- **engine/reconciler.py**: Exempted parent-child hedge pairs from wrong-side residue checks to prevent false gate triggers.
+
+### v3.9.16 — 2026-06-08
+**Hedge-Aware Reconciler & Child Cycle ID Repair.**
+- **engine/reconciler.py**: Skip `UNAUTHORIZED_LOSS` gate for parent-child hedge pairs when pair-level virtual net matches signed exchange net within tolerance. For non-hedged bots, use the clamped `unrelated_opposite_virtual` formula.
+- **engine/bot_executor.py**: Update `trades.cycle_id` of the hedge child from `bot_orders` filled entries if the child holds a position but has a stale cycle ID, triggering `seal_trade_state()` and returning `'active'`.
+- **tests/test_hedge_lifecycle.py**: Added `TestV3916ReconcilerFixes` verifying the stale cycle ID repair and hedge-aware reconciler.
+
+### v3.9.11 / v3.9.12 / v3.9.13 / v3.9.14 / v3.9.15 — 2026-06-05
+**Fill Claims Singleton Guard (INV-20), pre-commit placing row updates, and stale cancel verify before delete.**
+- **engine/migrations/migration_003_fill_claims.py**: Created `fill_claims` schema migration with a unique index on `(bot_id, order_id)` to atomically de-duplicate concurrent fill credits.
+- **engine/database.py**: Integrated migration 3 inline during database initialization.
+- **engine/ledger.py**: Added `caller` parameter to `credit_fill` and implemented the atomic `fill_claims` `INSERT OR IGNORE` singleton guard. Also fixed `handle_flatten` to conditionally include `positionSide='BOTH'` only when connected to a testnet/sandbox exchange to prevent mainnet order placement failures.
+- **engine/reconciler.py**: Updated the pre-commit resolve sweep to unconditionally update row status in DB to match exchange truth, preventing placing rows from staying stuck forever.
+- **engine/bot_executor.py**: Updated the stale cancel buffer resolution to verify order status and fill amount with the exchange using `fetch_order` before deleting a zero-fill order, protecting against late-arriving fill races.
+- **tests/test_v3911_fixes.py**: Created 6 test cases verifying positionSide testnet conditioning, fill claims singleton guard, pre-commit placing row updates, and stale cancel verify before delete.
+- **config/settings.py**: Bumped version to `3.9.11`.
+- **General**: Consolidates intermediate releases `v3.9.12` through `v3.9.15` containing incremental fixes.
+
+### v3.9.10 — 2026-06-05
+**INV-18 Extension: Pre-Commit Resolve Guard & Stale Cancel Buffer. INV-19: Unique CID database constraint.**
+- **engine/reconciler.py**: Added `lookup_succeeded` flag to `reconstruct_offline_fills` pre-commit sweep. Order intent rows are now only deleted if the API call confirmed the order was never placed (`lookup_succeeded=True` + OrderNotFound). If any transient exception occurs during lookup, the row is preserved to prevent false desync deletions.
+- **engine/bot_executor.py**: Stale order cancels now set status to `'cancelling'` instead of immediately deleting the row. A one-cycle buffer resolves the race window where a WS fill event could arrive between the cancel call and the DB delete. On the next cycle: if filled_amount > 0, `credit_fill` is called and status is set to `'filled'`; if filled_amount == 0, the row is deleted.
+- **engine/database.py**: Added `generate_cid(bot_id, order_type, cycle_id, step, is_replacement, for_check)` for deterministic, collision-resistant client_order_id generation with automatic `_R{timestamp}` suffix on uniqueness violations.
+- **engine/migrations/migration_002_unique_cid.py**: Created `UNIQUE INDEX idx_bot_orders_bot_cid ON bot_orders (bot_id, client_order_id)` with pre-migration deduplication of any existing duplicates.
+- **tests/test_inv18_stale_cancel.py**: Added `test_pre_commit_resolve_guard` (verifies placement row is preserved on transient exception; deleted on confirmed OrderNotFound) and `test_stale_cancel_buffer` (verifies `'cancelling'` buffer, zero-fill delete, and filled-amount credit+seal paths).
+- **tests/test_inv19_compliance.py**: Added `test_inv19_unique_index_constraint`, `test_inv19_generate_cid_uniqueness`, and `test_inv19_reconstructor_suffix`.
+- **config/settings.py**: Bumped version to `3.9.10`.
+
+### v3.9.9 — 2026-06-05
+**Reconciler SQL status alignment, INV-18 Invariant implementation, and Streamlit auto-refresh view hoisting.**
+- **engine/ledger.py**: Added `suppress_cascade` parameter to `credit_fill()` to prevent exit order fills from triggering double-resets during cancel sweeps.
+- **engine/exchange_interface.py**: Restructured `cancel_orders_by_bot_id()` to fetch orders first, check for partial fills, call `credit_fill(..., suppress_cascade=True)` and update order status FIRST before executing `cancel_order()`.
+- **engine/bot_executor.py**: 
+  - Restructured `_sync_replace_tp()` to account for old TP partial fills by subtracting them from the new target TP quantity (INV-18).
+  - Restructured `sync_stale_open_orders()` to check for partial fills, credit them first, and dynamically update DB statuses to `'partially_filled'`.
+- **ui/views/monitor.py**: Hoisted Streamlit fragments to the module level and cached data in session state to resolve nested fragment refresh timer reset bugs.
+- **tests/test_order_sync.py**: Added unit tests `test_inv18_tp_replace_accounts_for_partial_fill` and `test_inv18_cancel_sweep_credits_partial_fills` to verify the INV-18 partial fill protections.
+- **config/settings.py**: Bumped version to `3.9.9`.
+
+### v3.9.8 — 2026-06-05
+**UI MISSING CRITICAL ORDERS grace period check to prevent false warning flashes and row prefix suppression.**
+- **ui/views/monitor.py**: Added a 60-second grace period check to the missing critical orders (`NO ORDERS`) check based on the bot's most recent order created time. Also suppressed the `⚠️` status prefix on the bot row itself during this grace period.
+- **tests/test_ui_netting_suppression.py**: Added a unit test validating suppression behavior at 10 seconds (suppressed) and 90 seconds (fired).
+- **config/settings.py**: Bumped version to `3.9.8`.
+
+### v3.9.7 — 2026-06-05
+**Hedge child entry price accuracy and synchronous signaling on parent fill.**
+- **engine/bot_executor.py**: Update hedge child signaling to use parent's actual weighted average fill price from `bot_orders`, not `current_price` at poll time. Added automatic IOC retry fallback if GTX placement gets rejected.
+- **engine/ledger.py**: Trigger hedge child signal synchronously from the real-time fill event path (`credit_fill`) on parent grid/entry fill.
+- **engine/reconciler.py**: Trigger hedge child signal synchronously from the startup/offline fill reconstructor loop (`reconstruct_offline_fills`) on parent grid/entry fill.
+- **tests/test_hedge_lifecycle.py**: Added comprehensive unit tests for price accuracy, GTX/IOC fallback, and fill path signals.
+- **config/settings.py**: Bumped version to `3.9.7`.
 
 ### v3.9.6 — 2026-06-04
 **TP/exit order cascade reset trigger on stale open order missed fills.**
@@ -1081,7 +1394,7 @@ After restart, watch for:
 
 ---
 
-## 8. Testing Checklist
+## 9. Testing Checklist
 
 Run before every restart:
 ```powershell
@@ -1154,7 +1467,7 @@ MAX_ADOPTION_QTY_PER_CYCLE=0.5
 
 If `.env` ever gains extra garbage lines (e.g. after a test run), restore this exact structure manually.
 
-## 7. Reconciliation & Virtual Hedging
+## 10. Reconciliation & Virtual Hedging
 
 ### One-Way Mode Virtual Hedging
 - The system supports "Virtual Hedging" where multiple bots trade the same pair in One-Way mode.

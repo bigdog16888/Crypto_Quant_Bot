@@ -179,7 +179,7 @@ def fix_stuck_orders(runner, snapshot: Dict[str, Any]):
     # 1. Get all open orders from DB
     conn = database.get_connection()
     c = conn.cursor()
-    c.execute("SELECT id, bot_id, order_id, order_type, created_at FROM bot_orders WHERE status='open'")
+    c.execute("SELECT id, bot_id, order_id, order_type, created_at FROM bot_orders WHERE status IN ('open', 'new', 'placing')")
     open_orders = c.fetchall()
 
     active_trade_orders = set()
@@ -194,7 +194,7 @@ def fix_stuck_orders(runner, snapshot: Dict[str, Any]):
     # Grid orders live ONLY in bot_orders — without this they were treated as
     # orphans after 60s, cancelled, then immediately re-placed, causing a
     # runaway accumulation loop where positions grew unboundedly.
-    c.execute("SELECT order_id FROM bot_orders WHERE status='open'")
+    c.execute("SELECT order_id FROM bot_orders WHERE status IN ('open', 'new', 'placing', 'cancelling')")
     for row in c.fetchall():
         if row[0]: active_trade_orders.add(str(row[0]))
 

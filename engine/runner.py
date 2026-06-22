@@ -146,6 +146,17 @@ class BotRunner:
         except Exception as _m_err:
             logger.warning(f"⚠️ [MIGRATION] v2.0 schema migration skipped (non-fatal): {_m_err}")
 
+        # --- v3.9.10 UNIQUE client_order_id MIGRATION ---
+        # Idempotent: safe to run on every startup.
+        # Resolves any duplicate CIDs and establishes unique index on (bot_id, client_order_id).
+        try:
+            from engine.migrations.migration_002_unique_cid import run as _run_migration_2
+            _m2_result = _run_migration_2()
+            if _m2_result.get('applied'):
+                logger.info(f"✅ [MIGRATION] Applied client_order_id unique index changes: {_m2_result['applied']}")
+        except Exception as _m2_err:
+            logger.warning(f"⚠️ [MIGRATION] Unique client_order_id migration skipped (non-fatal): {_m2_err}")
+
         self.strategies = {} # Cache strategy instances: {bot_id: strategy_instance}
         
         # Safety / Circuit Breaker State
@@ -543,6 +554,30 @@ class BotRunner:
                             logger.critical(f"[STARTUP] Global wipe repair complete: {_wipe_result}")
                     except Exception as _w_err:
                         logger.error(f"❌ [STARTUP-GLOBAL-WIPE-REPAIR] Failed: {_w_err}")
+
+                    # Phase B: Sync pair to exchange at startup, after detect_and_repair_global_wipe()
+                    try:
+                        from engine.oneway_netting import sync_pair_to_exchange
+                        _conn = get_connection()
+                        _pairs = [r[0] for r in _conn.execute("SELECT DISTINCT pair FROM bots WHERE is_active=1").fetchall()]
+                        for _pair in _pairs:
+                            sync_pair_to_exchange(_pair, _parity_ex, _conn)
+                    except Exception as _sync_err:
+                        logger.error(f"❌ [STARTUP-EXCHANGE-SYNC] Failed check: {_sync_err}")
+
+
+                    # INV-26: Per-bot hedge child ghost check
+                    try:
+                        from engine.oneway_netting import detect_hedge_child_ghost, wipe_hedge_child_ghost
+                        _conn = get_connection()
+                        _hedge_children = _conn.execute(
+                            "SELECT id FROM bots WHERE is_active=1 AND bot_type='hedge_child'"
+                        ).fetchall()
+                        for (_child_id,) in _hedge_children:
+                            if detect_hedge_child_ghost(_parity_ex, _child_id, _conn):
+                                wipe_hedge_child_ghost(_parity_ex, _child_id, _conn)
+                    except Exception as _hcg_err:
+                        logger.error(f"❌ [STARTUP-HEDGE-CHILD-GHOST] Failed check: {_hcg_err}")
 
                     from engine.database import audit_pair_ledger_vs_exchange, flag_pair_ledger_mismatch
                     _mismatches = audit_pair_ledger_vs_exchange(_parity_ex)
@@ -1760,8 +1795,9 @@ class BotRunner:
                 except Exception as _hpc_err:
                     logger.error(f"[ASYNC-FLATTEN] _handle_pending_close raised for {f_name}: {_hpc_err}")
 
-        # Remove flatten-intercepted bots so they skip normal strategy execution
-        bots = [b for b in bots if b[0] not in flatten_intercepted_ids]
+        # Remove flatten-intercepted bots and pending_hedge_close bots so they skip normal strategy execution
+        SKIP_STATUSES = {'pending_hedge_close'}
+        bots = [b for b in bots if b[0] not in flatten_intercepted_ids and b[12] not in SKIP_STATUSES]
 
         # ================================================================
         # 🔁 v2.0 TP CASCADE DRAIN

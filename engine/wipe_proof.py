@@ -76,16 +76,8 @@ def safe_mark_reset_cleared(
         current_virtual_net = get_pair_virtual_net(symbol)
         
         # Get signed_open_qty for this bot
-        row_bot = cursor.execute(
-            "SELECT t.open_qty, b.direction FROM trades t JOIN bots b ON t.bot_id = b.id WHERE t.bot_id = ?",
-            (bot_id,)
-        ).fetchone()
-        if row_bot:
-            open_qty, direction = row_bot
-            open_qty_val = float(open_qty or 0)
-            signed_open_qty = open_qty_val if str(direction).upper() == 'LONG' else -open_qty_val
-        else:
-            signed_open_qty = 0.0
+        from engine.parity_gates import get_bot_signed_contribution
+        signed_open_qty = get_bot_signed_contribution(bot_id)
             
         if snapshot.source == WipeProofSource.CACHED_SNAP or (snapshot.source == WipeProofSource.LIVE_FETCH and snapshot.side == 'FLAT'):
             from engine.exchange_interface import normalize_symbol

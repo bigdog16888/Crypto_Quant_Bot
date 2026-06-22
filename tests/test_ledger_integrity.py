@@ -168,6 +168,7 @@ def test_canonical_dedup_uses_max_fill_row(memory_db):
     """Duplicate CID rows must not undercount — highest filled_amount row wins."""
     setup_bot_fixture(memory_db, 1, 'Short Bot', 'LINK/USDC:USDC', 'SHORT')
     cursor = memory_db.cursor()
+    cursor.execute("DROP INDEX IF EXISTS idx_bot_orders_bot_cid")
     cursor.execute(
         """
         INSERT INTO bot_orders
@@ -251,7 +252,7 @@ def test_cancelled_partial_fill_not_phantom(memory_db):
             return []
 
     # Run the reset cascade (exchange flat — parity gate allows reset)
-    database.reset_bot_after_tp(1, 20.0, exchange=_FlatEx())
+    database.reset_bot_after_tp(1, 20.0, action_label='MANUAL_CLOSE', exchange=_FlatEx())
     
     # Assert virtual net after reset is 0.0 (no longer phantom 5.28)
     assert database.get_pair_virtual_net('LINK/USDT:USDT') == 0.0
@@ -443,6 +444,7 @@ def test_duplicate_entry_same_cid_not_double_counted(memory_db):
     setup_bot_fixture(memory_db, 1, 'Duplicate Bot', 'BTC/USDC:USDC', 'LONG')
     
     cursor = memory_db.cursor()
+    cursor.execute("DROP INDEX IF EXISTS idx_bot_orders_bot_cid")
     # Insert three bot_orders rows with identical client_order_id and status='filled'
     cursor.execute("""
         INSERT INTO bot_orders (bot_id, order_type, order_id, price, amount, filled_amount, status, cycle_id, step, client_order_id, position_side)

@@ -163,7 +163,7 @@ These must be true at all times after v3.6.0 is deployed. Tests verify each one.
 
 **INV-8:** `update_active_positions_snapshot()` assigns the hedge child's SHORT position to the hedge child bot's `bot_id`. `bot_id=0` (orphan) never occurs for positions owned by hedge child bots.
 
-**INV-9:** The break-even TP price for a hedge child is exactly `trades.avg_entry_price` as computed by `seal_trade_state()` after all child entries have been credited. No separate calculation needed.
+**INV-9:** The hedge child TP price is: `current_price` if the position is already profitable at time of placement, otherwise `avg_entry_price` (break-even). A profitable SHORT child (`current < entry`) closes immediately at market. A losing SHORT child waits for price to recover to entry price.
 
 ---
 
@@ -258,16 +258,36 @@ No new math. No new function. The existing `seal_trade_state()` weighted average
 
 `apply_oneway_entry_cross_reduction()` in `oneway_netting.py` must be updated to suppress cross-reduction between a parent bot and its hedge child.
 
-**Current behaviour (wrong):**
-Parent LONG fills → finds hedge child SHORT as a neighbor → reduces child's `open_qty`
-
-**Correct behaviour:**
+**Correct behaviour (v3.6.0+):**
 Parent LONG fills → skips hedge child (parent/child relationship detected) → applies cross-reduction to any other unrelated SHORT bots on the pair normally
 
-**Detection:** In the neighbor query, add a check:
+**Detection:** In the neighbor query, exclude the filling bot's hedge child:
 ```sql
 AND NOT (b.id = (SELECT hedge_child_bot_id FROM bots WHERE id = <filling_bot_id>))
 ```
+
+---
+
+### 10.1. Cross-Reduction Race Condition — Stale TP and Physical Orphan (v4.0.1 fix)
+
+**Root cause identified June 10, 2026 (BTC 0.002 orphan):**
+
+The exact failure sequence:
+1. `short btc` places TP for 0.044 BTC at 23:46:48
+2. `long btc price` entry fills 0.002 BTC at 23:46:52 — cross-reduction fires, reduces `short btc` virtual `open_qty` from 0.044 → 0.042; zeros `long btc price` virtual `open_qty` to 0.0
+3. `short btc` TP fills at 23:46:55 for the **old qty 0.044** — but physical is now only 0.042
+4. 0.044 − 0.042 = **0.002 BTC over-close** → account goes net LONG +0.002
+5. Both bots are virtually flat → orphan has no owner
+
+**Two bugs, one race:**
+
+**Fix A (INV-28A) — Stale TP Cancellation.** When `apply_oneway_entry_cross_reduction` reduces a sibling bot's `open_qty`, any resting TP or `dust_close` order for that sibling is now over-sized. The function immediately cancels the resting order on the exchange (`exchange.cancel_order()`) and marks it `cancelled` with notes `[CROSS-REDUCE-CANCEL]` in `bot_orders`. The next `maintain_orders` cycle for the sibling places a correctly-sized replacement TP. This is the **primary fix** — it prevents the over-close entirely.
+
+**Fix B (INV-28B) — Physical Orphan Check.** When `apply_oneway_entry_cross_reduction` zeros the *filling* bot's virtual `open_qty` (ONEWAY_CROSS_SRC row), the function calls `get_exchange_signed_net()` to verify the physical position. If a physical long position > 0.0001 remains, the filling bot is immediately transitioned to `status='pending_flatten'`, triggering `_handle_pending_flatten` in `runner.py` to close it.
+
+**Exchange access from WS thread:** Both fixes require the exchange object on the WS event thread. `credit_fill` now accepts an optional `exchange=` kwarg. The WS handlers pass `BotRunner.get_instance()._local_exchange` (set during startup; falls back to on-the-fly `ExchangeInterface` construction using `config.TESTNET` from the environment if not yet populated).
+
+**Invariants cross-reference:** INV-28A and INV-28B are formally documented in `CODEBASE_GUIDE.md §3.48`.
 
 ---
 

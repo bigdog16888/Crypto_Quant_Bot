@@ -13,6 +13,8 @@ class MockStreamlit:
         self._session_state = {}
         
     def __getattr__(self, name):
+        if name in ('fragment', 'dialog', 'experimental_fragment', 'experimental_dialog'):
+            return lambda *args, **kwargs: (args[0] if (len(args) == 1 and callable(args[0]) and not kwargs) else (lambda f: f))
         def noop(*args, **kwargs):
             return None
         return noop

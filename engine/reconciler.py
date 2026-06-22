@@ -222,6 +222,10 @@ class BotState:
 
     cycle_phase: str = 'IDLE'
 
+    parent_bot_id: Optional[int] = None
+
+    hedge_child_bot_id: Optional[int] = None
+
 
 
 
@@ -400,7 +404,7 @@ class StateReconciler:
                     (tp_order_id, tp_order_id, bot_id)
                 ).fetchone()
 
-                if order_row and order_row[0] == 'filled':
+                if order_row and order_row[0] in ('filled', 'cancelling'):
                     continue
 
                 try:
@@ -696,7 +700,7 @@ class StateReconciler:
 
         # Get pairs from open orders too (CCXT maps some open states to 'new' or 'open')
 
-        cursor.execute("SELECT DISTINCT pair from bots WHERE id IN (SELECT DISTINCT bot_id FROM bot_orders WHERE status IN ('open', 'new'))")
+        cursor.execute("SELECT DISTINCT pair from bots WHERE id IN (SELECT DISTINCT bot_id FROM bot_orders WHERE status IN ('open', 'new', 'placing', 'cancelling'))")
 
         order_pairs = [r[0] for r in cursor.fetchall()]
 
@@ -844,7 +848,7 @@ class StateReconciler:
 
             FROM bot_orders bo JOIN bots b ON bo.bot_id=b.id
 
-            WHERE (bo.status IN ('placing', 'new', 'open'))
+            WHERE (bo.status IN ('placing', 'new', 'open', 'cancelling'))
 
               AND bo.filled_amount < bo.amount
 
@@ -871,16 +875,19 @@ class StateReconciler:
                 try:
 
                     exch_order = None
+                    lookup_succeeded = False
 
                     # Try direct fetch by clientOrderId first (Binance supports this)
 
                     try:
 
-                        exch_order = ex.fetch_order_by_client_order_id(pair, cid)
+                        exch_order = ex.fetch_order(cid, pair)
+                        lookup_succeeded = True
 
-                    except Exception:
-
-                        pass
+                    except Exception as e_cid:
+                        import ccxt
+                        if isinstance(e_cid, (ccxt.OrderNotFound, ccxt.InvalidOrder)) or "OrderNotFound" in type(e_cid).__name__ or "order not found" in str(e_cid).lower() or "-2013" in str(e_cid):
+                            lookup_succeeded = True
 
                     # Fallback: scan recent closed+open orders
 
@@ -962,7 +969,16 @@ class StateReconciler:
 
                                 from .ledger import credit_fill, seal_trade_state
 
-                                credit_fill(bot_id=bot_id, order_id=o_id, cumulative_qty=o_filled, avg_price=o_price, order_type=otype, is_cumulative=True)
+                                credit_fill(bot_id=bot_id, order_id=o_id, cumulative_qty=o_filled, avg_price=o_price, order_type=otype, is_cumulative=True, caller='reconciler')
+
+                                # BUG 3 FIX: Unconditionally promote the DB row status to match exchange truth.
+                                # credit_fill() may return False (fill_claims already claimed, or MAX() guard),
+                                # but the row status still needs to be updated from 'placing'/'open' to reflect
+                                # what the exchange actually says. Without this, placing rows stay stuck forever.
+                                _place_cur.execute(
+                                    "UPDATE bot_orders SET status=?, updated_at=? WHERE id=?",
+                                    (new_status, int(time.time()), db_id)
+                                )
 
                                 seal_trade_state(bot_id)
 
@@ -974,13 +990,18 @@ class StateReconciler:
 
                             logger.info(f"🗑️ [PRE-COMMIT-RESOLVE] Bot {bot_id} {otype} cid={cid} → {o_status} (no fill). Marked failed.")
 
-                    else:
+                    elif lookup_succeeded:
 
                         # Never reached the exchange — delete the intent row
 
                         _place_cur.execute("DELETE FROM bot_orders WHERE id=?", (db_id,))
 
                         logger.info(f"🗑️ [PRE-COMMIT-RESOLVE] Bot {bot_id} {otype} cid={cid} → not on exchange. Deleted (never placed).")
+
+                    else:
+                        logger.warning(f"⚠️ [PRE-COMMIT-RESOLVE] Bot {bot_id} {otype} cid={cid} → Lookup failed. Leaving DB row intact.")
+
+                    break
 
                     break
 
@@ -1187,6 +1208,8 @@ class StateReconciler:
                         _oi_conn = get_connection(); _oi_cur = _oi_conn.cursor()
 
                         for o in hist:
+
+                            _trigger_orphan_hedge_signal = False
 
                             o_id = str(o.get('id') or o.get('order') or o.get('orderId') or '')
 
@@ -1613,6 +1636,23 @@ class StateReconciler:
                                     )
 
                                 else:
+                                    _cid_exists = _oi_cur.execute(
+                                        "SELECT COUNT(*) FROM bot_orders WHERE bot_id = ? AND client_order_id = ?",
+                                        (attributed_bot_id, o_cid)
+                                    ).fetchone()[0] > 0
+                                    if _cid_exists:
+                                        base_cid = o_cid
+                                        o_cid = f"{base_cid}_{int(time.time())}"
+                                        suffix_idx = 1
+                                        while True:
+                                            _check = _oi_cur.execute(
+                                                "SELECT COUNT(*) FROM bot_orders WHERE bot_id = ? AND client_order_id = ?",
+                                                (attributed_bot_id, o_cid)
+                                            ).fetchone()[0]
+                                            if _check == 0:
+                                                break
+                                            o_cid = f"{base_cid}_{int(time.time())}_{suffix_idx}"
+                                            suffix_idx += 1
 
                                     _oi_cur.execute("""INSERT OR IGNORE INTO bot_orders
 
@@ -1626,7 +1666,11 @@ class StateReconciler:
 
                                          orphan_fill_ts))
 
-                                    logger.info(f"   ➕ [HISTORY-ORPHAN] Inserted missing bot_order: Bot {attributed_bot_id} {otype_r} qty={o_filled}@{o_price} order_id={o_id} cycle={cyc} filled_at={orphan_fill_ts}")
+                                    if _oi_cur.rowcount > 0:
+                                        logger.info(f"   ➕ [HISTORY-ORPHAN] Inserted missing bot_order: Bot {attributed_bot_id} {otype_r} qty={o_filled}@{o_price} order_id={o_id} cycle={cyc} filled_at={orphan_fill_ts}")
+                                        _trigger_orphan_hedge_signal = True
+                                    else:
+                                        _trigger_orphan_hedge_signal = False
 
 
 
@@ -1642,7 +1686,7 @@ class StateReconciler:
 
                                 logger.info(f"   🔄 [REVIVE-UPDATE] Updated existing bot_order to 'filled' for cycle {cyc}: Bot {attributed_bot_id} {otype_r} qty={o_filled}@{o_price} order_id={o_id}")
 
-
+                                _trigger_orphan_hedge_signal = True
 
                                 # REVIVE INTEGRITY: Align trades.cycle_id + stamp cycle_start_time
 
@@ -1695,6 +1739,62 @@ class StateReconciler:
                                     "WHERE bot_id=? AND (basket_start_time IS NULL OR basket_start_time=0)",
 
                                     (int(time.time()), attributed_bot_id))
+
+                            # 🛡️ HEDGE CHILD SIGNAL (OFFLINE PATH - HISTORY ORPHAN)
+                            if _trigger_orphan_hedge_signal and otype_r.lower() in ('entry', 'grid'):
+                                try:
+                                    _bot_row = _oi_cur.execute(
+                                        "SELECT name, pair, direction, hedge_child_bot_id, hedge_trigger_step FROM bots WHERE id = ?",
+                                        (attributed_bot_id,)
+                                    ).fetchone()
+                                    if _bot_row:
+                                        _bname, _bpair, _bdir, _child_id, _trigger = _bot_row
+                                        if _child_id and _trigger and _trigger > 0:
+                                            if step_g >= _trigger:
+                                                # Get step qty
+                                                _step_qty_row = _oi_cur.execute(
+                                                    """SELECT COALESCE(SUM(filled_amount), 0.0) FROM bot_orders
+                                                       WHERE bot_id = ? AND step = ? AND cycle_id = ?
+                                                       AND order_type IN ('entry', 'grid')
+                                                       AND status IN ('filled', 'partially_filled', 'closed')
+                                                       AND filled_amount > 0""",
+                                                    (attributed_bot_id, step_g, cyc)
+                                                ).fetchone()
+                                                _step_qty = float(_step_qty_row[0] or 0.0) if _step_qty_row else o_filled
+
+                                                # Get actual fill price
+                                                _price_row = _oi_cur.execute(
+                                                    """SELECT ROUND(SUM(filled_amount * price) / NULLIF(SUM(filled_amount), 0), 8)
+                                                       FROM bot_orders
+                                                       WHERE bot_id = ? AND step = ? AND cycle_id = ?
+                                                       AND order_type IN ('entry', 'grid')
+                                                       AND status IN ('filled', 'partially_filled', 'closed')
+                                                       AND filled_amount > 0""",
+                                                    (attributed_bot_id, step_g, cyc)
+                                                ).fetchone()
+                                                _hist_price = float(_price_row[0] or 0.0) if _price_row else 0.0
+                                                _step_fill_price = _hist_price if _hist_price > 0 else o_price
+
+                                                from engine.bot_executor import BotExecutor
+                                                executor = BotExecutor(runner=None)
+                                                logger.info(
+                                                    f"[HEDGE-OFFLINE] Synchronously signaling hedge child {_child_id} "
+                                                    f"for parent step {step_g} fill (orphan). Price={_step_fill_price:.4f}"
+                                                )
+                                                executor._signal_hedge_child_entry(
+                                                    parent_bot_id=attributed_bot_id,
+                                                    parent_name=_bname,
+                                                    parent_step=step_g,
+                                                    pair=_bpair,
+                                                    direction=_bdir,
+                                                    step_qty=_step_qty,
+                                                    step_fill_price=_step_fill_price,
+                                                    exchange=ex,
+                                                    parent_cycle_id=cyc,
+                                                    current_price=o_price
+                                                )
+                                except Exception as _hedge_err:
+                                    logger.error(f"❌ Failed to evaluate offline hedge child signal for bot {attributed_bot_id}: {_hedge_err}")
 
                         _oi_conn.commit(); pass # _oi_conn.close() disabled for singleton safety
 
@@ -2222,6 +2322,71 @@ class StateReconciler:
                                 old_inv = bot_states[bot_id].get('total_invested', 0)
 
                                 bot_states[bot_id]['total_invested'] = old_inv + (fill_price * unaccounted_qty)
+
+                    # Check if a new fill was credited/re-played in this iteration
+                    _new_fill_credited = False
+                    if otype == 'grid' and step >= curr_step:
+                        if not (unaccounted_qty <= 1e-8 and already_in_orders):
+                            _new_fill_credited = True
+                    elif otype == 'entry' and curr_step == 0 and unaccounted_qty > 1e-8:
+                        _new_fill_credited = True
+
+                    if _new_fill_credited:
+                        # 🛡️ HEDGE CHILD SIGNAL (OFFLINE PATH)
+                        try:
+                            _bot_row = cursor.execute(
+                                "SELECT name, pair, direction, hedge_child_bot_id, hedge_trigger_step FROM bots WHERE id = ?",
+                                (bot_id,)
+                            ).fetchone()
+                            if _bot_row:
+                                _bname, _bpair, _bdir, _child_id, _trigger = _bot_row
+                                if _child_id and _trigger and _trigger > 0:
+                                    if step >= _trigger:
+                                        _cycle_row = cursor.execute("SELECT COALESCE(cycle_id, 1) FROM trades WHERE bot_id = ?", (bot_id,)).fetchone()
+                                        _parent_cycle = _cycle_row[0] if _cycle_row else 1
+
+                                        _step_qty_row = cursor.execute(
+                                            """SELECT COALESCE(SUM(filled_amount), 0.0) FROM bot_orders
+                                               WHERE bot_id = ? AND step = ? AND cycle_id = ?
+                                               AND order_type IN ('entry', 'grid')
+                                               AND status IN ('filled', 'partially_filled', 'closed')
+                                               AND filled_amount > 0""",
+                                            (bot_id, step, _parent_cycle)
+                                        ).fetchone()
+                                        _step_qty = float(_step_qty_row[0] or 0.0) if _step_qty_row else unaccounted_qty
+
+                                        _price_row = cursor.execute(
+                                            """SELECT ROUND(SUM(filled_amount * price) / NULLIF(SUM(filled_amount), 0), 8)
+                                               FROM bot_orders
+                                               WHERE bot_id = ? AND step = ? AND cycle_id = ?
+                                               AND order_type IN ('entry', 'grid')
+                                               AND status IN ('filled', 'partially_filled', 'closed')
+                                               AND filled_amount > 0""",
+                                            (bot_id, step, _parent_cycle)
+                                        ).fetchone()
+                                        _hist_price = float(_price_row[0] or 0.0) if _price_row else 0.0
+                                        _step_fill_price = _hist_price if _hist_price > 0 else fill_price
+
+                                        from engine.bot_executor import BotExecutor
+                                        executor = BotExecutor(runner=None)
+                                        logger.info(
+                                            f"[HEDGE-OFFLINE] Synchronously signaling hedge child {_child_id} "
+                                            f"for parent step {step} fill. Historical Price={_step_fill_price:.4f}"
+                                        )
+                                        executor._signal_hedge_child_entry(
+                                            parent_bot_id=bot_id,
+                                            parent_name=_bname,
+                                            parent_step=step,
+                                            pair=_bpair,
+                                            direction=_bdir,
+                                            step_qty=_step_qty,
+                                            step_fill_price=_step_fill_price,
+                                            exchange=ex,
+                                            parent_cycle_id=_parent_cycle,
+                                            current_price=fill_price
+                                        )
+                        except Exception as _hedge_err:
+                            logger.error(f"❌ Failed to evaluate offline hedge child signal for bot {bot_id}: {_hedge_err}")
 
 
 
@@ -2759,7 +2924,7 @@ class StateReconciler:
 
                                 CASE 
 
-                                    WHEN status IN ('filled', 'closed') THEN
+                                    WHEN status IN ('filled', 'closed', 'auto_closed', 'hedge_exited', 'partially_filled') OR (status IN ('canceled', 'cancelled') AND filled_amount > 0) THEN
 
                                         CASE 
 
@@ -2797,7 +2962,7 @@ class StateReconciler:
 
                                 CASE 
 
-                                    WHEN status IN ('new', 'open', 'placing') THEN
+                                    WHEN status IN ('new', 'open', 'placing', 'cancelling') THEN
 
                                         CASE 
 
@@ -2817,7 +2982,7 @@ class StateReconciler:
 
                                 CASE 
 
-                                    WHEN status IN ('new', 'open', 'placing') THEN
+                                    WHEN status IN ('new', 'open', 'placing', 'cancelling') THEN
 
                                         CASE 
 
@@ -3147,7 +3312,9 @@ class StateReconciler:
 
                     # it is mathematically impossible to trade it out. Consolidate via virtual entry.
 
-                    if len(pair_positions) <= 1:
+                    is_hedged = (b.hedge_child_bot_id is not None) or (b.parent_bot_id is not None)
+
+                    if len(pair_positions) <= 1 and not is_hedged:
 
                         # Only target bots on the OPPOSITE side of the physical reality
 
@@ -3306,53 +3473,78 @@ class StateReconciler:
 
 
                             if is_valid_entry:
-
-                                if physical_matching_direction_qty < 0.0001 and (opposite_virtual_qty - physical_opposite_direction_qty) < bot_qty:
-
-                                    logger.critical(
-
-                                        f"💥 [UNAUTHORIZED POSITION LOSS] Bot {b.name}: Claims {bot_qty:.6f} units but Math Capacity is {max_possible_qty:.6f}! "
-
-                                        f"Entry was confirmed, so the position vanished externally (Liquidated/ADL/Manual). "
-
-                                        f"Strict ID-Based Tracking Doctrine enforces MANUAL INTERVENTION. No auto-wipe."
-
-                                    )
-
-                                    from .database import log_reconciliation
-
-                                    log_reconciliation(
-
-                                        bot_id=b.bot_id,
-
-                                        pair=b.pair,
-
-                                        action="UNAUTHORIZED_LOSS",
-
-                                        details=f"Missing Mass: Bot claims {bot_qty:.6f}, Math Capacity is {max_possible_qty:.6f}. Manual intervention required."
-
-                                    )
-
-                                    results.append(ReconciliationResult(
-
-                                        bot_id=b.bot_id, bot_name=b.name, pair=b.pair,
-
-                                        action_taken=ReconciliationAction.REQUIRE_MANUAL,
-
-                                        details="Unauthorized physical position loss detected. Manual intervention required.", 
-
-                                        requires_manual_intervention=True
-
-                                    ))
-
+                                is_unauthorized_loss = False
+                                max_claimable_qty = 0.0
+                                
+                                is_hedged = (b.hedge_child_bot_id is not None) or (b.parent_bot_id is not None)
+                                
+                                if is_hedged:
+                                    # Hedge-aware pair net check
+                                    p_id = b.bot_id if b.hedge_child_bot_id is not None else b.parent_bot_id
+                                    c_id = b.hedge_child_bot_id if b.hedge_child_bot_id is not None else b.bot_id
+                                    
+                                    p_state = next((x for x in bots if x.bot_id == p_id), None)
+                                    if p_state:
+                                        p_dir = p_state.direction.upper()
+                                    else:
+                                        # Fallback to database
+                                        from engine.database import get_connection as _gc
+                                        with _gc() as conn:
+                                            dir_row = conn.execute("SELECT direction FROM bots WHERE id=?", (p_id,)).fetchone()
+                                            p_dir = str(dir_row[0] or 'LONG').upper() if dir_row else 'LONG'
+                                            
+                                    parent_qty = bot_qtys.get(p_id, 0.0)
+                                    child_qty = bot_qtys.get(c_id, 0.0)
+                                    
+                                    if p_dir == 'LONG':
+                                        pair_net_virtual = parent_qty - child_qty
+                                    else:
+                                        pair_net_virtual = -parent_qty + child_qty
+                                        
+                                    pair_net_physical = global_physical_net
+                                    
+                                    from engine.parity_gates import qty_tolerance
+                                    tol = qty_tolerance()
+                                    
+                                    if abs(pair_net_virtual - pair_net_physical) <= tol:
+                                        # Pair is balanced — skip UNAUTHORIZED_LOSS entirely
+                                        is_unauthorized_loss = False
+                                    else:
+                                        # Only if pair net is NOT balanced, check individual bot contribution using physical as ground truth
+                                        max_claimable_qty = physical_matching_direction_qty
+                                        is_unauthorized_loss = bot_qty > (physical_matching_direction_qty + 0.0001)
                                 else:
+                                    # Non-hedged bot: use unrelated_opposite_virtual formula
+                                    # Since there's no hedge child, unrelated_opposite_virtual is same as opposite_virtual_qty
+                                    unrelated_opposite_virtual = opposite_virtual_qty
+                                    max_claimable_qty = physical_opposite_direction_qty - unrelated_opposite_virtual
+                                    if max_claimable_qty < 0.0:
+                                        max_claimable_qty = 0.0
+                                    is_unauthorized_loss = (physical_matching_direction_qty < 0.0001) and (bot_qty > max_claimable_qty + 0.0001)
 
+                                if is_unauthorized_loss:
+                                    logger.critical(
+                                        f"💥 [UNAUTHORIZED POSITION LOSS] Bot {b.name}: Claims {bot_qty:.6f} units but Math Capacity is {max_claimable_qty:.6f}! "
+                                        f"Entry was confirmed, so the position vanished externally (Liquidated/ADL/Manual). "
+                                        f"Strict ID-Based Tracking Doctrine enforces MANUAL INTERVENTION. No auto-wipe."
+                                    )
+                                    from .database import log_reconciliation
+                                    log_reconciliation(
+                                        bot_id=b.bot_id,
+                                        pair=b.pair,
+                                        action="UNAUTHORIZED_LOSS",
+                                        details=f"Missing Mass: Bot claims {bot_qty:.6f}, Math Capacity is {max_claimable_qty:.6f}. Manual intervention required."
+                                    )
+                                    results.append(ReconciliationResult(
+                                        bot_id=b.bot_id, bot_name=b.name, pair=b.pair,
+                                        action_taken=ReconciliationAction.REQUIRE_MANUAL,
+                                        details="Unauthorized physical position loss detected. Manual intervention required.", 
+                                        requires_manual_intervention=True
+                                    ))
+                                else:
                                     logger.warning(
-
-                                        f"⚠️ [PARTIAL VANISH DEFERRED] Bot {b.name}: Claims {bot_qty:.6f} units but Physical is {physical_matching_direction_qty:.6f} (max_capacity={max_possible_qty:.6f}). "
-
+                                        f"⚠️ [PARTIAL VANISH DEFERRED] Bot {b.name}: Claims {bot_qty:.6f} units but Physical is {physical_matching_direction_qty:.6f} (max_capacity={max_claimable_qty:.6f}). "
                                         f"Since Physical > 0, we will NOT wipe the bot's memory. Deferring to Net Gap Resolution."
-
                                     )
 
             # --- CASE B.2: STRUCTURAL GHOST DETECTION ---
@@ -3473,7 +3665,7 @@ class StateReconciler:
 
                                 SELECT COUNT(*), SUM(amount * price) FROM bot_orders 
 
-                                WHERE bot_id=? AND status IN ('filled', 'closed') 
+                                WHERE bot_id=? AND (status IN ('filled', 'closed', 'auto_closed', 'hedge_exited', 'partially_filled') OR (status IN ('canceled', 'cancelled') AND filled_amount > 0)) 
 
                                 AND cycle_id = ?
 
@@ -3729,45 +3921,57 @@ class StateReconciler:
                             break # Wiped all bots on this pair, exit loop early
 
                     else:
-
-                        # -------------------------------------------------------------
-
-                        # SCENARIO B: Pair Physical >= $5 (Multi-Bot Environment)
-
-                        # We Virtual Wipe this dust bot. The next Reconciler tick will 
-
-                        # issue an `adoption_reduce` to the healthy bot.
-
-                        # -------------------------------------------------------------
-
-                        logger.info(f"🧹 [DUST-CHASER] Scenario B: Pair physical notional is ${total_physical_notional:.2f} (>=$5). Executing Virtual Liquidation on {b.name}.")
-
-                        dust_qty = (b.total_invested / b.avg_entry_price) if b.avg_entry_price > 0 else 0.0
-
-                        if dust_qty > 0:
-
-                            save_bot_order(
-
-                                bot_id=b.bot_id, order_type='dust_close', exchange_order_id=f"VIRTUAL_LIQ_{b.bot_id}_{int(time.time())}",
-
-                                price=b.avg_entry_price, amount=dust_qty, step=0, status='filled', client_order_id=f"CQB_{b.bot_id}_VIRTLIQ"
-
-                            )
-
-                        safe_wipe_bot(b.bot_id, b.pair, b.direction, reason="DUST_CHASER: Scenario B - Virtual Liquidation", exit_price=0.0, bypass_ledger_guard=True, cursor=cursor)
-
-                        
-
+                        # SCENARIO B: Pair physical >= $5 (multi-bot environment)
+                        # The dust position is small but the exchange still holds it.
+                        # We cannot virtual-wipe without closing the exchange position first.
+                        # Place a GTC limit close order at current price and set cycle_phase
+                        # to PARTIAL_CLOSE_PENDING. The dust position will close naturally.
+                        logger.warning(
+                            f"🧹 [DUST-CHASER] Scenario B: Bot {b.name} has dust position "
+                            f"${b.total_invested:.2f} in multi-bot environment. "
+                            f"Placing GTC close order instead of virtual wipe."
+                        )
+                        try:
+                            exchange = self.exchanges.get('future')
+                            if not exchange and self.exchanges:
+                                exchange = list(self.exchanges.values())[0]
+                            current_price = exchange.get_last_price(b.pair) if exchange else 0.0
+                            
+                            close_side = 'sell' if b.direction.upper() == 'LONG' else 'buy'
+                            dust_qty = round(b.total_invested / b.avg_entry_price, 8) if b.avg_entry_price > 0 else 0.0
+                            if dust_qty > 0.0001:
+                                close_cid = f"CQB_{b.bot_id}_DUST_CLOSE_{int(time.time())}"
+                                close_order = exchange.create_order(
+                                    b.pair, 'limit', close_side, dust_qty,
+                                    price=current_price,
+                                    params={'timeInForce': 'GTC', 'newClientOrderId': close_cid}
+                                )
+                                if close_order:
+                                    save_bot_order(
+                                        bot_id=b.bot_id, order_type='close',
+                                        exchange_order_id=close_order['id'],
+                                        price=current_price, amount=dust_qty, step=0,
+                                        status='open', client_order_id=close_cid,
+                                        cycle_id=b.cycle_id
+                                    )
+                                    cursor.execute(
+                                        "UPDATE trades SET cycle_phase='PARTIAL_CLOSE_PENDING' WHERE bot_id=?",
+                                        (b.bot_id,)
+                                    )
+                                    logger.info(
+                                        f"✅ [DUST-CHASER] Placed GTC close for {b.name}: "
+                                        f"{dust_qty} {b.pair} @ {current_price}"
+                                    )
+                        except Exception as e_dust:
+                            logger.error(f"[DUST-CHASER] Failed to place close for {b.name}: {e_dust}", exc_info=True)
+                        # Do NOT call safe_wipe_bot — the PARTIAL_CLOSE_PENDING handler in
+                        # maintain_orders will reset the bot after the close fills
                         results.append(ReconciliationResult(
-
-                            bot_id=b.bot_id, bot_name=b.name, pair=pair, action_taken=ReconciliationAction.SYSTEM_FIX_ZOMBIE,
-
-                            details=f"Dust Chaser: Scrapped ${b.total_invested:.2f} un-sellable position.",
-
+                            bot_id=b.bot_id, bot_name=b.name, pair=b.pair,
+                            action_taken=ReconciliationAction.SYSTEM_FIX_ZOMBIE,
+                            details=f"Dust Chaser: Placed GTC close for ${b.total_invested:.2f} dust position."
                         ))
-
                         dust_cleared_any = True
-
                         continue
 
 
@@ -4371,7 +4575,7 @@ class StateReconciler:
 
                             FROM bot_orders bo
 
-                            WHERE bo.bot_id IN ({placeholders}) AND bo.status IN ('filled','closed') AND bo.filled_amount > 0
+                            WHERE bo.bot_id IN ({placeholders}) AND (bo.status IN ('filled','closed','auto_closed','hedge_exited','partially_filled') OR (bo.status IN ('canceled','cancelled') AND bo.filled_amount > 0)) AND bo.filled_amount > 0
 
                             GROUP BY bo.bot_id
 
@@ -5753,6 +5957,76 @@ class StateReconciler:
 
         self._align_memory_to_ledger()
 
+        # 1.6 Auto-Clear Stale REQUIRE_MANUAL_PROOF Gates
+        try:
+            from engine.database import get_connection, get_pair_virtual_net
+            from engine.parity_gates import get_exchange_signed_net, qty_tolerance
+            _conn = get_connection()
+            _ex = self.exchanges.get('future') or (list(self.exchanges.values())[0] if self.exchanges else None)
+            if _ex:
+                _gated_bots = _conn.execute(
+                    "SELECT id, name, pair, bot_type FROM bots WHERE status = 'REQUIRE_MANUAL_PROOF'"
+                ).fetchall()
+                for _gated_id, _gated_name, _gated_pair, _gated_type in _gated_bots:
+                    virtual = get_pair_virtual_net(_gated_pair)
+                    physical = get_exchange_signed_net(_ex, _gated_pair)
+                    if physical is not None:
+                        tol = qty_tolerance()
+                        if abs(virtual - physical) < tol:
+                            # Determine correct clear status
+                            _trade_row = _conn.execute(
+                                "SELECT open_qty FROM trades WHERE bot_id = ?", (_gated_id,)
+                            ).fetchone()
+                            _has_qty = (_trade_row[0] > 0.0001) if (_trade_row and _trade_row[0] is not None) else False
+                            
+                            if _has_qty:
+                                target_status = 'IN TRADE'
+                            else:
+                                target_status = 'Scanning' if _gated_type == 'standard' else 'hedge_standby'
+                                
+                            logger.info(
+                                f"[AUTO-CLEAR] Bot {_gated_id} ({_gated_name}): pair net now "
+                                f"matches exchange (virtual={virtual}, physical={physical}). "
+                                f"Clearing REQUIRE_MANUAL_PROOF -> {target_status}."
+                            )
+                            _conn.execute(
+                                "UPDATE bots SET status=? WHERE id=?", (target_status, _gated_id)
+                            )
+                            _conn.commit()
+        except Exception as _clear_err:
+            logger.error(f"❌ [AUTO-CLEAR-MANUAL-PROOF] Failed: {_clear_err}")
+
+
+        # INV-26: Per-bot hedge child ghost check
+
+        try:
+
+            from engine.oneway_netting import detect_hedge_child_ghost, wipe_hedge_child_ghost
+
+            from engine.database import get_connection
+
+            _conn = get_connection()
+
+            _ex = self.exchanges.get('future') or (list(self.exchanges.values())[0] if self.exchanges else None)
+
+            if _ex:
+
+                _hedge_children = _conn.execute(
+
+                    "SELECT id FROM bots WHERE is_active=1 AND bot_type='hedge_child'"
+
+                ).fetchall()
+
+                for (_child_id,) in _hedge_children:
+
+                    if detect_hedge_child_ghost(_ex, _child_id, _conn):
+
+                        wipe_hedge_child_ghost(_ex, _child_id, _conn)
+
+        except Exception as _hcg_err:
+
+            logger.error(f"❌ [RECON-HEDGE-CHILD-GHOST] Failed check: {_hcg_err}")
+
         
 
         # 2. Fetch Fresh State
@@ -5791,15 +6065,23 @@ class StateReconciler:
 
         results.extend(zombie_results)
 
-        
-
         # 4. Global Net Check & Resolution (now includes Net-Sum ghost detection)
-
         net_results = self.resolve_net_mismatch(bot_states, all_positions, all_orders, force_adoption=force_adoption)
-
         results.extend(net_results)
 
-        
+        # Phase B: Sync pair to exchange during reconciler cycle
+        try:
+            from engine.oneway_netting import sync_pair_to_exchange
+            from engine.database import get_connection
+            _conn = get_connection()
+            _ex = self.exchanges.get('future') or (list(self.exchanges.values())[0] if self.exchanges else None)
+            if _ex:
+                # Query all active pairs
+                _active_pairs = [r[0] for r in _conn.execute("SELECT DISTINCT pair FROM bots WHERE is_active=1").fetchall()]
+                for _pair in _active_pairs:
+                    sync_pair_to_exchange(_pair, _ex, _conn)
+        except Exception as _sync_err:
+            logger.error(f"❌ [RECON-EXCHANGE-SYNC] Failed exchange sync check: {_sync_err}")
 
         logger.info(f"✅ RECONCILIATION COMPLETE. {len(results)} actions taken.")
 
@@ -6105,9 +6387,9 @@ class StateReconciler:
 
             # Also cancel any open internal orders and archive filled orders to prevent zombie revival
 
-            cursor.execute("UPDATE bot_orders SET status='cancelled' WHERE bot_id=? AND status='open'", (bot.bot_id,))
+            cursor.execute("UPDATE bot_orders SET status='cancelled' WHERE bot_id=? AND status IN ('open', 'new', 'placing', 'cancelling')", (bot.bot_id,))
 
-            cursor.execute("UPDATE bot_orders SET status='reset_cleared' WHERE bot_id=? AND (status NOT IN ('open', 'new', 'auto_closed', 'reset_cleared', 'cancelled') OR (status IN ('cancelled', 'canceled') AND filled_amount > 0))", (bot.bot_id,))
+            cursor.execute("UPDATE bot_orders SET status='reset_cleared' WHERE bot_id=? AND (status NOT IN ('open', 'new', 'placing', 'cancelling', 'auto_closed', 'reset_cleared', 'cancelled') OR (status IN ('cancelled', 'canceled') AND filled_amount > 0))", (bot.bot_id,))
 
             
 
@@ -6363,57 +6645,36 @@ class StateReconciler:
             
 
             # Load bot config for mathematical step deduction
-
-            cursor.execute("SELECT base_size, martingale_multiplier FROM bots WHERE id=?", (bot_id,))
-
+            cursor.execute("SELECT base_size, martingale_multiplier, parent_bot_id, hedge_child_bot_id FROM bots WHERE id=?", (bot_id,))
             cfg_row = cursor.fetchone()
-
             base_size = float(cfg_row[0] or 0.0) if cfg_row else 0.0
-
             mart_mult = float(cfg_row[1] or 1.0) if cfg_row else 1.0
+            parent_bot_id = int(cfg_row[2]) if cfg_row and cfg_row[2] is not None else None
+            hedge_child_bot_id = int(cfg_row[3]) if cfg_row and cfg_row[3] is not None else None
 
             states.append(BotState(
-
                 bot_id=bot_id,
-
                 name=name,
-
                 pair=pair,
-
                 direction=status['direction'],
-
                 is_active=bool(is_active),
-
                 in_trade=status['total_invested'] > 0,
-
                 total_invested=status['total_invested'],
-
                 avg_entry_price=status['avg_entry_price'],
-
                 target_tp_price=status['target_tp_price'],
-
                 current_step=status['current_step'],
-
                 basket_start_time=status['basket_start_time'],
-
                 entry_order_id=str(order_ids.get('entry_order_id')) if order_ids.get('entry_order_id') else None,
-
                 tp_order_id=str(order_ids.get('tp_order_id')) if order_ids.get('tp_order_id') else None,
-
                 has_confirmed_entry=confirmed,
-
                 cycle_id=status.get('cycle_id', 1),
-
                 cycle_start_time=status.get('cycle_start_time', 0),
-
                 base_size=base_size,
-
                 martingale_multiplier=mart_mult,
-
                 bot_status=status.get('status', ''),
-
                 cycle_phase=status.get('cycle_phase', 'IDLE'),
-
+                parent_bot_id=parent_bot_id,
+                hedge_child_bot_id=hedge_child_bot_id,
             ))
 
         pass # conn.close() disabled for singleton safety
@@ -6746,7 +7007,7 @@ class StateReconciler:
 
                 "WHERE bot_id = ? AND cycle_id IS NULL "
 
-                "AND status NOT IN ('reset_cleared', 'failed', 'cancelled', 'new', 'open', 'placed') "
+                "AND status NOT IN ('reset_cleared', 'failed', 'cancelled', 'new', 'open', 'placed', 'placing', 'cancelling') "
 
                 "AND client_order_id LIKE 'CQB_%'",
 

@@ -183,6 +183,7 @@ def _credit_fill_with_retry(bot_id: int, order_id: str, client_id: str,
             bot_id=bot_id, order_id=order_id,
             cumulative_qty=qty, avg_price=price,
             order_type=order_type, is_cumulative=True, fill_ts=fill_ts,
+            caller='ws',
         )
         if ok:
             return True
@@ -192,6 +193,7 @@ def _credit_fill_with_retry(bot_id: int, order_id: str, client_id: str,
                 bot_id=bot_id, order_id=client_id,
                 cumulative_qty=qty, avg_price=price,
                 order_type=order_type, is_cumulative=True, fill_ts=fill_ts,
+                caller='ws',
             )
         return ok
     except Exception as e:
@@ -428,7 +430,7 @@ def _attribute_anonymous_fill(event: Dict):
         for bid, name, direction, cycle_id, step, _pair in active_bots:
             # Only adopt if this bot has NO open orders (deadlock / orphan sign)
             open_orders_count = conn.execute(
-                "SELECT COUNT(*) FROM bot_orders WHERE bot_id = ? AND status IN ('new', 'open')",
+                "SELECT COUNT(*) FROM bot_orders WHERE bot_id = ? AND status IN ('new', 'open', 'placing', 'cancelling')",
                 (bid,)
             ).fetchone()[0]
 
@@ -685,7 +687,8 @@ def _handle_order_partial_fill(bot_id: int, order_type: str, event: Dict):
             avg_price=avg_price,
             order_type=order_type.lower(),
             is_cumulative=True,
-            fill_ts=fill_ts
+            fill_ts=fill_ts,
+            caller='ws',
         )
 
         if credited:
@@ -749,7 +752,8 @@ def _handle_order_filled(bot_id: int, order_type: str, event: Dict):
                 avg_price=avg_price,
                 order_type='tp',
                 is_cumulative=True,
-                fill_ts=fill_ts
+                fill_ts=fill_ts,
+                caller='ws',
             )
             if symbol:
                 register_tp_cascade(bot_id, symbol, avg_price, exit_fill_ts=fill_ts)

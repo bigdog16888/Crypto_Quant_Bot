@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 class Config:
-    VERSION = "3.9.6"  # v3.9.6: Missed exit orders trigger reset/flatten lifecycle
+    VERSION = "4.1.1"  # v4.1.1: Phase B Exchange-Authoritative Position Sync (Observation-Only)
     ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
     def __init__(self):

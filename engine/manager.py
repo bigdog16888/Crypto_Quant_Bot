@@ -207,7 +207,7 @@ def _find_bot_orders(bot_id, pair, direction, open_orders, target_tp_price, sett
     
     bot_order_ids = get_bot_order_ids(bot_id)
     db_tp_id = bot_order_ids.get('tp_order_id')
-    db_grid_ids = [o.get('order_id') for o in bot_order_ids.get('grid_orders', []) if o.get('status') == 'open']
+    db_grid_ids = [o.get('order_id') for o in bot_order_ids.get('grid_orders', []) if o.get('status') in ('open', 'new', 'placing', 'cancelling')]
 
     has_my_tp = False
     my_tp_order = None

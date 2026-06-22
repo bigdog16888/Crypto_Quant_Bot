@@ -371,5 +371,76 @@ def test_adopt_from_physical_positions_skips_on_recent_tp_grace(memory_db):
     assert status['status'] == "IN TRADE"
 
 
+def test_auto_clear_manual_proof_when_pair_matches(memory_db):
+    # 1. Seed a standard bot that is gated with REQUIRE_MANUAL_PROOF (no active position)
+    _seed_bot(
+        memory_db, 
+        bot_id=10018, 
+        name="sui long", 
+        pair="SUI/USDC:USDC", 
+        direction="LONG", 
+        total_invested=0.0, 
+        open_qty=0.0, 
+        status="REQUIRE_MANUAL_PROOF"
+    )
+    
+    # 2. Seed a hedge child bot that is gated
+    _seed_bot(
+        memory_db, 
+        bot_id=100318, 
+        name="sui long_hedge", 
+        pair="SUI/USDC:USDC", 
+        direction="SHORT", 
+        total_invested=0.0, 
+        open_qty=0.0, 
+        status="REQUIRE_MANUAL_PROOF"
+    )
+    memory_db.execute("UPDATE bots SET bot_type = 'hedge_child' WHERE id = 100318")
+    memory_db.commit()
+
+    # 3. Seed an active bot with active position but gated
+    _seed_bot(
+        memory_db, 
+        bot_id=100002, 
+        name="short eth", 
+        pair="ETH/USDC:USDC", 
+        direction="SHORT", 
+        total_invested=100.0, 
+        open_qty=0.5, 
+        status="REQUIRE_MANUAL_PROOF"
+    )
+    memory_db.execute(
+        "INSERT INTO bot_orders (bot_id, step, order_type, order_id, price, amount, filled_amount, status, cycle_id, position_side) "
+        "VALUES (100002, 1, 'entry', 'TEST_ETH_ENTRY', 200.0, 0.5, 0.5, 'filled', 1, 'SHORT')"
+    )
+    memory_db.commit()
+
+    # Initialize StateReconciler with a mock exchange
+    mock_exchange = MagicMock()
+    # Return physical positions: SUI is flat (0.0), ETH is short 0.5 (matches virtual -0.5)
+    mock_exchange.fetch_positions.return_value = [
+        {'symbol': 'ETH/USDC:USDC', 'contracts': -0.5, 'side': 'short', 'entryPrice': 200.0}
+    ]
+    
+    exchanges = {'future': mock_exchange}
+    reconciler = StateReconciler(exchanges)
+    
+    # Run reconcile_all (which runs the auto-clear check)
+    reconciler.reconcile_all()
+    
+    # Assert standard bot status changed back to Scanning
+    status_sui = database.get_bot_status(10018)
+    assert status_sui['status'] == "Scanning"
+
+    # Assert hedge child bot status changed to hedge_standby
+    status_sui_hedge = database.get_bot_status(100318)
+    assert status_sui_hedge['status'] == "hedge_standby"
+
+    # Assert standard bot with active position changed back to IN TRADE
+    status_eth = database.get_bot_status(100002)
+    assert status_eth['status'] == "IN TRADE"
+
+
+
 
 

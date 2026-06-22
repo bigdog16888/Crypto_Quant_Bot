@@ -26,3 +26,8 @@ class NetworkError(ExchangeError):
 class ConfigurationError(BotError):
     """Raised for invalid bot configuration."""
     pass
+
+class GTXRejected(ExchangeError):
+    """Raised when a Post-Only (GTX) order is rejected by the exchange."""
+    pass
+

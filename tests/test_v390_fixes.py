@@ -112,7 +112,8 @@ class TestV390Fixes(unittest.TestCase):
         ex = MockExchangeFlat()
 
         with patch.object(ex, 'create_order') as mock_create, \
-             patch.object(ex, 'cancel_orders_by_bot_id') as mock_cancel:
+             patch.object(ex, 'cancel_orders_by_bot_id') as mock_cancel, \
+             patch('engine.exchange_interface.ExchangeInterface.fetch_positions', return_value=[]):
             
             _reset_to_hedge_standby(100322, self.conn, 10, exchange=ex)
             
@@ -156,7 +157,8 @@ class TestV390Fixes(unittest.TestCase):
 
         ex = MockExchangeWithPosition()
 
-        with patch.object(ex, 'create_order') as mock_create:
+        with patch.object(ex, 'create_order') as mock_create, \
+             patch('engine.exchange_interface.ExchangeInterface.fetch_positions', return_value=[]):
             _reset_to_hedge_standby(100322, self.conn, 10, exchange=ex)
             
             # Should skip Phase 1 order placement because of the in-flight check!

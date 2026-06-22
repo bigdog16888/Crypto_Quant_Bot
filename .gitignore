@@ -47,3 +47,18 @@ ENV/
 build/
 dist/
 *.egg-info/
+
+# Scratch investigation scripts (not deployable source)
+scratch/
+
+# Backup snapshots
+backups/
+
+# Output dumps
+*.out
+
+# Runtime data cache (volatile, regenerated on startup)
+data/market_cache.json
+
+# Rotated log files
+engine.log.*

@@ -301,3 +301,104 @@ def test_ui_missing_grids_grace_period(memory_db):
     )
     memory_db.commit()
     assert check_bot_missing_grid_with_grace(10016, current_step=2, max_steps=8) is True
+
+
+def test_ui_missing_critical_orders_grace_period(memory_db):
+    # Setup: Standard LONG bot with filled entry, no TP/grid, invested > 0.01
+    _seed_bot(memory_db, 10016, "Bot_LONG", 'BTC/USDC:USDC', 'LONG', open_qty=0.008, total_invested=100.0, current_step=1)
+
+    # Helper function to run the simulated UI logic with grace period check
+    def check_bot_critical_orders_with_grace(bid, current_step):
+        df_pos_f = pd.DataFrame([{
+             'id': bid,
+             'name': "Bot_LONG",
+             'pair': 'BTC/USDC:USDC',
+             'direction': 'LONG',
+             'total_invested': 100.0,
+             'current_step': current_step,
+             'status': 'IN TRADE',
+             'cycle_phase': 'ACTIVE',
+             'bot_type': 'standard'
+        }])
+        
+        # Simulated highlights/alert lists
+        physical_order_counts = {bid: 0} # 0 physical orders (no TP or grids)
+        bots_with_missing_orders = []
+        
+        # Highlight health logic
+        def highlight_health(row):
+            bid_local = int(row['id'])
+            status = str(row['status'])
+            # Grace period check for the row status prefix
+            last_order_time = 0.0
+            try:
+                last_order = memory_db.execute(
+                    "SELECT MAX(created_at) FROM bot_orders WHERE bot_id = ?",
+                    (bid_local,)
+                ).fetchone()
+                if last_order and last_order[0] is not None:
+                    last_order_time = float(last_order[0])
+            except Exception:
+                pass
+            last_order_age = time.time() - last_order_time
+            if last_order_age < 60:
+                return status
+            return f"⚠️ {status}"
+
+        # Alert banner check logic
+        for _, row in df_pos_f.iterrows():
+            bid_local = int(row['id'])
+            bot_inv = float(row['total_invested'] or 0)
+            actual_ph = physical_order_counts.get(bid_local, 0)
+            cycle_phase = str(row.get('cycle_phase', 'IDLE')).upper()
+            
+            is_missing = False
+            if actual_ph == 0 and bot_inv > 0.01 and cycle_phase != 'CARRY_PENDING':
+                is_missing = True
+                
+            if is_missing:
+                last_order_time = 0.0
+                try:
+                    last_order = memory_db.execute(
+                        "SELECT MAX(created_at) FROM bot_orders WHERE bot_id = ?",
+                        (bid_local,)
+                    ).fetchone()
+                    if last_order and last_order[0] is not None:
+                        last_order_time = float(last_order[0])
+                except Exception:
+                    pass
+                last_order_age = time.time() - last_order_time
+                if last_order_age < 60:
+                    pass
+                else:
+                    bots_with_missing_orders.append(row['name'])
+                    
+        status_highlighted = highlight_health(df_pos_f.iloc[0])
+        return status_highlighted, bots_with_missing_orders
+
+    # 1. No orders in DB at all (last_order_time is 0.0, age > 60s) -> warning fires, warning prefix added
+    status, missing_list = check_bot_critical_orders_with_grace(10016, current_step=1)
+    assert status == "⚠️ IN TRADE"
+    assert "Bot_LONG" in missing_list
+
+    # 2. Insert an order created 10 seconds ago -> warnings suppressed, status clean
+    now = time.time()
+    memory_db.execute(
+        "INSERT INTO bot_orders (bot_id, order_type, client_order_id, price, amount, filled_amount, status, step, created_at) "
+        "VALUES (10016, 'entry', 'CQB_10016_ENTRY_25_1', 60000.0, 0.005, 0.0, 'filled', 1, ?)",
+        (now - 10,)
+    )
+    memory_db.commit()
+    status, missing_list = check_bot_critical_orders_with_grace(10016, current_step=1)
+    assert status == "IN TRADE"
+    assert "Bot_LONG" not in missing_list
+
+    # 3. Update the order created_at to 90 seconds ago -> warning fires, warning prefix added
+    memory_db.execute(
+        "UPDATE bot_orders SET created_at = ? WHERE bot_id = 10016",
+        (now - 90,)
+    )
+    memory_db.commit()
+    status, missing_list = check_bot_critical_orders_with_grace(10016, current_step=1)
+    assert status == "⚠️ IN TRADE"
+    assert "Bot_LONG" in missing_list

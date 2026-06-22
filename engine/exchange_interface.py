@@ -778,6 +778,30 @@ class ExchangeInterface:
 
         cid = params.get("newClientOrderId") or params.get("clientOrderId")
 
+        # Failsafe check: Ensure unique index is not violated
+        cursor.execute(
+            "SELECT COUNT(*) FROM bot_orders WHERE bot_id = ? AND client_order_id = ?",
+            (bot_id, cid)
+        )
+        if cursor.fetchone()[0] > 0:
+            base_cid = cid
+            cid = f"{base_cid}_{int(time.time())}"
+            suffix_idx = 1
+            while True:
+                cursor.execute(
+                    "SELECT COUNT(*) FROM bot_orders WHERE bot_id = ? AND client_order_id = ?",
+                    (bot_id, cid)
+                )
+                if cursor.fetchone()[0] == 0:
+                    break
+                cid = f"{base_cid}_{int(time.time())}_{suffix_idx}"
+                suffix_idx += 1
+            
+            if "newClientOrderId" in params:
+                params["newClientOrderId"] = cid
+            if "clientOrderId" in params:
+                params["clientOrderId"] = cid
+
         # ── Step 2: Write pending receipt before touching exchange ───────────
         cursor.execute("""
             INSERT INTO bot_orders (
@@ -941,11 +965,55 @@ class ExchangeInterface:
         cancelled_count = 0
         try:
             prefix = f"CQB_{bot_id}_"
-            for order in self.fetch_open_orders(symbol):
-                if order.get('clientOrderId', '').startswith(prefix):
-                    self.cancel_order(order['id'], symbol)
+            open_orders = self.fetch_open_orders(symbol)
+            for order in open_orders:
+                client_id = order.get('clientOrderId', '')
+                if client_id.startswith(prefix):
+                    order_id = order['id']
+                    # 1. Fetch order from exchange to get actual filled qty
+                    try:
+                        ex_order = self.fetch_order(order_id, symbol)
+                        if ex_order:
+                            order = ex_order
+                    except Exception as _fe:
+                        self.logger.warning(f"[CANCEL-SWEEP] Fetch order {order_id} failed: {_fe}. Using open orders list data.")
+
+                    ex_filled = float(order.get('filled', 0) or 0)
+                    if ex_filled > 0:
+                        # Parse order type
+                        parts = client_id.split('_')
+                        order_type = 'grid'
+                        if len(parts) >= 3:
+                            extracted_type = parts[2].lower()
+                            if extracted_type in ('entry', 'grid', 'tp', 'close', 'sl', 'dust', 'adoption', 'forensic'):
+                                order_type = extracted_type
+                        
+                        from engine.database import update_order_status
+                        from engine.ledger import credit_fill
+                        
+                        avg_price = float(order.get('average') or order.get('price') or 0)
+                        
+                        # 2. Call credit_fill() FIRST with suppress_cascade=True
+                        self.logger.info(
+                            f"⚡ [CANCEL-SWEEP] Bot {bot_id}: Crediting partial fill of {ex_filled} "
+                            f"on order {order_id} ({order_type}) before cancellation."
+                        )
+                        credit_fill(
+                            bot_id=bot_id,
+                            order_id=order_id,
+                            cumulative_qty=ex_filled,
+                            avg_price=avg_price,
+                            order_type=order_type,
+                            is_cumulative=True,
+                            suppress_cascade=True
+                        )
+                        update_order_status(order_id, 'cancelled', bot_id=bot_id, filled_qty=ex_filled)
+                    
+                    # 3. Call cancel_order()
+                    self.cancel_order(order_id, symbol)
                     cancelled_count += 1
-        except: pass
+        except Exception as e:
+            self.logger.error(f"Error in cancel_orders_by_bot_id: {e}")
         return cancelled_count
 
     def cancel_all_orders(self, symbol: str):

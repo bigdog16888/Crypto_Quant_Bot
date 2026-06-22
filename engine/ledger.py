@@ -89,6 +89,38 @@ def credit_fill(
     is_cumulative: bool = True,
     fill_ts: int = 0,
     sync_to_exchange: bool = False,
+    exchange = None,
+    suppress_cascade: bool = False,
+    caller: str = '',
+) -> bool:
+    from engine.write_queue import WriteQueue
+    return WriteQueue().put_and_wait(
+        _credit_fill_internal,
+        bot_id,
+        order_id,
+        cumulative_qty,
+        avg_price,
+        order_type=order_type,
+        is_cumulative=is_cumulative,
+        fill_ts=fill_ts,
+        sync_to_exchange=sync_to_exchange,
+        exchange=exchange,
+        suppress_cascade=suppress_cascade,
+        caller=caller,
+    )
+
+def _credit_fill_internal(
+    bot_id: int,
+    order_id: str,
+    cumulative_qty: float,
+    avg_price: float,
+    order_type: str = 'grid',
+    is_cumulative: bool = True,
+    fill_ts: int = 0,
+    sync_to_exchange: bool = False,
+    exchange = None,
+    suppress_cascade: bool = False,
+    caller: str = '',
 ) -> bool:
     """
     Record a fill (or partial fill) in bot_orders.
@@ -147,6 +179,38 @@ def credit_fill(
         existing_fill = float(existing_fill or 0)
         order_amount = float(order_amount or 0)
 
+        # ── INV-20: fill_claims singleton guard ─────────────────────────────────
+        # Atomically claim this (bot_id, order_id) slot. INSERT OR IGNORE ensures
+        # only the first concurrent caller proceeds; all subsequent callers for the
+        # same fill event see 0 rows_affected and early-return.
+        # This eliminates the TOCTOU race where WS + REST both observe 0 filled_amount
+        # and both attempt to credit the same fill.
+        _claim_caller = caller or 'credit_fill'
+        try:
+            _claim_result = conn.execute(
+                "INSERT OR IGNORE INTO fill_claims (bot_id, order_id, caller, claimed_at) "
+                "VALUES (?, ?, ?, ?)",
+                (bot_id, str(order_id), _claim_caller, int(time.time()))
+            )
+            conn.commit()
+            if _claim_result.rowcount == 0:
+                # Another caller already claimed this fill — this is a benign duplicate.
+                logger.debug(
+                    f"[FILL-CLAIM] Bot {bot_id} order {order_id}: already claimed "
+                    f"(caller={_claim_caller}). Skipping duplicate credit."
+                )
+                return False
+            logger.debug(
+                f"[FILL-CLAIM] Bot {bot_id} order {order_id}: claimed by {_claim_caller}."
+            )
+        except Exception as _claim_err:
+            # fill_claims table not yet created (first-run race) — fail-open to preserve fills.
+            logger.warning(
+                f"[FILL-CLAIM] Guard check failed for bot {bot_id} order {order_id}: "
+                f"{_claim_err}. Proceeding without claim (fill_claims may not exist yet)."
+            )
+        # ────────────────────────────────────────────────────────────────────────
+
         # Never credit more than the order's declared size (+5% rounding tolerance).
         # Prevents unit bugs (e.g. amount=0.002 but exchange reports filled=1.0) from
         # inflating virtual net to ~1 BTC when only 0.002 was ordered.
@@ -175,7 +239,7 @@ def credit_fill(
 
         # Determine new status
         fully_filled = order_amount > 0 and (cumulative_qty / order_amount) >= 0.99
-        new_status = 'filled' if fully_filled else 'partially_filled'
+        new_status = 'filled' if (fully_filled and not suppress_cascade) else 'partially_filled'
 
         # Only reject truly administrative terminal statuses
         if current_status in ('reset_cleared', 'auto_closed'):
@@ -323,6 +387,7 @@ def credit_fill(
                         delta,
                         str(order_id),
                         avg_price,
+                        exchange=exchange,
                     )
             except Exception as _ow_err:
                 logger.warning(
@@ -330,6 +395,77 @@ def credit_fill(
                 )
 
         conn.commit()
+
+        # Trigger hedge child signal if parent bot grid/entry fill is credited
+        # This is for Fix 3A (real-time/online path)
+        if _otype_lower in _ENTRY_TYPES and delta > 1e-12:
+            try:
+                _bot_row = conn.execute(
+                    "SELECT name, pair, direction, hedge_child_bot_id, hedge_trigger_step FROM bots WHERE id = ?",
+                    (bot_id,)
+                ).fetchone()
+                if _bot_row:
+                    _bname, _bpair, _bdir, _child_id, _trigger = _bot_row
+                    if _child_id and _trigger and _trigger > 0:
+                        if row_step is not None and row_step >= _trigger:
+                            if exchange is None:
+                                _cfg_row = conn.execute("SELECT config FROM bots WHERE id = ?", (bot_id,)).fetchone()
+                                _mtype = 'future'
+                                if _cfg_row and _cfg_row[0]:
+                                    try:
+                                        import json
+                                        _cfg = json.loads(_cfg_row[0])
+                                        _mtype = _cfg.get('market_type', 'future')
+                                    except Exception:
+                                        pass
+                                from engine.exchange_interface import ExchangeInterface
+                                exchange = ExchangeInterface(market_type=_mtype)
+
+                            # Get parent's actual fill price for this step (historical weighted avg)
+                            _fill_price_row = conn.execute(
+                                """SELECT ROUND(SUM(filled_amount * price) / NULLIF(SUM(filled_amount), 0), 8)
+                                   FROM bot_orders
+                                   WHERE bot_id = ? AND step = ? AND cycle_id = ?
+                                   AND order_type IN ('entry', 'grid')
+                                   AND status IN ('filled', 'partially_filled', 'closed')
+                                   AND filled_amount > 0""",
+                                (bot_id, row_step, row_cycle)
+                            ).fetchone()
+                            actual_fill_price = float(_fill_price_row[0] or 0) if _fill_price_row else 0.0
+                            step_fill_price = actual_fill_price if actual_fill_price > 0 else avg_price
+
+                            # Get the step quantity
+                            _step_qty_row = conn.execute(
+                                """SELECT COALESCE(SUM(filled_amount), 0.0) FROM bot_orders
+                                   WHERE bot_id = ? AND step = ? AND cycle_id = ?
+                                   AND order_type IN ('entry', 'grid')
+                                   AND status IN ('filled', 'partially_filled', 'closed')
+                                   AND filled_amount > 0""",
+                                (bot_id, row_step, row_cycle)
+                            ).fetchone()
+                            _step_qty = float(_step_qty_row[0] or 0.0) if _step_qty_row else cumulative_qty
+
+                            from engine.bot_executor import BotExecutor
+                            executor = BotExecutor(runner=None)
+                            
+                            logger.info(
+                                f"[HEDGE-REALTIME] Parent bot {bot_id} step {row_step} fill credited. "
+                                f"Signaling hedge child {_child_id} synchronously. Price={step_fill_price:.4f}"
+                            )
+                            executor._signal_hedge_child_entry(
+                                parent_bot_id=bot_id,
+                                parent_name=_bname,
+                                parent_step=row_step,
+                                pair=_bpair,
+                                direction=_bdir,
+                                step_qty=_step_qty,
+                                step_fill_price=step_fill_price,
+                                exchange=exchange,
+                                parent_cycle_id=row_cycle,
+                                current_price=avg_price
+                            )
+            except Exception as _hedge_err:
+                logger.error(f"❌ Failed to evaluate online hedge child signal for bot {bot_id}: {_hedge_err}")
 
         logger.debug(
             f"[CREDIT-FILL] ✅ Bot {bot_id} {order_type}: order {order_id} "
@@ -347,7 +483,15 @@ def credit_fill(
 # seal_trade_state() — The Only Writer to trades Table
 # ---------------------------------------------------------------------------
 
-def seal_trade_state(bot_id: int) -> Dict[str, Any]:
+def seal_trade_state(bot_id: int, force_recompute: bool = False) -> Dict[str, Any]:
+    from engine.write_queue import WriteQueue
+    return WriteQueue().put_and_wait(
+        _seal_trade_state_internal,
+        bot_id,
+        force_recompute=force_recompute
+    )
+
+def _seal_trade_state_internal(bot_id: int, force_recompute: bool = False) -> Dict[str, Any]:
     """
     THE authoritative trades-table writer (v2.0).
 
@@ -431,51 +575,7 @@ def seal_trade_state(bot_id: int) -> Dict[str, Any]:
 
     main_open_qty = max(0.0, qty)
 
-    # ── OPEN_QTY ACCUMULATOR CROSS-CHECK [v2.3.2] ──────────────────────────────
-    # trades.open_qty is the authoritative running total — it was incremented/decremented
-    # atomically with every exchange-confirmed fill via credit_fill().
-    # For minor drifts (<20%) the accumulator wins (it reflects real-time fills).
-    # For large drifts (>20%) the recompute wins — a stale accumulator from a failed
-    # adoption_reduce/TP credit would otherwise cause the next TP to be oversized.
-    try:
-        conn = get_connection()
-        _accum_row = conn.execute(
-            "SELECT open_qty FROM trades WHERE bot_id=?", (bot_id,)
-        ).fetchone()
-        if _accum_row is not None:
-            accumulator_qty = float(_accum_row[0] or 0)
-            if abs(accumulator_qty) > 1e-8 or main_open_qty > 1e-8:
-                drift = abs(accumulator_qty - main_open_qty)
-                drift_base = max(abs(accumulator_qty), abs(main_open_qty), 1e-8)
-                drift_pct = drift / drift_base
-                if drift > max(0.5, accumulator_qty * 0.05):
-                    # ── LARGE-DRIFT SELF-HEAL [v2.3.2] ─────────────────────────
-                    logger.warning(
-                        f"[QTY-DRIFT-HEAL] Bot {bot_id}: accumulator={accumulator_qty:.8f} "
-                        f"vs basket_open={main_open_qty:.8f} (drift={drift:.8f} > {max(0.5, accumulator_qty * 0.05):.8f}). "
-                        f"Overwriting open_qty with recomputed basket truth."
-                    )
-                    conn.execute(
-                        "UPDATE trades SET open_qty=? WHERE bot_id=?",
-                        (main_open_qty, bot_id)
-                    )
-                    conn.commit()
-                elif drift_pct > 0.001:  # 0.1%–5%: minor drift → accumulator wins
-                    logger.warning(
-                        f"[QTY-DRIFT] Bot {bot_id}: accumulator={accumulator_qty:.8f} "
-                        f"vs basket_open={main_open_qty:.8f} (drift={drift_pct:.2%}). "
-                        f"Accumulator is authoritative — using it."
-                    )
-                    main_open_qty = max(0.0, accumulator_qty)
-                    if avg > 0:
-                        cost = main_open_qty * avg
-                else:
-                    main_open_qty = max(0.0, accumulator_qty)
-                    if avg > 0:
-                        cost = main_open_qty * avg
-    except Exception as _acc_err:
-        logger.warning(f"[SEAL] Bot {bot_id}: accumulator read failed: {_acc_err}")
-    # ────────────────────────────────────────────────────────────────────────────
+
 
     try:
         conn = get_connection()
@@ -822,7 +922,7 @@ def handle_tp_completion(
         try:
             db_locked = conn.execute(
                 "UPDATE bot_orders SET status='auto_closed', notes=?, updated_at=? "
-                "WHERE bot_id=? AND status IN ('open', 'new', 'placing')",
+                "WHERE bot_id=? AND status IN ('open', 'new', 'placing', 'cancelling')",
                 (
                     f"TP_CASCADE_RACE_GUARD: locked at tp_ts={exit_fill_ts}",
                     int(time.time()),
@@ -879,9 +979,9 @@ def handle_tp_completion(
         except Exception as e_log:
             logger.warning(f"[TP-CASCADE] Bot {bot_id}: trade_history log failed (non-fatal): {e_log}")
 
-        # 🛡️ HEDGE CHILD: place break-even TP if parent has an active hedge child
-        # Signal child with BE TP pending_placement BEFORE wiping parent.
-        # This way, even if the parent wipe is blocked, the child is already protected.
+        has_hedge_child_open = False
+        child_id = None
+        child_open_qty_val = 0.0
         try:
             from engine.database import get_connection as _gc_hc
             _hc_conn = _gc_hc()
@@ -896,20 +996,21 @@ def handle_tp_completion(
                 ).fetchone()
                 if child_state:
                     child_open_qty, child_avg, child_cycle, child_status = child_state
-                    child_open_qty = float(child_open_qty or 0)
+                    child_open_qty_val = float(child_open_qty or 0)
                     child_avg = float(child_avg or 0)
-                    if child_open_qty > 0.0001 and child_avg > 0:
-                        # Break-even TP = avg_entry_price of the hedge child
-                        be_price = child_avg
+                    if child_open_qty_val > 0.0001 and child_avg > 0:
+                        has_hedge_child_open = True
                         child_direction = _hc_conn.execute(
                             "SELECT direction FROM bots WHERE id=?", (child_id,)
                         ).fetchone()[0]
+                        # The hedge child TP price is: current_price if the position is already profitable, otherwise avg_entry_price.
+                        be_price = _calc_hedge_tp_price(child_direction, child_avg, exit_price)
                         be_cid = f"CQB_{child_id}_TP_{child_cycle}_BE"
 
                         # Check if active BE TP already exists
                         existing_be = _hc_conn.execute(
                             "SELECT id FROM bot_orders WHERE bot_id=? AND client_order_id LIKE ? "
-                            "AND status IN ('pending_placement', 'open', 'new', 'partially_filled', 'pending', 'placing')",
+                            "AND status IN ('pending_placement', 'open', 'new', 'partially_filled', 'pending', 'placing', 'cancelling')",
                             (child_id, f"{be_cid}%")
                         ).fetchone()
                         if not existing_be:
@@ -917,7 +1018,7 @@ def handle_tp_completion(
                             from engine.database import save_bot_order
                             save_bot_order(
                                 child_id, 'tp', f'PENDING_BE_{child_id}_{child_cycle}',
-                                be_price, child_open_qty, step=0,
+                                be_price, child_open_qty_val, step=0,
                                 status='pending_placement',
                                 client_order_id=be_cid,
                                 notes=f"Break-even TP pending placement: parent {bot_id} TP hit",
@@ -925,7 +1026,7 @@ def handle_tp_completion(
                             )
                             logger.info(
                                 f"[HEDGE-BE-TP] Child {child_id}: break-even TP registered "
-                                f"@ {be_price:.4f} for {child_open_qty:.6f} {child_direction}. "
+                                f"@ {be_price:.4f} for {child_open_qty_val:.6f} {child_direction}. "
                                 f"Will be placed by bot_executor on next cycle."
                             )
         except Exception as _hc_err:
@@ -935,11 +1036,99 @@ def handle_tp_completion(
                 exc_info=True
             )
 
+        if has_hedge_child_open and child_id:
+            logger.info(f"[HEDGE-GATE] Parent {bot_id}: active hedge child {child_id} has position {child_open_qty_val:.6f}. Placing parent in pending_hedge_close.")
+            try:
+                # Seal parent trade state first to ensure trades.open_qty matches ledger truth
+                from engine.ledger import seal_trade_state
+                seal_trade_state(bot_id)
+
+                reset_bot_after_tp(
+                    bot_id=bot_id,
+                    exit_price=exit_price,
+                    action_label='TP_HIT',
+                    notes=f'Hedge gate pending parent close. Child open qty: {child_open_qty_val:.6f}',
+                    exit_fill_ts=exit_fill_ts,
+                    exchange=exchange,
+                    skip_cycle_increment=True
+                )
+                
+                # Cancel parent exchange orders (stray grids, etc.)
+                if exchange and pair:
+                    try:
+                        exchange.cancel_orders_by_bot_id(bot_id, pair)
+                    except Exception as e_cancel:
+                        logger.error(f"[HEDGE-GATE] Failed to cancel parent exchange orders: {e_cancel}")
+                
+                return True
+            except Exception as e_gate:
+                logger.error(f"[HEDGE-GATE] Failed to transition parent to pending_hedge_close: {e_gate}")
+                return False
+
         # --- Step 3: Full atomic reset via existing reset_bot_after_tp ---
         # This handles: mark reset_cleared, increment cycle_id, zero trades row
         # Pass the exchange fill timestamp so cycle_start_time is anchored to
         # the actual TP execution moment, not the engine processing time.
         try:
+            # Seal trade state first to ensure trades.open_qty matches the ledger truth after the TP fill.
+            from engine.ledger import seal_trade_state
+            seal_trade_state(bot_id)
+
+            _row_qty = conn.execute(
+                "SELECT open_qty, direction, cycle_id FROM trades t JOIN bots b ON b.id = t.bot_id WHERE t.bot_id = ?",
+                (bot_id,)
+            ).fetchone()
+            _open_qty = float(_row_qty[0] or 0) if _row_qty else 0.0
+            _direction = str(_row_qty[1] or 'LONG').upper() if _row_qty else 'LONG'
+            _cycle_id = int(_row_qty[2] or 1) if _row_qty else 1
+
+            if _open_qty > 0.0001:
+                logger.warning(
+                    f"[TP-CASCADE] 🛑 Bot {bot_id}: open_qty={_open_qty:.6f} > 0 after TP fill. "
+                    f"Grid orders filled after TP placed. Transitioning to PARTIAL_CLOSE_PENDING."
+                )
+                conn.execute(
+                    "UPDATE trades SET cycle_phase = 'PARTIAL_CLOSE_PENDING' WHERE bot_id = ?",
+                    (bot_id,)
+                )
+                conn.commit()
+
+                # Place a reduce-only close order for the remaining open_qty
+                close_side = 'sell' if _direction == 'LONG' else 'buy'
+                close_cid = f"CQB_{bot_id}_CLOSE_{_cycle_id}_{int(time.time())}"
+                from engine.database import save_bot_order
+                save_bot_order(
+                    bot_id, 'close', close_cid,
+                    price=0.0, amount=_open_qty, step=0,
+                    status='pending_placement',
+                    client_order_id=close_cid,
+                    notes=f"PARTIAL_CLOSE_PENDING: Close remaining position of {_open_qty:.6f}",
+                    cycle_id=_cycle_id
+                )
+                try:
+                    _testnet = bool(getattr(exchange, 'is_testnet', False) or
+                                    getattr(getattr(exchange, 'exchange', None), 'sandbox', False))
+                    _params = {
+                        'reduceOnly': True,
+                        'newClientOrderId': close_cid,
+                    }
+                    from engine.bot_executor import BotExecutor
+                    _params = BotExecutor._resolve_position_side_param(_params, _testnet)
+                    close_order = exchange.create_order(
+                        normalize_symbol(pair), 'market', close_side, _open_qty,
+                        params=_params
+                    )
+                    if close_order and isinstance(close_order, dict):
+                        conn.execute(
+                            "UPDATE bot_orders SET order_id = ?, status = ?, updated_at = ? WHERE client_order_id = ?",
+                            (close_order['id'], close_order.get('status', 'open'), int(time.time()), close_cid)
+                        )
+                        conn.commit()
+                        logger.info(f"[TP-CASCADE] Placed close order {close_order['id']} for remaining {_open_qty:.6f}")
+                except Exception as e_close:
+                    logger.error(f"[TP-CASCADE] Failed to place close order: {e_close}")
+                return False
+
             reset_bot_after_tp(
                 bot_id=bot_id,
                 exit_price=exit_price,
@@ -949,6 +1138,19 @@ def handle_tp_completion(
                 exchange=exchange,
             )
             logger.info(f"[TP-CASCADE] ✅ Bot {bot_id}: Reset to Scanning. Cycle {cycle_id} → {cycle_id + 1} (cst={exit_fill_ts}).")
+
+            # Hook for hedge child TP completion
+            try:
+                _bt_row = conn.execute(
+                    "SELECT bot_type, parent_bot_id FROM bots WHERE id = ?", (bot_id,)
+                ).fetchone()
+                if _bt_row and _bt_row[0] == 'hedge_child' and _bt_row[1]:
+                    parent_bot_id = _bt_row[1]
+                    logger.info(f"[HEDGE-COMPLETE] Bot {bot_id} is a hedge child. Unblocking parent {parent_bot_id}.")
+                    complete_parent_cycle_after_hedge(parent_bot_id, exchange)
+            except Exception as e_hook:
+                logger.error(f"[HEDGE-COMPLETE] Failed to trigger parent unblock hook: {e_hook}")
+
             return True
 
         except Exception as e_reset:
@@ -964,6 +1166,34 @@ def handle_tp_completion(
     except Exception as e:
         logger.error(f"[TP-CASCADE] Bot {bot_id}: Cascade failed with exception: {e}", exc_info=True)
         return False
+
+
+def complete_parent_cycle_after_hedge(parent_bot_id: int, exchange=None):
+    """
+    Called when a hedge child's BE TP fills. Idempotently completes the parent
+    cycle that was waiting in pending_hedge_close.
+    """
+    from engine.database import get_connection, reset_bot_after_tp
+    conn = get_connection()
+    try:
+        # Check if parent is in pending_hedge_close
+        parent_row = conn.execute(
+            "SELECT status FROM bots WHERE id = ?", (parent_bot_id,)
+        ).fetchone()
+        if not parent_row or parent_row[0] != 'pending_hedge_close':
+            return
+            
+        logger.info(f"[HEDGE-UNBLOCK] Parent bot {parent_bot_id} in pending_hedge_close. Completing cycle reset.")
+        reset_bot_after_tp(
+            bot_id=parent_bot_id,
+            exit_price=0.0,
+            action_label='HEDGE_UNBLOCK',
+            notes='Hedge child TP complete, parent cycle incremented.',
+            exchange=exchange,
+            skip_cycle_increment=False
+        )
+    except Exception as e:
+        logger.error(f"❌ [HEDGE-UNBLOCK] Failed to complete parent cycle for bot {parent_bot_id}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -1058,13 +1288,20 @@ def handle_flatten(
 
                     cid = f"CQB_{bot_id}_FLATTEN_{cycle_id}_0"
                     try:
+                        # Rule #0: positionSide must NEVER be sent to mainnet (causes -4061).
+                        # Testnet requires positionSide='BOTH'; mainnet must omit it entirely.
+                        _flatten_is_testnet = bool(getattr(exchange, 'is_testnet', False) or
+                                                   getattr(getattr(exchange, 'exchange', None), 'sandbox', False))
+                        _flatten_params: dict = {
+                            'reduceOnly': True,
+                            'newClientOrderId': cid,
+                        }
+                        if _flatten_is_testnet:
+                            _flatten_params['positionSide'] = 'BOTH'
+                        # mainnet: positionSide absent — Binance One-Way mode requirement
                         close_order = exchange.create_order(
                             norm_pair, 'market', close_side, qty,
-                            params={
-                                'reduceOnly': True,
-                                'newClientOrderId': cid,
-                                'positionSide': direction.upper()
-                            }
+                            params=_flatten_params
                         )
                         if close_order:
                             actual_exit_price = float(
@@ -1131,3 +1368,25 @@ def handle_flatten(
         except Exception:
             pass
         return False
+
+def _calc_hedge_tp_price(direction: str, avg_entry_price: float, current_price: float) -> float:
+    """
+    Calculate the TP price for a hedge child bot.
+    - For SHORT:
+      - If current_price < avg_entry_price -> profitable -> close at current_price immediately.
+      - Otherwise -> losing/break-even -> close at avg_entry_price (resting limit order).
+    - For LONG:
+      - If current_price > avg_entry_price -> profitable -> close at current_price immediately.
+      - Otherwise -> losing/break-even -> close at avg_entry_price (resting limit order).
+    """
+    if direction.upper() == 'SHORT':
+        if current_price < avg_entry_price:
+            return current_price
+        else:
+            return avg_entry_price
+    else:  # LONG child
+        if current_price > avg_entry_price:
+            return current_price
+        else:
+            return avg_entry_price
+

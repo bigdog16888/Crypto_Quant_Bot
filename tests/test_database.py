@@ -173,6 +173,7 @@ class TestDatabase(unittest.TestCase):
         database.init_db()
         conn = database.get_connection()
         cursor = conn.cursor()
+        cursor.execute("DROP INDEX IF EXISTS idx_bot_orders_bot_cid")
 
         # Insert two filled rows with the same client_order_id (GTX retry double-fill scenario)
         cursor.execute(
@@ -391,6 +392,7 @@ class TestDatabase(unittest.TestCase):
         database.init_db()
         conn = database.get_connection()
         cursor = conn.cursor()
+        cursor.execute("DROP INDEX IF EXISTS idx_bot_orders_bot_cid")
 
         # Insert a bot
         bot_id = database.add_bot("CanonicalTestBot", "BTC/USDT", "LONG", 30.0, 1.5, 10.0)

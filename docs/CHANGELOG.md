@@ -2,6 +2,46 @@
 
 All notable **architecture** changes are documented here. Version numbers match `CODEBASE_GUIDE.md` and `docs/ARCHITECTURE_v3.x.md`.
 
+## v3.9.19 — 2026-06-08 — Hedge Child Ghost Detection & Missed BE TP Self-Healing (INV-26)
+
+- **engine/oneway_netting.py**:
+  - **Hedge Child Ghost Detection**: Added `detect_hedge_child_ghost()` to precisely verify if only the child bot's portion of a hedged position is gone (by comparing expected parent-only net with actual signed exchange net). Added `wipe_hedge_child_ghost()` to safely cancel orders, zero child trade metrics, set status to `hedge_standby`, log a critical error, and record a `drift_note` audit row.
+- **engine/runner.py**:
+  - Run the hedge child ghost detection check on startup sync right after the global wipe check.
+- **engine/reconciler.py**:
+  - Run the hedge child ghost detection check during every reconciler pass cycle.
+- **engine/bot_executor.py**:
+  - **Missed BE TP Self-Healing (INV-26)**: Added self-healing logic inside `maintain_orders()` to detect if a parent bot has completed its cycle while its hedge child still has `open_qty > 0` and no active TP order exists. Instantly registers and places a break-even TP order.
+- **CODEBASE_GUIDE.md**:
+  - Documented invariant `INV-26`.
+
+## v3.9.18 — 2026-06-08 — Precise DNA-WIPE Wall & Hedge Child Standby Status
+
+- **engine/database.py**:
+  - **Precise Wipe Wall (INV-25)**: Updated `[DNA-WIPE]` self-healing routine to query the most recent filled order timestamp (`status IN ('filled','partially_filled') AND filled_amount > 0`) for the wiped cycle and set `trades.wipe_wall_ts` and `trades.cycle_start_time` to it. Falls back to current system time if no fills exist. This prevents incorrect post-wipe forensic adoptions of historical orders.
+  - **Hedge Child Status Preservation**: Set resting status to `'hedge_standby'` instead of `'Scanning'` if the bot type is `'hedge_child'` during a DNA-wipe.
+- **CODEBASE_GUIDE.md**:
+  - Documented invariant `INV-25`.
+
+## v3.9.17 — 2026-06-08 — Hedge-Aware Residue Bypass & Signed Exposure
+
+- **engine/reconciler.py**:
+  - **Wrong-Side Residue Bypass**: Skip the `len(pair_positions) <= 1` wrong-side residue check for hedged bots, as hedge child bots are designed to hold opposite positions to parents and are not trapped residuals.
+  - **Direction-Signed Exposure**: Ensure `pair_net_virtual` uses signed quantities based on `BotState.direction` (`parent_qty - child_qty` if parent is `LONG`, else `-parent_qty + child_qty`).
+
+## v3.9.16 — 2026-06-08 — Hedge-Aware Reconciler & Child Cycle ID Repair
+
+- **engine/reconciler.py**:
+  - **Hedge-Aware Reconciler**: Skip `UNAUTHORIZED_LOSS` gate for parent-child hedge pairs when pair-level virtual net matches signed exchange net within tolerance. For non-hedged bots, use the clamped `unrelated_opposite_virtual` formula.
+- **engine/bot_executor.py**:
+  - **Stale Cycle ID Repair**: Update `trades.cycle_id` of the hedge child from `bot_orders` filled entries if the child holds a position but has a stale cycle ID, triggering `seal_trade_state()` and returning `'active'`.
+- **tests/test_hedge_lifecycle.py**:
+  - Added `TestV3916ReconcilerFixes` verifying the stale cycle ID repair and hedge-aware reconciler.
+
+## v3.9.11 / v3.9.12 / v3.9.13 / v3.9.14 / v3.9.15 — 2026-06-05
+
+- **General**: Incremental versions documenting intermediate fixes.
+
 ## v3.6.1 — 2026-06-03 — Reset hedge child to hedge_standby after TP
 
 - **engine/database.py** (`_reset_bot_after_tp_internal`):
