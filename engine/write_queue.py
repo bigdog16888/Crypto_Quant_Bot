@@ -30,9 +30,20 @@ class WriteQueue:
         import sys
         self._bypass = any(key in sys.modules for key in ('pytest', '_pytest'))
         self._queue = queue.Queue()
-        self._worker_thread = threading.Thread(target=self._worker_loop, name="WriteQueueWorker", daemon=True)
-        self._worker_thread.start()
+        self._instance_lock = threading.Lock()
+        self._worker_thread = None
+        self._ensure_worker_alive()
         self._initialized = True
+
+    def _ensure_worker_alive(self):
+        """Checks if the worker thread is alive, and restarts it if it is not."""
+        if getattr(self, '_bypass', False):
+            return
+        with self._instance_lock:
+            if self._worker_thread is None or not self._worker_thread.is_alive():
+                logger.warning("[WRITE-QUEUE] Worker thread is dead or not started. Starting/Restarting it.")
+                self._worker_thread = threading.Thread(target=self._worker_loop, name="WriteQueueWorker", daemon=True)
+                self._worker_thread.start()
 
     def _worker_loop(self):
         logger.info("WriteQueue worker thread started.")
@@ -62,6 +73,8 @@ class WriteQueue:
                 task.exception = e
             task.event.set()
             return task
+        
+        self._ensure_worker_alive()
         task = WriteTask(fn, args, kwargs)
         self._queue.put(task)
         return task
@@ -74,9 +87,16 @@ class WriteQueue:
             # Worker thread/bypass for nested wrapped calls
             return fn(*args, **kwargs)
 
+        self._ensure_worker_alive()
         task = WriteTask(fn, args, kwargs)
         self._queue.put(task)
-        task.event.wait()
+        
+        completed = task.event.wait(timeout=30.0)
+        if not completed:
+            logger.critical("[WRITE-QUEUE] TIMEOUT waiting for task. Worker may be deadlocked.")
+            raise TimeoutError("Write queue task timed out after 30s")
+            
         if task.exception is not None:
             raise task.exception
         return task.result
+

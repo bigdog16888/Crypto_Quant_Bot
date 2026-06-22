@@ -1,5 +1,5 @@
 # Crypto Quant Bot — AI Agent Codebase Guide
-**Version: 4.1.0 | Last Updated: 2026-06-22**
+**Version: 4.1.1 | Last Updated: 2026-06-22**
 
 > **READ THIS FIRST** before touching any code. This is the single authoritative guide.
 > It supersedes `UNIFIED_BOT_DOCUMENTATION.md` and all older session notes.
@@ -785,6 +785,11 @@ After restart, watch for:
 
 ## 8. Version History (Change Log)
 
+### v4.1.1 — 2026-06-22
+- Write queue: added 30s timeout to `task.event.wait()`, auto-restart dead worker thread
+- XRP phantom virtual_netting recovery — confirmed clean
+- 292 tests passing
+
 ### v4.1.0 — 2026-06-22
 **INV-31: Write Serialization for trades and bot_orders tables.**
 - **engine/write_queue.py**: Implemented the thread-safe `WriteQueue` singleton class to serialize all writes targeting the `trades` and `bot_orders` tables to prevent race conditions from concurrent writers. Added a deadlock bypass when executed from the worker thread.
@@ -1394,7 +1399,26 @@ After restart, watch for:
 
 ---
 
-## 9. Testing Checklist
+## 9. Known Open Items (Not Yet Implemented)
+
+### Phase C — Kill Virtual Netting (Proposed)
+The current virtual netting system writes synthetic `virtual_netting` rows to
+`bot_orders` to track cross-reductions. This is complex and error-prone.
+Phase C proposes replacing it with pair-level net accounting.
+Status: Design proposed, not yet approved for implementation.
+
+### pending_flatten status handling
+INV-28B sets `bots.status = 'pending_flatten'` when a physical orphan is detected.
+The runner does not yet have an explicit handler for this status.
+Status: Detection implemented, automated close not yet implemented.
+
+### cross_reduction_claims table cleanup
+The `cross_reduction_claims` table grows indefinitely. No cleanup/pruning job exists.
+Status: Schema created, maintenance job not implemented.
+
+---
+
+## 10. Testing Checklist
 
 Run before every restart:
 ```powershell
@@ -1467,7 +1491,7 @@ MAX_ADOPTION_QTY_PER_CYCLE=0.5
 
 If `.env` ever gains extra garbage lines (e.g. after a test run), restore this exact structure manually.
 
-## 10. Reconciliation & Virtual Hedging
+## 11. Reconciliation & Virtual Hedging
 
 ### One-Way Mode Virtual Hedging
 - The system supports "Virtual Hedging" where multiple bots trade the same pair in One-Way mode.

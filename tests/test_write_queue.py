@@ -155,3 +155,26 @@ class TestWriteQueue(unittest.TestCase):
         
         self.assertAlmostEqual(row16_post[0], 0.5)
         self.assertAlmostEqual(row22_post[0], 0.4)
+
+    def test_write_queue_timeout(self):
+        """Test that if event.wait times out, a TimeoutError is raised."""
+        import unittest.mock as mock
+        q = WriteQueue()
+        with mock.patch('threading.Event.wait', return_value=False):
+            with self.assertRaises(TimeoutError) as ctx:
+                q.put_and_wait(lambda: "should timeout")
+            self.assertIn("timed out after 30s", str(ctx.exception))
+
+    def test_write_queue_restart_dead_worker(self):
+        """Test that the worker thread is automatically restarted if it dies."""
+        q = WriteQueue()
+        # Kill the current worker by putting None
+        q._queue.put(None)
+        # Wait for the thread to exit
+        q._worker_thread.join(timeout=5.0)
+        self.assertFalse(q._worker_thread.is_alive())
+        
+        # Put a task, it should restart the thread and succeed!
+        res = q.put_and_wait(lambda: "restarted")
+        self.assertEqual(res, "restarted")
+        self.assertTrue(q._worker_thread.is_alive())
