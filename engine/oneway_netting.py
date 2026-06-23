@@ -860,8 +860,147 @@ def sync_pair_to_exchange(pair, exchange, conn):
             f"  Breakdown of contributing active bots:\n"
             f"{bot_breakdown}"
         )
-        
+        # Phase 2: attempt controlled FIFO reseal to correct drift
+        _attempt_drift_correction(pair, diff, bot_details, conn, sync_data, exchange=exchange)
+
     return sync_data
 
 
+def _attempt_drift_correction(pair, diff, bot_details, conn, sync_data, exchange=None):
+    """
+    Phase 2 — Exchange-Authoritative Position Sync (v4.1.3).
 
+    Called when sync_pair_to_exchange() detects drift > qty_tolerance().
+    Strategy:
+      1. Reseal all active bots on the pair via seal_trade_state() (bot_orders as truth),
+         sorted by oldest basket_start_time first.
+      2. Re-fetch exchange net and recompute db_sum_qty to check if drift is resolved.
+      3. If drift persists, write a manual-review flag to bots.notes (if column exists)
+         and to sync_data for JSON cache — no automatic overwrite of exchange data.
+
+    Parameters:
+        exchange: The exchange instance passed through from sync_pair_to_exchange.
+                  If None, post-reseal re-check is skipped with a warning.
+    """
+    import datetime
+    from engine.ledger import seal_trade_state
+    from engine.exchange_interface import normalize_symbol
+    from engine.parity_gates import get_exchange_signed_net, qty_tolerance
+
+    norm_pair = normalize_symbol(pair).upper()
+
+    # ── Step 1: Reseal all active bots on the pair (oldest-first FIFO order) ──
+    rows = conn.execute("""
+        SELECT b.id, b.name, b.direction, COALESCE(t.open_qty, 0.0), t.basket_start_time
+        FROM bots b
+        JOIN trades t ON t.bot_id = b.id
+        WHERE b.is_active = 1 AND b.normalized_pair = ?
+        ORDER BY CASE WHEN t.basket_start_time IS NULL THEN 1 ELSE 0 END,
+                 t.basket_start_time ASC
+    """, (norm_pair,)).fetchall()
+
+    logger.info(
+        f"[EXCHANGE-SYNC-CORRECT] Attempting FIFO reseal for {len(rows)} bot(s) on {pair} "
+        f"(diff={diff:+.8f})"
+    )
+
+    for row in rows:
+        bot_id, bot_name = row[0], row[1]
+        try:
+            seal_trade_state(bot_id)
+            logger.info(f"[EXCHANGE-SYNC-CORRECT] Resealed bot {bot_id} ({bot_name})")
+        except Exception as e:
+            logger.error(f"[EXCHANGE-SYNC-CORRECT] Reseal failed for bot {bot_id} ({bot_name}): {e}")
+
+    # ── Step 2: Re-check drift post-reseal ───────────────────────────────────
+    if exchange is None:
+        logger.warning(
+            f"[EXCHANGE-SYNC-CORRECT] No exchange instance available — skipping "
+            f"post-reseal drift check for {pair}."
+        )
+        sync_data['post_reseal_diff'] = None
+        sync_data['post_reseal_resolved'] = None
+        return
+
+    exchange_net_after = get_exchange_signed_net(exchange, pair)
+    if exchange_net_after is None:
+        logger.warning(
+            f"[EXCHANGE-SYNC-CORRECT] Could not re-fetch exchange net after reseal for {pair} — "
+            f"skipping post-reseal check."
+        )
+        sync_data['post_reseal_diff'] = None
+        sync_data['post_reseal_resolved'] = None
+        return
+
+    rows_after = conn.execute("""
+        SELECT b.direction, COALESCE(t.open_qty, 0.0)
+        FROM bots b
+        JOIN trades t ON t.bot_id = b.id
+        WHERE b.is_active = 1 AND b.normalized_pair = ?
+    """, (norm_pair,)).fetchall()
+
+    db_sum_after = round(
+        sum(float(r[1]) if r[0].upper() == 'LONG' else -float(r[1]) for r in rows_after),
+        8
+    )
+    diff_after = round(exchange_net_after - db_sum_after, 8)
+    tolerance = qty_tolerance()
+    resolved = abs(diff_after) <= tolerance
+
+    sync_data['post_reseal_exchange_net'] = exchange_net_after
+    sync_data['post_reseal_db_sum'] = db_sum_after
+    sync_data['post_reseal_diff'] = diff_after
+    sync_data['post_reseal_resolved'] = resolved
+
+    if resolved:
+        logger.info(
+            f"[EXCHANGE-SYNC-CORRECT] ✅ Drift resolved after reseal for {pair}. "
+            f"post_reseal_diff={diff_after:+.8f}"
+        )
+        return
+
+    # ── Step 3: Drift persists — write manual-review flag ────────────────────
+    logger.critical(
+        f"[EXCHANGE-SYNC-CORRECT] ❌ DRIFT UNRESOLVED after reseal for {pair}! "
+        f"post_reseal_diff={diff_after:+.8f}. Flagging bots for manual review."
+    )
+
+    # Check whether bots.notes column exists (no schema migration required)
+    try:
+        conn.execute("SELECT notes FROM bots LIMIT 1")
+        has_notes_col = True
+    except Exception:
+        has_notes_col = False
+
+    flag_ts = datetime.datetime.utcnow().isoformat()
+    for row in rows:
+        bot_id, bot_name = row[0], row[1]
+        flag_msg = (
+            f"[MANUAL-REVIEW] Exchange sync drift unresolved after reseal "
+            f"at {flag_ts} pair={pair} post_reseal_diff={diff_after:+.8f}"
+        )
+        if has_notes_col:
+            try:
+                conn.execute("UPDATE bots SET notes=? WHERE id=?", (flag_msg, bot_id))
+                conn.commit()
+                logger.warning(
+                    f"[EXCHANGE-SYNC-CORRECT] Manual review flag written to bots.notes "
+                    f"for bot {bot_id} ({bot_name})"
+                )
+            except Exception as e:
+                logger.error(
+                    f"[EXCHANGE-SYNC-CORRECT] Failed to write notes flag for bot {bot_id}: {e}"
+                )
+        else:
+            logger.warning(
+                f"[EXCHANGE-SYNC-CORRECT] bots.notes column missing — "
+                f"manual review flag for bot {bot_id} ({bot_name}) written to JSON cache only."
+            )
+
+    # Always persist flag state in sync_data (written to JSON cache by caller)
+    sync_data['manual_review_flag'] = {
+        'flagged': True,
+        'timestamp': flag_ts,
+        'post_reseal_diff': diff_after,
+        'bots': [{'bot_id': r[0], 'name': r[1]} for r in rows],
+    }

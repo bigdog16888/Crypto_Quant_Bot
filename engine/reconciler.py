@@ -585,6 +585,10 @@ class StateReconciler:
 
 
     def reconstruct_offline_fills(self, since_hours: int = 6, pair_filter: Optional[str] = None, forensic_mode: bool = False) -> Dict[str, int]:
+        from engine.write_queue import WriteQueue
+        return WriteQueue().put_and_wait(self._reconstruct_offline_fills_internal, since_hours, pair_filter, forensic_mode, _wq_timeout=120.0)
+
+    def _reconstruct_offline_fills_internal(self, since_hours: int = 6, pair_filter: Optional[str] = None, forensic_mode: bool = False) -> Dict[str, int]:
 
         from engine.parity_gates import forensic_adopt_allowed
         if forensic_mode and not forensic_adopt_allowed():
@@ -2322,6 +2326,53 @@ class StateReconciler:
                                 old_inv = bot_states[bot_id].get('total_invested', 0)
 
                                 bot_states[bot_id]['total_invested'] = old_inv + (fill_price * unaccounted_qty)
+
+                            else:
+                                # ── Stale-Trades Recovery (v4.1.3) ────────────────────────────────
+                                # unaccounted_qty=0: bot_orders already has filled_amount=fill_qty,
+                                # so the fill IS in the ledger. But if trades.open_qty=0, the fill
+                                # was never propagated to trades — this happens when a fill arrives
+                                # while the bot is in REQUIRE_MANUAL_PROOF (fill-credit is not
+                                # blocked in WS but credit_fill returns False because the cycle
+                                # advanced). Detect and heal by rolling cycle_id back to the fill's
+                                # cycle and resealing.
+                                bo_cycle = order.get('_db_cycle_id')  # populated below if available
+                                if not bo_cycle:
+                                    _bo_row = cursor.execute(
+                                        "SELECT cycle_id FROM bot_orders WHERE order_id=?",
+                                        (o_id,)
+                                    ).fetchone()
+                                    bo_cycle = _bo_row[0] if _bo_row else None
+
+                                current_open_qty = current_state.get('open_qty', 0.0)
+                                if bo_cycle and current_open_qty <= 1e-8 and fill_qty > 1e-8:
+                                    logger.warning(
+                                        f"[OFFLINE-STALE-TRADES] Bot {bot_id}: bot_orders has "
+                                        f"entry fill {o_id} (qty={fill_qty:.6f}, cycle={bo_cycle}) "
+                                        f"but trades.open_qty=0. Rolling cycle_id to {bo_cycle} "
+                                        f"and resealing — likely silenced-fill from REQUIRE_MANUAL_PROOF."
+                                    )
+                                    cursor.execute(
+                                        "UPDATE trades SET cycle_id=? WHERE bot_id=?",
+                                        (bo_cycle, bot_id)
+                                    )
+                                    conn.commit()
+                                    try:
+                                        from engine.ledger import seal_trade_state
+                                        seal_result = seal_trade_state(bot_id, force_recompute=True)
+                                        logger.info(
+                                            f"[OFFLINE-STALE-TRADES] Bot {bot_id}: reseal after "
+                                            f"cycle_id rollback → {seal_result}"
+                                        )
+                                        stats['entry_fills'] += 1
+                                        bot_states[bot_id]['current_step'] = 1
+                                        bot_states[bot_id]['entry_confirmed'] = 1
+                                        bot_states[bot_id]['total_invested'] = seal_result.get('cost', 0.0)
+                                        bot_states[bot_id]['open_qty'] = seal_result.get('qty', 0.0)
+                                    except Exception as _seal_err:
+                                        logger.error(
+                                            f"[OFFLINE-STALE-TRADES] Bot {bot_id}: reseal failed: {_seal_err}"
+                                        )
 
                     # Check if a new fill was credited/re-played in this iteration
                     _new_fill_credited = False
@@ -5924,6 +5975,10 @@ class StateReconciler:
     # ------------------------------------------------------------------
 
     def reconcile_all(self, force_adoption: bool = False):
+        from engine.write_queue import WriteQueue
+        return WriteQueue().put_and_wait(self._reconcile_all_internal, force_adoption, _wq_timeout=120.0)
+
+    def _reconcile_all_internal(self, force_adoption: bool = False):
 
         logger.info("🔄 STARTING RECONCILIATION CYCLE")
 
@@ -6320,6 +6375,10 @@ class StateReconciler:
 
 
     def _fix_ghost_bot(self, bot: BotState, proof_order_id: str = "MANUAL_FIX"):
+        from engine.write_queue import WriteQueue
+        return WriteQueue().put_and_wait(self._fix_ghost_bot_internal, bot, proof_order_id, _wq_timeout=120.0)
+
+    def _fix_ghost_bot_internal(self, bot: BotState, proof_order_id: str = "MANUAL_FIX"):
 
         """
 
@@ -6684,6 +6743,10 @@ class StateReconciler:
 
 
     def _align_memory_to_ledger(self):
+        from engine.write_queue import WriteQueue
+        return WriteQueue().put_and_wait(self._align_memory_to_ledger_internal, _wq_timeout=120.0)
+
+    def _align_memory_to_ledger_internal(self):
 
         """
 
@@ -7072,6 +7135,10 @@ class StateReconciler:
 
 
     def adopt_from_physical_positions(self, limit_per_symbol: int = 500) -> dict:
+        from engine.write_queue import WriteQueue
+        return WriteQueue().put_and_wait(self._adopt_from_physical_positions_internal, limit_per_symbol, _wq_timeout=120.0)
+
+    def _adopt_from_physical_positions_internal(self, limit_per_symbol: int = 500) -> dict:
 
         """
 
@@ -7383,7 +7450,7 @@ class StateReconciler:
 
                     # Adoption loop remains bot-specific, but uses the ticker-wide grouped_fills
 
-                    sys_orders = cursor.execute("SELECT id, order_id, client_order_id, order_type, price, amount, filled_amount, status, step FROM bot_orders WHERE bot_id=? AND status NOT IN ('cancelled','canceled','reset_cleared', 'failed', 'rejected', 'auto_closed') AND client_order_id LIKE ?", (bot_id, dna_prefix + "%")).fetchall()
+                    sys_orders = cursor.execute("SELECT id, order_id, client_order_id, order_type, price, amount, filled_amount, status, step FROM bot_orders WHERE bot_id=? AND status NOT IN ('cancelled','canceled','reset_cleared', 'failed', 'rejected', 'auto_closed', 'audit') AND client_order_id LIKE ?", (bot_id, dna_prefix + "%")).fetchall()
 
                     for row in sys_orders:
 

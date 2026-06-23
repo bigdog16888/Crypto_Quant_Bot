@@ -2,6 +2,70 @@
 
 All notable **architecture** changes are documented here. Version numbers match `CODEBASE_GUIDE.md` and `docs/ARCHITECTURE_v3.x.md`.
 
+## v4.1.4 — 2026-06-22 — Pre-Advance Invariant Check
+
+- **engine/database.py**:
+  - **Pre-Advance Invariant Check**: Closes the structural root cause of the recurring cycle-abandon-with-unaccounted-fill bug.
+  - Before advancing `trades.cycle_id`, compares `bot_orders` ground-truth net qty against `trades.open_qty`. If they diverge by > 1e-6, forces `seal_trade_state(force_recompute=True)`.
+  - In `check_and_repair_inconsistent_state`, queries `bot_orders` net qty for the current cycle before setting `cycle_id=NULL` or wiping phantom-invested; blocks the wipe if fills exist.
+- **tests/test_v414_pre_advance_invariant.py**:
+  - Created unit tests verifying the pre-advance invariant, ghost-step wipe blocking, and phantom-invested wipe blocking.
+
+## v4.1.3 — 2026-06-22 — Phase 2 Exchange-Authoritative Position Sync & Stale Trades Recovery
+
+- **engine/oneway_netting.py**:
+  - Added `_attempt_drift_correction()` to perform a FIFO reseal of all active bots on the pair via `seal_trade_state()` on drift detection.
+  - If drift persists, writes `[MANUAL-REVIEW]` flag to `bots.notes` and `exchange_sync_diagnostics.json`.
+- **engine/reconciler.py**:
+  - Added `[OFFLINE-STALE-TRADES]` path in `_reconstruct_offline_fills_internal`. Rolls `trades.cycle_id` back and force-reseals when `bot_orders.filled_amount` exists but `trades.open_qty` is zero.
+
+## v4.1.2 — 2026-06-22 — Reconciler Write Path Serialization
+
+- **engine/reconciler.py**:
+  - Wrapped key reconciler functions (`reconcile_all`, `reconstruct_offline_fills`, `_fix_ghost_bot`, `_align_memory_to_ledger`, `adopt_from_physical_positions`) entirely in `WriteQueue` to resolve write race conditions.
+  - Parameterized task timeouts in `WriteQueue` via `_wq_timeout` (increased to 120s).
+
+## v4.1.1 — 2026-06-22 — Write Queue Timeout & Thread Self-Healing
+
+- **engine/write_queue.py**:
+  - Added 30s timeout to `task.event.wait()` and auto-restart dead worker thread.
+
+## v4.1.0 — 2026-06-22 — Write Serialization (INV-31)
+
+- **engine/write_queue.py**:
+  - Implemented thread-safe `WriteQueue` singleton class to serialize all writes targeting `trades` and `bot_orders` tables.
+- **engine/ledger.py**:
+  - Wrapped `credit_fill()` and `seal_trade_state()` to execute via the write queue.
+- **engine/database.py**:
+  - Wrapped `reset_bot_after_tp()` to execute via the write queue.
+- **engine/oneway_netting.py**:
+  - Wrapped `apply_oneway_entry_cross_reduction()` to execute via the write queue.
+
+## v4.0.5 — 2026-06-22 — Parent-Child Handoff Status Gates & BE-Only Freeze (INV-29)
+
+- **engine/ledger.py**:
+  - Implemented parent `pending_hedge_close` gate in `handle_tp_completion` when its child is active, and added parent unblock callback `complete_parent_cycle_after_hedge()` when child closes.
+- **engine/bot_executor.py**:
+  - Added child `'be_only'` state to freeze grid order placement and cancel active grids when the parent has exited.
+- **engine/runner.py**:
+  - Excluded bots in `'pending_hedge_close'` status from execution runs.
+- **ui/views/monitor.py**:
+  - Extracted notification rendering to an asynchronous `@st.fragment` (`_notifications_fragment`) to prevent full view load blocks.
+
+## v4.0.4 — 2026-06-12 — Skip/Consolidated Release
+
+- Skipped / Consolidated release. Combined refinements directly into v4.0.5.
+
+## v4.0.1 — 2026-06-12 — Sibling TP Cancel & Physical Orphan Check (INV-28A / INV-28B)
+
+- **engine/oneway_netting.py**:
+  - Implemented sibling TP order cancellation and filling bot physical orphan check to resolve netting race conditions.
+
+## v4.0.0 — 2026-06-11 — Database Schema Standardization & Hedge Qty Deprecation (ADR-004)
+
+- **engine/database.py**:
+  - Removed the deprecated `hedge_qty` column from `trades` table. All queries updated to use signed net virtual calculations.
+
 ## v3.9.19 — 2026-06-08 — Hedge Child Ghost Detection & Missed BE TP Self-Healing (INV-26)
 
 - **engine/oneway_netting.py**:

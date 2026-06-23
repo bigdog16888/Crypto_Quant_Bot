@@ -1,6 +1,6 @@
 # Crypto Quant Bot — High-Level Engine Architecture
 
-This document defines the current state of the engine's data flows and state machines as of **v4.0.5 / v4.1.0**.
+This document defines the current state of the engine's data flows and state machines as of **v4.1.4**.
 
 ## 📊 Data Flow & Ledger Synchronization
 

@@ -217,7 +217,7 @@ Each scenario is a complete end-to-end lifecycle check.
 
 The integration test file for scenarios 1, 5, and 7 is:
 ```
-tests/test_hedge_lifecycle_integration.py
+tests/test_hedge_lifecycle.py
 ```
 
 Scenarios 2, 3, 4 require a running engine instance and are documented as

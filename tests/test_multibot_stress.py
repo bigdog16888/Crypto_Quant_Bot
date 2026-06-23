@@ -72,6 +72,7 @@ def test_concurrent_cycles(num_cycles=10):
     print("🧪 MULTI-BOT STRESS TEST")
     print("="*60 + "\n")
     
+    from config.constants import MAX_ORDERS_PER_CYCLE
     import tempfile
     import shutil
     import engine.database
@@ -98,7 +99,7 @@ def test_concurrent_cycles(num_cycles=10):
         
         if len(bot_ids) < 3:
             print("❌ Failed to create enough bots for stress test")
-            return False
+            assert False, "Failed to create enough bots for stress test"
         
         print(f"\n📊 Testing with {len(bot_ids)} bots running {num_cycles} cycles...\n")
         
@@ -126,7 +127,7 @@ def test_concurrent_cycles(num_cycles=10):
                         cycles_completed += 1
                         
                         # Check order limits are working
-                        if runner.orders_this_cycle > runner.MAX_ORDERS_PER_CYCLE:
+                        if runner.orders_this_cycle > MAX_ORDERS_PER_CYCLE:
                             errors.append(f"Cycle {cycle}: Order limit exceeded!")
                         
                         print(f"  ✓ Cycle {cycle+1}/{num_cycles} - Orders: {runner.orders_this_cycle}")
@@ -174,8 +175,12 @@ def test_concurrent_cycles(num_cycles=10):
         except Exception:
             pass
             
-    return success
+    assert success, "Stress test failed"
 
 if __name__ == "__main__":
-    result = test_concurrent_cycles(num_cycles=10)
-    sys.exit(0 if result else 1)
+    try:
+        test_concurrent_cycles(num_cycles=10)
+        sys.exit(0)
+    except AssertionError as e:
+        print(f"❌ Stress test failed: {e}")
+        sys.exit(1)

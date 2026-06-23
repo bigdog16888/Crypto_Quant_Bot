@@ -1351,7 +1351,7 @@ def _exchange_sync_diagnostics_fragment():
                     'open_qty': 'Open Qty',
                     'signed_qty': 'Signed Qty (Contribution)'
                 })
-                st.dataframe(df, use_container_width=True, hide_index=True)
+                st.dataframe(df, width='stretch', hide_index=True)
                 
         st.markdown("---")
 

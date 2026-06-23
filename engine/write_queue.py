@@ -83,6 +83,7 @@ class WriteQueue:
         """Enqueue and block the calling thread until the task is executed.
         If called from the worker thread itself, or if _bypass is True, bypasses queueing to avoid deadlock.
         """
+        _wq_timeout = kwargs.pop('_wq_timeout', 30)
         if getattr(self, '_bypass', False) or threading.current_thread() == self._worker_thread:
             # Worker thread/bypass for nested wrapped calls
             return fn(*args, **kwargs)
@@ -91,10 +92,10 @@ class WriteQueue:
         task = WriteTask(fn, args, kwargs)
         self._queue.put(task)
         
-        completed = task.event.wait(timeout=30.0)
+        completed = task.event.wait(timeout=_wq_timeout)
         if not completed:
-            logger.critical("[WRITE-QUEUE] TIMEOUT waiting for task. Worker may be deadlocked.")
-            raise TimeoutError("Write queue task timed out after 30s")
+            logger.critical(f"[WRITE-QUEUE] TIMEOUT waiting for task. Worker may be deadlocked. Timeout: {_wq_timeout}s.")
+            raise TimeoutError(f"Write queue task timed out after {int(_wq_timeout)}s")
             
         if task.exception is not None:
             raise task.exception

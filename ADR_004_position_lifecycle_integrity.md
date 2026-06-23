@@ -1,7 +1,7 @@
 # ADR-004: Position Lifecycle Integrity
 
 ## Status
-Proposed (Pending User Approval)
+Implemented (v4.1.3 / v4.1.4)
 
 ## Context & Problem Statement
 To guarantee position lifecycle integrity, the bot executor, ledger, and database must enforce strict state machine rules. The current implementation has three key vulnerabilities that can lead to orphan positions, drift, and incorrect resets.

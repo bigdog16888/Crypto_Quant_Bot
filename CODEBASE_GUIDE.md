@@ -1,5 +1,5 @@
 # Crypto Quant Bot — AI Agent Codebase Guide
-**Version: 4.1.1 | Last Updated: 2026-06-22**
+**Version: 4.1.4 | Last Updated: 2026-06-22**
 
 > **READ THIS FIRST** before touching any code. This is the single authoritative guide.
 > It supersedes `UNIFIED_BOT_DOCUMENTATION.md` and all older session notes.
@@ -671,13 +671,13 @@ INVARIANT: Hedge child bots have `base_size = 0` by design. They never place ind
 The strict `base_size < exchange_min_notional` config check in `process_bot` (bot_executor.py) MUST be bypassed entirely for `bot_type = 'hedge_child'`. Bypassing this guard ensures that hedge child bots are not halted with `Config Error` at startup.
 
 ### 3.57. Continuous TP Fill Audit REST Pricing (v3.6.6)
-INVARIANT (INV-X): `_audit_pending_exits()` runs every reconciler cycle. It is the authoritative catch for missed WebSocket TP fills. It uses exchange REST prices, never `avg_entry_price`.
+INVARIANT: `_audit_pending_exits()` runs every reconciler cycle. It is the authoritative catch for missed WebSocket TP fills. It uses exchange REST prices, never `avg_entry_price`.
 
 ### 3.58. Global Flattening Safety Guards (v3.6.6)
-INVARIANT (INV-X+1): Global flattening override requires 3 consecutive flat snapshots (Guard A) and snapshot freshness < 60s (Guard B). A single flat snapshot never triggers a wipe.
+INVARIANT: Global flattening override requires 3 consecutive flat snapshots (Guard A) and snapshot freshness < 60s (Guard B). A single flat snapshot never triggers a wipe.
 
 ### 3.59. Single Crediting Path via credit_fill (v3.6.6)
-INVARIANT (INV-X+2): `credit_fill()` is the only path for crediting fills — WebSocket, REST audit, or otherwise. Manual `bot_orders` injection is a last-resort emergency procedure, not a normal recovery path.
+INVARIANT: `credit_fill()` is the only path for crediting fills — WebSocket, REST audit, or otherwise. Manual `bot_orders` injection is a last-resort emergency procedure, not a normal recovery path.
 
 ### 3.60. Hedge Cycle Carry Forward Sync (v3.6.8)
 INVARIANT (INV-10): During the synchronization of the hedge child bot's `cycle_id` with its parent bot's `cycle_id` (pre-entry and post-entry), if the child bot still has an active position from a previous cycle (`trades.open_qty > 0.0001`), the engine automatically updates the `cycle_id` of all `bot_orders` belonging to that old cycle to the new `cycle_id`. This prevents active filled orders from being orphaned/ignored, avoiding virtual netting mismatches.
@@ -784,6 +784,28 @@ After restart, watch for:
 ---
 
 ## 8. Version History (Change Log)
+
+### v4.1.4 — 2026-06-22
+- **Pre-Advance Invariant Check** (`engine/database.py`): Closes the structural root cause of the recurring cycle-abandon-with-unaccounted-fill bug (four prior incidents including SUI bot 10018).
+- **Site 1** — `_reset_bot_after_tp_internal` (line ~1419): Before advancing `trades.cycle_id`, compares `bot_orders` ground-truth net qty (`old_net_qty`, already computed for carry-over) against `trades.open_qty`. If they diverge by > 1e-6, forces `seal_trade_state(force_recompute=True)` before the cycle advances. Logs `[PRE-ADVANCE-INVARIANT]`.
+- **Site 2** — `check_and_repair_inconsistent_state` ghost-step path (line ~173): Before setting `cycle_id=NULL`, queries `bot_orders` net qty for the current cycle. If > 1e-6, skips the NULL wipe and runs seal instead. Logs `[PRE-NULL-INVARIANT]`.
+- **Site 3** — `check_and_repair_inconsistent_state` phantom-invested path (line ~186): Same guard as Site 2. Phantom-invested wipe blocked when real fills are present in `bot_orders`.
+- **New test**: `tests/test_v414_pre_advance_invariant.py` — 6 tests covering: invariant fires when bot_orders ahead of trades, invariant silent in happy path, ghost-step site blocks NULL wipe, phantom-invested site blocks NULL wipe, phantom-invested site allows wipe when no fills, SUI end-to-end incident replay.
+- 297 passed, 4 subtests passed.
+
+- Phase 2 exchange-authoritative position sync: added `_attempt_drift_correction()` to `engine/oneway_netting.py`.
+- On drift detection, performs a FIFO reseal of all active bots on the pair via `seal_trade_state()` (bot_orders as truth), sorted oldest `basket_start_time` first.
+- Re-fetches exchange net post-reseal using the passed-through exchange instance (never instantiates a new connection).
+- If drift persists after reseal, writes `[MANUAL-REVIEW]` flag to `bots.notes` (guards column existence — no schema migration) and to `exchange_sync_diagnostics.json` cache.
+- `sync_data` dict now carries `post_reseal_diff`, `post_reseal_resolved`, and `manual_review_flag` keys for UI rendering.
+- **Stale-Trades Recovery** (`engine/reconciler.py`): Added `[OFFLINE-STALE-TRADES]` path in `_reconstruct_offline_fills_internal`. When `bot_orders.filled_amount=N` but `trades.open_qty=0` (silenced-fill pattern — REQUIRE_MANUAL_PROOF or cycle-advance race), rolls `trades.cycle_id` back to the fill's cycle and calls `seal_trade_state(force_recompute=True)` to heal without manual intervention.
+- **Root cause**: REQUIRE_MANUAL_PROOF bots whose fills arrive while `trades.cycle_id` has advanced leave `bot_orders` correct but `trades` stale. `reconstruct_offline_fills` computed `unaccounted_qty=0` (fill already in ledger) and skipped. New path detects this condition and heals automatically.
+- **SUI Bot 10018 recovery**: manually credited cycle 123 fill (7.4 SUI @ 0.7013), rolled `trades.cycle_id=123`, force-resealed → `open_qty=7.4`, `status='IN TRADE'`. Drift resolved.
+- 291 passed, 4 subtests passed.
+
+### v4.1.2 — 2026-06-22
+- Reconciler Write Path Serialization: Wrapped key reconciler functions entirely in `WriteQueue` (`reconcile_all`, `reconstruct_offline_fills`, `_fix_ghost_bot`, `_align_memory_to_ledger`, `adopt_from_physical_positions`) to resolve DEBT-002 write race conditions and preserve read-modify-write transactional integrity.
+- Parameterized task timeouts in `WriteQueue` via `_wq_timeout` (increased to 120s for reconciler cycles).
 
 ### v4.1.1 — 2026-06-22
 - Write queue: added 30s timeout to `task.event.wait()`, auto-restart dead worker thread
@@ -1423,7 +1445,7 @@ Status: Schema created, maintenance job not implemented.
 Run before every restart:
 ```powershell
 python -m pytest tests/ -x -q --tb=short
-# Expected: 179 passed, 0 skipped, 0 failed (including tests/test_hedge_loop.py)
+# Expected: 293 passed, 0 skipped, 0 failed (including tests/test_hedge_loop.py)
 ```
 
 Then verify in logs:

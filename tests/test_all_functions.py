@@ -42,7 +42,6 @@ def test_database():
         print(f"   get_bot_pnl_summary({bot_id}): {pnl}")
     
     print("   ✅ Database: PASSED")
-    return True
 
 def test_strategy():
     """Test strategy functions."""
@@ -67,7 +66,6 @@ def test_strategy():
     print(f"   MM initialized: {mm_strat}")
     
     print("   ✅ Strategy: PASSED")
-    return True
 
 def test_exchange():
     """Test exchange interface (may fail without API keys)."""
@@ -86,10 +84,8 @@ def test_exchange():
         print(f"   get_last_price(BTC/USDT): {price}")
         
         print("   ✅ Exchange: PASSED")
-        return True
     except Exception as e:
         print(f"   ⚠️ Exchange test skipped: {e}")
-        return True  # Non-fatal
 
 def test_runner():
     """Test runner imports and basic setup."""
@@ -97,12 +93,10 @@ def test_runner():
     from engine.runner import BotRunner
     print("   BotRunner import: OK")
     print("   ✅ Runner: PASSED")
-    return True
 
 def test_manager():
     """Test manager functions."""
     print("\n5. Testing Manager (Skipped - Obsolete)...")
-    return True
 
 def test_indicators():
     """Test indicator calculations."""
@@ -128,7 +122,6 @@ def test_indicators():
     print(f"   cci(): OK (last={cci_val.iloc[-1]:.2f})")
     
     print("   ✅ Indicators: PASSED")
-    return True
 
 def test_ui_views():
     """Test UI view imports (without Streamlit runtime)."""
@@ -154,32 +147,40 @@ def test_ui_views():
         print(f"   monitor: {e}")
     
     print("   ✅ UI Imports: PASSED")
-    return True
 
 def main():
     print("=" * 60)
     print("🧪 COMPREHENSIVE FUNCTION TEST")
     print("=" * 60)
     
+    tests = [
+        ("Database", test_database),
+        ("Strategy", test_strategy),
+        ("Exchange", test_exchange),
+        ("Runner", test_runner),
+        ("Manager", test_manager),
+        ("Indicators", test_indicators),
+        ("UI Imports", test_ui_views)
+    ]
+    
     results = []
-    results.append(("Database", test_database()))
-    results.append(("Strategy", test_strategy()))
-    results.append(("Exchange", test_exchange()))
-    results.append(("Runner", test_runner()))
-    results.append(("Manager", test_manager()))
-    results.append(("Indicators", test_indicators()))
-    results.append(("UI Imports", test_ui_views()))
+    all_passed = True
+    for name, func in tests:
+        try:
+            func()
+            results.append((name, True))
+        except Exception as e:
+            print(f"   ❌ {name} failed: {e}")
+            results.append((name, False))
+            all_passed = False
     
     print("\n" + "=" * 60)
     print("📊 SUMMARY")
     print("=" * 60)
     
-    all_passed = True
     for name, passed in results:
         status = "✅ PASSED" if passed else "❌ FAILED"
         print(f"  {name}: {status}")
-        if not passed:
-            all_passed = False
     
     print("\n" + ("✅ ALL TESTS PASSED" if all_passed else "❌ SOME TESTS FAILED"))
     return all_passed

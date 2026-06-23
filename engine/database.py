@@ -170,6 +170,31 @@ def heal_zombie_bots(conn):
                 if c.fetchone()[0] > 0:
                     continue  # Do not wipe, waiting for resting orders to fill!
 
+                # ── PRE-NULL INVARIANT CHECK (v4.1.4) ────────────────────────
+                # trades.open_qty=0 is stale if a fill landed in bot_orders while
+                # the bot was gated (REQUIRE_MANUAL_PROOF) and seal hasn't run.
+                # Check bot_orders ground truth before wiping cycle_id to NULL.
+                _bo_net = c.execute("""
+                    SELECT COALESCE(SUM(CASE WHEN order_type IN ('entry','grid','adoption','adoption_add','carry')
+                                            THEN filled_amount ELSE 0 END)
+                                  - SUM(CASE WHEN order_type IN ('tp','close','sl','dust_close','adoption_reduce')
+                                            THEN filled_amount ELSE 0 END), 0)
+                    FROM bot_orders WHERE bot_id = ? AND filled_amount > 0
+                    AND status NOT IN ('reset_cleared','auto_closed','virtual_netting')
+                    AND cycle_id = ?
+                """, (bot_id, cycle_id)).fetchone()
+                _bo_net_qty = max(0.0, float(_bo_net[0] or 0))
+                if _bo_net_qty > 1e-6:
+                    logger.warning(
+                        f"[PRE-NULL-INVARIANT] Bot {bot_id} ({pair}): bot_orders has "
+                        f"net qty={_bo_net_qty:.8f} in cycle {cycle_id} but trades.open_qty=0. "
+                        f"Skipping cycle_id=NULL wipe — running seal instead."
+                    )
+                    from engine.ledger import seal_trade_state
+                    seal_trade_state(bot_id, force_recompute=True)
+                    continue
+                # ─────────────────────────────────────────────────────────────
+
                 c.execute("UPDATE trades SET current_step = 0, total_invested = 0, avg_entry_price = 0, target_tp_price = 0, cycle_id = NULL WHERE bot_id = ?", (bot_id,))
                 conn.commit()
                 from engine.ledger import seal_trade_state
@@ -183,6 +208,31 @@ def heal_zombie_bots(conn):
             # seal wrote step=0 because cycle_id=NULL broke recompute_invested_from_orders.
             # Wiping here would erase a confirmed physical position.
             if step == 0 and (invested > 0.001 or avg_price > 0.001) and open_qty <= 0.0001:
+                # ── PRE-NULL INVARIANT CHECK (v4.1.4) ────────────────────────
+                # open_qty=0 from trades is stale if a fill is in bot_orders but
+                # seal hasn't run yet (e.g. fill arrived while bot was gated).
+                # Check bot_orders directly before wiping cycle_id to NULL.
+                _bo_net2 = c.execute("""
+                    SELECT COALESCE(SUM(CASE WHEN order_type IN ('entry','grid','adoption','adoption_add','carry')
+                                            THEN filled_amount ELSE 0 END)
+                                  - SUM(CASE WHEN order_type IN ('tp','close','sl','dust_close','adoption_reduce')
+                                            THEN filled_amount ELSE 0 END), 0)
+                    FROM bot_orders WHERE bot_id = ? AND filled_amount > 0
+                    AND status NOT IN ('reset_cleared','auto_closed','virtual_netting')
+                    AND cycle_id = ?
+                """, (bot_id, cycle_id)).fetchone()
+                _bo_net_qty2 = max(0.0, float(_bo_net2[0] or 0))
+                if _bo_net_qty2 > 1e-6:
+                    logger.warning(
+                        f"[PRE-NULL-INVARIANT] Bot {bot_id} ({pair}): bot_orders has "
+                        f"net qty={_bo_net_qty2:.8f} in cycle {cycle_id} but trades.open_qty=0 "
+                        f"(phantom-invested scenario). Skipping cycle_id=NULL wipe — running seal instead."
+                    )
+                    from engine.ledger import seal_trade_state
+                    seal_trade_state(bot_id, force_recompute=True)
+                    continue
+                # ─────────────────────────────────────────────────────────────
+
                 c.execute("UPDATE trades SET total_invested = 0, avg_entry_price = 0, target_tp_price = 0, cycle_id = NULL WHERE bot_id = ?", (bot_id,))
                 conn.commit()
                 from engine.ledger import seal_trade_state
@@ -1415,6 +1465,35 @@ def _reset_bot_after_tp_internal(cursor, bot_id, exit_price, direction=None, act
     # Use the actual exchange fill timestamp if provided; fall back to now.
     # This is the authoritative cycle boundary for all future fill attribution.
     new_cycle_start_time = exit_fill_ts if exit_fill_ts > 0 else now_ts
+
+    # ── PRE-ADVANCE INVARIANT CHECK (v4.1.4) ────────────────────────────────
+    # Before abandoning old_cycle, verify bot_orders ground truth matches
+    # trades.open_qty. If they diverge, a fill landed in bot_orders after the
+    # last seal (race: fill arrived while bot was gated or seal was in-flight).
+    # Force a seal now so the fill is recorded before the cycle advances.
+    # This is the single enforcement point that prevents fill-orphaning on
+    # any cycle boundary regardless of how the bot reached this state.
+    _trades_open_qty_row = cursor.execute(
+        "SELECT COALESCE(open_qty, 0) FROM trades WHERE bot_id = ?", (bot_id,)
+    ).fetchone()
+    _trades_open_qty = float(_trades_open_qty_row[0]) if _trades_open_qty_row else 0.0
+    # old_net_qty was already computed above from bot_orders for old_cycle
+    _QTY_EPSILON = 1e-6
+    if abs(old_net_qty - _trades_open_qty) > _QTY_EPSILON:
+        logger.warning(
+            f"[PRE-ADVANCE-INVARIANT] Bot {bot_id}: bot_orders net qty={old_net_qty:.8f} "
+            f"≠ trades.open_qty={_trades_open_qty:.8f} before cycle advance. "
+            f"Forcing seal_trade_state to capture unaccounted fills before abandoning cycle {old_cycle}."
+        )
+        try:
+            from engine.ledger import seal_trade_state
+            seal_trade_state(bot_id, force_recompute=True)
+        except Exception as _seal_ex:
+            logger.error(
+                f"[PRE-ADVANCE-INVARIANT] Bot {bot_id}: seal failed: {_seal_ex}. "
+                f"Proceeding with cycle advance — fill may be orphaned."
+            )
+    # ─────────────────────────────────────────────────────────────────────────
 
     # 🚀 ARCHITECTURAL FIX (v3.0.7): Increment cycle_id FIRST.
     cursor.execute("UPDATE trades SET cycle_id = ? WHERE bot_id = ?", (new_cycle, bot_id))
