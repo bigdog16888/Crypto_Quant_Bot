@@ -1,48 +1,45 @@
 {
-    "BTC/USDC:USDC": {
-        "timestamp": 1782180643,
-        "pair": "BTC/USDC:USDC",
-        "exchange_net": 0.005,
-        "db_sum_qty": 0.005,
+    "ETH/USDC:USDC": {
+        "timestamp": 1783060002,
+        "pair": "ETH/USDC:USDC",
+        "exchange_net": 0.0,
+        "db_sum_qty": 0.0,
         "diff": 0.0,
         "tolerance": 0.002,
         "drift_detected": false,
         "bots": [
             {
-                "bot_id": 10016,
-                "name": "long btc price",
-                "direction": "LONG",
-                "open_qty": 0.005,
-                "signed_qty": 0.005
-            },
-            {
-                "bot_id": 10022,
-                "name": "short btc",
-                "direction": "SHORT",
-                "open_qty": 0.0,
-                "signed_qty": -0.0
-            },
-            {
-                "bot_id": 100317,
-                "name": "long btc price_hedge",
-                "direction": "SHORT",
-                "open_qty": 0.0,
-                "signed_qty": -0.0
-            },
-            {
-                "bot_id": 100322,
-                "name": "short btc_hedge",
+                "bot_id": 100004,
+                "name": "ETH Bot 3",
                 "direction": "LONG",
                 "open_qty": 0.0,
                 "signed_qty": 0.0
             }
         ]
     },
+    "BTC/USDC:USDC": {
+        "timestamp": 1783060002,
+        "pair": "BTC/USDC:USDC",
+        "exchange_net": 0.05,
+        "db_sum_qty": 0.05,
+        "diff": 0.0,
+        "tolerance": 0.002,
+        "drift_detected": false,
+        "bots": [
+            {
+                "bot_id": 10016,
+                "name": "bot_10016",
+                "direction": "LONG",
+                "open_qty": 0.05,
+                "signed_qty": 0.05
+            }
+        ]
+    },
     "XRP/USDC:USDC": {
-        "timestamp": 1782180643,
+        "timestamp": 1783059765,
         "pair": "XRP/USDC:USDC",
-        "exchange_net": 14.3,
-        "db_sum_qty": 14.3,
+        "exchange_net": 4.7,
+        "db_sum_qty": 4.7,
         "diff": 0.0,
         "tolerance": 0.002,
         "drift_detected": false,
@@ -51,8 +48,8 @@
                 "bot_id": 10017,
                 "name": "xrp long",
                 "direction": "LONG",
-                "open_qty": 14.3,
-                "signed_qty": 14.3
+                "open_qty": 4.7,
+                "signed_qty": 4.7
             },
             {
                 "bot_id": 100313,
@@ -64,10 +61,10 @@
         ]
     },
     "SUI/USDC:USDC": {
-        "timestamp": 1782180643,
+        "timestamp": 1783060002,
         "pair": "SUI/USDC:USDC",
-        "exchange_net": 7.3,
-        "db_sum_qty": 7.3,
+        "exchange_net": 0.0,
+        "db_sum_qty": 0.0,
         "diff": 0.0,
         "tolerance": 0.002,
         "drift_detected": false,
@@ -76,15 +73,8 @@
                 "bot_id": 10018,
                 "name": "sui long",
                 "direction": "LONG",
-                "open_qty": 7.3,
-                "signed_qty": 7.3
-            },
-            {
-                "bot_id": 100000,
-                "name": "short sui",
-                "direction": "SHORT",
                 "open_qty": 0.0,
-                "signed_qty": -0.0
+                "signed_qty": 0.0
             },
             {
                 "bot_id": 100318,
@@ -92,18 +82,11 @@
                 "direction": "SHORT",
                 "open_qty": 0.0,
                 "signed_qty": -0.0
-            },
-            {
-                "bot_id": 100323,
-                "name": "short sui_hedge",
-                "direction": "LONG",
-                "open_qty": 0.0,
-                "signed_qty": 0.0
             }
         ]
     },
     "XAU/USDT:USDT": {
-        "timestamp": 1782180643,
+        "timestamp": 1783059765,
         "pair": "XAU/USDT:USDT",
         "exchange_net": 0.0,
         "db_sum_qty": 0.0,
@@ -128,7 +111,7 @@
         ]
     },
     "LINK/USDC:USDC": {
-        "timestamp": 1782180644,
+        "timestamp": 1783059765,
         "pair": "LINK/USDC:USDC",
         "exchange_net": 0.0,
         "db_sum_qty": 0.0,
@@ -152,8 +135,51 @@
             }
         ]
     },
+    "BNB/USDC:USDC": {
+        "timestamp": 1783059763,
+        "pair": "BNB/USDC:USDC",
+        "exchange_net": -0.04,
+        "db_sum_qty": -0.04,
+        "diff": 0.0,
+        "tolerance": 0.002,
+        "drift_detected": false,
+        "bots": [
+            {
+                "bot_id": 10007,
+                "name": "BNB short",
+                "direction": "SHORT",
+                "open_qty": 0.04,
+                "signed_qty": -0.04
+            },
+            {
+                "bot_id": 100314,
+                "name": "BNB short_hedge",
+                "direction": "LONG",
+                "open_qty": 0.0,
+                "signed_qty": 0.0
+            }
+        ]
+    },
+    "SOL/USDC:USDC": {
+        "timestamp": 1783059941,
+        "pair": "SOL/USDC:USDC",
+        "exchange_net": 0.0,
+        "db_sum_qty": 0.0,
+        "diff": 0.0,
+        "tolerance": 0.002,
+        "drift_detected": false,
+        "bots": [
+            {
+                "bot_id": 10008,
+                "name": "SOL_LONG_Bot",
+                "direction": "LONG",
+                "open_qty": 0.0,
+                "signed_qty": 0.0
+            }
+        ]
+    },
     "BTC/USDT": {
-        "timestamp": 1782180272,
+        "timestamp": 1783059964,
         "pair": "BTC/USDT",
         "exchange_net": 0.0,
         "db_sum_qty": 0.0,
@@ -163,152 +189,53 @@
         "bots": [
             {
                 "bot_id": 1,
-                "name": "StressTest_Bot_0_1782180271",
+                "name": "StressTest_Bot_0_1783059963",
                 "direction": "LONG",
                 "open_qty": 0.0,
                 "signed_qty": 0.0
             },
             {
                 "bot_id": 2,
-                "name": "StressTest_Bot_1_1782180271",
+                "name": "StressTest_Bot_1_1783059963",
                 "direction": "LONG",
                 "open_qty": 0.0,
                 "signed_qty": 0.0
             },
             {
                 "bot_id": 3,
-                "name": "StressTest_Bot_2_1782180271",
+                "name": "StressTest_Bot_2_1783059963",
                 "direction": "LONG",
                 "open_qty": 0.0,
                 "signed_qty": 0.0
             },
             {
                 "bot_id": 4,
-                "name": "StressTest_Bot_3_1782180271",
+                "name": "StressTest_Bot_3_1783059963",
                 "direction": "LONG",
                 "open_qty": 0.0,
                 "signed_qty": 0.0
             },
             {
                 "bot_id": 5,
-                "name": "StressTest_Bot_4_1782180271",
+                "name": "StressTest_Bot_4_1783059963",
                 "direction": "LONG",
                 "open_qty": 0.0,
                 "signed_qty": 0.0
             }
         ]
     },
-    "ETH/USDC:USDC": {
-        "timestamp": 1782180642,
-        "pair": "ETH/USDC:USDC",
-        "exchange_net": 0.0,
+    "BTC/USDC": {
+        "timestamp": 1783053746,
+        "pair": "BTC/USDC",
+        "exchange_net": -0.012,
         "db_sum_qty": 0.0,
-        "diff": 0.0,
+        "diff": -0.012,
         "tolerance": 0.002,
-        "drift_detected": false,
+        "drift_detected": true,
         "bots": [
             {
-                "bot_id": 10011,
-                "name": "eth",
-                "direction": "SHORT",
-                "open_qty": 0.0,
-                "signed_qty": -0.0
-            },
-            {
-                "bot_id": 10021,
-                "name": "long eth",
-                "direction": "LONG",
-                "open_qty": 0.0,
-                "signed_qty": 0.0
-            },
-            {
-                "bot_id": 100002,
-                "name": "short eth",
-                "direction": "SHORT",
-                "open_qty": 0.0,
-                "signed_qty": -0.0
-            },
-            {
-                "bot_id": 100316,
-                "name": "eth_hedge",
-                "direction": "LONG",
-                "open_qty": 0.0,
-                "signed_qty": 0.0
-            },
-            {
-                "bot_id": 100321,
-                "name": "long eth_hedge",
-                "direction": "SHORT",
-                "open_qty": 0.0,
-                "signed_qty": -0.0
-            },
-            {
-                "bot_id": 100325,
-                "name": "short eth_hedge",
-                "direction": "LONG",
-                "open_qty": 0.0,
-                "signed_qty": 0.0
-            }
-        ]
-    },
-    "SOL/USDC:USDC": {
-        "timestamp": 1782180642,
-        "pair": "SOL/USDC:USDC",
-        "exchange_net": 0.26,
-        "db_sum_qty": 0.26,
-        "diff": 0.0,
-        "tolerance": 0.002,
-        "drift_detected": false,
-        "bots": [
-            {
-                "bot_id": 10008,
-                "name": "sol",
-                "direction": "LONG",
-                "open_qty": 0.26,
-                "signed_qty": 0.26
-            },
-            {
-                "bot_id": 100001,
-                "name": "short sol",
-                "direction": "SHORT",
-                "open_qty": 0.0,
-                "signed_qty": -0.0
-            },
-            {
-                "bot_id": 100315,
-                "name": "sol_hedge",
-                "direction": "SHORT",
-                "open_qty": 0.0,
-                "signed_qty": -0.0
-            },
-            {
-                "bot_id": 100324,
-                "name": "short sol_hedge",
-                "direction": "LONG",
-                "open_qty": 0.0,
-                "signed_qty": 0.0
-            }
-        ]
-    },
-    "BNB/USDC:USDC": {
-        "timestamp": 1782180642,
-        "pair": "BNB/USDC:USDC",
-        "exchange_net": 0.0,
-        "db_sum_qty": 0.0,
-        "diff": 0.0,
-        "tolerance": 0.002,
-        "drift_detected": false,
-        "bots": [
-            {
-                "bot_id": 10007,
-                "name": "BNB short",
-                "direction": "SHORT",
-                "open_qty": 0.0,
-                "signed_qty": -0.0
-            },
-            {
-                "bot_id": 100314,
-                "name": "BNB short_hedge",
+                "bot_id": 10001,
+                "name": "dummy_bot",
                 "direction": "LONG",
                 "open_qty": 0.0,
                 "signed_qty": 0.0

@@ -266,13 +266,45 @@ def _drain_pending_fills() -> None:
         logger.error(
             f"[PENDING-FILL-EXHAUSTED] Bot {bid} {otype} order {order_id}: "
             f"credit_fill failed after {retries} retries ({age}s elapsed). "
-            f"Escalating to REQUIRE_MANUAL_PROOF — fill qty={qty:.6f} @ {price:.4f} NOT dropped."
+            f"Escalating to REQUIRE_MANUAL_PROOF."
         )
+        
+        # 1. Record the fill as best-effort (update bot_orders filled_amount)
+        recorded = False
+        try:
+            from engine.ledger import credit_fill
+            recorded = credit_fill(
+                bot_id=bid,
+                order_id=order_id,
+                cumulative_qty=qty,
+                avg_price=price,
+                order_type=otype,
+                is_cumulative=True,
+                fill_ts=fill_ts,
+                caller='pending_fill_exhausted'
+            )
+        except Exception as _e_cred:
+            logger.error(f"[PENDING-FILL-EXHAUSTED] Best-effort credit_fill failed for order {order_id}: {_e_cred}")
+            
+        # 2. THEN set REQUIRE_MANUAL_PROOF
         try:
             from engine.parity_gates import flag_orphan_fill_manual_proof
             flag_orphan_fill_manual_proof(bid, order_id, symbol, qty, 'pending_fill_exhausted')
         except Exception as _e:
             logger.error(f"[PENDING-FILL-ESCALATE] flag_orphan_fill_manual_proof failed: {_e}")
+            
+        # 3. Log warning that bot is gated but fill was recorded/attempted
+        if recorded:
+            logger.warning(
+                f"⚠️ [PENDING-FILL-GATED] Bot {bid} {otype} order {order_id}: "
+                f"Bot is now gated (REQUIRE_MANUAL_PROOF), but the fill was successfully recorded."
+            )
+        else:
+            logger.warning(
+                f"⚠️ [PENDING-FILL-GATED] Bot {bid} {otype} order {order_id}: "
+                f"Bot is now gated (REQUIRE_MANUAL_PROOF), best-effort fill recording did not succeed."
+            )
+            
         with _pending_fills_lock:
             _pending_fills.pop(order_id, None)
 
@@ -535,7 +567,9 @@ def handle_order_update(event: Dict):
             return
             
         bot_id = int(parts[1])
-        order_type = parts[2]  # ENTRY, TP, GRID
+        order_type = parts[2].upper()  # ENTRY, TP, GRID
+        if order_type == 'DUST':
+            order_type = 'DUST_CLOSE'
         
         logger.debug(f"📬 WS Processing {order_type} for Bot {bot_id} (Status: {status})")
 
@@ -761,7 +795,7 @@ def _handle_order_filled(bot_id: int, order_type: str, event: Dict):
         except Exception as e:
             logger.error(f"[WS-FILL] TP credit failed for bot {bot_id}: {e}")
 
-    elif order_type in ('GRID', 'ENTRY'):
+    elif order_type in ('GRID', 'ENTRY', 'DUST_CLOSE', 'CLOSE', 'SL', 'FLATTEN_CLOSE'):
         # v2.0: credit_fill → seal_trade_state
         try:
             from engine.ledger import credit_fill, seal_trade_state

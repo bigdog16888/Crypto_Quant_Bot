@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 class Config:
-    VERSION = "4.1.3"  # v4.1.3: Phase 2 exchange-authoritative position sync — FIFO reseal on drift
+    VERSION = "5.0.0"  # v5.0.0: First Stable Green Release
     ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
     def __init__(self):
@@ -76,6 +76,17 @@ class Config:
         self.MAX_ADOPTION_QTY_PER_CYCLE = float(os.getenv("MAX_ADOPTION_QTY_PER_CYCLE", "0.5"))
         # Max quantity allowed to be automatically trimmed/aligned by OWAY_REPAIR (default 50.0)
         self.MAX_OWAY_REPAIR_QTY = float(os.getenv("MAX_OWAY_REPAIR_QTY", "50.0"))
+
+        # ── ADR-005 Phase 3: Proportional Allocation ─────────────────────────────
+        # When True: sync_pair_to_exchange() writes trades.open_qty proportionally
+        # from exchange net; apply_oneway_entry_cross_reduction() is skipped.
+        # When False (default / Stage A): virtual netting active; PA logic runs in
+        # parallel observation-only mode and logs [PA-SYNC] lines for validation.
+        # v4.1.6: Proportional Allocation model permanently CANCELLED.
+        self.PROPORTIONAL_ALLOCATION = False
+        # After this many consecutive API failures per pair, set bots to REQUIRE_MANUAL_PROOF.
+        self.PA_SYNC_MAX_STALE_CYCLES = int(os.getenv("PA_SYNC_MAX_STALE_CYCLES", "5"))
+        # ─────────────────────────────────────────────────────────────────────────
 
         self.ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         self.PATHS = {

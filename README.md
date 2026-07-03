@@ -1,108 +1,97 @@
-# 🤖 Crypto Quant Bot (v4.1.4)
+# 🤖 Crypto Quant Bot (v4.3.8)
 
-A professional-grade, multi-bot algorithmic trading system designed for **Binance Futures (USDT/USDC)**. It features a robust **Virtual Position Manager** that allows multiple bots to trade the same pair independently (e.g., Hedging Long/Short) without conflict.
+A professional-grade, multi-bot algorithmic trading system for **Binance Futures (USDC)**. Each bot maintains independent virtual accounting while the engine enforces **proof-only reconciliation** against the exchange one-way net position.
 
-## 🌟 Key Features
+## 🌟 Key Features (v4.3.8)
 
-*   **Virtual Position System:** Each bot tracks its own position logic (`trades` table) while the engine reconciles with the exchange.
-*   **Fully Autonomous Reconciliation (v4.1.4):** Achieved absolute ledger parity (0.00 drift). The engine relies on cryptographic proof-of-fill (Deterministic ID mapping) and handles complex One-Way mode netting and Hedge-aware ledger recovery.
-*   **Ghost-Proof Order Management:** Advanced string-parsing logic for `clientOrderId` eliminates infinite cancel/recreate loops and stale order "ghosting."
-*   **Drift-Aware Consensus:** Pair-consensus logic accounts for sibling virtual positions on the same pair, preventing false-positive drift alerts in One-Way accounts.
-*   **Atomic State Integrity:** Consolidates snapshots into `BEGIN IMMEDIATE` transaction blocks with fail-safe recovery for TP and Grid placements.
-*   **High-Precision Arithmetic & Ledger Mapping:** All calculations use cent-level ($0.01) precision guards. WebSocket order fills map correctly to `pnl` and `cost_usdc` database columns, eliminating numerical noise.
-*   **🛡️ [DEDUP-GUARD] Pre-flight Check (v3.1):** Enforces a strict pre-flight state lock in `bot_executor.py` preventing duplicate orders from being placed during runner retry loops if an order is already executing.
-*   **💥 Single-Click Close Orphan UI (v3.1):** Dashboard features a visual mismatch-action button allowing users to immediately resolve and flatten orphaned positions on the exchange with single-click precision.
-*   **Async DB Write Queue (INV-31):** WebSocket fill events are dispatched to a non-blocking background SQLite write queue worker, keeping the CCXT listener lag-free and preventing DB-lock exceptions.
-*   **Hedge Child Lifecycle Integrity (INV-29):** Implements strict lifecycle gates and recovery paths for child hedge orders (TP/SL/BE) to prevent orphaned orders in volatile markets.
-*   **Pending Hedge Close & BE-Only States:** Protects virtual positions in volatile conditions using Break-Even only and pending-close states.
-*   **Dynamic Fragment UI Refresh:** Dashboard utilizes independent `@st.fragment` zones for Header (30s) and Bot Grid (15s) with live data-sync timestamps — zero full-page flickering.
-*   **SocketLock Singleton:** OS-enforced process protection (TCP port 19888) to prevent duplicate runners.
-*   **Real-Time UI:** Streamlit dashboard with ghosting-loop fixes, **Auto-Refresh**, Live Charts, Parallel Data Fetching, and Portfolio Heatmaps.
-*   **One-Way & Hedge Mode Support:** Fully compatible with Binance's One-Way and Hedge modes.
+* **Proof-Only Reconciliation (v3.5+):** Virtual positions derive only from `bot_orders` fills via `credit_fill()`. Parity is exact in quantity space (default tolerance 0.002).
+* **Independent Accounting (v4.3.0 / ADR-006):** Each bot tracks its own fills; pair-level net is the signed sum — no proportional cross-reduction.
+* **Authoritative Health State (v4.3.8):** `engine/health.py` computes netting, orphans, and header metrics once per cycle with a 120 s startup grace period (no false alarms on boot).
+* **INV-34 / INV-36 Safety:** Fills credit through manual-proof gates; missing-TP and double-close orphan detection protect in-trade bots.
+* **INV-32 Orphan Detection:** Unowned exchange positions surface as human-in-the-loop adoption alerts — never auto-adopted.
+* **Hedge Child Lifecycle (INV-29):** Parent/child hedge bots with BE-TP, cascade timeouts, and ghost detection.
+* **Async Write Queue (INV-31):** Non-blocking SQLite writes keep the WebSocket listener responsive.
+* **Streamlit Dashboard:** Native `@st.fragment` auto-refresh (Header 30 s, Bot Grid 15 s) with live parity display.
+* **One-Way Mode:** Binance account is **one-way** — never send `positionSide`.
 
 ---
 
 ## 🚀 Quick Start
 
 ### 1. Prerequisites
-*   Python 3.10+
-*   Binance Futures Account (Testnet or Mainnet)
-*   API Key & Secret
+* Python 3.10+
+* Binance Futures account (Testnet/Demo or Mainnet)
+* API key and secret
 
 ### 2. Installation
 ```bash
-# Clone repository
 git clone <repo_url>
 cd Crypto_Quant_Bot
-
-# Install dependencies
 pip install -r requirements.txt
 ```
 
 ### 3. Configuration
-Create a `.env` file in the root directory:
+Copy `.env.example` → `.env` and set:
 ```ini
-# --- EXCHANGE SETTINGS ---
-# Set both to True for Demo Trading
-# Set both to False for Mainnet (Real Money)
 TESTNET=True
 DEMO_TRADING=True
-
-BINANCE_API_KEY=your_api_key
-BINANCE_API_SECRET=your_api_secret
-
-# --- SYSTEM SETTINGS ---
+BINANCE_API_KEY=your_key
+BINANCE_API_SECRET=your_secret
 MARKET_TYPE=future
 ```
 
-### 4. Running the Bot
+### 4. Running
 
-**Option A: Combined Startup (Recommended)**
-Start both the trading engine and dashboard with a single command:
+**Combined (recommended):**
 ```bash
-run_stack.bat
+create_backup.bat          # optional — snapshot before first run
+run_stack.bat              # engine + dashboard
 ```
 
-**Option B: Separate Startup**
-**Step 1: Start the Trading Engine**
-This runs the backend logic (orders, websocket, risk management).
+**Separate:**
 ```bash
-run_bot.bat
-# OR
-python engine/runner.py
-```
-
-**Step 2: Launch the Dashboard**
-Open the web interface to monitor and control bots.
-```bash
-streamlit run ui/app.py
+run_bot.bat                # trading engine
+streamlit run ui/app.py    # dashboard
 ```
 
 ---
 
-## 🖥️ UI Dashboard Guide
+## 🖥️ Dashboard
 
-*   **📊 Live Monitor:**
-    *   **Overview Tab:** Global PnL, Total Equity, and Asset Breakdown.
-    *   **Live Charts Tab:** Real-time OHLCV charts for active pairs.
-    *   **Orders & History Tab:** View **Open Orders** (instantly fetched from DB) and **Recent Activity Log**.
-    *   **Auto-Refresh:** Toggle "⚡ Auto-Refresh" for 15s updates.
-*   **🏗️ Bot Creator:** Visually configure and launch new strategies (Martingale, Grid, etc.).
-*   **🛠️ Bot Manager:** Edit, Stop, or Delete existing bots.
-*   **📈 Analytics:** View historical performance, win rates, and equity curves.
+| Tab | Purpose |
+|-----|---------|
+| **Live Monitor** | Parity status, bot grid, orphan alerts, auto-refresh |
+| **Bot Creator** | Launch Martingale / Grid / Magic Hour strategies |
+| **Bot Manager** | Edit, stop, delete bots |
+| **Analytics** | Historical performance |
+
+Toggle **Auto-Refresh** only when actively monitoring — parallel fetching keeps it fast.
 
 ---
 
-## 🔧 Architecture & Troubleshooting
+## 🔧 Operator Tools
 
-See **[CODEBASE_GUIDE.md](file:///c:/Users/Gionie/Documents/GitHub/Crypto_Quant_Bot/CODEBASE_GUIDE.md)** for a deep dive into the system architecture, Pair-Consensus mathematical rules, and detailed debugging steps.
+| Tool | Command |
+|------|---------|
+| Bot state diagnostic | `python check_state.py` |
+| Live parity check | `python scripts/diag_live_state.py` |
+| One-shot ledger heal | `python scripts/run_startup_heal.py` |
+| Mismatch runbook | `docs/OPERATOR_MISMATCH_RUNBOOK.md` |
+| Version backup | `create_backup.bat` |
 
-### Common Fixes
-*   **System Slow?** Enable "Auto-Refresh" in the UI only when needed. The Dashboard now uses **parallel fetching** for speed.
-*   **Orders not showing?** The UI prioritizes the **Database** for speed. Click "Force Sync" if you suspect a mismatch.
-*   **API Errors?** If using Demo/Testnet, ensure `TESTNET=True` in `.env`. The system uses specific overrides for the `demo-fapi` endpoints to prevent `-2008` and `-2015` errors.
+---
+
+## 📚 Documentation
+
+| Document | Purpose |
+|----------|---------|
+| **[CODEBASE_GUIDE.md](CODEBASE_GUIDE.md)** | Authoritative guide for agents and developers |
+| **[docs/ARCHITECTURE_v3.5.md](docs/ARCHITECTURE_v3.5.md)** | Proof-ledger architecture |
+| **[docs/CHANGELOG.md](docs/CHANGELOG.md)** | Version history |
+| **[docs/adr/](docs/adr/)** | Architecture decision records |
+| **[TEST_SCENARIOS.md](TEST_SCENARIOS.md)** | Manual test scenarios |
 
 ---
 
 ## ⚠️ Disclaimer
-This software is for educational purposes. Cryptocurrency trading involves high risk. The authors are not responsible for any financial losses incurred while using this bot.
+This software is for educational purposes. Cryptocurrency trading involves high risk. The authors are not responsible for financial losses.

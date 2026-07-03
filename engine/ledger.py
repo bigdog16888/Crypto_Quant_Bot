@@ -55,6 +55,8 @@ def register_tp_cascade(bot_id: int, pair: str, exit_price: float, exit_fill_ts:
                       Passed through to reset_bot_after_tp to anchor cycle_start_time
                       to the actual trade-close moment on the exchange.
     """
+    from engine.database import get_connection
+    conn = get_connection()
     with _tp_cascade_lock:
         _tp_cascade_registry.add((bot_id, pair, exit_price, exit_fill_ts))
     logger.info(f"[TP-REGISTRY] Bot {bot_id} {pair} @ {exit_price:.6f} queued (fill_ts={exit_fill_ts}).")
@@ -159,6 +161,13 @@ def _credit_fill_internal(
 
     try:
         conn = get_connection()
+
+        # Get bot status to enforce REQUIRE_MANUAL_PROOF safety gates
+        _b_row = conn.execute("SELECT status FROM bots WHERE id = ?", (bot_id,)).fetchone()
+        bot_status = _b_row[0] if _b_row else ""
+        is_gated = (bot_status == 'REQUIRE_MANUAL_PROOF')
+        # Gated status blocks entry signals but NOT fill recording
+        # Fill recording always proceeds regardless of status
 
         # Find the bot_orders row — try order_id first, then client_order_id
         row = conn.execute(
@@ -274,7 +283,7 @@ def _credit_fill_internal(
         _ENTRY_TYPES = ('entry', 'grid', 'adoption_add', 'adoption',
                         'forensic_adoption_add')
         _EXIT_TYPES  = ('tp', 'close', 'sl', 'dust_close', 'adoption_reduce',
-                        'forensic_adoption_reduce')
+                        'forensic_adoption_reduce', 'flatten_close')
 
         if order_type in _ENTRY_TYPES and row_step is not None and row_cycle is not None and order_amount > 0:
             try:
@@ -371,34 +380,13 @@ def _credit_fill_internal(
             # Non-fatal: open_qty will be backfilled by check_and_fix_integrity on next startup
             logger.warning(f"[OPEN-QTY] Bot {bot_id}: accumulator update failed: {_oq_err}")
 
-        # One-way shared book: opposite-direction siblings must lose open_qty when this
-        # entry/grid fill nets against their side on the exchange.
-        if _otype_lower in _ENTRY_TYPES and delta > 1e-12:
-            try:
-                pair_row = conn.execute(
-                    "SELECT pair, direction FROM bots WHERE id = ?", (bot_id,)
-                ).fetchone()
-                if pair_row:
-                    from engine.oneway_netting import apply_oneway_entry_cross_reduction
-                    apply_oneway_entry_cross_reduction(
-                        bot_id,
-                        pair_row[0],
-                        pair_row[1],
-                        delta,
-                        str(order_id),
-                        avg_price,
-                        exchange=exchange,
-                    )
-            except Exception as _ow_err:
-                logger.warning(
-                    f"[ONEWAY-CROSS] Bot {bot_id} post-fill netting failed: {_ow_err}"
-                )
+        # One-way shared book netting logic removed under ADR-006. Independent accounting active.
 
         conn.commit()
 
         # Trigger hedge child signal if parent bot grid/entry fill is credited
         # This is for Fix 3A (real-time/online path)
-        if _otype_lower in _ENTRY_TYPES and delta > 1e-12:
+        if _otype_lower in _ENTRY_TYPES and delta > 1e-12 and bot_status != 'REQUIRE_MANUAL_PROOF':
             try:
                 _bot_row = conn.execute(
                     "SELECT name, pair, direction, hedge_child_bot_id, hedge_trigger_step FROM bots WHERE id = ?",
@@ -483,15 +471,36 @@ def _credit_fill_internal(
 # seal_trade_state() — The Only Writer to trades Table
 # ---------------------------------------------------------------------------
 
-def seal_trade_state(bot_id: int, force_recompute: bool = False) -> Dict[str, Any]:
+def seal_trade_state(
+    bot_id: int,
+    force_recompute: bool = False,
+    *,
+    cycle_floor: int = None,
+) -> Dict[str, Any]:
+    """Public entry-point for sealing bot trade state.
+
+    Args:
+        cycle_floor: Optional[int]. When provided, passes straight through to
+                 recompute_invested_from_orders(cycle_floor=...) so the FIFO
+                 computation spans [cycle_floor, trades.cycle_id] instead of
+                 just trades.cycle_id.  Used exclusively by the cross-cycle
+                 orphan healer in the reconciler (v4.1.5).  All existing
+                 callers omit this — behaviour is identical to before.
+    """
     from engine.write_queue import WriteQueue
     return WriteQueue().put_and_wait(
         _seal_trade_state_internal,
         bot_id,
-        force_recompute=force_recompute
+        force_recompute=force_recompute,
+        cycle_floor=cycle_floor,
     )
 
-def _seal_trade_state_internal(bot_id: int, force_recompute: bool = False) -> Dict[str, Any]:
+def _seal_trade_state_internal(
+    bot_id: int,
+    force_recompute: bool = False,
+    *,
+    cycle_floor: int = None,
+) -> Dict[str, Any]:
     """
     THE authoritative trades-table writer (v2.0).
 
@@ -561,20 +570,18 @@ def _seal_trade_state_internal(bot_id: int, force_recompute: bool = False) -> Di
                 f"[LEDGER-PREFLIGHT] Bot {bot_id}: total_invested={_pf_row[0]:.4f} "
                 f"but entry_confirmed=0. Forcing entry_confirmed=1 before seal."
             )
-            from engine.database import update_bot_status as _pf_ubs
-            _pf_ubs(bot_id, entry_confirmed=1)
+            conn.execute("UPDATE trades SET entry_confirmed = 1 WHERE bot_id = ?", (bot_id,))
+            conn.commit()
     except Exception as _pf_err:
         logger.warning(f"[LEDGER-PREFLIGHT] Bot {bot_id}: pre-flight guard failed (non-fatal): {_pf_err}")
     # ────────────────────────────────────────────────────────────────────────────
 
     try:
-        cost, avg, qty, step = recompute_invested_from_orders(bot_id)
+        cost, avg, qty, step = recompute_invested_from_orders(bot_id, cycle_floor=cycle_floor)
     except Exception as e:
         logger.error(f"[SEAL] recompute_invested_from_orders failed for bot {bot_id}: {e}")
         return {}
-
     main_open_qty = max(0.0, qty)
-
 
 
     try:
@@ -682,9 +689,60 @@ def _seal_trade_state_internal(bot_id: int, force_recompute: bool = False) -> Di
         if cost > 0.01 or main_open_qty > 1e-8:
             new_status = 'IN TRADE'
         else:
-            new_status = 'Scanning'
+            # Preserve pending_hedge_close status if it has an active hedge child
+            has_active_child = False
+            try:
+                row_child = conn.execute(
+                    "SELECT hedge_child_bot_id FROM bots WHERE id = ?", (bot_id,)
+                ).fetchone()
+                if row_child and row_child[0]:
+                    child_id = row_child[0]
+                    row_child_trade = conn.execute(
+                        "SELECT open_qty FROM trades WHERE bot_id = ?", (child_id,)
+                    ).fetchone()
+                    if row_child_trade and float(row_child_trade[0] or 0) > 1e-8:
+                        has_active_child = True
+            except Exception as _hc_err:
+                logger.warning(f"[SEAL] Bot {bot_id} active child check failed: {_hc_err}")
 
-        conn.execute("UPDATE bots SET status = ? WHERE id = ?", (new_status, bot_id))
+            if has_active_child:
+                new_status = 'pending_hedge_close'
+            else:
+                new_status = 'Scanning'
+
+        # Preserve REQUIRE_MANUAL_PROOF status if currently gated
+        row_curr_status = conn.execute("SELECT status FROM bots WHERE id = ?", (bot_id,)).fetchone()
+        curr_status = row_curr_status[0] if row_curr_status else ""
+        if curr_status == 'REQUIRE_MANUAL_PROOF':
+            # Only preserve gate if position is still open (entry fill)
+            # If position is now flat (TP completed), clear the gate
+            step_size_tolerance = 1e-5
+            try:
+                # Attempt to determine actual step size from exchange if runner exists
+                row_pair = conn.execute("SELECT pair FROM bots WHERE id = ?", (bot_id,)).fetchone()
+                if row_pair and row_pair[0]:
+                    pair = row_pair[0]
+                    from engine.runner import BotRunner
+                    runner = BotRunner.get_instance()
+                    if runner and runner.exchange:
+                        prec = runner.exchange.get_symbol_precision(pair)
+                        if prec and 'step_size' in prec:
+                            step_size_tolerance = float(prec['step_size']) * 0.5
+            except Exception:
+                pass
+
+            if main_open_qty <= step_size_tolerance:
+                new_status = 'Scanning'
+                logger.info(f"[SEAL] Bot {bot_id}: REQUIRE_MANUAL_PROOF cleared — position is now flat after TP.")
+                cascade_statuses = ('pending_close', 'FLATTENING', 'pending_flatten', 'pending_hedge_close')
+                cascade_ts = int(time.time()) if new_status in cascade_statuses else 0
+                conn.execute("UPDATE bots SET status = ?, cascade_started_at = ? WHERE id = ?", (new_status, cascade_ts, bot_id))
+            else:
+                logger.info(f"[SEAL] Bot {bot_id}: REQUIRE_MANUAL_PROOF preserved — position still open (open_qty={main_open_qty:.6f})")
+        else:
+            cascade_statuses = ('pending_close', 'FLATTENING', 'pending_flatten', 'pending_hedge_close')
+            cascade_ts = int(time.time()) if new_status in cascade_statuses else 0
+            conn.execute("UPDATE bots SET status = ?, cascade_started_at = ? WHERE id = ?", (new_status, cascade_ts, bot_id))
         conn.commit()
 
 
@@ -1241,7 +1299,7 @@ def handle_flatten(
         norm_pair = normalize_symbol(pair)
 
         # --- Step 1: Set FLATTENING status to block new orders ---
-        conn.execute("UPDATE bots SET status='FLATTENING' WHERE id=?", (bot_id,))
+        conn.execute("UPDATE bots SET status='FLATTENING', cascade_started_at=? WHERE id=?", (int(time.time()), bot_id))
         conn.commit()
         logger.info(f"[FLATTEN] Bot {bot_id}: Status → FLATTENING")
 

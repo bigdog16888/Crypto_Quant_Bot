@@ -177,10 +177,10 @@ def heal_zombie_bots(conn):
                 _bo_net = c.execute("""
                     SELECT COALESCE(SUM(CASE WHEN order_type IN ('entry','grid','adoption','adoption_add','carry')
                                             THEN filled_amount ELSE 0 END)
-                                  - SUM(CASE WHEN order_type IN ('tp','close','sl','dust_close','adoption_reduce')
+                                  - SUM(CASE WHEN order_type IN ('tp','close','sl','dust_close','adoption_reduce','flatten_close')
                                             THEN filled_amount ELSE 0 END), 0)
                     FROM bot_orders WHERE bot_id = ? AND filled_amount > 0
-                    AND status NOT IN ('reset_cleared','auto_closed','virtual_netting')
+                    AND status NOT IN ('reset_cleared','auto_closed','virtual_netting','archived_legacy')
                     AND cycle_id = ?
                 """, (bot_id, cycle_id)).fetchone()
                 _bo_net_qty = max(0.0, float(_bo_net[0] or 0))
@@ -215,10 +215,10 @@ def heal_zombie_bots(conn):
                 _bo_net2 = c.execute("""
                     SELECT COALESCE(SUM(CASE WHEN order_type IN ('entry','grid','adoption','adoption_add','carry')
                                             THEN filled_amount ELSE 0 END)
-                                  - SUM(CASE WHEN order_type IN ('tp','close','sl','dust_close','adoption_reduce')
+                                  - SUM(CASE WHEN order_type IN ('tp','close','sl','dust_close','adoption_reduce','flatten_close')
                                             THEN filled_amount ELSE 0 END), 0)
                     FROM bot_orders WHERE bot_id = ? AND filled_amount > 0
-                    AND status NOT IN ('reset_cleared','auto_closed','virtual_netting')
+                    AND status NOT IN ('reset_cleared','auto_closed','virtual_netting','archived_legacy')
                     AND cycle_id = ?
                 """, (bot_id, cycle_id)).fetchone()
                 _bo_net_qty2 = max(0.0, float(_bo_net2[0] or 0))
@@ -250,7 +250,7 @@ def heal_zombie_bots(conn):
                 ledger_net = c.execute("""
                     SELECT COALESCE(SUM(
                         CASE WHEN order_type IN ('entry','grid','adoption_add','adoption') THEN filled_amount
-                             WHEN order_type IN ('tp','close','adoption_reduce','dust_close','sl') THEN -filled_amount
+                             WHEN order_type IN ('tp','close','adoption_reduce','dust_close','sl','flatten_close') THEN -filled_amount
                              ELSE 0 END
                     ), 0)
                     FROM bot_orders
@@ -421,6 +421,44 @@ def auto_create_and_link_hedge_children(conn):
             
             conn.commit()
             logger.info(f"🩹 [HEDGE-HEAL] Successfully linked parent {bot_id} → child {child_id} (trigger step = {hedge_trigger_step}).")
+
+def _prune_cross_reduction_claims(conn, retention_days=30):
+    """
+    Remove cross_reduction_claims rows older than retention_days.
+    The UNIQUE(source_order_id, target_bot_id) constraint only needs
+    to prevent duplicates within the window where a fill event could
+    be re-delivered (WS retry, REST audit overlap). 30 days is
+    far beyond any realistic re-delivery window.
+    
+    Safe to run with open positions — only deletes old rows,
+    never modifies active accounting state.
+    """
+    cutoff = int(time.time()) - (retention_days * 86400)
+    result = conn.execute(
+        "DELETE FROM cross_reduction_claims WHERE claimed_at < ?",
+        (cutoff,)
+    )
+    deleted = result.rowcount
+    if deleted > 0:
+        conn.commit()
+        logger.info(
+            f"[PRUNE] cross_reduction_claims: removed {deleted} rows "
+            f"older than {retention_days} days."
+        )
+
+def _prune_fill_claims(conn, retention_days=30):
+    cutoff = int(time.time()) - (retention_days * 86400)
+    result = conn.execute(
+        "DELETE FROM fill_claims WHERE claimed_at < ?",
+        (cutoff,)
+    )
+    deleted = result.rowcount
+    if deleted > 0:
+        conn.commit()
+        logger.info(
+            f"[PRUNE] fill_claims: removed {deleted} rows "
+            f"older than {retention_days} days."
+        )
 
 def init_db():
     """Initializes the database schema and performs necessary migrations."""
@@ -869,6 +907,80 @@ def init_db():
         heal_zombie_bots(conn)
         auto_create_and_link_hedge_children(conn)
 
+        # Create schema_migrations table
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                version     TEXT PRIMARY KEY,
+                applied_at  INTEGER NOT NULL,
+                description TEXT
+            )
+        """)
+        conn.commit()
+
+        # Helper functions to detect schema state for auto-seeding
+        def _col_exists(table: str, column: str) -> bool:
+            try:
+                res = conn.execute(f"PRAGMA table_info({table})").fetchall()
+                return any(row[1] == column for row in res)
+            except Exception:
+                return False
+
+        def _tbl_exists(table: str) -> bool:
+            try:
+                res = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+                return res is not None
+            except Exception:
+                return False
+
+        def _idx_exists(index: str) -> bool:
+            try:
+                res = conn.execute("SELECT name FROM sqlite_master WHERE type='index' AND name=?", (index,)).fetchone()
+                return res is not None
+            except Exception:
+                return False
+
+        # Auto-seed schema_migrations based on current database state (for pre-existing databases)
+        seeds = []
+        if _tbl_exists('reconciliation_logs'):
+            seeds.append(('migration_001_v2_schema', 'v2.0 + v2.1 Database Schema Migration'))
+        if _idx_exists('idx_bot_orders_bot_cid'):
+            seeds.append(('migration_002_unique_cid', 'Unique client_order_id Index Migration'))
+        if _tbl_exists('fill_claims'):
+            seeds.append(('migration_003_fill_claims', 'fill_claims table'))
+        if _tbl_exists('cross_reduction_claims'):
+            seeds.append(('migration_004_cross_reduction_claims', 'cross_reduction_claims'))
+        if _col_exists('bots', 'cascade_started_at'):
+            seeds.append(('migration_005_cid_too_long', 'clean up existing oversized CIDs'))
+        if _col_exists('cross_reduction_claims', 'deprecated_at'):
+            seeds.append(('migration_006_pa_legacy_netting', 'PA legacy netting migration'))
+        if _col_exists('bots', 'cascade_started_at'):
+            seeds.append(('migration_007_cascade_started_at', 'add cascade_started_at column'))
+        
+        # For migration 008, check if there are any un-archived legacy virtual netting rows
+        try:
+            pending_count = conn.execute("""
+                SELECT COUNT(*) FROM bot_orders 
+                WHERE order_type='virtual_netting' 
+                AND status NOT IN ('archived_legacy','reset_cleared','cancelled','canceled','auto_closed')
+            """).fetchone()[0]
+        except Exception:
+            pending_count = 1
+        if pending_count == 0:
+            seeds.append(('migration_008_archive_legacy_netting', 'Archive legacy virtual_netting rows'))
+
+        if _col_exists('bots', 'notes'):
+            seeds.append(('migration_009_bots_notes_column', 'add notes column to bots table'))
+        if _tbl_exists('unowned_position_alerts'):
+            seeds.append(('migration_010_unowned_position_alerts', 'create unowned_position_alerts table'))
+
+        for version, desc in seeds:
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations "
+                "(version, applied_at, description) VALUES (?, 0, ?)",
+                (version, desc)
+            )
+        conn.commit()
+
         # Run migrations to ensure full schema alignment
         try:
             from engine.migrations.migration_001_v2_schema import run as _run_migration_1
@@ -879,8 +991,41 @@ def init_db():
             _run_migration_3(DB_PATH)
             from engine.migrations.migration_004_cross_reduction_claims import run as _run_migration_4
             _run_migration_4(DB_PATH)
+            from engine.migrations.migration_005_cid_too_long import run as _run_migration_5
+            _run_migration_5(DB_PATH)
+            from engine.migrations.migration_006_pa_legacy_netting import run as _run_migration_6
+            _run_migration_6(DB_PATH)
+            from engine.migrations.migration_007_cascade_started_at import run as _run_migration_7
+            _run_migration_7(DB_PATH)
+            from engine.migrations.migration_008_archive_legacy_netting import run as _run_migration_8
+            _run_migration_8(DB_PATH)
+            from engine.migrations.migration_009_bots_notes_column import run as _run_migration_9
+            _run_migration_9(DB_PATH)
+            from engine.migrations.migration_010_unowned_position_alerts import run as _run_migration_10
+            _run_migration_10(DB_PATH)
         except Exception as _mig_err:
             logger.warning(f"Failed to run inline migrations during init_db: {_mig_err}")
+
+        # Create indexes if not exists
+        try:
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_cross_reduction_claims_claimed_at
+                ON cross_reduction_claims (claimed_at);
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_fill_claims_claimed_at
+                ON fill_claims (claimed_at);
+            """)
+            conn.commit()
+        except Exception as _idx_err:
+            logger.warning(f"Failed to create claims index during init_db: {_idx_err}")
+
+        # Run pruning
+        try:
+            _prune_cross_reduction_claims(conn, retention_days=30)
+            _prune_fill_claims(conn, retention_days=30)
+        except Exception as _prune_err:
+            logger.warning(f"Failed to prune claims tables during init_db: {_prune_err}")
     except Exception as e:
         try:
             logger.warning(f"Database init warning (non-fatal): {e}")
@@ -1320,7 +1465,7 @@ def _reset_bot_after_tp_internal(cursor, bot_id, exit_price, direction=None, act
 
     cursor.execute("""
         SELECT ROUND(COALESCE(SUM(CASE WHEN order_type IN ('entry', 'grid', 'adoption_add', 'adoption') THEN filled_amount ELSE 0 END), 0) -
-               COALESCE(SUM(CASE WHEN order_type IN ('tp', 'close', 'adoption_reduce', 'dust_close', 'sl') THEN filled_amount ELSE 0 END), 0), 8)
+               COALESCE(SUM(CASE WHEN order_type IN ('tp', 'close', 'adoption_reduce', 'dust_close', 'sl', 'flatten_close') THEN filled_amount ELSE 0 END), 0), 8)
         FROM bot_orders WHERE bot_id = ? AND filled_amount > 0 AND (cycle_id = ? OR cycle_id IS NULL)
         AND status NOT IN ('reset_cleared', 'auto_closed')
     """, (bot_id, old_cycle))
@@ -1411,8 +1556,8 @@ def _reset_bot_after_tp_internal(cursor, bot_id, exit_price, direction=None, act
     phys_side = 'LONG' if bot_dir_upper == 'LONG' else 'SHORT'
     norm_pair = pair.split(':')[0].replace('/', '')
     snap_row = cursor.execute(
-        "SELECT size FROM active_positions WHERE pair=? AND side=?",
-        (norm_pair, phys_side)
+        "SELECT size FROM active_positions WHERE pair=? AND side=? AND bot_id=?",
+        (norm_pair, phys_side, bot_id)
     ).fetchone()
     if snap_row and float(snap_row[0] or 0) > 0:
         phys_qty = float(snap_row[0])
@@ -1494,6 +1639,33 @@ def _reset_bot_after_tp_internal(cursor, bot_id, exit_price, direction=None, act
                 f"Proceeding with cycle advance — fill may be orphaned."
             )
     # ─────────────────────────────────────────────────────────────────────────
+    
+    # 🧹 SWEEP BALANCED HISTORICAL CYCLES (v4.1.5)
+    # Automatically sweep older balanced cycles to reset_cleared.
+    try:
+        cursor.execute("""
+            SELECT cycle_id,
+                   SUM(CASE WHEN order_type IN ('entry','grid','adoption','adoption_add','carry') THEN filled_amount ELSE 0.0 END) AS entry_qty,
+                   SUM(CASE WHEN order_type IN ('tp','close','dust_close','sl','adoption_reduce','flatten_close') THEN filled_amount ELSE 0.0 END) AS exit_qty
+            FROM bot_orders
+            WHERE bot_id = ? AND cycle_id < ? AND cycle_id IS NOT NULL AND status = 'filled'
+            GROUP BY cycle_id
+        """, (bot_id, new_cycle))
+        all_cycles = cursor.fetchall()
+        balanced_cycles = []
+        for cid, eq, xq in all_cycles:
+            if abs(eq - xq) < 1e-6:
+                balanced_cycles.append(cid)
+        if balanced_cycles:
+            placeholders = ','.join('?' for _ in balanced_cycles)
+            cursor.execute(f"""
+                UPDATE bot_orders
+                SET status = 'reset_cleared', updated_at = ?
+                WHERE bot_id = ? AND cycle_id IN ({placeholders}) AND status = 'filled'
+            """, [now_ts, bot_id] + balanced_cycles)
+            logger.info(f"🧹 [CYCLE-SWEEP] Bot {bot_id}: Swept balanced old cycles {balanced_cycles} to reset_cleared.")
+    except Exception as e_sweep:
+        logger.error(f"[CYCLE-SWEEP] Failed to sweep old cycles for bot {bot_id}: {e_sweep}")
 
     # 🚀 ARCHITECTURAL FIX (v3.0.7): Increment cycle_id FIRST.
     cursor.execute("UPDATE trades SET cycle_id = ? WHERE bot_id = ?", (new_cycle, bot_id))
@@ -1748,8 +1920,8 @@ def safe_wipe_bot(
 
     cached_phys_qty = 0.0
     phys_row = cursor.execute(
-        "SELECT ABS(size) FROM active_positions WHERE pair=? AND side=?",
-        (clean_pair, side_check)
+        "SELECT ABS(size) FROM active_positions WHERE pair=? AND side=? AND bot_id=?",
+        (clean_pair, side_check, bot_id)
     ).fetchone()
     if phys_row and phys_row[0]:
         cached_phys_qty = float(phys_row[0])
@@ -1810,7 +1982,7 @@ def safe_wipe_bot(
         SELECT COALESCE(SUM(
             CASE WHEN order_type IN ('entry','grid','adoption_add','adoption') THEN filled_amount ELSE 0 END
         ) - SUM(
-            CASE WHEN order_type IN ('tp','close','adoption_reduce','dust_close','sl') THEN filled_amount ELSE 0 END
+            CASE WHEN order_type IN ('tp','close','adoption_reduce','dust_close','sl','flatten_close') THEN filled_amount ELSE 0 END
         ), 0)
         FROM bot_orders
         WHERE bot_id=? AND filled_amount > 0
@@ -3321,7 +3493,7 @@ def consolidate_duplicate_bot_orders(bot_id: int = None) -> int:
         # was the stale value that inflated open_qty.
         EXIT_TYPES = frozenset({
             'tp', 'close', 'sl', 'dust_close', 'adoption_reduce',
-            'forensic_adoption_reduce', 'hedge_tp',
+            'forensic_adoption_reduce', 'hedge_tp', 'flatten_close',
         })
 
         for _bid, cid, id_csv in groups:
@@ -3610,7 +3782,7 @@ def verify_filled_orders_against_exchange(exchange, bot_id: int = None) -> int:
 
 
 
-def recompute_invested_from_orders(bot_id: int, cycle_id: int = None) -> tuple:
+def recompute_invested_from_orders(bot_id: int, cycle_id: int = None, *, cycle_floor: int = None) -> tuple:
     """
     Derive (total_invested, avg_entry_price, current_step) from confirmed filled
     bot_orders for the bot's current cycle using chronological FIFO matching.
@@ -3635,6 +3807,32 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None) -> tuple:
             return (0.0, 0.0, 0.0, 0)
             
         wall_ts = int(row_trade[2] or 0)
+
+        # Determine the cycle floor
+        if cycle_floor is None:
+            # Auto-detection orphan scan: find the lowest cycle_id < target_cycle with unbalanced status='filled'
+            # Note: virtual_netting and legacy_netting are permanently excluded from exit order types
+            cursor.execute("""
+                SELECT cycle_id,
+                       SUM(CASE WHEN order_type IN ('entry','grid','adoption','adoption_add','carry') THEN filled_amount ELSE 0.0 END) AS entry_qty,
+                       SUM(CASE WHEN order_type IN ('tp','close','dust_close','sl','adoption_reduce','flatten_close') THEN filled_amount ELSE 0.0 END) AS exit_qty
+                FROM bot_orders
+                WHERE bot_id = ?
+                  AND cycle_id < ?
+                  AND cycle_id IS NOT NULL
+                  AND filled_amount > 0
+                  AND status = 'filled'
+                GROUP BY cycle_id
+                HAVING (entry_qty - exit_qty) > 1e-6
+                ORDER BY cycle_id ASC
+                LIMIT 1
+            """, (bot_id, target_cycle))
+            row_floor = cursor.fetchone()
+            if row_floor:
+                cycle_floor = row_floor[0]
+                logger.info(f"[RECOMPUTE] Bot {bot_id}: Auto-detected cycle_floor={cycle_floor} due to unbalanced older cycle.")
+            else:
+                cycle_floor = target_cycle
         
         # 🚀 [v3.8.1 HEDGE CHILD DIRECTION AWARENESS]
         # Query bot's direction directly from bots table as the canonical source
@@ -3652,7 +3850,7 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None) -> tuple:
             SELECT bo.step, bo.price, bo.filled_amount
             {_canonical_bot_orders_from('bo')}
             AND bo.bot_id = ?
-              AND bo.cycle_id = ?
+              AND bo.cycle_id >= ? AND bo.cycle_id <= ?
               AND (bo.position_side = ? OR bo.position_side IS NULL OR bo.position_side = 'BOTH' OR bo.position_side = '')
               AND (
                   bo.status IN ('filled', 'closed', 'auto_closed', 'hedge_exited', 'partially_filled')
@@ -3662,7 +3860,7 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None) -> tuple:
               AND bo.order_type IN ('entry', 'grid', 'adoption', 'adoption_add', 'carry')
               AND (? = 0 OR bo.created_at >= ?)
             ORDER BY bo.created_at ASC;
-        """, (bot_id, target_cycle, bot_side, wall_ts, wall_ts))
+        """, (bot_id, cycle_floor, target_cycle, bot_side, wall_ts, wall_ts))
         
         buys = [
             {'step': r[0], 'price': float(r[1]), 'qty': float(r[2])}
@@ -3674,17 +3872,17 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None) -> tuple:
             SELECT bo.filled_amount
             {_canonical_bot_orders_from('bo')}
             AND bo.bot_id = ?
-              AND bo.cycle_id = ?
+              AND bo.cycle_id >= ? AND bo.cycle_id <= ?
               AND (bo.position_side = ? OR bo.position_side IS NULL OR bo.position_side = 'BOTH' OR bo.position_side = '')
               AND (
                   bo.status IN ('filled', 'closed', 'auto_closed', 'hedge_exited', 'partially_filled')
                   OR (bo.status IN ('canceled', 'cancelled', 'cancelling') AND bo.filled_amount > 0)
               )
               AND bo.filled_amount > 0
-              AND bo.order_type IN ('adoption_reduce', 'tp', 'close', 'dust_close', 'sl', 'virtual_netting')
+              AND bo.order_type IN ('adoption_reduce', 'tp', 'close', 'dust_close', 'sl', 'flatten_close')
               AND (? = 0 OR bo.created_at >= ?)
             ORDER BY bo.created_at ASC;
-        """, (bot_id, target_cycle, bot_side, wall_ts, wall_ts))
+        """, (bot_id, cycle_floor, target_cycle, bot_side, wall_ts, wall_ts))
         
         sells = [float(r[0]) for r in cursor.fetchall()]
         total_sold = sum(sells)
@@ -3787,8 +3985,8 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None) -> tuple:
 
         # ── SOURCE 2: active_positions snapshot (available after prime_startup_snapshot) ──
         snap_row = cursor.execute(
-            "SELECT entry_price FROM active_positions WHERE pair=? AND side=?",
-            (norm_pair, snap_side)
+            "SELECT entry_price FROM active_positions WHERE pair=? AND side=? AND bot_id=?",
+            (norm_pair, snap_side, bot_id)
         ).fetchone()
         if snap_row and float(snap_row[0] or 0) > 0:
             carry_avg_price = float(snap_row[0])
@@ -3837,144 +4035,29 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None) -> tuple:
 def get_pair_virtual_net(symbol: str) -> float:
     """
     Returns the signed virtual net quantity for a normalized symbol across ALL active bots.
-    
-    This is the SINGLE SOURCE OF TRUTH for virtual position accounting.
-    Uses identical logic to recompute_invested_from_orders() — same cycle guard,
-    same wipe_wall filter, same order type buckets, same hedge treatment.
-    
-    LONG bots contribute positive qty. SHORT bots contribute negative qty.
-    Net result mirrors what the exchange sees in one-way mode.
-    
-    If no bot_orders exist for a bot, falls back to trades.open_qty to ensure compatibility
-    with unit tests.
+    Under ADR-006, this is simply the sum of open_qty (direction-adjusted) across active bots,
+    including both standard and hedge_child bots to represent true system-wide virtual net.
     """
     from engine.exchange_interface import normalize_symbol
     norm_symbol = normalize_symbol(symbol).upper()
-    
+
     conn = get_connection()
-    cursor = conn.cursor()
-    
     try:
-        # Get all active bots. We'll filter them by normalized pair in Python to be 100% sure.
-        cursor.execute("""
-            SELECT b.id, b.direction, b.pair, b.normalized_pair,
-                   t.cycle_id as cycle_id,
-                   COALESCE(t.wipe_wall_ts, 0) as wipe_wall_ts,
-                   COALESCE(t.position_side, b.direction) as position_side,
-                   COALESCE(t.open_qty, 0) as open_qty
+        rows = conn.execute("""
+            SELECT b.direction, COALESCE(t.open_qty, 0.0)
             FROM bots b
-            LEFT JOIN trades t ON t.bot_id = b.id
-            WHERE b.is_active >= 0
-        """)
+            JOIN trades t ON t.bot_id = b.id
+            WHERE b.is_active = 1 AND (b.normalized_pair = ? OR b.pair = ? OR b.normalized_pair = ? OR b.pair = ?)
+        """, (norm_symbol, symbol, symbol, norm_symbol)).fetchall()
         
-        all_active_bots = cursor.fetchall()
-        if not all_active_bots:
-            return 0.0
-        
-        total_net = 0.0
-        
-        for bot_id, direction, raw_pair, bot_norm_pair, cycle_id, wipe_wall_ts, position_side, open_qty in all_active_bots:
-            current_bot_norm = (bot_norm_pair or normalize_symbol(raw_pair)).upper()
-            if current_bot_norm != norm_symbol:
-                continue
-                
-            # Fallback for bots without any orders
-            order_count = cursor.execute(
-                "SELECT COUNT(*) FROM bot_orders WHERE bot_id = ?", (bot_id,)
-            ).fetchone()[0]
-            
-            if order_count == 0:
-                oq = float(open_qty or 0)
-                direction_upper = str(direction).upper()
-                signed_qty = round(oq if direction_upper == 'LONG' else -oq, 8)
-                total_net = round(total_net + signed_qty, 8)
-                continue
-            
-            if cycle_id is None:
-                cycle_id_safe = -1
-                wipe_wall_ts_safe = 0
+        net_qty = 0.0
+        for direction, open_qty in rows:
+            qty = float(open_qty)
+            if direction.upper() == 'LONG':
+                net_qty += qty
             else:
-                cycle_id_safe = cycle_id
-                wipe_wall_ts_safe = int(wipe_wall_ts or 0)
-            
-            # Use identical SQL to recompute_invested_from_orders
-            res = cursor.execute(f"""
-                SELECT
-                    COALESCE(SUM(
-                        CASE WHEN bo.cycle_id = ? 
-                             AND (
-                                 bo.status IN ('filled', 'closed', 'auto_closed', 'hedge_exited', 'partially_filled')
-                                 OR (bo.status IN ('canceled', 'cancelled', 'cancelling') AND bo.filled_amount > 0)
-                             )
-                             AND (? = 0 OR bo.created_at >= ?)
-                             AND bo.order_type IN ('entry','grid','adoption_add','adoption','carry')
-                        THEN bo.filled_amount ELSE 0.0 END
-                    ), 0.0) AS bought_qty,
-                    
-                    COALESCE(SUM(
-                        CASE WHEN bo.cycle_id = ?
-                             AND (
-                                 bo.status IN ('filled', 'closed', 'auto_closed', 'hedge_exited', 'partially_filled')
-                                 OR (bo.status IN ('canceled', 'cancelled', 'cancelling') AND bo.filled_amount > 0)
-                             )
-                             AND (? = 0 OR bo.created_at >= ?)
-                             AND bo.order_type IN ('adoption_reduce','tp','close','dust_close','sl','virtual_netting')
-                        THEN bo.filled_amount ELSE 0.0 END
-                    ), 0.0) AS sold_qty,
-                    
-                    -- Hedge: cross-cycle, no wipe_wall — matches recompute_invested_from_orders exactly
-                    ROUND(COALESCE(SUM(
-                        CASE 
-                            WHEN bo.status NOT IN ('auto_closed','reset_cleared','rejected','failed')
-                                 AND bo.order_type LIKE 'hedge%' AND bo.order_type NOT LIKE '%tp%'
-                            THEN bo.filled_amount
-                            WHEN bo.status NOT IN ('auto_closed','reset_cleared','rejected','failed')
-                                 AND (bo.order_type LIKE 'hedge%tp%' OR bo.order_type LIKE 'hedgetp%')
-                            THEN -bo.filled_amount
-                            ELSE 0.0
-                        END
-                    ), 0.0), 8) AS hedge_qty
-                    
-                {_canonical_bot_orders_from('bo')}
-                  AND bo.bot_id = ?
-                  AND (
-                      bo.order_type LIKE 'hedge%' 
-                      OR bo.position_side = ? 
-                      OR bo.position_side IS NULL 
-                      OR bo.position_side = 'BOTH' 
-                      OR bo.position_side = ''
-                  )
-                  AND (
-                      bo.status IN ('filled', 'closed', 'auto_closed', 'hedge_exited', 'partially_filled')
-                      OR (bo.status IN ('canceled', 'cancelled', 'cancelling') AND bo.filled_amount > 0)
-                  )
-                  AND bo.filled_amount > 0
-            """, (
-                cycle_id_safe, wipe_wall_ts_safe, wipe_wall_ts_safe,  # bought_qty
-                cycle_id_safe, wipe_wall_ts_safe, wipe_wall_ts_safe,  # sold_qty
-                bot_id, position_side
-            )).fetchone()
-            
-            if not res:
-                continue
-            
-            bought_qty, sold_qty, hedge_qty = float(res[0] or 0), float(res[1] or 0), float(res[2] or 0)
-            
-            # Net entry/exit qty (no hedge here — hedge is a separate exchange-side position)
-            # Clamp to >= 0.0 to prevent negative virtual quantity anomalies due to wipe_wall_ts asymmetry
-            bot_net_qty = max(0.0, round(bought_qty - sold_qty, 8))
-            
-            # Sign by direction for one-way mode netting
-            direction_upper = str(direction).upper()
-            if direction_upper == 'LONG':
-                signed_qty = bot_net_qty - hedge_qty   # hedge is a SHORT, reduces net LONG
-            else:
-                signed_qty = -bot_net_qty + hedge_qty  # hedge on a SHORT bot adds back LONG
-                
-            total_net = round(total_net + signed_qty, 8)
-        
-        return total_net
-        
+                net_qty -= qty
+        return round(net_qty, 8)
     except Exception as e:
         logger.error(f"[get_pair_virtual_net] Error for {symbol}: {e}")
         return 0.0
@@ -4025,7 +4108,24 @@ def sync_trades_from_orders(bot_id: int) -> bool:
                 derived_phase = 'ACTIVE'
         else:
             if cached_phase not in ('IDLE', 'SCANNING'):
-                derived_phase = 'IDLE'
+                if cached_phase == 'HEDGE_PENDING_CLOSE':
+                    # Check if hedge child bot has active trade (non-zero open_qty)
+                    has_active_child = False
+                    row_child = cursor.execute("""
+                        SELECT t.open_qty 
+                        FROM bots b
+                        JOIN trades t ON t.bot_id = b.id
+                        WHERE b.parent_bot_id = ? AND b.bot_type = 'hedge_child' AND b.is_active = 1
+                    """, (bot_id,)).fetchone()
+                    if row_child and float(row_child[0] or 0.0) > 1e-8:
+                        has_active_child = True
+                    
+                    if has_active_child:
+                        derived_phase = 'HEDGE_PENDING_CLOSE'
+                    else:
+                        derived_phase = 'IDLE'
+                else:
+                    derived_phase = 'IDLE'
 
         delta_qty = abs(main_open_qty - cached_open_qty)
         is_phase_diff = (derived_phase != cached_phase)
@@ -4480,6 +4580,7 @@ def update_order_status(order_id, status, bot_id=None, filled_qty=None):
     Updates the status of an order in bot_orders.
     🚀 EVIDENCE PROTECTION: Only updates filled_amount if the new qty is >= existing.
     Prevents late exchange reports (0 quantity remaining) from erasing proven fill history.
+    Enforces a strict state transition matrix to prevent race-condition status downgrades.
     """
     try:
         conn = get_connection()
@@ -4487,6 +4588,59 @@ def update_order_status(order_id, status, bot_id=None, filled_qty=None):
         
         # Current time as timestamp
         now_ts = int(time.time())
+        
+        conn.execute("BEGIN IMMEDIATE")
+        
+        # 1. Fetch current status to validate transition
+        if bot_id:
+            cursor.execute("SELECT status, filled_amount FROM bot_orders WHERE order_id = ? AND bot_id = ? LIMIT 1", (str(order_id), bot_id))
+        else:
+            cursor.execute("SELECT status, filled_amount FROM bot_orders WHERE order_id = ? LIMIT 1", (str(order_id),))
+        row = cursor.fetchone()
+        
+        if row:
+            curr_status, curr_filled = row[0], row[1]
+            curr_status_lower = curr_status.lower() if curr_status else ''
+            new_status_lower = status.lower()
+            
+            # Rule 1: Allow reset_cleared from any status as administrative override
+            if new_status_lower == 'reset_cleared':
+                pass
+            else:
+                # Rule 2: Block transition from terminal -> active
+                terminal_statuses = ('filled', 'closed', 'cancelled', 'canceled', 'failed', 'rejected', 'expired')
+                active_statuses = ('open', 'partially_filled', 'cancelling')
+                if curr_status_lower in terminal_statuses and new_status_lower in active_statuses:
+                    logger.warning(f"🚫 [STATE-MACHINE] Blocked status transition for order {order_id} from terminal '{curr_status}' to active '{status}'.")
+                    conn.rollback()
+                    return False
+                
+                # Rule 3: Block transition from filled/closed -> cancelled/canceled
+                if curr_status_lower in ('filled', 'closed') and new_status_lower in ('cancelled', 'canceled'):
+                    logger.warning(f"🚫 [STATE-MACHINE] Blocked status transition for order {order_id} from '{curr_status}' to '{status}' (Fill always wins).")
+                    conn.rollback()
+                    return False
+                    
+                # Rule 4: Block transition from cancelled/canceled -> filled/closed unless new_filled_qty > existing
+                if curr_status_lower in ('cancelled', 'canceled') and new_status_lower in ('filled', 'closed'):
+                    new_qty = float(filled_qty) if filled_qty is not None else 0.0
+                    curr_qty = float(curr_filled) if curr_filled is not None else 0.0
+                    if new_qty <= curr_qty:
+                        logger.warning(
+                            f"🚫 [STATE-MACHINE] Blocked status transition for order {order_id} from '{curr_status}' to '{status}' "
+                            f"because new fill quantity ({new_qty}) is not greater than existing ({curr_qty})."
+                        )
+                        conn.rollback()
+                        return False
+                    else:
+                        logger.info(
+                            f"✅ [STATE-MACHINE] Allowed status upgrade for order {order_id} from '{curr_status}' to '{status}' "
+                            f"due to new fill quantity ({new_qty} > {curr_qty})."
+                        )
+        else:
+            # If the order is not found, we cannot update it.
+            conn.rollback()
+            return False
 
         if filled_qty is not None:
             # Conditional update: only update filled_amount if it increases or matches (never downgrade evidence)
@@ -4509,13 +4663,15 @@ def update_order_status(order_id, status, bot_id=None, filled_qty=None):
             sql += " AND bot_id = ?"
             params.append(bot_id)
             
-        conn.execute("BEGIN IMMEDIATE")
         cursor.execute(sql, tuple(params))
+        updated_rows = cursor.rowcount
         conn.commit()
+        return updated_rows > 0
     except Exception as e:
         logger.error(f"Failed to update order status {order_id}: {e}")
         try: conn.rollback()
         except: pass
+        return False
 
 def update_order_fill(order_id, filled_qty, bot_id=None):
     """Updates the filled_amount of an order in bot_orders."""
@@ -4546,11 +4702,31 @@ def save_bot_order(bot_id, order_type, exchange_order_id, price, amount, step, s
     conn = get_connection()
     cursor = conn.cursor()
     try:
-        # Resolve current cycle_id and bot direction
+        # Resolve current cycle_id (Lookup-then-Fallback)
         if cycle_id is None:
-            cursor.execute("SELECT COALESCE(cycle_id, 1) FROM trades WHERE bot_id=?", (bot_id,))
-            c_row = cursor.fetchone()
-            cycle_id = c_row[0] if c_row else 1
+            # Step 1: Look up existing record to inherit cycle_id
+            cursor.execute("""
+                SELECT cycle_id FROM bot_orders 
+                WHERE (order_id = ? OR (client_order_id = ? AND client_order_id IS NOT NULL))
+                  AND bot_id = ? 
+                LIMIT 1
+            """, (str(exchange_order_id), str(client_order_id), bot_id))
+            row = cursor.fetchone()
+            
+            if row and row[0] is not None:
+                cycle_id = row[0]
+            else:
+                # Step 2: Fall back to trades table
+                cursor.execute("SELECT COALESCE(cycle_id, 1) FROM trades WHERE bot_id=?", (bot_id,))
+                c_row = cursor.fetchone()
+                cycle_id = c_row[0] if c_row else 1
+                
+                # Log a loud warning for terminal updates falling back to current cycle
+                if status.lower() in ('filled', 'closed', 'cancelled', 'canceled'):
+                    logger.warning(
+                        f"🚨 [CYCLE-FALLBACK] Terminal status '{status}' for order {exchange_order_id} (CID: {client_order_id}) "
+                        f"fell back to current trade cycle {cycle_id} because no pre-existing row was found in bot_orders."
+                    )
         
         cursor.execute("SELECT direction FROM bots WHERE id=?", (bot_id,))
         b_row = cursor.fetchone()

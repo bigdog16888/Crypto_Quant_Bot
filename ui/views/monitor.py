@@ -17,6 +17,7 @@ from engine.reconciler import StateReconciler, ReconciliationAction
 from engine.parity_gates import qty_tolerance as pair_qty_tolerance
 from config.settings import config as global_config
 from engine.exchange_interface import normalize_symbol as _norm_universal
+from engine.health import get_system_health as _get_system_health
 
 # --- Performance Caching Wrappers ---
 @st.cache_resource(ttl=3600, show_spinner=False)
@@ -201,136 +202,76 @@ def _render_header_ui(data):
 def _header_metrics_fragment():
     # Display Sync Status within fragment
     st.caption(f"  ⚡ Header Sync: {time.strftime('%H:%M:%S')}")
-    
+
     auto_refresh = st.session_state.get("auto_refresh_toggle", True)
-    wizard_active = any(bool(st.session_state.get(k)) for k in st.session_state if k.startswith(("forensic_trades_", "adopt_force_sel_", "trade_sel_", "_confirm_")))
-    
+    wizard_active = any(bool(st.session_state.get(k)) for k in st.session_state
+                        if k.startswith(("forensic_trades_", "adopt_force_sel_", "trade_sel_", "_confirm_")))
+
+    # ── Single source of truth: consume health_data computed in render_monitor_view ──
+    health_data = st.session_state.get("system_health_data")
     cached = st.session_state.get("cached_header_data")
+
     if (not auto_refresh or wizard_active) and cached:
         _render_header_ui(cached)
         return
 
     try:
-        conn = get_connection()
-        cur = conn.cursor()
-
-        # 1. Active Bots
-        cur.execute("SELECT COUNT(*) FROM bots WHERE is_active = 1")
-        active_count = cur.fetchone()[0]
-
-        # 2. Total Invested (Exposure) from DB
-        cur.execute("SELECT SUM(total_invested) FROM trades WHERE total_invested > 0")
-        total_invested_res = cur.fetchone()
-        total_invested_db = total_invested_res[0] if total_invested_res[0] else 0.0
-
-        # 3. Calculate Global PnL (Requires live prices)
-        cur.execute("SELECT t.total_invested, t.avg_entry_price, b.pair, b.direction FROM trades t JOIN bots b ON t.bot_id = b.id WHERE t.total_invested > 0 AND b.is_active = 1")
-        active_trades = cur.fetchall()
-
-        global_pnl_usd = 0.0
-
-        # Fetch prices for active trades
-        active_symbols = list(set([t[2] for t in active_trades]))
-        price_map = {}
-        if active_symbols:
+        if health_data and health_data.get("header_metrics"):
+            hm = health_data["header_metrics"]
+            data = {
+                'total_equity':      hm.get('total_equity', 0.0),
+                'futures_balance':   hm.get('futures_balance', 0.0),
+                'global_pnl_usd':    hm.get('global_pnl_usd', 0.0),
+                'total_invested_db': hm.get('total_invested_db', 0.0),
+                'active_count':      hm.get('active_count', 0),
+                'bots_in_trade':     hm.get('bots_in_trade', 0),
+                'scanning_count':    hm.get('scanning_count', 0),
+                'open_qty_notional': hm.get('open_qty_notional', 0.0),
+                'assets_breakdown':  hm.get('assets_breakdown', []),
+                'adoptions_today':   hm.get('adoptions_today', 0),
+                'last_act_str':      hm.get('last_act_str', 'NO RECENT ACTIVITY'),
+            }
+        else:
+            # Fallback: compute locally if health_data not yet available
+            conn = get_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM bots WHERE is_active = 1")
+            active_count = cur.fetchone()[0]
+            cur.execute("SELECT SUM(total_invested) FROM trades WHERE total_invested > 0")
+            r = cur.fetchone(); total_invested_db = float(r[0] or 0.0)
+            cur.execute(
+                "SELECT COUNT(*) FROM trades t JOIN bots b ON b.id=t.bot_id "
+                "WHERE b.is_active=1 AND t.total_invested > 0.01"
+            )
+            bots_in_trade = int(cur.fetchone()[0] or 0)
+            cur.execute(
+                "SELECT COALESCE(SUM(t.open_qty * t.avg_entry_price), 0) "
+                "FROM trades t JOIN bots b ON b.id=t.bot_id "
+                "WHERE b.is_active=1 AND t.open_qty > 1e-8 AND t.avg_entry_price > 0"
+            )
+            open_qty_notional = float(cur.fetchone()[0] or 0.0)
+            cur.execute("SELECT COUNT(*) FROM reconciliation_logs WHERE action LIKE '%ADOPTION%' AND timestamp > ?", (int(time.time()) - 86400,))
+            adoptions_today = cur.fetchone()[0]
+            cur.execute("SELECT action, symbol, price FROM trade_history ORDER BY id DESC LIMIT 1")
+            last_h = cur.fetchone()
+            last_act_str = f"{last_h[0]}: {last_h[1]} @ {last_h[2]:,.2f}" if last_h else "NO RECENT ACTIVITY"
+            futures_balance = 0.0
             try:
-                ex_global = get_exchange_instance(market_type=global_config.MARKET_TYPE)
-                for sym in active_symbols:
-                    price = ex_global.get_last_price(sym)
-                    if price:
-                        price_map[sym] = float(price)
+                fut_data = fetch_balance_cached('future')
+                if fut_data and 'total' in fut_data:
+                    for asset, amount in fut_data['total'].items():
+                        if amount and amount > 0 and asset in ('USDT', 'USDC', 'USD', 'BUSD'):
+                            futures_balance += amount
             except Exception: pass
+            data = {
+                'total_equity': futures_balance, 'futures_balance': futures_balance,
+                'global_pnl_usd': 0.0, 'total_invested_db': total_invested_db,
+                'active_count': active_count, 'bots_in_trade': bots_in_trade,
+                'scanning_count': max(0, active_count - bots_in_trade),
+                'open_qty_notional': open_qty_notional, 'assets_breakdown': [],
+                'adoptions_today': adoptions_today, 'last_act_str': last_act_str,
+            }
 
-        for trade in active_trades:
-            inv, entry, pair, direction = trade
-            curr = price_map.get(pair, 0.0)
-            if curr > 0 and entry > 0.0001:
-                if direction == 'LONG': pnl = (curr - entry) / entry * inv
-                else: pnl = (entry - curr) / entry * inv
-                global_pnl_usd += pnl
-
-        # 4. Fetch Multi-Asset Balances (Spot + Futures)
-        futures_balance = 0.0
-        spot_balance = 0.0
-        total_equity = 0.0
-        assets_breakdown = []
-
-        # --- A. Futures Balance ---
-        try:
-            fut_data = fetch_balance_cached('future')
-            if fut_data and 'total' in fut_data:
-                for asset, amount in fut_data['total'].items():
-                    if amount and amount > 0:
-                        assets_breakdown.append({
-                            'Type': 'Futures', 'Asset': asset, 'Balance': amount,
-                            'Unrealized PnL': 0.0, 'Equity': amount
-                        })
-                        if asset in ['USDT', 'USDC', 'USD', 'BUSD']: futures_balance += amount
-        except Exception: pass
-
-        # --- B. Spot Balance ---
-        try:
-            cur.execute("SELECT config FROM bots WHERE is_active = 1")
-            active_configs = cur.fetchall()
-            needs_spot = False
-            for cfg in active_configs:
-                try:
-                    c_dict = json.loads(cfg[0]) if cfg[0] else {}
-                    if c_dict.get('market_type') == 'spot':
-                        needs_spot = True; break
-                except: pass
-
-            if needs_spot and global_config.MARKET_TYPE != 'future':
-                spot_data = fetch_balance_cached('spot')
-                if spot_data and 'total' in spot_data:
-                    for asset, amount in spot_data['total'].items():
-                        if amount > 0:
-                            val = amount if asset in ['USDT', 'USDC', 'DAI', 'BUSD'] else 0.0
-                            if val > 0: spot_balance += val
-                            assets_breakdown.append({
-                                'Type': 'Spot', 'Asset': asset, 'Balance': amount,
-                                'Unrealized PnL': 0.0, 'Equity': val
-                            })
-        except Exception: pass
-
-        total_equity = futures_balance + spot_balance + global_pnl_usd
-
-        cur.execute(
-            "SELECT COUNT(*) FROM trades t JOIN bots b ON b.id=t.bot_id "
-            "WHERE b.is_active=1 AND t.total_invested > 0.01"
-        )
-        bots_in_trade = int(cur.fetchone()[0] or 0)
-        cur.execute(
-            "SELECT COALESCE(SUM(t.open_qty * t.avg_entry_price), 0) "
-            "FROM trades t JOIN bots b ON b.id=t.bot_id "
-            "WHERE b.is_active=1 AND t.open_qty > 1e-8 AND t.avg_entry_price > 0"
-        )
-        open_qty_notional = float(cur.fetchone()[0] or 0.0)
-        scanning_count = max(0, int(active_count) - bots_in_trade)
-
-        # 5. Adoptions Count (Forensic Audit)
-        cur.execute("SELECT COUNT(*) FROM reconciliation_logs WHERE action LIKE '%ADOPTION%' AND timestamp > ?", (int(time.time()) - 86400,))
-        adoptions_today = cur.fetchone()[0]
-
-        # --- System Status Ribbon ---
-        cur.execute("SELECT action, symbol, price FROM trade_history ORDER BY id DESC LIMIT 1")
-        last_h = cur.fetchone()
-        last_act_str = f"{last_h[0]}: {last_h[1]} @ {last_h[2]:,.2f}" if last_h else "NO RECENT ACTIVITY"
-
-        # Update cache
-        data = {
-            'total_equity': total_equity,
-            'futures_balance': futures_balance,
-            'global_pnl_usd': global_pnl_usd,
-            'total_invested_db': total_invested_db,
-            'active_count': active_count,
-            'bots_in_trade': bots_in_trade,
-            'scanning_count': scanning_count,
-            'open_qty_notional': open_qty_notional,
-            'assets_breakdown': assets_breakdown,
-            'adoptions_today': adoptions_today,
-            'last_act_str': last_act_str
-        }
         st.session_state["cached_header_data"] = data
         _render_header_ui(data)
     except Exception as e:
@@ -374,8 +315,9 @@ def _bot_positions_fragment():
 
         hedged_bot_ids = set(df_h_f[df_h_f['filled_amount'] > 1e-8]['bot_id'].unique())
         
-        # Pre-calculate physical order counts for health checks
+        # Pre-calculate physical order counts and lists for health checks
         physical_order_counts = {}
+        physical_orders_for_bot = {}
         for o in market_orders_f:
             cid = str(o.get('clientOrderId') or '')
             if cid.startswith('CQB_'):
@@ -384,6 +326,9 @@ def _bot_positions_fragment():
                     if len(parts) >= 2:
                         bid_parsed = int(parts[1])
                         physical_order_counts[bid_parsed] = physical_order_counts.get(bid_parsed, 0) + 1
+                        if bid_parsed not in physical_orders_for_bot:
+                            physical_orders_for_bot[bid_parsed] = []
+                        physical_orders_for_bot[bid_parsed].append(o)
                 except: pass
 
         # Apply Display Status Mapping
@@ -573,8 +518,10 @@ def _bot_positions_fragment():
         order_status_color = "green"
 
         bots_with_missing_orders = []
+        bots_with_no_exit_orders = []
         bots_with_partial_orders = []
         bots_with_margin_held = []
+        bots_with_stuck_dust = []
         for _, row in df_pos_f.iterrows():
             bid, bot_inv, c_step = int(row['id']), float(row['total_invested'] or 0), int(row.get('current_step', 0))
             actual_ph = physical_order_counts.get(bid, 0)
@@ -584,6 +531,34 @@ def _bot_positions_fragment():
                 continue
                 
             cycle_phase = str(row.get('cycle_phase', 'IDLE')).upper()
+
+            if cycle_phase == 'STUCK_DUST_NO_EXIT':
+                bots_with_stuck_dust.append(row['name'])
+
+            # Check specifically for missing TP/exit orders for bots IN TRADE (INV-35)
+            bot_type_str = str(row.get('bot_type', ''))
+            is_hedge_bot = bot_type_str == 'hedge_child' or 'hedge' in bot_type_str.lower()
+            critical_gap_type = None
+            if bid not in hedged_bot_ids and not is_hedge_bot:
+                has_tp = any(
+                    o for o in physical_orders_for_bot.get(bid, [])
+                    if o.get('order_type') == 'tp' or 'TP' in str(o.get('clientOrderId') or '')
+                )
+                if not has_tp and bot_inv > 0.01 and str(row.get('status','')).upper() == 'IN TRADE':
+                    dur_days = 0.0
+                    try:
+                        from engine.database import get_connection as _gc_dur
+                        with _gc_dur() as _conn_dur:
+                            _t_row = _conn_dur.execute(
+                                "SELECT updated_at FROM trades WHERE bot_id=?", (bid,)
+                            ).fetchone()
+                            if _t_row and _t_row[0]:
+                                dur_days = round((time.time() - float(_t_row[0])) / 86400.0, 1)
+                    except:
+                        pass
+                    bots_with_no_exit_orders.append(f"{row['name']} (in trade {dur_days} days, fully exposed)")
+                    bots_with_missing_orders.append(row['name'])
+                    critical_gap_type = 'NO_TP'
 
             if bid in hedged_bot_ids:
                 # A bot in pure HEDGED phase legitimately has 0 physical orders:
@@ -601,7 +576,7 @@ def _bot_positions_fragment():
                 bots_with_margin_held.append(f"{row['name']}")
             else:
                 is_missing = False
-                if actual_ph == 0 and bot_inv > 0.01 and cycle_phase != 'CARRY_PENDING':
+                if actual_ph == 0 and bot_inv > 0.01 and cycle_phase != 'CARRY_PENDING' and critical_gap_type != 'NO_TP':
                     is_missing = True
                     if row.get('bot_type') == 'hedge_child':
                         parent_id = row.get('parent_bot_id')
@@ -679,7 +654,11 @@ def _bot_positions_fragment():
                                     # Genuinely missing grid — emit warning
                                     bots_with_partial_orders.append(f"{row['name']} ({actual_ph}/2)")
 
-        if bots_with_missing_orders:
+        if bots_with_stuck_dust:
+            order_health_msg, order_status_color = f"⚠️ STUCK DUST NO EXIT: {', '.join(bots_with_stuck_dust)} — Exit order blocked by multi-bot net exposure limits (Testnet Catch-22)!", "red"
+        elif bots_with_no_exit_orders:
+            order_health_msg, order_status_color = f"⚠️ NO EXIT ORDER: {', '.join(bots_with_no_exit_orders)}!", "red"
+        elif bots_with_missing_orders:
             order_health_msg, order_status_color = f"⚠️ MISSING CRITICAL ORDERS: {', '.join(bots_with_missing_orders)}!", "red"
         elif bots_with_margin_held:
             order_health_msg, order_status_color = f"⚠️ MARGIN HELD: {', '.join(bots_with_margin_held)} — TP blocked by account margin limit. Free margin to allow TP placement.", "orange"
@@ -886,7 +865,7 @@ def _bot_positions_fragment():
             res = {
                 'Trigger': 'N/A', 'Orders': '0', 'TP_Price': 0.0,
                 'Grid_Price': 0.0, 'Grid_Amount': 0.0,
-                'Expected_Profit': 0.0, 'EE_Status': '-',
+                'Expected_Profit': 0.0, 'Expected_Profit_Str': '-', 'EE_Status': '-',
                 'TP_Price_Str': '-', 'Grid_Price_Str': '-',
                 'Action_Age': '-', 'Trade_Age': '-', 'Ages': '-',
             }
@@ -1132,10 +1111,25 @@ def _bot_positions_fragment():
                 o_qty = _clean(row.get('open_qty'))
                 tp_p = _clean(res['TP_Price'] or row.get('target_tp_price'))
                 avg_p = _clean(row.get('avg_entry_price'))
-                if o_qty > 1e-8 and tp_p > 1e-8 and avg_p > 1e-8:
+                status = str(row.get('status', '')).upper()
+                if 'SCANNING' not in status and o_qty > 1e-8 and tp_p > 1e-8 and avg_p > 1e-8:
                     side = str(row.get('direction', 'LONG')).upper()
                     if side == 'SHORT': res['Expected_Profit'] = (avg_p - tp_p) * o_qty
                     else: res['Expected_Profit'] = (tp_p - avg_p) * o_qty
+                    
+                    profit = res['Expected_Profit']
+                    is_be = False
+                    if cfg.get('UseEarlyExit', False):
+                        if abs(tp_p - avg_p) <= 0.01 or (avg_p > 0 and (abs(tp_p - avg_p) / avg_p) < 0.0005):
+                            is_be = True
+                    
+                    profit_val = 0.0 if abs(profit) < 0.005 else profit
+                    if is_be:
+                        res['Expected_Profit_Str'] = f"${profit_val:,.2f} ⚖️ BE"
+                    else:
+                        res['Expected_Profit_Str'] = f"${profit_val:,.2f}"
+                else:
+                    res['Expected_Profit_Str'] = "-"
                 
                 # 4. Early Exit (EE) Status — compact format
                 if row.get('bot_type') == 'hedge_child':
@@ -1187,15 +1181,7 @@ def _bot_positions_fragment():
         df_pos_f['Active TP'] = info_df['TP_Price_Str']
         df_pos_f['Next Grid'] = info_df['Grid_Price_Str']
 
-        # Visual Profit Feedback
-        def format_profit(row):
-            x = row['Expected_Profit']
-            status = str(row.get('status', '')).upper()
-            if 'SCANNING' in status or abs(x) < 0.001:
-                return "-"
-            return f"${x:,.2f}"
-
-        df_pos_f['Exp $'] = info_df.apply(format_profit, axis=1)
+        df_pos_f['Exp $'] = info_df['Expected_Profit_Str']
         df_pos_f['EE'] = info_df['EE_Status']
         df_pos_f['Ages (pos/cyc)'] = info_df['Ages']
         df_pos_f['Total Invested'] = df_pos_f['total_invested'].apply(
@@ -1387,8 +1373,223 @@ def _notifications_fragment():
         pass # Fail silently to keep UI responsive
 
 
+def render_unowned_positions_banner():
+    """
+    Renders a warning banner and manual adoption flow for unowned exchange positions.
+
+    Two sources are shown:
+    1. Real-time orphan_positions from health_data (exchange != 0 AND no bot open_qty).
+    2. DB-backed unowned_position_alerts table for the manual adoption workflow.
+
+    Stale DB alerts created before the current ENGINE_STARTED_AT are suppressed so
+    orphan data from previous sessions does not persist across engine restarts.
+    """
+    # ── (1) Real-time orphan positions from health_data ────────────────────────
+    health_data = st.session_state.get("system_health_data") or {}
+    orphans = health_data.get("orphan_positions", [])
+    if orphans and not health_data.get("startup_suppression"):
+        st.error(
+            f"⚠️ **{len(orphans)} orphan exchange position(s) detected** — "
+            "exchange holds a net position with no matching bot open_qty."
+        )
+        for o in orphans:
+            st.write(
+                f"• **{o['pair']}**: exchange_net `{o['exchange_net']:+.4f}` "
+                f"≈ **${o['notional_usd']:,.2f}** — no bot open_qty accounts for this."
+            )
+
+    # ── (2) DB-backed adoption alerts (suppressed if created before engine start) ──
+    engine_started_at = health_data.get("engine_started_at", 0.0)
+
+    conn = get_connection()
+    try:
+        pending_alerts = conn.execute("""
+            SELECT a.id, a.bot_id, a.pair, a.normalized_pair, a.exchange_qty, a.db_qty, a.notes,
+                   COALESCE(a.created_at, 0) as created_at
+            FROM unowned_position_alerts a
+            WHERE a.status = 'pending_review'
+        """).fetchall()
+    except Exception:
+        # Table might not exist or be locked
+        return
+
+    # Filter out stale alerts from previous sessions
+    if engine_started_at > 0:
+        pending_alerts = [
+            a for a in pending_alerts
+            if float(a[7] or 0) >= engine_started_at
+        ]
+
+    if not pending_alerts:
+        return
+
+    st.error(f"⚠️ **{len(pending_alerts)} unowned exchange positions detected — manual adoption required**")
+
+    from engine.oneway_netting import get_typical_position_size
+
+    for alert in pending_alerts:
+        alert_id, alert_bot_id, pair, norm_pair, ex_qty, db_qty, notes, _created_at = alert
+        shortfall = ex_qty - db_qty
+
+        
+        title = f"Orphan Position: {pair} | Drift: {shortfall:+.4f}"
+        with st.expander(title, expanded=True):
+            st.markdown(f"**Description**: {notes}")
+            st.write(f"• **Exchange Net Position**: `{ex_qty:+.4f}`")
+            st.write(f"• **Database Net Position**: `{db_qty:+.4f}`")
+            st.write(f"• **Discovered Shortfall**: `{shortfall:+.4f}`")
+
+            # Fetch all active bots on this pair for dropdown selection
+            active_bots = conn.execute("""
+                SELECT b.id, b.name, b.direction 
+                FROM bots b
+                WHERE b.is_active = 1 AND b.normalized_pair = ?
+            """, (norm_pair,)).fetchall()
+            
+            if not active_bots:
+                st.error("No active bots found on this pair to adopt the position.")
+                continue
+
+            bot_options = {f"{r[1]} ({r[0]}) | {r[2]}": r[0] for r in active_bots}
+            
+            # Determine default index
+            default_index = 0
+            if alert_bot_id is not None:
+                for idx, (label, bid) in enumerate(bot_options.items()):
+                    if bid == alert_bot_id:
+                        default_index = idx
+                        break
+
+            # Always display dropdown for human override capability
+            selected_label = st.selectbox(
+                "Select Bot for Adoption", 
+                options=list(bot_options.keys()), 
+                index=default_index,
+                key=f"select_bot_{alert_id}"
+            )
+            target_bot_id = bot_options[selected_label]
+            
+            if alert_bot_id is not None:
+                st.info(f"Auto-matched Suggestion: **{selected_label}**")
+            else:
+                st.warning("No candidate bot automatically matched this position size/direction. Please select a bot manually.")
+
+            # Fetch the selected/target bot details (cycle_id)
+            bot_row = conn.execute("""
+                SELECT b.name, t.cycle_id 
+                FROM bots b JOIN trades t ON t.bot_id = b.id 
+                WHERE b.id = ?
+            """, (target_bot_id,)).fetchone()
+            
+            if not bot_row:
+                st.error("Could not fetch target bot trade cycle.")
+                continue
+                
+            bot_name, cycle_id = bot_row
+
+            # Fetch average entry price from exchange for the pair
+            avg_price = 0.0
+            try:
+                ex = get_exchange_instance('future')
+                pos = ex.fetch_positions()
+                for p in pos:
+                    if p.get('symbol') == pair:
+                        avg_price = float(p.get('entryPrice') or 0.0)
+                        break
+            except Exception:
+                pass
+
+            if avg_price <= 0.0:
+                st.warning("Could not fetch a valid entry price from exchange. Will prompt for manual entry if none is active.")
+                avg_price = st.number_input(
+                    "Average Entry Price", 
+                    value=0.0, 
+                    min_value=0.0, 
+                    step=0.01, 
+                    key=f"manual_price_{alert_id}"
+                )
+
+            # Code preview
+            ts_now = int(time.time())
+            st.code(f"""-- Parameterized Adoption Insert Preview:
+INSERT INTO bot_orders (bot_id, order_type, status, amount, filled_amount, price, step, cycle_id, client_order_id, notes, created_at, updated_at)
+VALUES ({target_bot_id}, 'adoption', 'filled', {abs(shortfall)}, {abs(shortfall)}, {avg_price}, 1, {cycle_id}, 'CQB_{target_bot_id}_ADOPTION_{ts_now}', '[MANUAL-ADOPTION] Adopted unowned exchange position.', {ts_now}, {ts_now});
+""", language="sql")
+
+            col1, col2 = st.columns([1, 4])
+            with col1:
+                if st.button("Approve Adoption", key=f"app_adopt_{alert_id}"):
+                    if avg_price <= 0.0:
+                        st.error("Cannot adopt: failed to fetch or supply a valid entry price from exchange. Try again.")
+                    else:
+                        conn_write = get_connection()
+                        # Insert adoption order (parameterized)
+                        conn_write.execute(
+                            """INSERT INTO bot_orders (bot_id, order_type, status, amount, filled_amount,
+                               price, step, cycle_id, client_order_id, notes, created_at, updated_at)
+                               VALUES (?, 'adoption', 'filled', ?, ?, ?, 1, ?, ?, ?, ?, ?)""",
+                            (target_bot_id, abs(shortfall), abs(shortfall), avg_price, cycle_id,
+                             f"CQB_{target_bot_id}_ADOPTION_{ts_now}",
+                             "[MANUAL-ADOPTION] Adopted unowned exchange position.",
+                             ts_now, ts_now)
+                        )
+                        # Mark alert as adopted (parameterized)
+                        conn_write.execute(
+                            "UPDATE unowned_position_alerts SET status = 'adopted', bot_id = ? WHERE id = ?",
+                            (target_bot_id, alert_id)
+                        )
+                        conn_write.commit()
+                        
+                        # Reseal the trade state to update trades.open_qty
+                        from engine.ledger import seal_trade_state
+                        seal_trade_state(target_bot_id, force_recompute=True)
+                        
+                        st.success(f"Position successfully adopted for {bot_name}!")
+                        time.sleep(0.5)
+                        st.rerun()
+            with col2:
+                if st.button("Dismiss Alert", key=f"dismiss_{alert_id}"):
+                    conn_write = get_connection()
+                    conn_write.execute(
+                        "UPDATE unowned_position_alerts SET status = 'dismissed' WHERE id = ?",
+                        (alert_id,)
+                    )
+                    conn_write.commit()
+                    st.info("Alert dismissed.")
+                    time.sleep(0.5)
+                    st.rerun()
+
+
 def render_monitor_view():
     _notifications_fragment()
+
+    # ── SINGLE AUTHORITATIVE HEALTH COMPUTATION ──────────────────────────────
+    # Compute once per render cycle; all fragments read from session_state.
+    # force_refresh is set to True when the user clicks 'Refresh Now'.
+    try:
+        _ex = get_exchange_instance(global_config.MARKET_TYPE)
+        _health = _get_system_health(
+            db_path=global_config.PATHS['DB_FILE'],
+            exchange_instance=_ex,
+            norm_fn=_norm_universal,
+            qty_tolerance_fn=pair_qty_tolerance,
+            force_refresh=st.session_state.pop("_force_health_refresh", False),
+        )
+        st.session_state["system_health_data"] = _health
+    except Exception as _he:
+        _health = st.session_state.get("system_health_data") or {}
+
+    # ── STARTUP SUPPRESSION BANNER ───────────────────────────────────────────
+    if _health.get("startup_suppression"):
+        remaining = int(_health.get("startup_remaining_s", 0))
+        st.warning(
+            f"⏳ **Engine starting up** — health alerts suppressed for "
+            f"**{remaining}s** remaining. Netting mismatches and order alerts "
+            f"will not fire until the grace period expires."
+        )
+
+    render_unowned_positions_banner()
+
     col1, col2 = st.columns([4, 1])
     with col1:
         st.header("📊 Live Market Monitor")
@@ -1402,6 +1603,8 @@ def render_monitor_view():
                     ex = ExchangeInterface()
                     pos = ex.fetch_positions()
                     update_active_positions_snapshot(pos)
+                # Force health refresh so operator sees immediate updated state
+                st.session_state["_force_health_refresh"] = True
                 st.toast("✅ Active positions synchronized")
                 time.sleep(0.5)
                 st.rerun()
@@ -1498,6 +1701,7 @@ def render_monitor_view():
         st.write("")
         if st.button("🔄 Refresh Now", width='stretch'):
             st.cache_data.clear()
+            st.session_state["_force_health_refresh"] = True
             st.rerun()
 
     # --- Data Fetching (Parallel) ---
@@ -1672,6 +1876,7 @@ def render_monitor_view():
 
         # --- Recent Trade History (Added) ---
         st.subheader("📜 Recent Activity Log")
+        st.caption("🧹 **Auto-Reconcile**: Normal startup cleanup of phantom ledger state & global flatten verification | ⚠️ **SYSTEM_WIPE**: Operator-initiated position wipe (requires review)")
         try:
             conn = get_connection()
             # Fetch last 200 actions for deep scrolling
@@ -1692,6 +1897,20 @@ def render_monitor_view():
             conn.close()
             
             if not df_hist.empty:
+                # Distinguish Auto-Reconcile from actual operator SYSTEM_WIPEs
+                def format_action(row):
+                    act = row['Action']
+                    details = str(row.get('Details') or '')
+                    price_val = row.get('Price')
+                    if act == 'SYSTEM_WIPE':
+                        if price_val == 0.0 or not details or 'manual' not in details.lower():
+                            return '🧹 Auto-Reconcile'
+                        else:
+                            return '⚠️ SYSTEM_WIPE'
+                    return act
+                
+                df_hist['Action'] = df_hist.apply(format_action, axis=1)
+
                 # Format Price and PnL
                 df_hist['Price'] = df_hist['Price'].apply(lambda x: f"${x:,.2f}" if isinstance(x, (int, float)) else x)
                 df_hist['Realized PnL'] = df_hist['Realized PnL'].apply(lambda x: f"${x:,.2f}" if isinstance(x, (int, float)) and x != 0 else "-")

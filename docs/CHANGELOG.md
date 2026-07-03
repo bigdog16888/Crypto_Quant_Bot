@@ -1,6 +1,75 @@
 # Changelog — Crypto Quant Bot
 
-All notable **architecture** changes are documented here. Version numbers match `CODEBASE_GUIDE.md` and `docs/ARCHITECTURE_v3.x.md`.
+All notable **architecture** changes are documented here. Version numbers match `CODEBASE_GUIDE.md`, `config/settings.py`, and `docs/ARCHITECTURE_v3.x.md`.
+
+## v4.3.8 — 2026-07-02 — Authoritative Health State & Project Cleanup
+
+- **engine/health.py (new module)**:
+  - Implemented `compute_system_health()` — single authoritative aggregator for netting status, order health, header metrics, orphan positions, and startup suppression.
+  - Added `get_system_health()` with 10 s TTL cache and `force_refresh` override.
+- **engine/runner.py**:
+  - Writes `ENGINE_STARTED_AT` to `system_equity` on startup; 120 s grace period suppresses false-positive netting alerts during boot.
+- **ui/views/monitor.py**:
+  - Consumes `st.session_state["system_health_data"]` for header metrics and orphan banners; startup banner shows remaining grace seconds.
+- **tests/test_health_and_startup.py**:
+  - 22 tests covering grace period, health schema, TTL cache, orphan detection, and stale alert filtering.
+- **Project cleanup**:
+  - Removed 500+ archived scratch debug scripts, obsolete recovery scripts, and stale root docs.
+  - Consolidated ADRs into `docs/adr/`, legacy tests into `tests/legacy/`.
+  - Added `create_backup.bat` + `scripts/create_version_backup.ps1` for version snapshots.
+  - Updated `README.md` and synced `config/settings.py` VERSION to 4.3.8.
+
+## v4.3.7 — 2026-07-01 — Double-Close / Residual Side-Orphan Mitigation (INV-36)
+
+- **engine/reconciler.py**:
+  - Pending close order subtraction when calculating side-residual orphans; skips redundant market closes when open TP/SL/CLOSE orders already cover the remainder.
+
+## v4.3.6 — 2026-07-01 — credit_fill Safety Bypass & Missing-TP Health Check (INV-34 / INV-36)
+
+- **engine/ledger.py & engine/ws_event_handlers.py**:
+  - Implemented the **INV-34** safety bypass: `credit_fill()` records fills and updates `open_qty` even when a bot is gated in `REQUIRE_MANUAL_PROOF` or `MANUAL_GATE`. Only entry-level order placement and hedge triggers remain blocked.
+  - Allowed TP completion cascades to execute and reset the bot status back to `Scanning` once the position is flat, automatically clearing the manual proof gate.
+- **ui/views/monitor.py & tests/test_ui_hedge_warnings.py**:
+  - Implemented the **INV-36** missing exit order presence invariant. The health check specifically verifies that an active bot in trade has a corresponding TP order on the exchange/database, raising a critical `NO_TP` gap type warning if absent.
+- **tests/test_inv34.py**:
+  - Added comprehensive integration tests covering fill recording, TP cascades, hedge triggers, and gate transitions for gated bots.
+
+## v4.3.0 — 2026-06-25 — Independent Accounting Model Transition (ADR-006 / DEBT-001)
+
+- **engine/oneway_netting.py & engine/ledger.py**:
+  - Removed `apply_oneway_entry_cross_reduction` and `cross_reduction_claims` entirely, completing the transition from proportional allocation/netting (ADR-005) to the **ADR-006 Independent Accounting Model**.
+- **engine/migrations/migration_008_archive_legacy_netting.py**:
+  - Implemented migration to archive existing `virtual_netting` rows in the `bot_orders` table by setting their status to `'archived_legacy'`.
+  - Added a force-reseal execution for all active bots to recalculate `open_qty` purely from real fills.
+- **engine/database.py**:
+  - Registered and executed migration 008 inline inside `init_db`.
+  - Added fallback matching on raw `b.pair` in `get_pair_virtual_net` when `normalized_pair` is NULL to gracefully handle manually seeded bots in tests.
+  - Excluded `virtual_netting`/`legacy_netting` from all FIFO exit-fill calculations and exit order types in database queries.
+- **engine/parity_gates.py**:
+  - Excluded `virtual_netting`/`legacy_netting` from exit order types.
+- **engine/reconciler.py**:
+  - Added a stale whitelist auto-clear check in the reconciler that automatically deletes manual whitelists when raw physical matches virtual net.
+  - Added `bot_id` filters to `active_positions` queries in reset/wipe functions to ensure correct sibling bot isolation.
+- **tests/test_stale_whitelist_cleanup.py**:
+  - Added unit tests verifying independent accounting, zero virtual netting row writes, archived row exclusions, migration behavior, and manual whitelist auto-clearing.
+
+## v4.2.0 — 2026-06-24 — Zombie Bot Healing, Netting Visibility, Exemptions, and Directional Fix
+
+- **engine/database.py**:
+  - **`legacy_netting` Exit Visibility (Diff 0)**: Added `legacy_netting` to the exit status gate inside `recompute_invested_from_orders` to recognize migrated netting rows as exits.
+  - **Authoritative Recompute Delegation (Diffs 1-3)**: Replaced duplicate raw SQL query checks in `heal_zombie_bots` Scenario 1, 3, 5 with calls to `recompute_invested_from_orders`, making Scenario 5 cross-cycle aware and preventing it from zeroing out bots with real cross-cycle fills (like `short btc`).
+  - **Directional Orphan Query Correction**: Corrected the cross-cycle orphan detection query to use `HAVING (entry_qty - exit_qty) > 1e-6` instead of `ABS(entry_qty - exit_qty) > 1e-6`, preventing over-closed cycles (exits > entries) from being merged forward.
+  - **`get_pair_virtual_net` Realignment**: Aligned `get_pair_virtual_net` to support `legacy_netting` status/order types and the directional cross-cycle orphan check (`HAVING (entry_qty - exit_qty) > 1e-6`), correcting the signed net calculations and resolving the SUIUSDC dashboard net mismatch.
+  - **Safe Database Wipes Exemption**: Exempted safe database wipes (where `force=False` and the exchange is flat) from requiring human approval.
+- **engine/reconciler.py**:
+  - **Directional Healer Correction**: Corrected the local cross-cycle orphan healer query to use `HAVING (entry_qty - exit_qty) > 1e-6`.
+- **engine/exchange_interface.py**:
+  - **Human Approval Exemptions**: Exempted risk-reducing `reduceOnly` orders (SL, dust close, runner flattens) from the `REQUIRE_HUMAN_APPROVAL` block to allow them to execute autonomously.
+- **engine/bot_executor.py**:
+  - **Dust Cooldown Backoff**: Implemented a 5-minute cooldown backoff tracker (`_DUST_FLUSH_COOLDOWN`) for failed dust flushes to protect exchange API limits.
+- **tests/test_ledger_integrity.py**:
+  - Aligned test assertion query with the directional filter.
+  - Added new integration test `test_recompute_does_not_merge_overclosed_historical_cycles` to verify the directional query fix.
 
 ## v4.1.4 — 2026-06-22 — Pre-Advance Invariant Check
 

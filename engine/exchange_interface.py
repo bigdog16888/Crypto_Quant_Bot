@@ -600,7 +600,13 @@ class ExchangeInterface:
         # ── Layer 1.5 gate (Human Approval for Market/Close) ───────────────
         import os
         if config.REQUIRE_HUMAN_APPROVAL and type.upper() == 'MARKET':
-            if not human_approved and not params.get('human_approved', False):
+            is_exempt = (
+                human_approved or 
+                params.get('human_approved', False) or 
+                params.get('reduceOnly', False) or 
+                params.get('reduce_only', False)
+            )
+            if not is_exempt:
                 bot_id = params.get('bot_id', 'unknown') if params else 'unknown'
                 log_line = f"{int(time.time())} | 🛡️ [BLOCKED-ACTION] | Bot: {bot_id} | Symbol: {symbol} | Type: {type.upper()} | Side: {side.upper()} | Amount: {amount} | Call Site: {_call_site}\n"
                 blocked_log_path = os.path.join(config.ROOT_DIR, "blocked_actions.log")
@@ -985,7 +991,9 @@ class ExchangeInterface:
                         order_type = 'grid'
                         if len(parts) >= 3:
                             extracted_type = parts[2].lower()
-                            if extracted_type in ('entry', 'grid', 'tp', 'close', 'sl', 'dust', 'adoption', 'forensic'):
+                            if extracted_type == 'dust':
+                                extracted_type = 'dust_close'
+                            if extracted_type in ('entry', 'grid', 'tp', 'close', 'sl', 'dust_close', 'adoption', 'forensic'):
                                 order_type = extracted_type
                         
                         from engine.database import update_order_status
@@ -1022,7 +1030,13 @@ class ExchangeInterface:
             if config.TESTNET or config.DEMO_TRADING:
                 endpoint = '/fapi/v1/allOpenOrders'
                 params = {'symbol': normalize_symbol(symbol)}
-                return self._raw_request(endpoint, method='DELETE', params=params)
+                res = self._raw_request(endpoint, method='DELETE', params=params)
+                if hasattr(self, '_open_orders'):
+                    if isinstance(self._open_orders, list):
+                        self._open_orders = [o for o in self._open_orders if o.get('symbol') != symbol]
+                    elif isinstance(self._open_orders, dict):
+                        self._open_orders = {k: v for k, v in self._open_orders.items() if v.get('symbol') != symbol}
+                return res
             return self.exchange.cancel_all_orders(symbol)
         except Exception as e:
             self.logger.error(f"Cancel All Orders Failed for {symbol}: {e}")

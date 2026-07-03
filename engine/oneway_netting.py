@@ -22,6 +22,13 @@ from engine.exchange_interface import normalize_symbol
 
 logger = logging.getLogger(__name__)
 
+# ADR-005 Phase 3 — Proportional Allocation stale-cycle tracker.
+# Counts consecutive reconciler cycles per pair where get_exchange_signed_net
+# returned None (API down).  When count > PA_SYNC_MAX_STALE_CYCLES, bots on
+# that pair are set to REQUIRE_MANUAL_PROOF.
+_pa_stale_cycles: dict = {}
+
+
 
 def _qty_tol() -> float:
     return float(getattr(config, 'PAIR_PARITY_QTY_TOLERANCE', 0.002))
@@ -122,361 +129,6 @@ def gate_oneway_opposite_entry(
             f"cannot place {my_dir} entry until opposite side is flat"
         )
     return True, ''
-
-
-def apply_oneway_entry_cross_reduction(
-    filling_bot_id: int,
-    pair: str,
-    direction: str,
-    delta: float,
-    source_order_id: str,
-    avg_price: float = 0.0,
-    exchange = None,
-) -> float:
-    from engine.write_queue import WriteQueue
-    return WriteQueue().put_and_wait(
-        _apply_oneway_entry_cross_reduction_internal,
-        filling_bot_id,
-        pair,
-        direction,
-        delta,
-        source_order_id,
-        avg_price=avg_price,
-        exchange=exchange,
-    )
-
-def _apply_oneway_entry_cross_reduction_internal(
-    filling_bot_id: int,
-    pair: str,
-    direction: str,
-    delta: float,
-    source_order_id: str,
-    avg_price: float = 0.0,
-    exchange = None,
-) -> float:
-    """
-    When a bot credits entry/grid qty on a one-way pair, reduce opposite-direction
-    siblings' open_qty by the same amount (exchange already netted the position).
-    Returns total qty reduced on siblings.
-    """
-    if delta <= 1e-12:
-        return 0.0
-
-    from engine.database import get_connection, save_bot_order
-    from engine.ledger import seal_trade_state
-
-    norm = _pair_norm(pair)
-    filler_dir = str(direction).upper()
-    target_dir = 'SHORT' if filler_dir == 'LONG' else 'LONG'
-    conn = get_connection()
-
-    neighbors: List[Tuple[int, float]] = []
-    # Fix 4 (v3.5.8): Also fetch b.status so we can skip bots that are not actively
-    # trading. A SCANNING or REQUIRE_MANUAL_PROOF bot may have a stale open_qty
-    # residual from a prior cycle — cross-reducing against it creates phantom
-    # virtual_netting rows and inflates the SHORT bot's open_qty reduction count.
-    _INACTIVE_STATUSES = frozenset({
-        'scanning', '\U0001f7e2 scanning',   # 🟢 SCANNING
-        'stopped',
-        'hedge_standby',
-    })
-    for bid, bdir, raw_pair, bot_norm, oq, b_status in conn.execute(
-        """
-        SELECT b.id, b.direction, b.pair, b.normalized_pair,
-               COALESCE(t.open_qty, 0), b.status
-        FROM bots b
-        JOIN trades t ON t.bot_id = b.id
-        WHERE b.is_active = 1 AND b.bot_type != 'hedge_child'
-          AND b.id != ?
-          AND b.id != COALESCE((SELECT hedge_child_bot_id FROM bots WHERE id = ?), -1)
-          AND b.id != COALESCE((SELECT parent_bot_id FROM bots WHERE id = ?), -1)
-        """,
-        (filling_bot_id, filling_bot_id, filling_bot_id),
-    ).fetchall():
-        if (bot_norm or normalize_symbol(raw_pair)).upper() != norm:
-            continue
-        if str(bdir).upper() != target_dir:
-            continue
-        # Skip bots that are not actively holding a position.
-        if str(b_status or '').lower() in _INACTIVE_STATUSES:
-            continue
-        oqf = float(oq or 0)
-        if oqf > 1e-12:
-            neighbors.append((bid, oqf))
-
-    if not neighbors:
-        return 0.0
-
-    # INV-28B Constraint Check: Fetch source bot open_qty BEFORE reduction
-    pre_reduction_source_qty = 0.0
-    try:
-        _pre_row = conn.execute(
-            "SELECT COALESCE(open_qty, 0.0) FROM trades WHERE bot_id = ?",
-            (filling_bot_id,)
-        ).fetchone()
-        if _pre_row:
-            pre_reduction_source_qty = float(_pre_row[0])
-    except Exception as _pre_err:
-        logger.warning(f"Failed to fetch pre-reduction source qty: {_pre_err}")
-
-    # Map old open_qty for siblings
-    old_qty_map = {bid: oq for bid, oq in neighbors}
-
-    remaining = delta
-    total_cut = 0.0
-    ts = int(time.time())
-    reduced_bots = []
-    cuts_map = {}
-    for nb_id, oq in sorted(neighbors, key=lambda x: -x[1]):
-        if remaining <= 1e-12:
-            break
-        cut = round(min(oq, remaining), 8)
-        if cut <= 0:
-            continue
-        cycle_row = conn.execute(
-            "SELECT cycle_id FROM trades WHERE bot_id = ?", (nb_id,)
-        ).fetchone()
-        cycle_id = int(cycle_row[0] or 1) if cycle_row else 1
-
-        # 1. RECENCY CHECK FIRST (do NOT insert claim yet)
-        recency_row = conn.execute(
-            """
-            SELECT MAX(filled_at) FROM bot_orders 
-            WHERE bot_id = ? AND cycle_id = ? AND order_type IN ('entry', 'grid') AND status = 'filled'
-            """,
-            (nb_id, cycle_id)
-        ).fetchone()
-        max_filled_at = recency_row[0] if recency_row and recency_row[0] is not None else 0
-        if max_filled_at > 0 and (time.time() - max_filled_at < 30):
-            logger.warning(
-                f"⚠️ [ONEWAY-RECENCY] Skipping cross-reduction for bot {nb_id} cycle {cycle_id} "
-                f"due to recent entry fill ({int(time.time() - max_filled_at)}s ago < 30s)."
-            )
-            continue
-
-        # 2. CLAIM INSERT SECOND (only if recency check passed)
-        res = conn.execute(
-            """
-            INSERT OR IGNORE INTO cross_reduction_claims 
-            (source_order_id, source_bot_id, target_bot_id, reduction_qty, claimed_at)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (str(source_order_id or 'manual'), filling_bot_id, nb_id, cut, int(time.time()))
-        )
-        if res.rowcount == 0:
-            logger.warning(
-                f"⚠️ [ONEWAY-IDEMPOTENCY] Skip: cross-reduction from source_order_id {source_order_id} "
-                f"to target_bot_id {nb_id} already claimed."
-            )
-            continue
-
-        # Generate a unique order_id and client_order_id for the virtual netting row
-        _src = str(source_order_id or 'manual')
-        vn_order_id = f"VN_{nb_id}_{_src}_{int(time.time())}"
-        vn_client_order_id = f"CQB_{nb_id}_VNET_{_src}_{int(time.time())}"
-        save_bot_order(
-            nb_id,
-            'virtual_netting',
-            vn_order_id,
-            avg_price or 0.0,
-            cut,
-            step=0,
-            status='filled',
-            client_order_id=vn_client_order_id,
-            notes=(
-                f"ONEWAY_CROSS: bot {filling_bot_id} {filler_dir} entry -{cut:.6f} "
-                f"from shared position (src {source_order_id})"
-            ),
-            cycle_id=cycle_id,
-        )
-        conn.execute(
-            "UPDATE bot_orders SET filled_amount = ? WHERE client_order_id = ? AND bot_id = ?",
-            (cut, vn_client_order_id, nb_id),
-        )
-        
-        # Write virtual_netting exit on the filling bot as well (since this portion of the fill netted instead of adding exposure)
-        filling_cycle_row = conn.execute(
-            "SELECT cycle_id FROM trades WHERE bot_id = ?", (filling_bot_id,)
-        ).fetchone()
-        filling_cycle_id = int(filling_cycle_row[0] or 1) if filling_cycle_row else 1
-        vn_order_id_src = f"VN_{filling_bot_id}_{nb_id}_{int(time.time())}"
-        vn_client_order_id_src = f"CQB_{filling_bot_id}_VNET_SRC_{nb_id}_{int(time.time())}"
-        save_bot_order(
-            filling_bot_id,
-            'virtual_netting',
-            vn_order_id_src,
-            avg_price or 0.0,
-            cut,
-            step=0,
-            status='filled',
-            client_order_id=vn_client_order_id_src,
-            notes=(
-                f"ONEWAY_CROSS_SRC: netting entry against bot {nb_id} ({target_dir}) "
-                f"position (src {source_order_id})"
-            ),
-            cycle_id=filling_cycle_id,
-        )
-        conn.execute(
-            "UPDATE bot_orders SET filled_amount = ? WHERE client_order_id = ? AND bot_id = ?",
-            (cut, vn_client_order_id_src, filling_bot_id),
-        )
-        
-        remaining -= cut
-        total_cut += cut
-        cuts_map[nb_id] = cut
-        reduced_bots.append(nb_id)
-        if filling_bot_id not in reduced_bots:
-            reduced_bots.append(filling_bot_id)
-        logger.warning(
-            f"⚖️ [ONEWAY-CROSS] Pair {norm}: bot {filling_bot_id} {filler_dir} entry "
-            f"−{cut:.6f} from bot {nb_id} ({target_dir}) open_qty "
-            f"(source order {source_order_id})."
-        )
-
-    if total_cut > 0:
-        conn.commit()
-        for nb_id in reduced_bots:
-            try:
-                seal_trade_state(nb_id, force_recompute=True)
-            except Exception as e_seal:
-                logger.error(f"Failed to seal cross-reduced bot {nb_id}: {e_seal}")
-
-            # Fix A (INV-28A) — Stale TP cancellation in oneway_netting.py:
-            if nb_id != filling_bot_id:
-                try:
-                    # 1. Query bot_orders for any row WHERE bot_id=nb_id AND status IN ('open','new') AND order_type IN ('tp','dust_close')
-                    _nb_tps = conn.execute(
-                        "SELECT id, order_id, client_order_id "
-                        "FROM bot_orders WHERE bot_id=? "
-                        "AND order_type IN ('tp','dust_close') "
-                        "AND status IN ('open','new')",
-                        (nb_id,)
-                    ).fetchall()
-                    
-                    if _nb_tps:
-                        # Fetch the sibling bot's pair
-                        _nb_pair_row = conn.execute("SELECT pair FROM bots WHERE id = ?", (nb_id,)).fetchone()
-                        _nb_pair = _nb_pair_row[0] if _nb_pair_row else pair
-                        
-                        _local_exchange = exchange
-                        if not _local_exchange:
-                            try:
-                                from engine.runner import BotRunner
-                                _runner = BotRunner.get_instance()
-                                if _runner and hasattr(_runner, 'exchange') and _runner.exchange:
-                                    _local_exchange = _runner.exchange
-                            except Exception:
-                                pass
-
-                        if not _local_exchange:
-                            _cfg_row = conn.execute("SELECT config FROM bots WHERE id = ?", (nb_id,)).fetchone()
-                            _mtype = 'future'
-                            if _cfg_row and _cfg_row[0]:
-                                try:
-                                    import json
-                                    _cfg = json.loads(_cfg_row[0])
-                                    _mtype = _cfg.get('market_type', 'future')
-                                except Exception:
-                                    pass
-                            from engine.exchange_interface import ExchangeInterface
-                            _local_exchange = ExchangeInterface(market_type=_mtype)
-
-                        for _tp_row in _nb_tps:
-                            _row_id, _order_id, _client_order_id = _tp_row
-                            # 2. Call exchange.cancel_order wrapped in try/except
-                            try:
-                                _local_exchange.cancel_order(_order_id, _nb_pair)
-                            except Exception as _ex_cancel_err:
-                                logger.warning(
-                                    f"[CROSS-REDUCE-CANCEL] Failed to cancel order {_order_id} "
-                                    f"on exchange for bot {nb_id}: {_ex_cancel_err}"
-                                )
-                            
-                            # 3. UPDATE bot_orders
-                            conn.execute(
-                                "UPDATE bot_orders SET status='cancelled', "
-                                "notes = COALESCE(notes,'') || ' [CROSS-REDUCE-CANCEL: stale TP after open_qty reduction]', "
-                                "updated_at = unixepoch() "
-                                "WHERE id = ?", (_row_id,)
-                            )
-                            conn.commit()
-
-                            # 4. Log the cancellation
-                            old_qty = old_qty_map.get(nb_id, 0.0)
-                            new_qty = old_qty - cuts_map.get(nb_id, 0.0)
-                            logger.warning(
-                                f"[INV-28A] Bot {nb_id}: cancelled stale TP {_order_id} after cross-reduction "
-                                f"reduced open_qty {old_qty:.6f} → {new_qty:.6f}. maintain_orders will resize next cycle."
-                            )
-                except Exception as _cr_err:
-                    logger.error(f"[CROSS-REDUCE-CANCEL] Failed for bot {nb_id}: {_cr_err}")
-
-        # Fix B (INV-28B) — Physical orphan check in oneway_netting.py:
-        if pre_reduction_source_qty > 1e-8:
-            try:
-                # 1. Read trades.open_qty WHERE bot_id = source_bot_id
-                filling_oq_row = conn.execute(
-                    "SELECT COALESCE(t.open_qty, 0.0) FROM trades t WHERE t.bot_id = ?",
-                    (filling_bot_id,)
-                ).fetchone()
-                filling_oq = float(filling_oq_row[0]) if filling_oq_row else 0.0
-                
-                # If virtual open_qty <= 1e-8:
-                if filling_oq <= 1e-8:
-                    # 2. Read bots.direction WHERE id = source_bot_id
-                    _dir_row = conn.execute("SELECT direction FROM bots WHERE id = ?", (filling_bot_id,)).fetchone()
-                    _direction = _dir_row[0] if _dir_row else filler_dir
-                    
-                    # 3. Resolve exchange and call get_exchange_signed_net
-                    _local_exchange = exchange
-                    if not _local_exchange:
-                        try:
-                            from engine.runner import BotRunner
-                            _runner = BotRunner.get_instance()
-                            if _runner and hasattr(_runner, 'exchange') and _runner.exchange:
-                                _local_exchange = _runner.exchange
-                        except Exception:
-                            pass
-
-                    if not _local_exchange:
-                        _cfg_row = conn.execute("SELECT config FROM bots WHERE id = ?", (filling_bot_id,)).fetchone()
-                        _mtype = 'future'
-                        if _cfg_row and _cfg_row[0]:
-                            try:
-                                import json
-                                _cfg = json.loads(_cfg_row[0])
-                                _mtype = _cfg.get('market_type', 'future')
-                            except Exception:
-                                pass
-                        from engine.exchange_interface import ExchangeInterface
-                        _local_exchange = ExchangeInterface(market_type=_mtype)
-
-                    from engine.parity_gates import get_exchange_signed_net
-                    # 4. signed_net = result
-                    signed_net = get_exchange_signed_net(_local_exchange, pair)
-                    
-                    if signed_net is not None:
-                        # 5. source_is_long = direction.upper() == 'LONG'
-                        source_is_long = _direction.upper() == 'LONG'
-                        # 6. orphan_exists
-                        orphan_exists = (source_is_long and signed_net > 0.0001) or \
-                                        (not source_is_long and signed_net < -0.0001)
-                        # 7. If virtual open_qty <= 1e-8 AND orphan_exists: UPDATE and Log CRITICAL
-                        if orphan_exists:
-                            conn.execute(
-                                "UPDATE bots SET status='pending_flatten' WHERE id = ?",
-                                (filling_bot_id,)
-                            )
-                            conn.commit()
-                            logger.critical(
-                                f"[INV-28B] Bot {filling_bot_id}: virtual open_qty=0 but physical "
-                                f"net={signed_net:.6f} on {_direction} side. Setting pending_flatten. "
-                                f"Runner will close orphan next cycle."
-                            )
-            except Exception as _ob_err:
-                logger.error(f"[CROSS-REDUCE-ORPHAN-CHECK] Failed: {_ob_err}")
-
-    return total_cut
 
 
 def reconcile_oneway_pair_open_qty(
@@ -631,140 +283,149 @@ def get_authoritative_close_qty(exchange, pair: str, direction: str, db_qty: flo
     return round(min(db_qty, exchange_qty), 8)
 
 
-def detect_hedge_child_ghost(exchange, child_bot_id, conn) -> bool:
+def detect_bot_ghost(exchange, bot_id, conn) -> bool:
     """
-    Returns True if hedge child has open_qty > 0 but exchange shows
-    no position on that side for that pair.
+    Returns True if the trades table claims open_qty > 0 but the authoritative
+    recompute_invested_from_orders shows that the bot's actual filled orders
+    sum to 0 (i.e. the cached open_qty is a phantom/ghost not backed by fills).
     """
-    child_row = conn.execute(
-        "SELECT b.pair, b.direction, t.open_qty, b.parent_bot_id "
+    bot_row = conn.execute(
+        "SELECT b.pair, b.direction, t.open_qty, t.cycle_id "
         "FROM bots b JOIN trades t ON t.bot_id = b.id "
-        "WHERE b.id = ?", (child_bot_id,)
+        "WHERE b.id = ?", (bot_id,)
     ).fetchone()
-    if not child_row or float(child_row[2] or 0) <= 0.0001:
-        return False  # no position to check
-
-    pair, direction, open_qty, parent_bot_id = child_row
-    open_qty = float(open_qty)
-
-    # Get parent info
-    parent_row = conn.execute(
-        "SELECT b.direction, t.open_qty "
-        "FROM bots b JOIN trades t ON t.bot_id = b.id "
-        "WHERE b.id = ?", (parent_bot_id,)
-    ).fetchone()
-
-    parent_direction = parent_row[0] if parent_row else ('SHORT' if direction == 'LONG' else 'LONG')
-    parent_open_qty = float(parent_row[1] or 0.0) if parent_row else 0.0
-
-    from engine.parity_gates import get_exchange_signed_net, qty_tolerance
-    exchange_net = get_exchange_signed_net(exchange, pair)
-    if exchange_net is None:
-        # If API call failed, do not assume ghost to be safe
+    if not bot_row or float(bot_row[2] or 0) <= 0.0001:
         return False
 
-    parent_contribution = parent_open_qty if parent_direction == 'LONG' else -parent_open_qty
+    current_cycle = bot_row[3]
 
-    # Deduct signed net contribution of all other active bots on the same pair
-    from engine.exchange_interface import normalize_symbol
-    norm_pair = normalize_symbol(pair).upper()
-    other_contribution = 0.0
-    _exclude_ids = (child_bot_id, parent_bot_id or -1)
-    other_rows = conn.execute(
-        "SELECT b.direction, COALESCE(t.open_qty, 0) FROM bots b JOIN trades t ON t.bot_id = b.id "
-        "WHERE b.is_active = 1 AND b.normalized_pair = ? AND b.id NOT IN (?, ?)",
-        (norm_pair, _exclude_ids[0], _exclude_ids[1])
-    ).fetchall()
-    for _other_dir, _other_qty in other_rows:
-        oq = float(_other_qty or 0.0)
-        if _other_dir.upper() == 'LONG':
-            other_contribution += oq
-        else:
-            other_contribution -= oq
+    # Sanity check: does any filled entry exist for current cycle?
+    filled_entry_count = conn.execute(
+        "SELECT COUNT(*) FROM bot_orders "
+        "WHERE bot_id=? AND cycle_id=? "
+        "AND order_type IN ('entry','grid','adoption','carry') "
+        "AND status IN ('filled','partially_filled') "
+        "AND filled_amount > 0.0001",
+        (bot_id, current_cycle)
+    ).fetchone()[0]
 
-    tolerance = qty_tolerance()
-    if len(other_rows) > 0:
-        expected_exchange_net_without_child = parent_contribution + other_contribution
-        if abs(expected_exchange_net_without_child - exchange_net) < tolerance:
-            # Exchange matches parent + other bots (i.e. child is gone) -> child position is gone!
-            return True
-    else:
-        pair_net_without_child = parent_contribution
-        if abs(pair_net_without_child - exchange_net) < tolerance:
-            # Exchange matches parent-only contribution -> child position is gone!
-            return True
+    if filled_entry_count == 0:
+        # No fills in current cycle — could be cycle_id mismatch,
+        # not a ghost. Log warning but do NOT declare ghost.
+        logger.warning(
+            f"[GHOST-CHECK] Bot {bot_id}: open_qty={bot_row[2]:.6f} "
+            f"but zero filled entries in cycle {current_cycle}. "
+            f"Possible cycle_id mismatch — NOT declaring ghost. "
+            f"Run operator_repair.py diagnose to investigate."
+        )
+        return False
+
+    # Only now run recompute — cycle has real fills so result is trustworthy
+    from engine.database import recompute_invested_from_orders
+    try:
+        _, _, recomputed_qty, _ = recompute_invested_from_orders(bot_id)
+    except Exception as e:
+        logger.error(f"[GHOST-CHECK] recompute failed for bot {bot_id}: {e}")
+        return False
+
+    if recomputed_qty <= 0.0001:
+        logger.warning(
+            f"[GHOST-CHECK] Bot {bot_id} GHOST CONFIRMED: "
+            f"trades.open_qty={bot_row[2]:.6f} but recomputed=0 "
+            f"from {filled_entry_count} filled entries in cycle {current_cycle}."
+        )
+        return True
 
     return False
 
 
-def wipe_hedge_child_ghost(exchange, child_bot_id, conn):
+
+def wipe_bot_ghost(exchange, bot_id, conn):
     # 1. Fetch details
     row = conn.execute(
-        "SELECT b.name, b.pair, b.direction, t.open_qty, t.cycle_id "
+        "SELECT b.name, b.pair, b.direction, b.bot_type, t.open_qty, t.cycle_id "
         "FROM bots b JOIN trades t ON t.bot_id = b.id "
-        "WHERE b.id = ?", (child_bot_id,)
+        "WHERE b.id = ?", (bot_id,)
     ).fetchone()
     if not row:
         return
-    name, pair, direction, open_qty, cycle_id = row
+    name, pair, direction, bot_type, open_qty, cycle_id = row
 
-    # 1. Cancel any open orders for this child on exchange
+    target_status = 'hedge_standby' if bot_type == 'hedge_child' else 'Scanning'
+
+    # 1. Cancel any open orders for this bot on exchange
     if exchange:
         try:
-            exchange.cancel_orders_by_bot_id(child_bot_id, pair)
-            logger.info(f"🧹 [HEDGE-GHOST] Cancelled open orders for hedge child {child_bot_id} on {pair}.")
+            exchange.cancel_orders_by_bot_id(bot_id, pair)
+            logger.info(f"🧹 [GHOST-WIPE] Cancelled open orders for bot {bot_id} on {pair}.")
         except Exception as e:
-            logger.error(f"Failed to cancel open orders for hedge child {child_bot_id} on {pair}: {e}")
+            logger.error(f"Failed to cancel open orders for bot {bot_id} on {pair}: {e}")
 
-    # 2. Set status to hedge_standby (will be committed atomically in step 3)
+    # 2. Set status to target status
     conn.execute(
-        "UPDATE bots SET status = 'hedge_standby' WHERE id = ?", (child_bot_id,)
+        "UPDATE bots SET status = ? WHERE id = ?", (target_status, bot_id)
     )
 
     # 3. Cancel open internal orders and archive filled orders to prevent zombie revival
     conn.execute(
         "UPDATE bot_orders SET status='cancelled' "
         "WHERE bot_id=? AND status IN ('open', 'new', 'placing', 'cancelling')",
-        (child_bot_id,)
+        (bot_id,)
     )
     conn.execute(
         "UPDATE bot_orders SET status='reset_cleared' "
         "WHERE bot_id=? AND (status NOT IN ('open', 'new', 'placing', 'cancelling', 'auto_closed', 'reset_cleared', 'cancelled') OR (status IN ('cancelled', 'canceled') AND filled_amount > 0))",
-        (child_bot_id,)
+        (bot_id,)
     )
     conn.commit()
 
     # 4. Seal the bot using its new 'reset_cleared' state (reads 0.0 open_qty)
     from engine.ledger import seal_trade_state
-    seal_trade_state(child_bot_id, force_recompute=True)
+    seal_trade_state(bot_id, force_recompute=True)
 
-    # Force status to hedge_standby if seal overwrote it to Scanning
+    # Force status to target_status if seal overwrote it to Scanning
     conn.execute(
-        "UPDATE bots SET status = 'hedge_standby' WHERE id = ?",
-        (child_bot_id,)
+        "UPDATE bots SET status = ? WHERE id = ?",
+        (target_status, bot_id)
+    )
+    # Reset cycle_phase to IDLE — seal_trade_state zeros open_qty but does not
+    # touch cycle_phase, leaving it ACTIVE. An ACTIVE cycle with open_qty=0 and
+    # no orders creates the GHOST_STEP illegal state that GTR is designed to catch.
+    conn.execute(
+        "UPDATE trades SET cycle_phase = 'IDLE' WHERE bot_id = ?",
+        (bot_id,)
     )
     conn.commit()
 
     # 5. Write a drift_note audit row
     from engine.database import save_bot_order
     ts_now = int(time.time())
-    drift_cid = f"CQB_{child_bot_id}_DRIFT_GHOST_WIPE_{ts_now}"
+    drift_cid = f"CQB_{bot_id}_GH_WP_{ts_now}"
     try:
         save_bot_order(
-            child_bot_id, 'drift_note', f'GHOST_WIPE_{child_bot_id}_{ts_now}',
+            bot_id, 'drift_note', f'GHOST_WIPE_{bot_id}_{ts_now}',
             price=0.0, amount=0.0, step=0, status='audit',
             client_order_id=drift_cid,
-            notes=f"[HEDGE-GHOST] DB claims {open_qty} but exchange is flat on this side. Auto-wiped to hedge_standby.",
+            notes=f"[GHOST-WIPE] DB claims {open_qty} but exchange is flat on this side. Auto-wiped to {target_status}.",
             cycle_id=cycle_id
         )
     except Exception as e:
-        logger.error(f"Failed to save drift_note audit row for hedge child ghost {child_bot_id}: {e}")
+        logger.error(f"Failed to save drift_note audit row for ghost bot {bot_id}: {e}")
 
-    # 5. Log CRITICAL: [HEDGE-GHOST] Child {id} ({name}): DB claims {open_qty} but exchange is flat. Auto-wiped to hedge_standby.
+    # 6. Log CRITICAL
     logger.critical(
-        f"[HEDGE-GHOST] Child {child_bot_id} ({name}): DB claims "
-        f"{open_qty} but exchange is flat. Auto-wiped to hedge_standby."
+        f"[GHOST-WIPE] Bot {bot_id} ({name}): DB claims "
+        f"{open_qty} but exchange is flat. Auto-wiped to {target_status}."
     )
+
+
+# Backward compatibility aliases
+def detect_hedge_child_ghost(exchange, child_bot_id, conn) -> bool:
+    return detect_bot_ghost(exchange, child_bot_id, conn)
+
+
+def wipe_hedge_child_ghost(exchange, child_bot_id, conn):
+    return wipe_bot_ghost(exchange, child_bot_id, conn)
 
 
 def sync_pair_to_exchange(pair, exchange, conn):
@@ -784,6 +445,28 @@ def sync_pair_to_exchange(pair, exchange, conn):
     exchange_net = get_exchange_signed_net(exchange, pair)
     if exchange_net is None:
         logger.warning(f"[EXCHANGE-SYNC] Failed to fetch real exchange net position for pair {pair}.")
+        # ADR-005 stale-cycle tracking: increment counter and apply circuit breaker.
+        try:
+            from config.settings import config as _cfg
+            _pa_stale_cycles[pair] = _pa_stale_cycles.get(pair, 0) + 1
+            _stale = _pa_stale_cycles[pair]
+            if _cfg.PROPORTIONAL_ALLOCATION and _stale >= _cfg.PA_SYNC_MAX_STALE_CYCLES:
+                logger.critical(
+                    f"[PA-SYNC] Exchange API unavailable for {pair} for {_stale} consecutive "
+                    f"reconciler cycles (threshold={_cfg.PA_SYNC_MAX_STALE_CYCLES}). "
+                    f"Setting bots to REQUIRE_MANUAL_PROOF."
+                )
+                from engine.exchange_interface import normalize_symbol as _ns
+                _norm = _ns(pair).upper()
+                conn.execute(
+                    "UPDATE bots SET status='REQUIRE_MANUAL_PROOF' "
+                    "WHERE is_active=1 AND normalized_pair=? "
+                    "AND status NOT IN ('STOPPED','REQUIRE_MANUAL_PROOF')",
+                    (_norm,)
+                )
+                conn.commit()
+        except Exception as _stale_err:
+            logger.error(f"[PA-SYNC] Stale-cycle handler failed for {pair}: {_stale_err}")
         return None
 
     norm_pair = normalize_symbol(pair).upper()
@@ -862,6 +545,8 @@ def sync_pair_to_exchange(pair, exchange, conn):
         )
         # Phase 2: attempt controlled FIFO reseal to correct drift
         _attempt_drift_correction(pair, diff, bot_details, conn, sync_data, exchange=exchange)
+
+    # Proportional Allocation logic removed under ADR-006. Standard GTR drift check only.
 
     return sync_data
 
@@ -1004,3 +689,219 @@ def _attempt_drift_correction(pair, diff, bot_details, conn, sync_data, exchange
         'post_reseal_diff': diff_after,
         'bots': [{'bot_id': r[0], 'name': r[1]} for r in rows],
     }
+
+
+def get_typical_position_size(conn, bot_id: int) -> float:
+    """
+    Returns the average filled amount of entry/grid/adoption orders for the bot,
+    or 0.0 if no historical filled orders exist.
+    """
+    row = conn.execute("""
+        SELECT AVG(filled_amount) 
+        FROM bot_orders 
+        WHERE bot_id = ? 
+          AND order_type IN ('entry', 'grid', 'adoption', 'adoption_add', 'carry') 
+          AND status IN ('filled', 'partially_filled') 
+          AND filled_amount > 0
+    """, (bot_id,)).fetchone()
+    return float(row[0]) if (row and row[0] is not None) else 0.0
+
+
+def detect_unowned_exchange_positions(conn, exchange):
+    """
+    INV-32: Scrapes the active exchange positions and compares them against the cumulative
+    database order books for all active bots to detect unowned positions.
+    """
+    from engine.parity_gates import qty_tolerance
+    import time
+
+    tolerance = qty_tolerance()
+
+    # 1. Fetch live positions from exchange
+    try:
+        all_positions = exchange.fetch_positions()
+    except Exception as e:
+        logger.error(f"[ORPHAN-DETECTOR] Failed to fetch positions: {e}")
+        return
+
+    # Map of normalized symbol -> signed net quantity on exchange
+    exchange_nets = {}
+    for p in all_positions:
+        # fetch_positions returns net_qty which is already signed (negative for SHORT, positive for LONG)
+        signed_qty = float(p.get('net_qty', 0.0) or p.get('contracts', 0.0) or 0.0)
+        symbol = p.get('symbol')
+        if abs(signed_qty) > 0.0001:
+            norm = normalize_symbol(symbol).upper()
+            exchange_nets[norm] = signed_qty
+
+    # 2. Get all active bots' trading pairs
+    active_pairs = [r[0] for r in conn.execute(
+        "SELECT DISTINCT pair FROM bots WHERE is_active = 1"
+    ).fetchall()]
+
+    for pair in active_pairs:
+        norm_pair = normalize_symbol(pair).upper()
+        exchange_qty = exchange_nets.get(norm_pair, 0.0)
+
+        # 3. Sum bot_orders.filled_amount across all active bots on that pair
+        # using the FIFO entry minus exit fills logic (ADR-006 Pair level)
+        active_bot_rows = conn.execute(
+            "SELECT id, direction, status FROM bots WHERE is_active = 1 AND normalized_pair = ?",
+            (norm_pair,)
+        ).fetchall()
+        active_bot_ids = [r[0] for r in active_bot_rows]
+
+        if not active_bot_ids:
+            continue
+
+        placeholders = ','.join('?' for _ in active_bot_ids)
+
+        # Calculate db quantity for each bot on the pair and sum them up signed
+        pair_db_qty = 0.0
+        for bot_id, direction, _ in active_bot_rows:
+            # Fetch current cycle_id and cycle_floor
+            row_trade = conn.execute(
+                "SELECT cycle_id, wipe_wall_ts FROM trades WHERE bot_id = ?",
+                (bot_id,)
+            ).fetchone()
+            if not row_trade:
+                continue
+            target_cycle = row_trade[0]
+            wall_ts = int(row_trade[1] or 0)
+            
+            # Auto-detect cycle floor
+            row_floor = conn.execute("""
+                SELECT cycle_id,
+                       SUM(CASE WHEN order_type IN ('entry','grid','adoption','adoption_add','carry') THEN filled_amount ELSE 0.0 END) AS entry_qty,
+                       SUM(CASE WHEN order_type IN ('tp','close','dust_close','sl','adoption_reduce','flatten_close') THEN filled_amount ELSE 0.0 END) AS exit_qty
+                FROM bot_orders
+                WHERE bot_id = ?
+                  AND cycle_id < ?
+                  AND cycle_id IS NOT NULL
+                  AND filled_amount > 0
+                  AND status = 'filled'
+                GROUP BY cycle_id
+                HAVING (entry_qty - exit_qty) > 1e-6
+                ORDER BY cycle_id ASC
+                LIMIT 1
+            """, (bot_id, target_cycle)).fetchone()
+            
+            if row_floor:
+                cycle_floor = row_floor[0]
+            else:
+                cycle_floor = target_cycle
+
+            # Run FIFO calculation for this bot starting from cycle_floor and wall_ts
+            # Fetch entries
+            entries = conn.execute(f"""
+                SELECT filled_amount FROM bot_orders
+                WHERE bot_id = ?
+                  AND cycle_id >= ? AND cycle_id <= ?
+                  AND (
+                      status IN ('filled', 'closed', 'auto_closed', 'hedge_exited', 'partially_filled')
+                      OR (status IN ('canceled', 'cancelled', 'cancelling') AND filled_amount > 0)
+                  )
+                  AND filled_amount > 0
+                  AND order_type IN ('entry', 'grid', 'adoption', 'adoption_add', 'carry')
+                  AND (? = 0 OR created_at >= ?)
+                ORDER BY created_at ASC
+            """, (bot_id, cycle_floor, target_cycle, wall_ts, wall_ts)).fetchall()
+            
+            # Fetch exits
+            exits = conn.execute(f"""
+                SELECT filled_amount FROM bot_orders
+                WHERE bot_id = ?
+                  AND cycle_id >= ? AND cycle_id <= ?
+                  AND (
+                      status IN ('filled', 'closed', 'auto_closed', 'hedge_exited', 'partially_filled')
+                      OR (status IN ('canceled', 'cancelled', 'cancelling') AND filled_amount > 0)
+                  )
+                  AND filled_amount > 0
+                  AND order_type IN ('adoption_reduce', 'tp', 'close', 'dust_close', 'sl', 'flatten_close')
+                  AND (? = 0 OR created_at >= ?)
+                ORDER BY created_at ASC
+            """, (bot_id, cycle_floor, target_cycle, wall_ts, wall_ts)).fetchall()
+            
+            total_exit_qty = sum(float(r[0]) for r in exits)
+            
+            # Match FIFO
+            accum_sold = total_exit_qty
+            bot_open_qty = 0.0
+            for r in entries:
+                qty = float(r[0])
+                if accum_sold > 0.0:
+                    if qty <= accum_sold:
+                        accum_sold = round(accum_sold - qty, 8)
+                    else:
+                        bot_open_qty += round(qty - accum_sold, 8)
+                        accum_sold = 0.0
+                else:
+                    bot_open_qty += qty
+            
+            bot_open_qty = round(bot_open_qty, 8)
+            signed_oq = bot_open_qty if direction.upper() == 'LONG' else -bot_open_qty
+            pair_db_qty += signed_oq
+
+        pair_db_qty = round(pair_db_qty, 8)
+        shortfall = round(exchange_qty - pair_db_qty, 8)
+
+        # 4. If drift exceeds tolerance, identify candidates and log alert
+        if abs(shortfall) > tolerance:
+            # Look for flat bots (open_qty = 0)
+            flat_bots = conn.execute(f"""
+                SELECT b.id, b.name, b.direction, t.cycle_id 
+                FROM bots b JOIN trades t ON t.bot_id = b.id 
+                WHERE b.is_active = 1 AND b.normalized_pair = ? 
+                  AND t.open_qty < ? AND b.id IN ({placeholders})
+            """, [norm_pair, tolerance] + active_bot_ids).fetchall()
+
+            candidates = []
+            for f_bot_id, f_name, f_dir, f_cycle in flat_bots:
+                # Sign of shortfall must match the bot direction
+                # If shortfall is positive (+), exchange has more contracts than DB (more LONG exposure needed) -> matches LONG bot
+                # If shortfall is negative (-), exchange is more short than DB -> matches SHORT bot
+                shortfall_is_long = shortfall > 0
+                bot_is_long = f_dir.upper() == 'LONG'
+
+                if shortfall_is_long == bot_is_long:
+                    typical_size = get_typical_position_size(conn, f_bot_id)
+
+                    # Matches typical size OR typical size is 0.0 (no history, accepts any shortfall size)
+                    if typical_size == 0.0 or abs(abs(shortfall) - typical_size) < tolerance:
+                        candidates.append((f_bot_id, f_name))
+
+            # Determine best candidate to suggest
+            suggested_bot_id = None
+            if candidates:
+                suggested_bot_id = candidates[0][0]
+                cand_names = ", ".join(f"{c[1]} (ID: {c[0]})" for c in candidates)
+                notes_msg = f"[AUTO-DETECT] Position drift of {shortfall:+.4f} detected. Candidates: {cand_names}."
+            else:
+                notes_msg = f"[AUTO-DETECT] Position drift of {shortfall:+.4f} detected, but no matching flat bot could be found."
+
+            # Enforce exactly one pending alert per pair to prevent double adoption / duplicates
+            exists = conn.execute("""
+                SELECT id FROM unowned_position_alerts 
+                WHERE normalized_pair = ? AND status = 'pending_review'
+            """, (norm_pair,)).fetchone()
+
+            if exists:
+                conn.execute("""
+                    UPDATE unowned_position_alerts 
+                    SET bot_id = ?, exchange_qty = ?, db_qty = ?, detected_at = ?, notes = ?
+                    WHERE id = ?
+                """, (suggested_bot_id, exchange_qty, pair_db_qty, int(time.time()), notes_msg, exists[0]))
+                conn.commit()
+                logger.info(f"🔄 [ORPHAN-DETECTOR] Updated existing unowned position alert for {pair} (drift={shortfall:+.4f})")
+            else:
+                conn.execute("""
+                    INSERT INTO unowned_position_alerts 
+                    (bot_id, pair, normalized_pair, exchange_qty, db_qty, detected_at, status, notes)
+                    VALUES (?, ?, ?, ?, ?, ?, 'pending_review', ?)
+                """, (
+                    suggested_bot_id, pair, norm_pair, exchange_qty, pair_db_qty, int(time.time()), notes_msg
+                ))
+                conn.commit()
+                logger.critical(f"⚠️ [ORPHAN-DETECTOR] Created new unowned position alert for {pair} (drift={shortfall:+.4f}, suggest={suggested_bot_id})")
+
+

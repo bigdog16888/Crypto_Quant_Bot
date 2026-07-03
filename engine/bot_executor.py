@@ -36,6 +36,8 @@ _thread_local = threading.local()
 # API Error Tracker (Hammer Shield)
 # Tracks consecutive errors per bot to detect API loops and banish them before a Binance Global Ban.
 _API_ERROR_TRACKER = {}
+# Cooldown tracker for dust sweeps/flushes to prevent API hammering loops when they fail or are blocked
+_DUST_FLUSH_COOLDOWN = {}
 
 def _to_ccxt_pair(normalized_or_ccxt: str, all_bot_pairs: list = None) -> str:
     """
@@ -82,36 +84,42 @@ def sync_stale_open_orders(bot_id: int, exchange: ExchangeInterface, conn, max_a
         logger.warning(f"[ORDER-SYNC] Bot {bot_id} has no pair symbol configured.")
         return 0
 
-    cutoff_time = int(time.time()) - max_age_seconds
+    now_ts = int(time.time())
+    cutoff_default = now_ts - max_age_seconds
+    cutoff_pending = now_ts - 30
     
     # Query bot_orders for rows where:
     # - bot_id = given bot_id
-    # - status IN ('open', 'new', 'partially_filled', 'placing')
-    # - created_at < (now - max_age_seconds)
-    # - order_id IS NOT NULL AND order_id NOT LIKE 'PENDING_%'
+    # - status IN ('open', 'new', 'partially_filled', 'placing', 'cancelling', 'pending_placement')
+    # - created_at is older than the respective thresholds (30s for pending_placement, max_age_seconds for others)
+    # - order_id IS NOT NULL and is not empty
+    # - order_type is not netting
     rows = conn.execute(
-        "SELECT id, order_id, client_order_id, order_type, amount, filled_amount, status, price, step, cycle_id "
+        "SELECT id, order_id, client_order_id, order_type, amount, filled_amount, status, price, step, cycle_id, created_at "
         "FROM bot_orders "
         "WHERE bot_id = ? "
-        "AND status IN ('open', 'new', 'partially_filled', 'placing', 'cancelling') "
-        "AND created_at < ? "
+        "AND status IN ('open', 'new', 'partially_filled', 'placing', 'cancelling', 'pending_placement') "
+        "AND ( (status = 'pending_placement' AND created_at < ?) OR (status != 'pending_placement' AND created_at < ?) ) "
         "AND order_id IS NOT NULL "
         "AND order_id != '' "
-        "AND order_id NOT LIKE 'PENDING_%' "
-        "AND order_type != 'virtual_netting'",
-        (bot_id, cutoff_time)
+        "AND (status = 'pending_placement' OR order_id NOT LIKE 'PENDING_%') "
+        "AND order_type NOT IN ('virtual_netting', 'legacy_netting')",
+        (bot_id, cutoff_pending, cutoff_default)
     ).fetchall()
 
     if not rows:
         return 0
 
-    logger.debug(f"[ORDER-SYNC] Bot {bot_name}: scanning {len(rows)} stale open orders older than {max_age_seconds}s.")
+    logger.debug(f"[ORDER-SYNC] Bot {bot_name}: scanning {len(rows)} stale open/pending orders.")
     synced_count = 0
     fills_synced = False
 
     for row in rows:
-        row_id, order_id, client_order_id, order_type, amount, filled_amount, status, price, step, cycle_id = row
+        row_id, order_id, client_order_id, order_type, amount, filled_amount, status, price, step, cycle_id, created_at = row
         try:
+            if order_id and any(str(order_id).startswith(prefix) for prefix in ('PENDING_', 'PLACING_', 'GHOST_')):
+                logger.info(f"[ORDER-SYNC] Bot {bot_name}: Skipping fetch_order for synthetic order {order_id}")
+                continue
             order_info = exchange.fetch_order(order_id, symbol)
             if not order_info:
                 logger.warning(f"[ORDER-SYNC] Bot {bot_name}: fetch_order returned None for order {order_id} ({client_order_id}).")
@@ -218,7 +226,7 @@ def sync_stale_open_orders(bot_id: int, exchange: ExchangeInterface, conn, max_a
                                 f"[ORDER-SYNC] Bot {bot_id}: handle_tp_completion failed "
                                 f"after sync: {_cascade_err}. Bot may need manual reset."
                             )
-                    elif order_type in ('sl', 'close'):
+                    elif order_type in ('sl', 'close', 'flatten_close'):
                         try:
                             from engine.ledger import handle_flatten
                             logger.warning(
@@ -255,10 +263,16 @@ def sync_stale_open_orders(bot_id: int, exchange: ExchangeInterface, conn, max_a
                     (int(time.time()), row_id)
                 )
                 conn.commit()
-                logger.warning(
-                    f"[ORDER-SYNC] Bot {bot_name}: order {client_order_id} not found on exchange "
-                    f"(treated as cancelled). Corrected in DB."
-                )
+                if status == 'pending_placement':
+                    logger.warning(
+                        f"[STALE-PENDING] Bot {bot_id}: pending_placement order {client_order_id} "
+                        f"never reached exchange (OrderNotFound). Marking cancelled to unblock re-placement."
+                    )
+                else:
+                    logger.warning(
+                        f"[ORDER-SYNC] Bot {bot_name}: order {client_order_id} not found on exchange "
+                        f"(treated as cancelled). Corrected in DB."
+                    )
                 synced_count += 1
             else:
                 logger.error(f"❌ [ORDER-SYNC] Failed to fetch order status from exchange for order {order_id} bot {bot_name}: {e}")
@@ -630,7 +644,7 @@ def _reset_to_hedge_standby(child_bot_id: int, conn, parent_cycle_id: int, excha
         (parent_cycle_id, child_bot_id)
     )
     conn.execute(
-        "UPDATE bots SET status = 'hedge_standby' WHERE id = ?",
+        "UPDATE bots SET status = 'hedge_standby', cascade_started_at = 0 WHERE id = ?",
         (child_bot_id,)
     )
     conn.commit()
@@ -641,13 +655,13 @@ def _reset_to_hedge_standby(child_bot_id: int, conn, parent_cycle_id: int, excha
 
     # Force status to hedge_standby if seal overwrote it
     conn.execute(
-        "UPDATE bots SET status = 'hedge_standby' WHERE id = ?",
+        "UPDATE bots SET status = 'hedge_standby', cascade_started_at = 0 WHERE id = ?",
         (child_bot_id,)
     )
     conn.commit()
 
     # Audit row (always written, Phase 1 or not)
-    drift_cid = f"CQB_{child_bot_id}_DRIFT_ENFORCE_RESET_{int(time.time())}"
+    drift_cid = f"CQB_{child_bot_id}_DF_RST_{int(time.time())}"
     save_bot_order(
         child_bot_id, 'drift_note', drift_cid,
         price=0.0, amount=0.0, step=0, status='audit',
@@ -924,7 +938,7 @@ class BotExecutor:
                     _cur.execute("""
                         SELECT
                             COALESCE(SUM(CASE WHEN order_type IN ('entry','grid','adoption_add','adoption') THEN filled_amount ELSE 0 END), 0),
-                            COALESCE(SUM(CASE WHEN order_type IN ('tp','close','adoption_reduce','dust_close','sl') THEN filled_amount ELSE 0 END), 0)
+                            COALESCE(SUM(CASE WHEN order_type IN ('tp','close','adoption_reduce','dust_close','sl','flatten_close') THEN filled_amount ELSE 0 END), 0)
                         FROM bot_orders
                         WHERE bot_id=? AND (cycle_id=? OR cycle_id IS NULL)
                         AND status NOT IN ('reset_cleared','auto_closed','failed','placing')
@@ -1414,6 +1428,7 @@ class BotExecutor:
             logger.info(f"🔄 [TP-SYNC] {name}: Cancelling stale TP {tp_order_id}...")
             cancel_response = None
             filled_qty = 0.0
+            inv18_corrected = False
             try:
                 cancel_response = exchange.cancel_order(tp_order_id, pair)
                 
@@ -1428,7 +1443,11 @@ class BotExecutor:
             except Exception as e:
                 logger.warning(f"[TP-SYNC] {name}: Cancel failed ({e}). Attempting to fetch order status...")
                 try:
-                    cancel_response = exchange.fetch_order(tp_order_id, pair)
+                    if tp_order_id and any(str(tp_order_id).startswith(prefix) for prefix in ('PENDING_', 'PLACING_', 'GHOST_')):
+                        logger.info(f"🔎 [TP-SYNC] Skipping fetch_order for synthetic TP {tp_order_id}")
+                        cancel_response = None
+                    else:
+                        cancel_response = exchange.fetch_order(tp_order_id, pair)
                 except Exception as inner_e:
                     logger.error(f"[TP-SYNC] {name}: Could not fetch old TP status: {inner_e}")
 
@@ -1463,6 +1482,7 @@ class BotExecutor:
                     # 🛡️ INV-18: Subtract already-filled quantity from new target quantity
                     old_db_qty = db_qty
                     db_qty = max(0.0, db_qty - filled_qty)
+                    inv18_corrected = True
                     logger.info(f"🛡️ [INV-18] {name}: Old TP had partial fill of {filled_qty}. Adjusted new TP qty from {old_db_qty:.4f} to {db_qty:.4f}.")
 
                 if orig_qty > 0:
@@ -1490,14 +1510,24 @@ class BotExecutor:
                 _latest_qty_row = _conn.execute("SELECT open_qty FROM trades WHERE bot_id=?", (bot_id,)).fetchone()
                 if _latest_qty_row:
                     _latest_qty = float(_latest_qty_row[0] or 0)
-                    logger.info(f"🔄 [TP-SYNC] {name}: Setting replacement TP qty to current trades.open_qty: {_latest_qty:.6f} (cancelled order original target was {db_qty:.6f})")
-                    db_qty = _latest_qty
+                    if not inv18_corrected:
+                        # Original bug: db_qty is stale from caller, fresher DB value wins
+                        logger.info(f"🔄 [TP-SYNC] {name}: Setting replacement TP qty to current trades.open_qty: {_latest_qty:.6f} (cancelled order original target was {db_qty:.6f})")
+                        db_qty = _latest_qty
+                    elif _latest_qty < db_qty:
+                        # INV-18 ran but DB is *even lower* (fill also propagated via WS) — be conservative
+                        logger.info(f"🔄 [TP-SYNC] {name}: DB re-read {_latest_qty:.6f} < INV-18 corrected qty {db_qty:.6f}. Using DB qty.")
+                        db_qty = _latest_qty
+                    else:
+                        # INV-18 ran and its value is more conservative — keep it, ignore stale DB
+                        logger.info(f"🔄 [TP-SYNC] {name}: INV-18 value {db_qty:.6f} kept (DB {_latest_qty:.6f} is stale/larger)")
             except Exception as e:
                 logger.error(f"[TP-SYNC] Failed to re-verify open_qty from trades: {e}")
 
             # Mark cancelled in DB — but remember the old price so we can restore if placement fails
-            old_placed_price = float(existing_tp_order.get('price') or existing_tp_order.get('stopPrice') or 0)
-            update_order_status(tp_order_id, 'cancelled', bot_id=bot_id, filled_qty=filled_qty)
+            if not update_order_status(tp_order_id, 'cancelled', bot_id=bot_id, filled_qty=filled_qty):
+                logger.warning(f"⚠️ [TP-SYNC] {name}: Failed to mark TP {tp_order_id} as cancelled (likely already filled). Aborting replacement TP placement.")
+                return None
 
             if db_qty <= 0 or db_tp <= 0 or config.DRY_RUN:
                 logger.info(f"🛑 [TP-SYNC] {name}: db_qty is {db_qty:.4f} (<= 0) after verification. Aborting replacement.")
@@ -1535,7 +1565,8 @@ class BotExecutor:
                 # (which checks 'new','open','filled') does NOT block the next cycle from retrying.
                 # 'placed' is still in the placed_tp lookup ('open','new','placed') so the price
                 # anchor is preserved for drift comparison.
-                update_order_status(tp_order_id, 'placed', bot_id=bot_id)
+                if not update_order_status(tp_order_id, 'placed', bot_id=bot_id):
+                    logger.error(f"🚨 [STATE-GUARD ERROR] Unexpected status update failure for TP order {tp_order_id} to placed (retry path).")
                 return None
 
             # 🚀 HARDENED: Use cycle_id for strict idempotency
@@ -2471,7 +2502,8 @@ class BotExecutor:
                                     logger.info(f"🧹 {name}: Purging orphan-risk order {oid} ({cid}) from exchange before cycle reset.")
                                     try:
                                         exchange.cancel_order(oid, pair)
-                                        update_order_status(oid, 'cancelled', bot_id=bot_id)
+                                        if not update_order_status(oid, 'cancelled', bot_id=bot_id):
+                                            logger.error(f"🚨 [ORPHAN-WARNING] {name}: Failed to mark lingering order {oid} ({cid}) as cancelled (likely already filled).")
                                     except Exception as e_cancel:
                                         logger.warning(f"⚠️ {name}: Could not cancel lingering order {oid}: {e_cancel}")
                             except Exception as e_fetch:
@@ -2514,28 +2546,33 @@ class BotExecutor:
                                     _dust_threshold_pct = 5.0
 
                                     if _dust_usd <= _dust_threshold_usd or _dust_pct <= _dust_threshold_pct:
-                                        logger.warning(
-                                            f"🧹 [DUST-SWEEP] {name}: Post-TP residual {_dust_qty:.6f} {pair.split('/')[0]} "
-                                            f"(${_dust_usd:.2f}, {_dust_pct:.1f}% of prior). Auto-closing as dust."
-                                        )
-                                        try:
-                                            _dust_prec = exchange.get_symbol_precision(pair) or {}
-                                            _strat = self._get_strategy_instance(bot_id, bot_config)
-                                            _dust_qty_r = _strat._round_qty(_dust_qty)
-                                            _dust_cid = self._generate_deterministic_id(bot_id, 'DUST', bot_status.get('cycle_id', 0), 0)
-                                            _dust_params = {'newClientOrderId': _dust_cid, 'reduceOnly': True}
-                                            _dust_order = exchange.create_order(pair, 'market', _dust_side, _dust_qty_r, params=_dust_params)
-                                            if _dust_order:
-                                                _dust_oid = str(_dust_order.get('id', 'DUST_CLOSE'))
-                                                save_bot_order(
-                                                    bot_id, 'dust_close', _dust_oid, actual_exit, _dust_qty_r,
-                                                    0, 'filled', client_order_id=_dust_cid,
-                                                    notes=f'Post-TP dust sweep: {_dust_qty_r} {pair} @ market',
-                                                    cycle_id=bot_status.get('cycle_id', 0)
-                                                )
-                                                logger.info(f"✅ [DUST-SWEEP] {name}: Dust closed {_dust_qty_r} {pair}. OID={_dust_oid}")
-                                        except Exception as _e_dust_close:
-                                            logger.error(f"❌ [DUST-SWEEP] {name}: Dust close failed: {_e_dust_close}. Residual {_dust_qty} on exchange — manual action required.")
+                                        # Check cooldown to prevent rapid retries on failure
+                                        if time.time() < _DUST_FLUSH_COOLDOWN.get(bot_id, 0.0):
+                                            logger.info(f"🧹 [DUST-SWEEP] {name}: Dust close is in cooldown. Skipping.")
+                                        else:
+                                            logger.warning(
+                                                f"🧹 [DUST-SWEEP] {name}: Post-TP residual {_dust_qty:.6f} {pair.split('/')[0]} "
+                                                f"(${_dust_usd:.2f}, {_dust_pct:.1f}% of prior). Auto-closing as dust."
+                                            )
+                                            try:
+                                                _dust_prec = exchange.get_symbol_precision(pair) or {}
+                                                _strat = self._get_strategy_instance(bot_id, bot_config)
+                                                _dust_qty_r = _strat._round_qty(_dust_qty)
+                                                _dust_cid = self._generate_deterministic_id(bot_id, 'DUST', bot_status.get('cycle_id', 0), 0)
+                                                _dust_params = {'newClientOrderId': _dust_cid, 'reduceOnly': True}
+                                                _dust_order = exchange.create_order(pair, 'market', _dust_side, _dust_qty_r, params=_dust_params, human_approved=True)
+                                                if _dust_order:
+                                                    _dust_oid = str(_dust_order.get('id', 'DUST_CLOSE'))
+                                                    save_bot_order(
+                                                        bot_id, 'dust_close', _dust_oid, actual_exit, _dust_qty_r,
+                                                        0, 'filled', client_order_id=_dust_cid,
+                                                        notes=f'Post-TP dust sweep: {_dust_qty_r} {pair} @ market',
+                                                        cycle_id=bot_status.get('cycle_id', 0)
+                                                    )
+                                                    logger.info(f"✅ [DUST-SWEEP] {name}: Dust closed {_dust_qty_r} {pair}. OID={_dust_oid}")
+                                            except Exception as _e_dust_close:
+                                                logger.error(f"❌ [DUST-SWEEP] {name}: Dust close failed: {_e_dust_close}. Residual {_dust_qty} on exchange — manual action required.")
+                                                _DUST_FLUSH_COOLDOWN[bot_id] = time.time() + 300.0 # 5 minutes cooldown
                                     else:
                                         logger.error(
                                             f"🚨 [DUST-SWEEP] {name}: Post-TP LARGE residual {_dust_qty:.6f} {pair.split('/')[0]} "
@@ -2636,6 +2673,152 @@ class BotExecutor:
                     )
                 return None
 
+            if _hc_state == 'active':
+                # --- INV-30: Hedge Child Continuous Qty Reconciliation ---
+                try:
+                    # 1. Fetch parent details
+                    parent_row = _hc_enforce_conn.execute(
+                        "SELECT p.id, p.hedge_trigger_step, t.open_qty, t.cycle_id, t.current_step "
+                        "FROM bots c "
+                        "JOIN bots p ON p.id = c.parent_bot_id "
+                        "JOIN trades t ON t.bot_id = p.id "
+                        "WHERE c.id = ?",
+                        (bot_id,)
+                    ).fetchone()
+                    if parent_row:
+                        parent_id, hedge_trigger, parent_open_qty, parent_cycle_id, parent_step = parent_row
+                        hedge_trigger = int(hedge_trigger or 0)
+                        parent_open_qty = float(parent_open_qty or 0.0)
+                        parent_cycle_id = int(parent_cycle_id or 1)
+                        parent_step = int(parent_step or 0)
+
+                        # Compute pre-trigger accumulated qty (steps 1 to hedge_trigger - 1)
+                        if hedge_trigger <= 1:
+                            pre_trigger_accumulated_qty = 0.0
+                        else:
+                            accum_row = _hc_enforce_conn.execute(
+                                "SELECT COALESCE(SUM(filled_amount), 0.0) FROM bot_orders "
+                                "WHERE bot_id = ? AND cycle_id = ? AND step >= 1 AND step < ? "
+                                "AND order_type IN ('entry', 'grid')",
+                                (parent_id, parent_cycle_id, hedge_trigger)
+                            ).fetchone()
+                            pre_trigger_accumulated_qty = float(accum_row[0]) if accum_row else 0.0
+
+                        # parent_hedgeable_qty
+                        parent_hedgeable_qty = max(0.0, parent_open_qty - pre_trigger_accumulated_qty)
+
+                        # 2. Fetch child's current open_qty from trades
+                        child_qty_row = _hc_enforce_conn.execute(
+                            "SELECT open_qty, cycle_id FROM trades WHERE bot_id = ?",
+                            (bot_id,)
+                        ).fetchone()
+                        child_open_qty = float(child_qty_row[0] or 0.0) if child_qty_row else 0.0
+                        child_cycle_id = int(child_qty_row[1] or 1) if child_qty_row else 1
+
+                        # 3. Compute aggregate drift and tolerance
+                        prec = exchange.get_symbol_precision(pair)
+                        tolerance = float(prec.get('step_size', 0.001) or 0.001)
+                        aggregate_drift = parent_hedgeable_qty - child_open_qty
+
+                        # 4. Check if over-hedged first
+                        if aggregate_drift < -tolerance:
+                            logger.warning(
+                                f"[INV-30] Hedge drift detected: child {bot_id} over-hedged "
+                                f"by {abs(aggregate_drift):.6f} {pair}. Parent hedgeable={parent_hedgeable_qty:.6f}, "
+                                f"child={child_open_qty:.6f}. Transitioning to pending_flatten."
+                            )
+                            _hc_enforce_conn.execute(
+                                "UPDATE bots SET status = 'pending_flatten', cascade_started_at = ? WHERE id = ?",
+                                (int(time.time()), bot_id)
+                            )
+                            _hc_enforce_conn.commit()
+                        else:
+                            # Iterate step S from hedge_trigger to parent_step
+                            # checking saturation independently per step
+                            for S in range(hedge_trigger, parent_step + 1):
+                                child_step = S - hedge_trigger + 1
+
+                                # Query parent step qty (filled entries/grids for step S)
+                                parent_step_row = _hc_enforce_conn.execute(
+                                    "SELECT COALESCE(SUM(filled_amount), 0.0) FROM bot_orders "
+                                    "WHERE bot_id = ? AND cycle_id = ? AND step = ? "
+                                    "AND order_type IN ('entry', 'grid') "
+                                    "AND status IN ('filled', 'partially_filled') "
+                                    "AND filled_amount > 0",
+                                    (parent_id, parent_cycle_id, S)
+                                ).fetchone()
+                                parent_step_qty = float(parent_step_row[0]) if parent_step_row else 0.0
+
+                                # Query child step qty: filled/partially_filled + open/new/placing/cancelling
+                                child_filled_row = _hc_enforce_conn.execute(
+                                    "SELECT COALESCE(SUM(filled_amount), 0.0) FROM bot_orders "
+                                    "WHERE bot_id = ? AND cycle_id = ? AND step = ? "
+                                    "AND order_type IN ('entry', 'grid') "
+                                    "AND status IN ('filled', 'partially_filled')",
+                                    (bot_id, child_cycle_id, child_step)
+                                ).fetchone()
+                                child_filled_qty = float(child_filled_row[0]) if child_filled_row else 0.0
+
+                                child_inflight_row = _hc_enforce_conn.execute(
+                                    "SELECT COALESCE(SUM(amount), 0.0) FROM bot_orders "
+                                    "WHERE bot_id = ? AND cycle_id = ? AND step = ? "
+                                    "AND order_type IN ('entry', 'grid') "
+                                    "AND status IN ('open', 'new', 'placing', 'cancelling')",
+                                    (bot_id, child_cycle_id, child_step)
+                                ).fetchone()
+                                child_inflight_qty = float(child_inflight_row[0]) if child_inflight_row else 0.0
+
+                                child_step_qty = child_filled_qty + child_inflight_qty
+                                delta = parent_step_qty - child_step_qty
+
+                                if delta > tolerance:
+                                    logger.warning(
+                                        f"[INV-30] Under-hedge drift of {delta:.6f} detected at step {child_step} "
+                                        f"(parent step {S}) for child {bot_id}. "
+                                        f"Parent step qty={parent_step_qty:.6f}, child step qty={child_step_qty:.6f}. "
+                                        f"Placing catch-up entry."
+                                    )
+                                    price_to_use = float(current_price or 0)
+                                    if price_to_use <= 0:
+                                        try:
+                                            price_to_use = float(exchange.get_last_price(pair) or 0)
+                                        except Exception:
+                                            price_to_use = 0.0
+                                    
+                                    cid = f"CQB_{bot_id}_ENTRY_{child_cycle_id}_{child_step}_CATCHUP_{int(time.time())}"[:36]
+                                    child_direction = _hc_enforce_conn.execute("SELECT direction FROM bots WHERE id=?", (bot_id,)).fetchone()[0]
+                                    child_side = 'sell' if child_direction == 'SHORT' else 'buy'
+                                    entry_qty = exchange.round_to_step(delta, tolerance)
+
+                                    if entry_qty > 0 and price_to_use > 0:
+                                        params = {
+                                            'timeInForce': 'GTC',
+                                            'postOnly': False,
+                                            'post_only': False,
+                                            'newClientOrderId': cid
+                                        }
+                                        is_testnet = getattr(config, 'TESTNET', False) or getattr(config, 'DEMO_TRADING', False)
+                                        params = self._resolve_position_side_param(params, is_testnet)
+                                        
+                                        try:
+                                            order = exchange.create_order(
+                                                pair, 'limit', child_side, entry_qty, price_to_use, params=params
+                                            )
+                                            if order:
+                                                save_bot_order(
+                                                    bot_id, 'entry', str(order['id']), price_to_use, entry_qty,
+                                                    step=child_step, status=order.get('status', 'open'),
+                                                    client_order_id=cid,
+                                                    notes=f"[INV-30] Catch-up entry placed for step {child_step} (delta={delta:.6f})",
+                                                    cycle_id=child_cycle_id
+                                                )
+                                        except Exception as e_place:
+                                            logger.error(f"❌ [INV-30] Failed to place catch-up entry order: {e_place}")
+                                    # Break to only place one catch-up order per maintain_orders cycle
+                                    break
+                except Exception as e_inv30:
+                    logger.error(f"❌ [INV-30] Error during continuous qty reconciliation: {e_inv30}")
+
             # 1. Get current open orders
             open_orders = None
             if market_snapshot:
@@ -2669,7 +2852,8 @@ class BotExecutor:
                             logger.info(f"💰 [WS-FILL-CATCH] Stale order {c_cid} filled amount {f_amt} during cancel buffer! Crediting fill.")
                             from engine.database import update_order_status as _uos_catch
                             from engine.ledger import credit_fill as _cf_catch, seal_trade_state as _sts_catch
-                            _uos_catch(ex_oid, 'filled', bot_id=bot_id, filled_qty=f_amt)
+                            if not _uos_catch(ex_oid, 'filled', bot_id=bot_id, filled_qty=f_amt):
+                                logger.error(f"🚨 [STATE-GUARD ERROR] Unexpected status update failure for catch-fill order {ex_oid} to filled.")
                             _cf_catch(bot_id=bot_id, order_id=str(ex_oid), cumulative_qty=f_amt, avg_price=float(c_price or 0), order_type=str(c_type or 'grid').lower(), is_cumulative=True)
                             _sts_catch(bot_id)
                         else:
@@ -2703,7 +2887,11 @@ class BotExecutor:
                     # Stalemate check on local_tp_id
                     logger.warning(f"⏳ [HEDGE-MAINTAIN] {name}: CCXT says TP is missing, but DB has {local_tp_id}. Verifying status...")
                     try:
-                        order_status = exchange.fetch_order(local_tp_id, pair)
+                        if local_tp_id and any(str(local_tp_id).startswith(prefix) for prefix in ('PENDING_', 'PLACING_', 'GHOST_')):
+                            logger.info(f"🔎 [HEDGE-MAINTAIN] Skipping fetch_order for synthetic local_tp_id {local_tp_id}")
+                            order_status = None
+                        else:
+                            order_status = exchange.fetch_order(local_tp_id, pair)
                         status_str = order_status.get('status') if order_status else 'unknown'
                         
                         if status_str in ['canceled', 'cancelled', 'expired', 'rejected']:
@@ -3076,7 +3264,8 @@ class BotExecutor:
                         logger.info(f"💰 [WS-FILL-CATCH] Stale order {c_cid} filled amount {f_amt} during cancel buffer! Crediting fill.")
                         from engine.database import update_order_status as _uos_catch
                         from engine.ledger import credit_fill as _cf_catch, seal_trade_state as _sts_catch
-                        _uos_catch(ex_oid, 'filled', bot_id=bot_id, filled_qty=f_amt)
+                        if not _uos_catch(ex_oid, 'filled', bot_id=bot_id, filled_qty=f_amt):
+                            logger.error(f"🚨 [STATE-GUARD ERROR] Unexpected status update failure for catch-fill order {ex_oid} to filled.")
                         _cf_catch(bot_id=bot_id, order_id=str(ex_oid), cumulative_qty=f_amt, avg_price=float(c_price or 0), order_type=str(c_type or 'grid').lower(), is_cumulative=True, caller='cancel_verify')
                         _sts_catch(bot_id)
                     else:
@@ -3102,7 +3291,8 @@ class BotExecutor:
                                     )
                                     from engine.database import update_order_status as _uos_catch2
                                     from engine.ledger import credit_fill as _cf_catch2, seal_trade_state as _sts_catch2
-                                    _uos_catch2(ex_oid, 'filled', bot_id=bot_id, filled_qty=_ex_filled_verify)
+                                    if not _uos_catch2(ex_oid, 'filled', bot_id=bot_id, filled_qty=_ex_filled_verify):
+                                        logger.error(f"🚨 [STATE-GUARD ERROR] Unexpected status update failure for catch-fill-verify order {ex_oid} to filled.")
                                     _cf_catch2(bot_id=bot_id, order_id=str(ex_oid), cumulative_qty=_ex_filled_verify, avg_price=_ex_price_verify, order_type=str(c_type or 'grid').lower(), is_cumulative=True, caller='cancel_verify')
                                     _sts_catch2(bot_id)
                                 elif _ex_status_verify in ('canceled', 'cancelled', 'expired', 'rejected'):
@@ -3198,9 +3388,29 @@ class BotExecutor:
                 # If the close order was cancelled or failed, re-place it
                 close_orders = [o for o in bot_open_orders if '_CLOSE_' in o.get('clientOrderId', '')]
                 if not close_orders:
+                    # FIX 1 — Idempotency guard for PARTIAL_CLOSE_PENDING:
+                    from engine.database import get_connection as _gc_conn_partial
+                    _conn_partial = _gc_conn_partial()
+                    existing_pending = _conn_partial.execute(
+                        "SELECT COUNT(*) FROM bot_orders "
+                        "WHERE bot_id=? AND order_type='close' "
+                        "AND status='pending_placement' "
+                        "AND cycle_id=?",
+                        (bot_id, bot_status.get('cycle_id', 1))
+                    ).fetchone()[0]
+                    
+                    if existing_pending > 0:
+                        logger.warning(
+                            f"[PARTIAL_CLOSE_PENDING] Bot {name}: skipping new close row, "
+                            f"{existing_pending} pending_placement rows already exist. "
+                            f"Waiting for exchange placement or manual resolution."
+                        )
+                        return None
+
                     logger.warning(f"⚠️ [PARTIAL_CLOSE_PENDING] Bot {name} ({bot_id}) has open_qty={current_open_qty:.6f} but no active close order. Re-placing.")
                     close_side = 'sell' if direction == 'LONG' else 'buy'
-                    close_cid = f"CQB_{bot_id}_CLOSE_{bot_status.get('cycle_id', 1)}_{int(time.time())}"
+                    # FIX 3 — CID must be cycle-stable, not time-based:
+                    close_cid = f"CQB_{bot_id}_CLOSE_{bot_status.get('cycle_id', 1)}"
                     from engine.database import save_bot_order as _sbo_partial
                     _sbo_partial(
                         bot_id, 'close', close_cid,
@@ -3224,9 +3434,19 @@ class BotExecutor:
                         )
                         if close_order:
                             from engine.database import update_order_status as _uos_partial
-                            _uos_partial(close_order['id'], close_order.get('status', 'open'), bot_id=bot_id, filled_qty=0.0)
+                            if not _uos_partial(close_order['id'], close_order.get('status', 'open'), bot_id=bot_id, filled_qty=0.0):
+                                logger.error(f"🚨 [STATE-GUARD ERROR] Unexpected status update failure for partial close order {close_order['id']} to {close_order.get('status', 'open')}.")
                     except Exception as e_close:
                         logger.error(f"[PARTIAL_CLOSE_PENDING] Fallback place close failed: {e_close}")
+                        # FIX 2 — ReduceOnly rejection triggers ghost detection immediately:
+                        if any(phrase in str(e_close) for phrase in ["ReduceOnly", "-2022", "reduceOnly", "reduce-only"]):
+                            logger.warning(f"⚠️ [PARTIAL_CLOSE_PENDING] ReduceOnly rejection detected for bot {name} ({bot_id}): {e_close}")
+                            from engine.oneway_netting import detect_bot_ghost, wipe_bot_ghost
+                            if detect_bot_ghost(exchange, bot_id, _conn_partial):
+                                logger.info(f"🧹 [GHOST-DETECTED] Bot {name} ({bot_id}) confirmed as a ghost on ReduceOnly rejection. Wiping ghost state.")
+                                wipe_bot_ghost(exchange, bot_id, _conn_partial)
+                                _conn_partial.commit()
+                                return None
             return None
 
         pass
@@ -3459,7 +3679,11 @@ class BotExecutor:
                 # We must verify if the ID is actually DEAD before blocking re-placement.
                 logger.warning(f"⏳ {name}: CCXT says TP is missing, but DB has {local_tp_id}. Verifying status...")
                 try:
-                    order_status = exchange.fetch_order(local_tp_id, pair)
+                    if local_tp_id and any(str(local_tp_id).startswith(prefix) for prefix in ('PENDING_', 'PLACING_', 'GHOST_')):
+                        logger.info(f"🔎 {name}: Skipping fetch_order for synthetic local_tp_id {local_tp_id}")
+                        order_status = None
+                    else:
+                        order_status = exchange.fetch_order(local_tp_id, pair)
                     status_str = order_status.get('status') if order_status else 'unknown'
                     
                     if status_str in ['canceled', 'cancelled', 'expired', 'rejected']:
@@ -3552,32 +3776,38 @@ class BotExecutor:
                              logger.debug(f'[EXPECTED] cancel unrecognised TP status: {_e}')
                          from engine.database import get_connection as _gc
                          from engine.database import update_order_status as _uos
-                         _uos(local_tp_id, 'cancelled', bot_id=bot_id)
-                         _c = _gc()
-                         _c.execute("UPDATE trades SET tp_order_id = NULL WHERE bot_id = ?", (bot_id,))
-                         _c.commit(); _c.close()
-                         local_tp_id = None # Allow immediate replacement below!
+                         if _uos(local_tp_id, 'cancelled', bot_id=bot_id):
+                             _c = _gc()
+                             _c.execute("UPDATE trades SET tp_order_id = NULL WHERE bot_id = ?", (bot_id,))
+                             _c.commit(); _c.close()
+                             local_tp_id = None # Allow immediate replacement below!
+                         else:
+                             logger.warning(f"⚠️ {name}: Stored TP {local_tp_id} cancelled update was rejected (likely filled). Retaining state.")
                 except Exception as _evict_err:
                      err_str = str(_evict_err).lower()
                      if "not found" in err_str or "-2013" in err_str:
                          logger.warning(f"🚫 {name}: Stored TP ID {local_tp_id} NOT FOUND on exchange. Evicting from DB state.")
                          from engine.database import get_connection as _gc
                          from engine.database import update_order_status as _uos
-                         _uos(local_tp_id, 'cancelled', bot_id=bot_id) # 🚀 FUNDAMENTAL FIX: Clear bot_orders state
-                         _c = _gc()
-                         _c.execute("UPDATE trades SET tp_order_id = NULL WHERE bot_id = ?", (bot_id,))
-                         _c.commit(); _c.close()
-                         local_tp_id = None # Allow placement below
+                         if _uos(local_tp_id, 'cancelled', bot_id=bot_id): # 🚀 FUNDAMENTAL FIX: Clear bot_orders state
+                             _c = _gc()
+                             _c.execute("UPDATE trades SET tp_order_id = NULL WHERE bot_id = ?", (bot_id,))
+                             _c.commit(); _c.close()
+                             local_tp_id = None # Allow placement below
+                         else:
+                             logger.warning(f"⚠️ {name}: Stored TP ID {local_tp_id} NOT FOUND on exchange, but cancelled update was rejected (likely filled).")
                      else:
                          logger.error(f"❌ {name}: Failed to evict stalemate TP ID {local_tp_id}: {_evict_err}")
                          # Also forcefully clear to prevent deadlock if API throws strange errors repeatedly
                          from engine.database import get_connection as _gc
                          from engine.database import update_order_status as _uos
-                         _uos(local_tp_id, 'cancelled', bot_id=bot_id)
-                         _c = _gc()
-                         _c.execute("UPDATE trades SET tp_order_id = NULL WHERE bot_id = ?", (bot_id,))
-                         _c.commit(); _c.close()
-                         local_tp_id = None
+                         if _uos(local_tp_id, 'cancelled', bot_id=bot_id):
+                             _c = _gc()
+                             _c.execute("UPDATE trades SET tp_order_id = NULL WHERE bot_id = ?", (bot_id,))
+                             _c.commit(); _c.close()
+                             local_tp_id = None
+                         else:
+                             logger.warning(f"⚠️ {name}: Stored TP ID {local_tp_id} failed to cancel, and DB status update was rejected (likely filled).")
             
             if local_tp_id is None:
                 # 🚀 API LAG GUARD (v2.3.5)
@@ -3665,41 +3895,88 @@ class BotExecutor:
                                     # Correct architecture: fire a net-REDUCING market order to zero the virtual position.
                                     # In One-Way mode, this is always safe: it's just netting against the pair's physical position.
                                     # The CID tags it to this bot only — sibling bots are fully unaffected.
-                                    logger.warning(f"🧹 [DUST-FLUSH] {name}: Virtual position ${bot_status.get('total_invested', 0):.2f} below min notional. Firing market dust-close.")
-                                    try:
-                                        dust_qty = tp_amount  # qty returned from _prepare_tp_order_params
-                                        dust_side = 'sell' if direction == 'LONG' else 'buy'
-                                        dust_cid = self._generate_deterministic_id(bot_id, 'DUST', bot_status.get('cycle_id', 0), bot_status.get('current_step', 1))
-                                        
-                                        # Market close — no price needed, taker execution
-                                        # 🚀 FIX: Add reduceOnly=True to bypass MIN_NOTIONAL filter for sub-$5 orders
-                                        dust_order = exchange.create_order(
-                                            pair, 'market', dust_side, dust_qty,
-                                            params={'newClientOrderId': dust_cid, 'reduceOnly': True}
-                                        )
-                                        
-                                        if dust_order:
-                                            dust_fill_price = float(dust_order.get('average') or dust_order.get('price') or current_price)
-                                            logger.info(f"✅ [DUST-FLUSH] {name}: Market close executed. ID={dust_order['id']} qty={dust_qty} @ ~{dust_fill_price:.4f}")
+                                    # Check cooldown to prevent rapid retries on failure
+                                    if time.time() < _DUST_FLUSH_COOLDOWN.get(bot_id, 0.0):
+                                        logger.info(f"🧹 [DUST-FLUSH] {name}: Dust close is in cooldown. Skipping.")
+                                    else:
+                                        logger.warning(f"🧹 [DUST-FLUSH] {name}: Virtual position ${bot_status.get('total_invested', 0):.2f} below min notional. Firing market dust-close.")
+                                        try:
+                                            dust_qty = tp_amount  # qty returned from _prepare_tp_order_params
+                                            dust_side = 'sell' if direction == 'LONG' else 'buy'
+                                            dust_cid = self._generate_deterministic_id(bot_id, 'DUST', bot_status.get('cycle_id', 0), bot_status.get('current_step', 1))
                                             
-                                            # Credit the fill and seal the cycle
-                                            from engine.ledger import credit_fill as _cf_dust, seal_trade_state as _sts_dust
-                                            from engine.database import update_order_status as _uos_dust
-                                            _credited = _cf_dust(
-                                                bot_id=bot_id,
-                                                order_id=str(dust_order['id']),
-                                                cumulative_qty=dust_qty,
-                                                avg_price=dust_fill_price,
-                                                order_type='tp',
-                                                is_cumulative=True
+                                            # Try to adjust qty to clear min_notional without reduceOnly (Option A)
+                                            adjusted = False
+                                            try:
+                                                prec = exchange.get_symbol_precision(pair)
+                                                _min_notional = prec.get('min_notional')
+                                                if _min_notional is None:
+                                                     _min_notional = 100.0 if (getattr(config, 'TESTNET', False) or getattr(config, 'DEMO_TRADING', False)) else 5.0
+                                                
+                                                notional_now = dust_qty * current_price
+                                                if notional_now < _min_notional:
+                                                    min_qty_needed = _min_notional / current_price
+                                                    rounded_min_qty = exchange.round_to_step(min_qty_needed, prec['step_size'])
+                                                    if rounded_min_qty * current_price < _min_notional:
+                                                        rounded_min_qty = exchange.round_to_step(min_qty_needed + prec['step_size'], prec['step_size'])
+                                                    
+                                                    extra_qty = rounded_min_qty - dust_qty
+                                                    extra_value = extra_qty * current_price
+                                                    # Verify the adjustment is tiny (at most $5 USD or at most 50% increase)
+                                                    if extra_value <= 5.0 or (dust_qty > 0 and extra_qty / dust_qty <= 0.5):
+                                                        logger.info(f"✨ [DUST-ADJUST] {name}: Adjusting dust qty from {dust_qty:.6f} to {rounded_min_qty:.6f} to meet min_notional ${_min_notional:.2f} (extra_value=${extra_value:.2f}). Removing reduceOnly.")
+                                                        dust_qty = rounded_min_qty
+                                                        adjusted = True
+                                            except Exception as e_adj:
+                                                logger.warning(f"⚠️ [DUST-ADJUST] {name}: Failed to calculate adjustment: {e_adj}")
+
+                                            params = {'newClientOrderId': dust_cid}
+                                            if not adjusted:
+                                                params['reduceOnly'] = True
+
+                                            # Market close — no price needed, taker execution
+                                            dust_order = exchange.create_order(
+                                                pair, 'market', dust_side, dust_qty,
+                                                params=params,
+                                                human_approved=True
                                             )
-                                            _uos_dust(dust_order['id'], 'filled', bot_id=bot_id, filled_qty=dust_qty)
-                                            # v2.3.4: Use cent-level seal check
-                                            if _credited or dust_qty > 1e-8:
-                                                _sts_dust(bot_id)
-                                            logger.info(f"✅ [DUST-FLUSH] {name}: Ledger sealed. Bot will resume scanning next cycle.")
-                                    except Exception as e_dust:
-                                        logger.error(f"❌ [DUST-FLUSH] {name}: Market dust-close failed: {e_dust}. Bot may require manual intervention.")
+                                            
+                                            if dust_order:
+                                                dust_fill_price = float(dust_order.get('average') or dust_order.get('price') or current_price)
+                                                logger.info(f"✅ [DUST-FLUSH] {name}: Market close executed. ID={dust_order['id']} qty={dust_qty} @ ~{dust_fill_price:.4f}")
+                                                
+                                                # Credit the fill and seal the cycle
+                                                from engine.ledger import credit_fill as _cf_dust, seal_trade_state as _sts_dust
+                                                from engine.database import update_order_status as _uos_dust
+                                                _credited = _cf_dust(
+                                                    bot_id=bot_id,
+                                                    order_id=str(dust_order['id']),
+                                                    cumulative_qty=dust_qty,
+                                                    avg_price=dust_fill_price,
+                                                    order_type='tp',
+                                                    is_cumulative=True
+                                                )
+                                                if not _uos_dust(dust_order['id'], 'filled', bot_id=bot_id, filled_qty=dust_qty):
+                                                    logger.error(f"🚨 [STATE-GUARD ERROR] Unexpected status update failure for dust order {dust_order['id']} to filled.")
+                                                # v2.3.4: Use cent-level seal check
+                                                if _credited or dust_qty > 1e-8:
+                                                    _sts_dust(bot_id)
+                                                logger.info(f"✅ [DUST-FLUSH] {name}: Ledger sealed. Bot will resume scanning next cycle.")
+                                        except Exception as e_dust:
+                                            logger.error(f"❌ [DUST-FLUSH] {name}: Market dust-close failed: {e_dust}. Bot may require manual intervention.")
+                                            _DUST_FLUSH_COOLDOWN[bot_id] = time.time() + 300.0 # 5 minutes cooldown
+                                            
+                                            # Escalate to STUCK_DUST_NO_EXIT status in DB (INV-35 / Fix 2)
+                                            try:
+                                                from engine.database import get_connection as _gc_stuck
+                                                with _gc_stuck() as _conn_stuck:
+                                                    _conn_stuck.execute(
+                                                        "UPDATE trades SET cycle_phase='STUCK_DUST_NO_EXIT' WHERE bot_id=?",
+                                                        (bot_id,)
+                                                    )
+                                                logger.critical(f"🚨 [STUCK_DUST_NO_EXIT] {name}: TP is stuck due to reduceOnly catch-22 and min notional. cycle_phase set to STUCK_DUST_NO_EXIT.")
+                                            except Exception as e_stuck:
+                                                logger.error(f"Failed to update cycle_phase to STUCK_DUST_NO_EXIT: {e_stuck}")
                                 else:
                                     # ---------------------------------
                                     # STANDARD TP PLACEMENT
@@ -3715,12 +3992,12 @@ class BotExecutor:
                                         save_bot_order(bot_id, 'tp', order['id'], tp_price, tp_amount, bot_status['current_step'], order.get('status', 'open'), client_order_id=effective_tp_cid)
                                         logger.info(f"✅ {name}: Maintained TP order for {pair} @ {tp_price}")
                                         # Clear any stale MARGIN_HELD phase stamp since TP is now placed
-                                        if str(bot_status.get('cycle_phase', '')).upper() == 'MARGIN_HELD':
+                                        if str(bot_status.get('cycle_phase', '')).upper() in ('MARGIN_HELD', 'STUCK_DUST_NO_EXIT'):
                                             try:
                                                 from engine.database import get_connection as _gc_mhc
                                                 with _gc_mhc() as _conn_mhc:
                                                     _conn_mhc.execute(
-                                                        "UPDATE trades SET cycle_phase='ACTIVE' WHERE bot_id=? AND cycle_phase='MARGIN_HELD'",
+                                                        "UPDATE trades SET cycle_phase='ACTIVE' WHERE bot_id=? AND cycle_phase IN ('MARGIN_HELD', 'STUCK_DUST_NO_EXIT')",
                                                         (bot_id,)
                                                     )
                                             except Exception:
@@ -4114,6 +4391,15 @@ class BotExecutor:
                            # delegating caused an infinite "Blocked by Local DB Lock" loop.
                            if actual_fill_qty <= 0 or actual_fill_price <= 0:
                                logger.error(f"❌ {name}: Cannot process inline fill — zero qty={actual_fill_qty} or price={actual_fill_price}. Evicting grid to unblock.")
+                               from engine.database import get_connection as _gc
+                               from engine.database import update_order_status as _uos
+                               if _uos(latest_grid_id, 'cancelled', bot_id=bot_id):
+                                   _c = _gc()
+                                   _c.execute("UPDATE trades SET grid_order_id = NULL WHERE bot_id = ?", (bot_id,))
+                                   _c.commit(); _c.close()
+                                   local_grid_ids = []
+                               else:
+                                   logger.warning(f"⚠️ {name}: Stored Grid {latest_grid_id} cancelled update was rejected (likely filled). Retaining state.")
                            else:
                                try:
                                    # v2.0: credit_fill (idempotent) -> seal_trade_state (single writer)
@@ -4127,7 +4413,8 @@ class BotExecutor:
                                        order_type='grid',
                                        is_cumulative=True
                                    )
-                                   _uos(latest_grid_id, 'filled', bot_id=bot_id, filled_qty=actual_fill_qty)
+                                   if not _uos(latest_grid_id, 'filled', bot_id=bot_id, filled_qty=actual_fill_qty):
+                                       logger.error(f"🚨 [STATE-GUARD ERROR] Unexpected status update failure for grid order {latest_grid_id} to filled.")
                                    if _credited:
                                        _sts(bot_id)
                                    logger.info(
@@ -4354,7 +4641,8 @@ class BotExecutor:
                  try:
                      exchange.cancel_order(existing_grid_order['id'], pair)
                      from engine.database import update_order_status as _uos
-                     _uos(existing_grid_order['id'], 'cancelled', bot_id=bot_id)
+                     if not _uos(existing_grid_order['id'], 'cancelled', bot_id=bot_id):
+                         logger.warning(f"⚠️ {name}: Max steps reached grid cancel update rejected for {existing_grid_order['id']} (likely filled).")
                  except Exception as _e:
                      logger.debug(f'[EXPECTED] max-step ghost grid cancel: {_e}')
              
@@ -4362,7 +4650,8 @@ class BotExecutor:
                  logger.warning(f"🧹 {name}: Max steps reached but DB lists Grid ghosts {local_grid_ids}. Sweeping DB cleanly.")
                  from engine.database import update_order_status as _uos
                  for ghost_id in local_grid_ids:
-                     _uos(ghost_id, 'cancelled', bot_id=bot_id)
+                     if not _uos(ghost_id, 'cancelled', bot_id=bot_id):
+                         logger.warning(f"⚠️ {name}: Max steps reached ghost grid cancel update rejected for {ghost_id} (likely filled).")
 
         # 3c. GRID SYNC-DRIFT: If grid exists but price is imprecise or drifted
         elif existing_grid_order and bot_status['total_invested'] > 0:
@@ -4410,8 +4699,10 @@ class BotExecutor:
                                 grid_order_id = existing_grid_order.get('order_id', existing_grid_order.get('id'))
                                 exchange.cancel_order(grid_order_id, pair)
                                 filled_qty = float(existing_grid_order.get('filled', 0) or 0)
-                                update_order_status(grid_order_id, 'cancelled', bot_id=bot_id, filled_qty=filled_qty)
-                                existing_grid_order = None # Force re-place in next cycle
+                                if update_order_status(grid_order_id, 'cancelled', bot_id=bot_id, filled_qty=filled_qty):
+                                    existing_grid_order = None # Force re-place in next cycle
+                                else:
+                                    logger.warning(f"⚠️ [GRID-SYNC] {name}: Failed to mark grid order {grid_order_id} as cancelled (likely filled). Retaining state.")
                             except Exception as e_grid_sync:
                                 logger.error(f"❌ [GRID-SYNC] {name}: Failed to cancel drifted grid: {e_grid_sync}")
 
@@ -4548,22 +4839,57 @@ class BotExecutor:
         )
         conn.commit()
 
-        # Invariant A: Deterministic CIDs
-        cid = f"CQB_{child_bot_id}_ENTRY_{parent_cycle_id}_{parent_step}"
-        cid_fallback = f"CQB_{child_bot_id}_ENTRY_{parent_cycle_id}_{parent_step}_IOC"
+        # Determine if this is the first hedge entry for this cycle
+        prior_entries = conn.execute(
+            "SELECT COUNT(*) FROM bot_orders "
+            "WHERE bot_id=? AND cycle_id=? AND order_type='entry' "
+            "AND status NOT IN ('cancelled','failed','reset_cleared','auto_closed','rejected')",
+            (child_bot_id, parent_cycle_id)
+        ).fetchone()[0]
 
-        # Idempotency: check if this cycle and step already has a hedge entry for this parent cycle in DB
-        existing = conn.execute(
-            "SELECT id FROM bot_orders WHERE bot_id=? AND client_order_id IN (?, ?) "
-            "AND status NOT IN ('reset_cleared','auto_closed','cancelled','failed','rejected')",
-            (child_bot_id, cid, cid_fallback)
+        # 1. Query the parent's filled qty for this step across all order_ids (including retries)
+        parent_qty_row = conn.execute(
+            "SELECT COALESCE(SUM(filled_amount), 0) FROM bot_orders "
+            "WHERE bot_id = ? AND step = ? AND cycle_id = ? "
+            "AND order_type IN ('entry', 'grid') "
+            "AND (status IN ('filled', 'partially_filled', 'cancelled', 'closed', 'expired') OR filled_amount > 0)",
+            (parent_bot_id, parent_step, parent_cycle_id)
         ).fetchone()
-        if existing:
+        parent_target_qty = max(float(parent_qty_row[0]) if parent_qty_row else 0.0, step_qty)
+
+        # 2. Query the child's entered qty for this step
+        child_qty_row = conn.execute(
+            "SELECT COALESCE(SUM("
+            "  CASE WHEN status IN ('open', 'new', 'placing', 'cancelling') THEN amount ELSE filled_amount END"
+            "), 0) FROM bot_orders "
+            "WHERE bot_id = ? AND step = ? AND cycle_id = ? "
+            "AND order_type IN ('entry', 'grid')",
+            (child_bot_id, child_step, parent_cycle_id)
+        ).fetchone()
+        child_step_qty = float(child_qty_row[0]) if child_qty_row else 0.0
+
+        # 3. Compute delta
+        qty_delta = parent_target_qty - child_step_qty
+
+        # Get exchange precision step size
+        prec = exchange.get_symbol_precision(pair)
+        qty_step = float(prec.get('step_size', 0.001) or 0.001)
+
+        # 4. If qty_delta <= step_size: skip
+        if qty_delta <= qty_step:
             logger.info(
-                f"[HEDGE-SIGNAL] Child {child_bot_id}: entry for cycle {parent_cycle_id} step {parent_step} "
-                f"already exists in DB. Skipping."
+                f"[HEDGE-SIGNAL] Child {child_bot_id}: step {parent_step} is saturated "
+                f"(parent_target_qty={parent_target_qty:.6f}, child_step_qty={child_step_qty:.6f}, "
+                f"delta={qty_delta:.6f} <= step_size={qty_step:.6f}). Skipping."
             )
             return True
+
+        entry_qty_raw = qty_delta
+
+        # 5. Generate a new deterministic CID
+        is_repl = child_step_qty > 0.0001
+        cid = self._generate_deterministic_id(child_bot_id, 'ENTRY', parent_cycle_id, parent_step, is_replacement=is_repl)
+        cid_fallback = self._generate_deterministic_id(child_bot_id, 'ENTRY', parent_cycle_id, parent_step, suffix='GTC', is_replacement=is_repl)
 
         # Check exchange directly before placing
         for check_cid in (cid, cid_fallback):
@@ -4581,36 +4907,6 @@ class BotExecutor:
                         return True
             except Exception:
                 pass  # Not found = safe to place
-
-        # Determine if this is the first hedge entry for this cycle
-        # If yes: use parent's full open_qty to hedge entire accumulated position
-        # If no: use step_qty (the increment for this step only)
-        prior_entries = conn.execute(
-            "SELECT COUNT(*) FROM bot_orders "
-            "WHERE bot_id=? AND cycle_id=? AND order_type='entry' "
-            "AND status NOT IN ('cancelled','failed','reset_cleared','auto_closed','rejected')",
-            (child_bot_id, parent_cycle_id)
-        ).fetchone()[0]
-
-        if prior_entries == 0:
-            # First entry this cycle — hedge the full parent position
-            parent_open_qty = conn.execute(
-                "SELECT COALESCE(open_qty, 0) FROM trades WHERE bot_id = ?",
-                (parent_bot_id,)
-            ).fetchone()
-            full_hedge_qty = float(parent_open_qty[0] or 0) if parent_open_qty else step_qty
-            if full_hedge_qty > 0.0001:
-                entry_qty_raw = full_hedge_qty
-                logger.info(
-                    f"[HEDGE-SIGNAL] Child {child_bot_id}: FIRST entry this cycle — "
-                    f"hedging full parent position {full_hedge_qty:.6f} "
-                    f"(step_qty was {step_qty:.6f})"
-                )
-            else:
-                entry_qty_raw = step_qty
-        else:
-            # Subsequent entry — hedge only this step's increment
-            entry_qty_raw = step_qty
 
         # Determine child direction (opposite to parent)
         child_direction = 'SHORT' if direction.upper() == 'LONG' else 'LONG'
@@ -4665,9 +4961,53 @@ class BotExecutor:
                 target_symbol_norm = normalize_symbol(pair)
                 expected_side = 'long' if child_direction.upper() == 'LONG' else 'short'
                 for p in positions:
-                    if normalize_symbol(p['symbol']) == target_symbol_norm and p['side'] == expected_side:
-                        _current_phys = {'size': float(p['qty'])}
-                        break
+                    if normalize_symbol(p.get('symbol', '')) == target_symbol_norm:
+                        pos_amt = None
+
+                        # 1. Try raw Binance positionAmt first (always signed)
+                        raw_info = p.get('info', {})
+                        raw_pa = raw_info.get('positionAmt', raw_info.get('positionAmount'))
+                        if raw_pa is not None:
+                            pos_amt = float(raw_pa)
+
+                        # 2. Try top-level positionAmt (always signed)
+                        if pos_amt is None or pos_amt == 0:
+                            raw_pa_top = p.get('positionAmt', p.get('positionAmount'))
+                            if raw_pa_top is not None:
+                                pos_amt = float(raw_pa_top)
+
+                        # 3. Try CCXT contracts (signed in some versions)
+                        if pos_amt is None or pos_amt == 0:
+                            raw_contracts = p.get('contracts')
+                            if raw_contracts is not None:
+                                pos_amt = float(raw_contracts)
+
+                        # 4. Try CCXT qty/size (for compatibility/mocks)
+                        if pos_amt is None or pos_amt == 0:
+                            raw_qty = p.get('qty', p.get('size'))
+                            if raw_qty is not None:
+                                pos_amt = float(raw_qty)
+
+                        # If the detected pos_amt is positive but side is explicitly SHORT, correct the sign
+                        if pos_amt is not None and pos_amt > 0:
+                            side = str(p.get('side', '')).upper()
+                            if side == 'SHORT':
+                                pos_amt = -pos_amt
+
+                        # 5. Fall back to side field only if positionAmt/contracts/qty unavailable
+                        if pos_amt is None or pos_amt == 0:
+                            side = str(p.get('side', '')).upper()
+                            size = float(p.get('contracts', 0) or 
+                                         p.get('qty', 0) or
+                                         p.get('size', 0) or
+                                         abs(float(p.get('positionAmt', 0) or p.get('info', {}).get('positionAmt', 0))))
+                            pos_amt = size if side == 'LONG' else -size
+                        
+                        p_side = 'long' if pos_amt > 0 else 'short' if pos_amt < 0 else 'flat'
+                        if p_side == expected_side:
+                            p_qty = float(p.get('qty') if p.get('qty') is not None else p.get('size') if p.get('size') is not None else abs(pos_amt))
+                            _current_phys = {'size': p_qty}
+                            break
         except Exception as e_phys:
             logger.error(f"[HEDGE-SIGNAL] Failed to fetch positions from exchange for capacity check: {e_phys}")
 
@@ -4703,21 +5043,21 @@ class BotExecutor:
                 )
                 saved_price = float(order.get('price') or step_fill_price)
             except GTXRejected as e_gtx:
-                # Price moved past fill level — place as taker limit (IOC) at current_price
                 logger.warning(
                     f"[HEDGE-SIGNAL] GTX rejected for child {child_bot_id} step {parent_step}. "
-                    f"Retrying as IOC at current market price. Error: {e_gtx}"
+                    f"Falling back to GTC limit at step fill price {step_fill_price:.6f}. "
+                    f"Order will rest in book until price returns. Error: {e_gtx}"
                 )
                 params = dict(params)
-                params['timeInForce'] = 'IOC'
+                params['timeInForce'] = 'GTC'
                 params.pop('postOnly', None)
                 for cid_key in ('clientOrderId', 'newClientOrderId'):
                     if cid_key in params:
                         params[cid_key] = cid_fallback
                 order = exchange.create_order(
-                    pair, 'limit', child_side, entry_qty, current_price, params=params
+                    pair, 'limit', child_side, entry_qty, step_fill_price, params=params
                 )
-                saved_price = float(order.get('price') or current_price)
+                saved_price = float(order.get('price') or step_fill_price)
         except Exception as e:
             logger.error(
                 f"[HEDGE-SIGNAL] Child {child_bot_id}: entry placement failed: {e}. "
@@ -4848,18 +5188,18 @@ class BotExecutor:
                 if divergence_usd > 50000.0:
                     logger.critical(f"🛑 {name}: SL/Market Close Blocked! System net vs physical diverges by ${divergence_usd:.2f}. Bypassing API to strictly wipe Ghost DB.")
                     from engine.database import safe_wipe_bot
-                    safe_wipe_bot(bot_id, pair, direction, reason="SL_GHOST_WIPE: divergence > $50000", exit_price=current_price)
+                    safe_wipe_bot(bot_id, pair, direction, reason="SL_GHOST_WIPE: divergence > $50000", exit_price=current_price, human_approved=True)
                     return
 
                 if actual_size > 0:
                     logger.warning(f"Placing market order to close {actual_size} {pair} {position_side} for bot {name} SL")
                     order = None
                     try:
-                        order = exchange.create_order(pair, 'market', position_side, actual_size)
+                        order = exchange.create_order(pair, 'market', position_side, actual_size, params={'reduceOnly': True}, human_approved=True)
                     except Exception as e_order:
                         logger.error(f"❌ {name}: Failed to place SL Market Order ({e_order}). Purging local Ghost state.")
                         from engine.database import safe_wipe_bot
-                        safe_wipe_bot(bot_id, pair, direction, reason=f"SL_API_REJECT_GHOST", exit_price=current_price)
+                        safe_wipe_bot(bot_id, pair, direction, reason=f"SL_API_REJECT_GHOST", exit_price=current_price, human_approved=True)
                         return
 
                     if order:
@@ -4875,11 +5215,11 @@ class BotExecutor:
                 else:
                     logger.info(f"ℹ️ {name}: No virtual size to close. Running wipe guard before DB reset.")
                     from engine.database import safe_wipe_bot
-                    safe_wipe_bot(bot_id, pair, direction, reason="SL_EXIT_NO_VIRTUAL_POSITION", exit_price=current_price)
+                    safe_wipe_bot(bot_id, pair, direction, reason="SL_EXIT_NO_VIRTUAL_POSITION", exit_price=current_price, human_approved=True)
             else:
                 logger.info(f"ℹ️ {name}: Bot has 0 avg_entry_price. Running wipe guard before DB reset.")
                 from engine.database import safe_wipe_bot
-                safe_wipe_bot(bot_id, pair, direction, reason="SL_EXIT_ZERO_PRICE", exit_price=current_price)
+                safe_wipe_bot(bot_id, pair, direction, reason="SL_EXIT_ZERO_PRICE", exit_price=current_price, human_approved=True)
 
         except Exception as e:
             logger.error(f"❌ {name}: Error executing SL for {pair}: {e}")

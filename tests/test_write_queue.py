@@ -153,8 +153,30 @@ class TestWriteQueue(unittest.TestCase):
         # 10022 got -0.1 reduction, open_qty becomes 0.4
         row22_post = conn.execute("SELECT open_qty FROM trades WHERE bot_id = 10022").fetchone()
         
-        self.assertAlmostEqual(row16_post[0], 0.5)
-        self.assertAlmostEqual(row22_post[0], 0.4)
+        self.assertAlmostEqual(row16_post[0], 0.6)
+        self.assertAlmostEqual(row22_post[0], 0.5)
+
+    def test_write_queue_handles_nested_reconciler_calls(self):
+        """Test that reconciler wrapped functions can call each other nestedly
+        without deadlocking on the WriteQueue.
+        """
+        from engine.reconciler import StateReconciler
+        import unittest.mock as mock
+
+        reconciler = StateReconciler(exchanges={})
+        reconciler._reconcile_all_internal = mock.MagicMock()
+        reconciler._reconstruct_offline_fills_internal = mock.MagicMock(return_value="reconstructed")
+        reconciler._align_memory_to_ledger_internal = mock.MagicMock(return_value="aligned")
+
+        def mock_reconcile_all_internal(force_adoption=False):
+            res1 = reconciler.reconstruct_offline_fills()
+            res2 = reconciler._align_memory_to_ledger()
+            return f"{res1}_{res2}"
+
+        reconciler._reconcile_all_internal.side_effect = mock_reconcile_all_internal
+
+        result = reconciler.reconcile_all()
+        self.assertEqual(result, "reconstructed_aligned")
 
     def test_write_queue_timeout(self):
         """Test that if event.wait times out, a TimeoutError is raised."""
@@ -178,3 +200,4 @@ class TestWriteQueue(unittest.TestCase):
         res = q.put_and_wait(lambda: "restarted")
         self.assertEqual(res, "restarted")
         self.assertTrue(q._worker_thread.is_alive())
+

@@ -818,5 +818,331 @@ def test_hedge_be_fallback_parent_active_guard(memory_db):
     assert row[1] == pytest.approx(0.5)
 
 
+def test_crosscycle_orphan_healer_cycle_floor(memory_db):
+    """cycle_floor includes fills from older cycles in FIFO computation."""
+    setup_bot_fixture(memory_db, 1, 'SUI Bot', 'SUI/USDC:USDC', 'LONG')
+    cursor = memory_db.cursor()
+    
+    # Cycle 123: entry fill, no exit (orphaned — never swept to reset_cleared)
+    cursor.execute("""
+        INSERT INTO bot_orders (bot_id, order_type, order_id, price, amount,
+                                filled_amount, status, cycle_id, step)
+        VALUES (1, 'entry', 'orphan_entry', 0.71, 356.0, 356.0, 'filled', 123, 1)
+    """)
+    # trades.cycle_id = 126 (three cycles later)
+    cursor.execute("UPDATE trades SET cycle_id = 126 WHERE bot_id = 1")
+    memory_db.commit()
+    
+    # Explicit current cycle floor (cycle_floor=126): cycle 123 fill is excluded (invisible)
+    cost, avg, qty, step = database.recompute_invested_from_orders(1, cycle_floor=126)
+    assert qty == 0.0, "With cycle_floor=126, orphaned fill must be excluded"
+    
+    # Default call (cycle_floor=None): cycle 123 fill is automatically detected and included
+    cost, avg, qty, step = database.recompute_invested_from_orders(1)
+    assert pytest.approx(qty, abs=1e-6) == 356.0, "Auto-detected cycle_floor must include the orphan fill"
+    
+    # Explicit cycle_floor call (cycle_floor=123): cycle 123 fill is included
+    cost, avg, qty, step = database.recompute_invested_from_orders(1, cycle_floor=123)
+    assert pytest.approx(qty, abs=1e-6) == 356.0, "With cycle_floor=123, fill must be visible"
+    assert pytest.approx(cost, abs=0.01) == 252.76  # 356 * 0.71
+
+
+def test_crosscycle_floor_excludes_cycles_below_floor(memory_db):
+    """Fills in cycles below cycle_floor are not included."""
+    setup_bot_fixture(memory_db, 1, 'Test Bot', 'BTC/USDC:USDC', 'LONG')
+    cursor = memory_db.cursor()
+    
+    # Cycle 10: old orphan
+    cursor.execute("""
+        INSERT INTO bot_orders (bot_id, order_type, order_id, price, amount,
+                                filled_amount, status, cycle_id, step)
+        VALUES (1, 'entry', 'old_orphan', 50000.0, 1.0, 1.0, 'filled', 10, 1)
+    """)
+    # Cycle 20: newer orphan
+    cursor.execute("""
+        INSERT INTO bot_orders (bot_id, order_type, order_id, price, amount,
+                                filled_amount, status, cycle_id, step)
+        VALUES (1, 'entry', 'new_orphan', 50000.0, 0.5, 0.5, 'filled', 20, 1)
+    """)
+    cursor.execute("UPDATE trades SET cycle_id = 25 WHERE bot_id = 1")
+    memory_db.commit()
+    
+    # cycle_floor=20: only cycle 20 fill included, not cycle 10
+    cost, avg, qty, step = database.recompute_invested_from_orders(1, cycle_floor=20)
+    assert pytest.approx(qty, abs=1e-6) == 0.5
+
+
+def test_pre_advance_all_cycle_sweep_and_scan(memory_db):
+    """v4.1.5: Verify old-cycle sweep and orphan detection before cycle advance."""
+    from unittest.mock import patch
+    setup_bot_fixture(memory_db, 1, 'Sweep Bot', 'BTC/USDC:USDC', 'LONG')
+    cursor = memory_db.cursor()
+    
+    # Cycle 1: balanced fills (entry + tp)
+    cursor.execute("""
+        INSERT INTO bot_orders (bot_id, order_type, order_id, price, amount, filled_amount, status, cycle_id, step)
+        VALUES 
+        (1, 'entry', 'e1', 50000.0, 1.0, 1.0, 'filled', 1, 1),
+        (1, 'tp', 'tp1', 51000.0, 1.0, 1.0, 'filled', 1, 2)
+    """)
+    # Cycle 2: orphaned fill (entry, no tp)
+    cursor.execute("""
+        INSERT INTO bot_orders (bot_id, order_type, order_id, price, amount, filled_amount, status, cycle_id, step)
+        VALUES (1, 'entry', 'e2', 50000.0, 0.5, 0.5, 'filled', 2, 1)
+    """)
+    # Set trades.cycle_id = 3 so old_cycle = 3, and trades.open_qty = 0.0
+    cursor.execute("UPDATE trades SET cycle_id = 3, open_qty = 0.0 WHERE bot_id = 1")
+    memory_db.commit()
+    
+    with patch('engine.parity_gates.assert_cycle_reset_allowed', return_value=None), \
+         patch('engine.database._log_trade_internal', return_value=None), \
+         patch('engine.database.add_notification', return_value=None), \
+         patch('engine.wipe_proof.safe_mark_reset_cleared', return_value=None), \
+         patch('engine.database.clear_active_position_for_bot', return_value=None):
+        
+        database._reset_bot_after_tp_internal(
+            cursor=cursor,
+            bot_id=1,
+            exit_price=51000.0,
+            action_label='TP_HIT',
+            human_approved=True
+        )
+    
+    # Check if Cycle 1 rows (balanced) were swept to 'reset_cleared'
+    rows_c1 = cursor.execute("SELECT status FROM bot_orders WHERE cycle_id = 1").fetchall()
+    assert all(r[0] == 'reset_cleared' for r in rows_c1), "Cycle 1 fills must be swept to reset_cleared"
+    
+    # Check if Cycle 2 row (unbalanced orphan) was NOT swept to 'reset_cleared' (remains 'filled')
+    row_c2 = cursor.execute("SELECT status FROM bot_orders WHERE cycle_id = 2").fetchone()
+    assert row_c2[0] == 'filled', "Cycle 2 orphan must not be swept"
+
+
+def test_heal_local_crosscycle_orphans_end_to_end(memory_db):
+    """v4.1.5: Test reconciler's own _heal_local_crosscycle_orphans end-to-end against live schema."""
+    from engine.reconciler import StateReconciler
+    setup_bot_fixture(memory_db, 100, 'short sui', 'SUI/USDC:USDC', 'SHORT')
+    cursor = memory_db.cursor()
+    
+    # Insert entry fills for cycle 71, 72, and 73
+    cursor.execute("""
+        INSERT INTO bot_orders (bot_id, order_type, order_id, price, amount, filled_amount, status, cycle_id, step)
+        VALUES 
+        (100, 'entry', 'e71', 0.75, 13.1, 13.1, 'filled', 71, 1),
+        (100, 'entry', 'e72', 0.75, 13.1, 13.1, 'filled', 72, 1),
+        (100, 'entry', 'e73', 0.75, 13.3, 13.3, 'filled', 73, 1)
+    """)
+    # Set trades.cycle_id = 73, open_qty = 13.3, total_invested = 9.975 (13.3 * 0.75)
+    cursor.execute("UPDATE trades SET cycle_id = 73, open_qty = 13.3, total_invested = 9.975 WHERE bot_id = 100")
+    memory_db.commit()
+    
+    # Initialize reconciler
+    reconciler = StateReconciler()
+    
+    # 1. Call _heal_local_crosscycle_orphans - first run detects and heals the orphans
+    healed_count = reconciler._heal_local_crosscycle_orphans(100, 73)
+    assert healed_count == 2, "First run should detect and heal 2 orphan cycles"
+    
+    # Verify trades table was corrected
+    row = cursor.execute("SELECT open_qty, total_invested FROM trades WHERE bot_id = 100").fetchone()
+    assert row is not None
+    assert pytest.approx(row[0], abs=1e-6) == 39.5
+    assert pytest.approx(row[1], abs=0.01) == 29.625  # (13.1 + 13.1 + 13.3) * 0.75
+    
+    # 2. Call _heal_local_crosscycle_orphans again - second run should detect they are already healed and return 0 (no redundant writes/logs)
+    healed_count_2 = reconciler._heal_local_crosscycle_orphans(100, 73)
+    assert healed_count_2 == 0, "Second run should bypass healing since trades cache already matches the healed state"
+
+
+def test_reset_cleared_history_excluded_from_default_recompute(memory_db):
+    """v4.1.5 EXCLUSION GUARD: 50+ historical reset_cleared cycles must be invisible to
+    recompute_invested_from_orders() when called with no cycle_floor argument.
+
+    Guarantee: resolved history (status='reset_cleared') is the safety wall that keeps
+    cycle_floor=None auto-detection from absorbing old, already-reconciled data.
+    Any regression that makes reset_cleared rows visible would silently inflate
+    open_qty and total_invested for every bot that has ever taken profit.
+    """
+    setup_bot_fixture(memory_db, 1, 'Test Bot', 'BTC/USDC:USDC', 'LONG')
+    cursor = memory_db.cursor()
+
+    # ── Phase 1: Insert 52 historical resolved cycles ─────────────────────────
+    # Each cycle has a matched entry + tp pair, both swept to reset_cleared.
+    # These represent normal historical TP cycles that closed cleanly.
+    for cycle_num in range(1, 53):           # cycles 1..52 (old, resolved)
+        cursor.execute("""
+            INSERT INTO bot_orders (bot_id, order_type, order_id, price, amount,
+                                    filled_amount, status, cycle_id, step)
+            VALUES
+            (1, 'entry', ?, 50000.0, 0.1, 0.1, 'reset_cleared', ?, 1),
+            (1, 'tp',    ?, 51000.0, 0.1, 0.1, 'reset_cleared', ?, 2)
+        """, (f'e{cycle_num}', cycle_num, f'tp{cycle_num}', cycle_num))
+
+    # ── Phase 2: Current active cycle (53) with a live entry fill ────────────
+    cursor.execute("""
+        INSERT INTO bot_orders (bot_id, order_type, order_id, price, amount,
+                                filled_amount, status, cycle_id, step)
+        VALUES (1, 'entry', 'live_entry', 52000.0, 0.2, 0.2, 'filled', 53, 1)
+    """)
+
+    # Set trades to current cycle 53 with a stale cached open_qty of 0
+    cursor.execute("UPDATE trades SET cycle_id = 53, open_qty = 0.0, total_invested = 0.0 WHERE bot_id = 1")
+    memory_db.commit()
+
+    # ── Assertion 1: Default call (cycle_floor=None) ───────────────────────────
+    # Must return ONLY the cycle-53 live fill.
+    # The 52 * 0.1 = 5.2 qty from resolved history must NOT appear.
+    cost, avg, qty, step = database.recompute_invested_from_orders(1)
+    assert pytest.approx(qty, abs=1e-6) == 0.2, (
+        f"Default recompute must see ONLY the current cycle fill (0.2). "
+        f"Got {qty:.8f} — reset_cleared history is leaking through the exclusion wall."
+    )
+    assert pytest.approx(cost, abs=0.01) == 0.2 * 52000.0, (
+        f"Default recompute total_invested must match only the current entry cost. Got {cost:.4f}."
+    )
+
+    # ── Assertion 2: Explicit current-cycle call ──────────────────────────────
+    # cycle_floor=53 should give identical results.
+    cost2, avg2, qty2, step2 = database.recompute_invested_from_orders(1, cycle_floor=53)
+    assert pytest.approx(qty2, abs=1e-6) == 0.2, (
+        f"cycle_floor=53 (current) must see ONLY the current cycle fill. Got {qty2:.8f}."
+    )
+
+    # ── Assertion 3: Historical cycles are truly invisible ────────────────────
+    # Directly verify the auto-detection orphan scan (the inner SQL that drives
+    # cycle_floor=None auto-selection) sees zero unbalanced cycles.
+    # The 52 resolved cycles are balanced AND reset_cleared — the HAVING filter on
+    # status='filled' must exclude all of them.
+    conn = database.get_connection()
+    orphan_rows = conn.execute("""
+        SELECT bo.cycle_id,
+               SUM(CASE WHEN bo.order_type IN ('entry','grid','adoption','adoption_add','carry')
+                        THEN bo.filled_amount ELSE 0 END) AS entry_qty,
+               SUM(CASE WHEN bo.order_type IN
+                        ('tp','close','dust_close','sl','adoption_reduce',
+                         'virtual_netting','legacy_netting')
+                        THEN bo.filled_amount ELSE 0 END) AS exit_qty
+        FROM bot_orders bo
+        WHERE bo.bot_id = 1
+          AND bo.cycle_id < 53
+          AND bo.cycle_id IS NOT NULL
+          AND bo.filled_amount > 0
+          AND bo.status = 'filled'
+        GROUP BY bo.cycle_id
+        HAVING (entry_qty - exit_qty) > 1e-6
+    """).fetchall()
+
+    assert len(orphan_rows) == 0, (
+        f"Auto-detection orphan scan must find ZERO unbalanced cycles from reset_cleared history. "
+        f"Found: {orphan_rows}"
+    )
+
+
+def test_recompute_does_not_merge_overclosed_historical_cycles(memory_db):
+    """Proves that a historical cycle with exits > entries (over-closed cycle)
+    does NOT get auto-detected as an orphan and merged forward into the current cycle's recompute.
+    
+    This locks in the fix for the directional blind spot: only entries > exits (under-closed cycles)
+    are treated as orphans. Exits > entries must not merge.
+    """
+    bot_id = 12345
+    setup_bot_fixture(memory_db, bot_id, 'Overclosed Test Bot', 'ETH/USDC:USDC', 'LONG')
+    cursor = memory_db.cursor()
+
+    # Cycle 1 (Historical): Over-closed (entry = 1.0, exit = 2.0, net = -1.0)
+    cursor.execute("""
+        INSERT INTO bot_orders (bot_id, order_type, order_id, price, amount,
+                                filled_amount, status, cycle_id, step)
+        VALUES
+        (12345, 'entry', 'old_entry', 1600.0, 1.0, 1.0, 'filled', 1, 1),
+        (12345, 'tp',    'old_tp',    1650.0, 2.0, 2.0, 'filled', 1, 2)
+    """)
+
+    # Cycle 2 (Live): Active position (entry = 0.5, net = 0.5)
+    cursor.execute("""
+        INSERT INTO bot_orders (bot_id, order_type, order_id, price, amount,
+                                filled_amount, status, cycle_id, step)
+        VALUES
+        (12345, 'entry', 'live_entry', 1700.0, 0.5, 0.5, 'filled', 2, 1)
+    """)
+
+    # Set trades cache to active cycle 2
+    cursor.execute("UPDATE trades SET cycle_id = 2, open_qty = 0.5, total_invested = 850.0, current_step = 1 WHERE bot_id = 12345")
+    memory_db.commit()
+
+    # Under the new directional query, Cycle 1 is ignored because exits > entries.
+    # Recompute should only see Cycle 2 (qty = 0.5).
+    # If the old HAVING ABS() query were used, Cycle 1 would be merged, causing the recompute
+    # to evaluate combined entries (1.5) against combined exits (2.0), returning 0.0.
+    cost, avg, qty, step = database.recompute_invested_from_orders(bot_id)
+
+    assert qty == 0.5, (
+        f"Recompute should not merge over-closed Cycle 1. Expected qty 0.5, got {qty}."
+    )
+    assert cost == 0.5 * 1700.0, (
+        f"Recompute cost should only reflect Cycle 2. Expected {0.5 * 1700.0}, got {cost}."
+    )
+
+
+def test_sync_trades_from_orders_preserves_pending_hedge_close(memory_db):
+    """Proves that sync_trades_from_orders does not wipe a parent bot in HEDGE_PENDING_CLOSE phase
+    if its hedge child bot has a non-zero open_qty.
+    """
+    parent_id = 20001
+    child_id = 20002
+    
+    # 1. Setup parent and child bots
+    setup_bot_fixture(memory_db, parent_id, 'BNB Parent', 'BNB/USDC:USDC', 'SHORT')
+    setup_bot_fixture(memory_db, child_id, 'BNB Child', 'BNB/USDC:USDC', 'LONG')
+    
+    cursor = memory_db.cursor()
+    
+    # Update parent to have child relation and status='pending_hedge_close'
+    cursor.execute("UPDATE bots SET hedge_child_bot_id = ?, bot_type = 'standard' WHERE id = ?", (child_id, parent_id))
+    cursor.execute("UPDATE bots SET parent_bot_id = ?, bot_type = 'hedge_child' WHERE id = ?", (parent_id, child_id))
+    
+    # Set child to have an active trade (open_qty = 0.3)
+    cursor.execute("UPDATE trades SET cycle_id = 84, open_qty = 0.3, cycle_phase = 'ACTIVE' WHERE bot_id = ?", (child_id,))
+    cursor.execute("UPDATE bots SET status = 'IN TRADE' WHERE id = ?", (child_id,))
+    
+    # Set parent to TP-cleared but hedge-pending state (cycle_id = 84, status='pending_hedge_close', phase='HEDGE_PENDING_CLOSE')
+    cursor.execute("""
+        UPDATE trades 
+        SET cycle_id = 84, cycle_phase = 'HEDGE_PENDING_CLOSE', open_qty = 0.0, 
+            current_step = 0, total_invested = 0, avg_entry_price = 0 
+        WHERE bot_id = ?
+    """, (parent_id,))
+    cursor.execute("UPDATE bots SET status = 'pending_hedge_close' WHERE id = ?", (parent_id,))
+    
+    memory_db.commit()
+    
+    # 2. Run sync_trades_from_orders on parent
+    correction_written = database.sync_trades_from_orders(parent_id)
+    assert not correction_written, "sync_trades_from_orders should return False (no correction/wipe)"
+    
+    # Verify parent trades state was preserved
+    row = cursor.execute("SELECT cycle_id, cycle_phase, open_qty FROM trades WHERE bot_id = ?", (parent_id,)).fetchone()
+    assert row[0] == 84, f"Parent cycle must stay 84, got {row[0]}"
+    assert row[1] == 'HEDGE_PENDING_CLOSE', f"Parent phase must stay HEDGE_PENDING_CLOSE, got {row[1]}"
+    
+    row_bot = cursor.execute("SELECT status FROM bots WHERE id = ?", (parent_id,)).fetchone()
+    assert row_bot[0] == 'pending_hedge_close', f"Parent status must stay pending_hedge_close, got {row_bot[0]}"
+    
+    # 3. Simulate closing the child bot's position
+    cursor.execute("UPDATE trades SET open_qty = 0.0, cycle_phase = 'IDLE' WHERE bot_id = ?", (child_id,))
+    cursor.execute("UPDATE bots SET status = 'Scanning' WHERE id = ?", (child_id,))
+    memory_db.commit()
+    
+    # Run sync_trades_from_orders again on parent
+    correction_written = database.sync_trades_from_orders(parent_id)
+    assert correction_written, "sync_trades_from_orders should write correction (DNA-wipe) now that child is closed"
+    
+    # Verify parent was wiped
+    row = cursor.execute("SELECT cycle_id, cycle_phase, open_qty FROM trades WHERE bot_id = ?", (parent_id,)).fetchone()
+    assert row[0] == 85, f"Parent cycle must increment to 85, got {row[0]}"
+    assert row[1] == 'IDLE', f"Parent phase must reset to IDLE, got {row[1]}"
+    
+    row_bot = cursor.execute("SELECT status FROM bots WHERE id = ?", (parent_id,)).fetchone()
+    assert row_bot[0] == 'Scanning', f"Parent status must reset to Scanning, got {row_bot[0]}"
+
 
 

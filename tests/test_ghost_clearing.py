@@ -37,10 +37,10 @@ class TestGhostClearingHedged(unittest.TestCase):
         
         Expected: NO reset occurs because diff ($0.50) is well within percentage tolerance.
         """
-        # (id, name, pair, direction, strategy, config, invested, step, rsi, active)
+        # (id, name, pair, direction, strategy, config, invested, step, rsi, active, base_size, martingale_multiplier, status)
         bots = [
-            (10001, "Bot_Long", "BTC/USDC", "LONG", "Martingale", '{"market_type": "future"}', 265.0, 1, 30.0, 1),
-            (10002, "Bot_Short", "BTC/USDC", "SHORT", "Martingale", '{"market_type": "future"}', 269.0, 1, 30.0, 1)
+            (10001, "Bot_Long", "BTC/USDC", "LONG", "Martingale", '{"market_type": "future"}', 265.0, 1, 30.0, 1, 100.0, 1.0, "ACTIVE"),
+            (10002, "Bot_Short", "BTC/USDC", "SHORT", "Martingale", '{"market_type": "future"}', 269.0, 1, 30.0, 1, 100.0, 1.0, "ACTIVE")
         ]
         self.runner.get_active_bots.return_value = bots
         
@@ -84,7 +84,7 @@ class TestGhostClearingHedged(unittest.TestCase):
         is eventually called for bot 30001.
         """
         bots = [
-            (30001, "Bot_Ghost", "BTC/USDC", "LONG", "Martingale", '{"market_type": "future"}', 500.0, 1, 30.0, 1)
+            (30001, "Bot_Ghost", "BTC/USDC", "LONG", "Martingale", '{"market_type": "future"}', 500.0, 1, 30.0, 1, 100.0, 1.0, "ACTIVE")
         ]
         self.runner.get_active_bots.return_value = bots
         self.runner.cycle_count = 10

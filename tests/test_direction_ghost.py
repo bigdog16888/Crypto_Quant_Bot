@@ -237,7 +237,8 @@ class TestPhantomEntryDetection(unittest.TestCase):
                 manual_close_pct REAL DEFAULT 100.0,
                 last_error TEXT,
                 last_error_time INTEGER,
-                pos_limit_hit INTEGER DEFAULT 0
+                pos_limit_hit INTEGER DEFAULT 0,
+                cascade_started_at INTEGER DEFAULT 0
             )""")
             conn.execute("""CREATE TABLE trades (
                 bot_id INTEGER PRIMARY KEY,
@@ -377,7 +378,8 @@ class TestPhantomEntryDetection(unittest.TestCase):
                 manual_close_pct REAL DEFAULT 100.0,
                 last_error TEXT,
                 last_error_time INTEGER,
-                pos_limit_hit INTEGER DEFAULT 0
+                pos_limit_hit INTEGER DEFAULT 0,
+                cascade_started_at INTEGER DEFAULT 0
             )""")
             conn.execute("""CREATE TABLE trades (
                 bot_id INTEGER PRIMARY KEY,

@@ -2,7 +2,7 @@
 
 **Status:** Current production design. **Supersedes** `ARCHITECTURE_v3.4.md` for all parity, healing, maintenance, and shutdown behavior.
 
-**Last updated:** 2026-05-20
+**Last updated:** 2026-07-02 (app version v4.3.8)
 
 ---
 

@@ -21,11 +21,7 @@ from engine.bot_executor import BotExecutor
 import engine.bot_executor
 from engine.metrics import MetricsServer, BOT_CYCLE_TIME
 from engine.integrity import enforce_integrity
-from engine.database import (
-    get_connection, get_bot_status, get_starting_equity
-)
 from engine.ws_cache import get_ws_cache
-
 
 from config.settings import config
 from config.constants import (
@@ -37,13 +33,13 @@ from config.constants import (
     STABLECOINS
 )
 
-# Configure logging with rotation (Max 50MB, keep 5 backups)
+# Configure logging with rotation (Max 10MB, keep 5 backups)
 log_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 log_file = config.PATHS["LOG_FILE"]
 
 rotating_handler = RotatingFileHandler(
-    log_file, 
-    maxBytes=10 * 1024 * 1024, # 10MB (Reduced from 50MB for resource efficiency)
+    log_file,
+    maxBytes=10 * 1024 * 1024,
     backupCount=5,
     encoding='utf-8'
 )
@@ -57,7 +53,6 @@ logging.basicConfig(
     handlers=[rotating_handler, stream_handler]
 )
 logger = logging.getLogger("BotRunner")
-logger.critical(f"DEBUG: Loaded BotExecutor from {engine.bot_executor.__file__}")
 
 # NOISE REDUCTION: Silence non-critical network warnings
 logging.getLogger('ccxt').setLevel(logging.ERROR)
@@ -112,12 +107,12 @@ class BotRunner:
         self.running = False
         # BotExecutor instance (lazy initialization for strategy caching)
         self._bot_executor: BotExecutor | None = None
-        
+
         # Main thread exchanges (kept for global ops like check_circuit_breaker)
         # Smart Initialization: Only load what is needed
         self.exchanges = {}
         self._initialize_exchanges()
-        
+
         # For backward compatibility and global actions
         self.exchange = self.exchanges.get(config.MARKET_TYPE, None)
         if not self.exchange:
@@ -126,7 +121,7 @@ class BotRunner:
                 self.exchange = list(self.exchanges.values())[0]
                 logger.critical("NO EXCHANGES INITIALIZED! Engine cannot run.")
                 sys.exit(1)
-                
+
         # --- FUNDAMENTAL FIX: EARLY INTEGRITY CHECK ---
         # Ensure DB is clean before any logic runs
         try:
@@ -158,26 +153,31 @@ class BotRunner:
             logger.warning(f"⚠️ [MIGRATION] Unique client_order_id migration skipped (non-fatal): {_m2_err}")
 
         self.strategies = {} # Cache strategy instances: {bot_id: strategy_instance}
-        
+
         # Safety / Circuit Breaker State
         self.initial_equity = 0.0
         self.circuit_breaker_triggered = False
-        
+
         # CRITICAL: Enable trading (mission execution gate)
         self.trading_enabled = config.TRADING_ENABLED
-        
+
         # 🚀 TTL Cache for multi-timeframe OHLCV data
         # Format: {(pair, timeframe): {'data': DataFrame, 'fetched_at': float}}
         self._tf_cache = {}
-        
+
         # ========== RUNAWAY ORDER PROTECTION ==========
         self.orders_this_cycle = 0
         self.orders_today = {}  # {bot_id: count}
         self.last_order_reset = time.time()
-        
+
         # UI Synchronization: Write PID file so Streamlit knows we are running
         self._write_pid_file()
-        
+
+        # INV-31: Ground Truth Reconciler initialization
+        from engine.ground_truth_reconciler import GroundTruthReconciler
+        self._gtr = GroundTruthReconciler()
+        self._gtr_cycle_counter = 0
+
         # LAYER 3 FIX: Cycle counter for periodic reconciliation
         self.cycle_count = 0
 
@@ -193,7 +193,7 @@ class BotRunner:
         except Exception as _rec_err:
             logger.warning(f"Could not initialize StateReconciler: {_rec_err}")
             self._reconciler = None
-        
+
         # Complete startup: safety baseline, state sync, trading mode
         self._post_init()
 
@@ -217,7 +217,7 @@ class BotRunner:
     def _post_init(self):
         """Post-initialization: safety baseline, startup sync, trading mode."""
         self._initialize_safety_baseline()
-        
+
         # State Synchronization
         try:
             logger.info("Starting Startup Sync...")
@@ -228,7 +228,7 @@ class BotRunner:
                 logger.info("Startup Sync Complete")
         except Exception as e:
             logger.error(f"Failed to sync bots on startup (non-fatal): {e}")
-        
+
         # Safe Monitor Mode: Disable execution if flag is False
         self.trading_enabled = getattr(config, 'TRADING_ENABLED', False)
         if not self.trading_enabled:
@@ -248,7 +248,7 @@ class BotRunner:
         """
         if bot_id in self.strategies:
             return self.strategies[bot_id]
-        
+
         # Create new strategy instance
         try:
             strategy = MartingaleStrategy(params)
@@ -266,7 +266,7 @@ class BotRunner:
         try:
             active_bots = self.get_active_bots()
             required_markets = set()
-            
+
             # 1. Determine required markets
             for bot in active_bots:
                 # bot[5] is config_json
@@ -276,17 +276,17 @@ class BotRunner:
                         m_type = normalize_market_type(cfg.get('market_type', config.MARKET_TYPE))
                         required_markets.add(m_type)
                     except: pass
-            
+
             # Always add default market type (for safety/fallback)
             required_markets.add(config.MARKET_TYPE)
-            
+
             # If specified global overrides
             if getattr(config, 'FUTURES_ONLY_MODE', False):
                 required_markets.discard('spot')
                 required_markets.add('future')
-                
+
             logger.info(f"DEBUG: Required Markets: {required_markets}")
-            
+
             # 2. Initialize each required market
             for m_type in required_markets:
                 try:
@@ -302,7 +302,7 @@ class BotRunner:
             # call before prime_startup_snapshot(), causing a sequential startup delay and
             # double-reconciliation. prime_startup_snapshot() + reconstruct_offline_fills()
             # are the authoritative startup reconciliation path.
-            
+
             # Use a single reconciler instance for subsequent checks
             # 📸 PHASE 2: prime_startup_snapshot() fetches positions ONCE atomically.
             # This replaces the separate fetch_positions loop that used to fire here
@@ -314,7 +314,7 @@ class BotRunner:
                 reconciler.prime_startup_snapshot()
             except Exception as e:
                 logger.error(f"❌ [STARTUP] Failed to prime startup snapshot: {e}")
-            
+
             # 4. Write-Ahead Logging Cleanup (Phase 3)
             # Recover any pending orders from previous crashed session.
             try:
@@ -327,15 +327,15 @@ class BotRunner:
                         logger.info(f"📋 WAL Cleanup: {wal_stats['confirmed']} recovered, {wal_stats['failed']} failed out of {wal_stats['total']} pending")
             except Exception as e:
                 logger.error(f"Failed to run WAL cleanup: {e}")
-            
+
             # 5. Offline Fill Detection (Phase 4)
             # NOTE: reconstruct_offline_fills is called ONCE in startup_sync().
             # Removed duplicate call here (Phase 2 architecture — single offline-fill pass).
-            
-            
+
+
             # 6. WebSocket Stream Initialization moved to explicit startup or run_cycle
             # Logic moved to ensure reliable background thread management
-                
+
         except Exception as e:
              logger.error(f"Error during smart exchange init: {e}")
 
@@ -354,7 +354,7 @@ class BotRunner:
         Uses the new comprehensive reconciliation system (v2.0).
         """
         logger.info("Starting comprehensive state reconciliation...")
-        
+
         if not self.exchanges:
              logger.warning("⚠️ Cannot sync bots: Exchanges not initialized.")
              return
@@ -364,17 +364,17 @@ class BotRunner:
             # We must pass the actual exchange instances
             from engine.reconciler import StateReconciler
             reconciler = StateReconciler(self.exchanges)
-            
+
             # Execute Full Reconciliation
             results = reconciler.reconcile_all()
-            
+
             # Log summary (v2.0: Actions Taken)
             actions_count = sum(1 for r in results if r.action_taken.value != "no_action")
             zombie_fixes = sum(1 for r in results if r.action_taken.value == "reset_to_idle")
             manual_warnings = sum(1 for r in results if r.requires_manual_intervention)
-            
+
             logger.info(f"Reconciliation complete: {actions_count} actions taken ({zombie_fixes} zombie resets), {manual_warnings} manual warnings needed.")
-            
+
             # 🚨 Emit loud alerts for anything requiring manual intervention
             for r in results:
                 if r.requires_manual_intervention:
@@ -389,10 +389,10 @@ class BotRunner:
                         f"         Then manually reset the correct bot to match exchange reality.\n"
                         f"════════════════════════════════════════════════════"
                     )
-            
+
         except Exception as e:
             logger.error(f"❌ Critical Error during State Reconciliation: {e}")
-    
+
 
 
     def startup_sync(self):
@@ -518,13 +518,13 @@ class BotRunner:
                 _consecutive_matches = 0
                 _max_barrier_retries = 10
                 _barrier_stable = False
-                
+
                 logger.info("⏳ [STARTUP-BARRIER] Entering active trades count stability check (max 10s)...")
                 for _attempt in range(1, _max_barrier_retries + 1):
                     _check_conn = get_connection()
                     _count = _check_conn.execute("SELECT COUNT(*) FROM trades WHERE total_invested > 0").fetchone()[0]
                     logger.info(f"   [STARTUP-BARRIER] Check {_attempt}: active trades count = {_count}")
-                    
+
                     if _last_count is not None and _count == _last_count:
                         _consecutive_matches += 1
                         if _consecutive_matches >= 1:
@@ -533,10 +533,10 @@ class BotRunner:
                             break
                     else:
                         _consecutive_matches = 0
-                        
+
                     _last_count = _count
                     time.sleep(1)
-                    
+
                 if not _barrier_stable:
                     logger.warning("⚠️ [STARTUP-BARRIER] Active trades count did not stabilize after 10s. Proceeding anyway.")
 
@@ -566,18 +566,18 @@ class BotRunner:
                         logger.error(f"❌ [STARTUP-EXCHANGE-SYNC] Failed check: {_sync_err}")
 
 
-                    # INV-26: Per-bot hedge child ghost check
+                    # INV-26: Per-bot ghost check (all active bots)
                     try:
-                        from engine.oneway_netting import detect_hedge_child_ghost, wipe_hedge_child_ghost
+                        from engine.oneway_netting import detect_bot_ghost, wipe_bot_ghost
                         _conn = get_connection()
-                        _hedge_children = _conn.execute(
-                            "SELECT id FROM bots WHERE is_active=1 AND bot_type='hedge_child'"
+                        _active_bots = _conn.execute(
+                            "SELECT id FROM bots WHERE is_active=1"
                         ).fetchall()
-                        for (_child_id,) in _hedge_children:
-                            if detect_hedge_child_ghost(_parity_ex, _child_id, _conn):
-                                wipe_hedge_child_ghost(_parity_ex, _child_id, _conn)
-                    except Exception as _hcg_err:
-                        logger.error(f"❌ [STARTUP-HEDGE-CHILD-GHOST] Failed check: {_hcg_err}")
+                        for (_bot_id,) in _active_bots:
+                            if detect_bot_ghost(_parity_ex, _bot_id, _conn):
+                                wipe_bot_ghost(_parity_ex, _bot_id, _conn)
+                    except Exception as _ghost_err:
+                        logger.error(f"❌ [STARTUP-BOT-GHOST] Failed check: {_ghost_err}")
 
                     from engine.database import audit_pair_ledger_vs_exchange, flag_pair_ledger_mismatch
                     _mismatches = audit_pair_ledger_vs_exchange(_parity_ex)
@@ -716,7 +716,7 @@ class BotRunner:
                 try:
                     orders = ex.fetch_open_orders()
                     if not orders: continue
-                    
+
                     for o in orders:
                         cid = o.get('clientOrderId', '')
                         # Identify Bot ID from ClientID (Format: CQB_{bot_id}_...)
@@ -725,17 +725,17 @@ class BotRunner:
                             parts = cid.split('_')
                             if len(parts) > 1:
                                 bot_id = parts[1]
-                        
+
                         # Decision Logic
                         should_cancel = False
                         reason = ""
-                        
+
                         if bot_id:
                             if bot_id not in allowed_bot_ids:
                                 # 🚀 SIGNATURE-BASED ACCURACY FIX:
                                 # Do NOT purge orders with CQB prefix - they are "System DNA".
                                 # Tag them as STRAY for the UI to handle, don't just delete them.
-                                should_cancel = False 
+                                should_cancel = False
                                 reason = f"Bot {bot_id} exists on exchange but is STOPPED/Unknown in DB. Tagging for recovery."
                                 logger.info(f"📍 [STARTUP-SYNC] Identified STRAY Bot Order {o['id']} (Bot {bot_id}). PRESERVING for recovery.")
                         else:
@@ -743,12 +743,12 @@ class BotRunner:
                             if getattr(config, 'STRICT_CLEANUP', True):
                                 should_cancel = True
                                 reason = "Unknown/Manual Order (Strict Mode)"
-                        
+
                         if should_cancel:
                             logger.warning(f"🚫 [STARTUP-CLEANUP] Cancelling Ghost Order {o['id']} ({o['symbol']}): {reason}")
                             ex.cancel_order(o['id'], o['symbol'])
                             total_cancelled += 1
-                            
+
                 except Exception as e:
                     logger.error(f"   > Failed to scan orders for {m_type}: {e}")
 
@@ -771,7 +771,7 @@ class BotRunner:
                     WS_WARMUP_SECONDS = 20
                     logger.info(f"⏳ [STARTUP-RECON] Waiting {WS_WARMUP_SECONDS}s for WS cache to warm up before reconcile_all...")
                     time.sleep(WS_WARMUP_SECONDS)
-                    
+
                     # One final position snapshot refresh after warmup — ensures active_positions
                     # is current before reconcile_all makes any state decisions.
                     try:
@@ -787,7 +787,7 @@ class BotRunner:
                                 logger.warning(f"⚠️ [STARTUP-RECON] Post-warmup snapshot failed for {_mt}: {_pe2}")
                     except Exception as _snap2_err:
                         logger.warning(f"⚠️ [STARTUP-RECON] Post-warmup snapshot error (non-fatal): {_snap2_err}")
-                    
+
                     logger.info("🛡️ [STARTUP-RECON] Executing full reconciliation pass...")
                     self._reconciler.reconcile_all()
                     logger.info("✅ [STARTUP-RECON] Full reconciliation complete.")
@@ -853,7 +853,7 @@ class BotRunner:
     def _calculate_unrealized_pnl(self, exchange_snapshot=None) -> float:
         """Calculates total unrealized PnL across all active market types."""
         total_unrealized_pnl = 0.0
-        
+
         # If snapshot provided, use it
         if exchange_snapshot:
             for mt, data in exchange_snapshot.items():
@@ -872,7 +872,7 @@ class BotRunner:
                     total_unrealized_pnl += float(p.get('unrealizedPnl', 0.0) or 0.0)
             except Exception as e:
                 logger.warning(f"Failed to fetch positions for PnL calculation in {mt}: {e}")
-                
+
         return total_unrealized_pnl
 
     def _initialize_safety_baseline(self):
@@ -882,23 +882,23 @@ class BotRunner:
             logger.info("NO_API_MODE: Skipping safety baseline initialization (no API key configured)")
             self.initial_equity = 0.0
             return
-            
+
         try:
             # === CRITICAL FIX: Use DB STARTING_EQUITY as true baseline ===
-            total_stablecoin = get_starting_equity() 
+            total_stablecoin = get_starting_equity()
             active_bots = [b for b in self.get_active_bots() if b[9] == 1]
-            
+
             # 1. Invested Cost
             invested_sum = 0.0
             for bot in active_bots:
                 t_data = get_bot_status(bot[0])
                 if t_data and t_data.get('total_invested'):
                     invested_sum += float(t_data['total_invested'])
-            
+
             # Initial equity is the fixed baseline + invested cost
             self.initial_equity = total_stablecoin + invested_sum
             logger.info(f"Safety Baseline Initialized. Equity: ${self.initial_equity:.2f} (Base: {total_stablecoin:.2f} + Pos: {invested_sum:.2f})")
-            
+
         except Exception as e:
             logger.error(f"Failed to initialize safety baseline: {e}")
             self.initial_equity = 0.0
@@ -909,7 +909,7 @@ class BotRunner:
         """
         if getattr(config, 'NO_API_MODE', False):
             return
-            
+
         if self.circuit_breaker_triggered or self.initial_equity <= 0:
             return
 
@@ -934,7 +934,7 @@ class BotRunner:
                 for bot in active_bots:
                     config_dict = json.loads(bot[5]) if bot[5] else {}
                     active_market_types.add(normalize_market_type(config_dict.get('market_type', config.MARKET_TYPE)))
-                
+
                 if not active_market_types: active_market_types.add(config.MARKET_TYPE)
 
                 for mt in active_market_types:
@@ -945,17 +945,17 @@ class BotRunner:
                                 total_stablecoin += self._calculate_stablecoin_balance(balance)
                                 balance_fetch_success = True
                         except Exception: pass
-            
+
             if not balance_fetch_success:
                 logger.warning("Circuit breaker check skipped - balance fetch failed")
                 return
-                
+
             invested_cost = 0.0
             for bot in active_bots:
                 t_data = get_bot_status(bot[0])
                 if t_data and t_data.get('total_invested') and t_data['total_invested'] > 0:
                     invested_cost += float(t_data['total_invested'])
-            
+
             # Unrealized PnL from snapshot/cache
             unrealized_pnl = 0.0
             if exchange_snapshot:
@@ -969,7 +969,7 @@ class BotRunner:
                 for bot in active_bots:
                     config_dict = json.loads(bot[5]) if bot[5] else {}
                     active_market_types.add(normalize_market_type(config_dict.get('market_type', config.MARKET_TYPE)))
-                
+
                 if not active_market_types: active_market_types.add(config.MARKET_TYPE)
 
                 for mt in active_market_types:
@@ -979,12 +979,12 @@ class BotRunner:
                             for p in positions:
                                 unrealized_pnl += float(p.get('unrealizedPnl', 0.0) or 0.0)
                         except: pass
-            
+
             current_equity = total_stablecoin + invested_cost + unrealized_pnl
-            
+
             # Log for debugging
             logger.debug(f"Circuit Check: Equity ${current_equity:.2f} (Cash: {total_stablecoin:.2f} + Cost: {invested_cost:.2f} + uPnL: {unrealized_pnl:.2f})")
-            
+
             if self.initial_equity > 0:
                 drawdown = (self.initial_equity - current_equity) / self.initial_equity * 100
                 if drawdown >= config.GLOBAL_STOP_LOSS_PCT:
@@ -1003,9 +1003,9 @@ class BotRunner:
         try:
             # Query returns all bots LEFT JOIN trades to get real investment state
             cursor.execute('''
-                SELECT b.id, b.name, b.pair, b.direction, b.strategy_type, b.config, 
-                       COALESCE(t.total_invested, 0), 
-                       COALESCE(t.current_step, 0), 
+                SELECT b.id, b.name, b.pair, b.direction, b.strategy_type, b.config,
+                       COALESCE(t.total_invested, 0),
+                       COALESCE(t.current_step, 0),
                        b.rsi_limit, b.is_active,
                        b.base_size, b.martingale_multiplier,
                        b.status
@@ -1017,7 +1017,7 @@ class BotRunner:
         except Exception as e:
             logger.error(f"Error fetching bots: {e}")
             return []
-        finally: 
+        finally:
             pass # conn.close() disabled for singleton safety
 
 
@@ -1042,147 +1042,97 @@ class BotRunner:
     # access is done inline so we don't need a sub-thread or extra
     # process-level state beyond self.pending_close_cycles.
     # ================================================================
-
-    def _handle_pending_flatten(self, bot_id: int, bot_name: str, pair: str, direction: str) -> None:
+    def _handle_pending_flatten(self, bot_id, pair, direction, open_qty, conn):
         """
-        Called once when a bot's status transitions to 'pending_flatten'.
-
-        Flow:
-          1. Cancel all CQB_<bot_id>_ open child orders.
-          2. Physical pre-check: query exchange for live position qty.
-             - If already 0 (BE TP beat us): wipe bot directly, no market order.
-          3. Compute close qty from trades ledger.
-          4. Place reduceOnly market close order.
-          5. Record status='pending_close' in bot_orders.
-          6. Set bot DB status → 'pending_close'.
-          7. Start cycle counter.
+        Execute a reduceOnly market close for a bot in pending_flatten state.
+        Follows INV-15: exchange first, DB second.
+        Follows INV-16: writes exchange_order_audit WAL receipt before order.
         """
-        logger.info(f"[HEDGE-FLATTEN] Bot {bot_name} (ID {bot_id}) pending_flatten detected — starting async close.")
-        ex = list(self.exchanges.values())[0] if self.exchanges else None
-        if not ex:
-            logger.error(f"[HEDGE-FLATTEN] No exchange available for bot {bot_name}. Cannot flatten.")
-            return
+        import time
 
-        # ── Step 1: Cancel all child orders ──────────────────────────────────
+        logger.warning(
+            f"[PENDING-FLATTEN] Bot {bot_id} ({pair}): executing forced "
+            f"close for open_qty={open_qty:.6f}. Writing WAL receipt first."
+        )
+
+        # INV-15 Phase 1: Write WAL receipt before exchange call
+        cid = f"CQB_{bot_id}_FLATTEN_{int(time.time())}"
+        conn.execute("""
+            INSERT INTO bot_orders 
+            (bot_id, order_type, status, amount, filled_amount, price,
+             client_order_id, cycle_id, created_at, updated_at)
+            SELECT ?, 'flatten_close', 'placing', ?, 0, 0, ?, cycle_id,
+                   ?, ?
+            FROM trades WHERE bot_id=?
+        """, (bot_id, open_qty, cid, int(time.time()), int(time.time()), 
+              bot_id))
+        conn.commit()
+
+        # INV-15 Phase 2: Execute exchange close
         try:
-            open_ords = ex.fetch_open_orders(pair) or []
-            prefix = f"CQB_{bot_id}_"
-            for o in open_ords:
-                cid = o.get('clientOrderId', '')
-                if cid.startswith(prefix):
-                    try:
-                        ex.cancel_order(o['id'], pair)
-                        logger.info(f"  ✅ [HEDGE-FLATTEN] Cancelled child order {cid}")
-                    except Exception as _ce:
-                        logger.warning(f"  ⚠️ [HEDGE-FLATTEN] Could not cancel {cid}: {_ce}")
-        except Exception as _oe:
-            logger.warning(f"  ⚠️ [HEDGE-FLATTEN] Child order cancellation failed (non-fatal): {_oe}")
+            close_side = 'sell' if direction.upper() == 'LONG' else 'buy'
 
-        # ── Step 2: Physical position pre-check ──────────────────────────────
-        # Query the exchange NOW to see if the physical position still exists.
-        # Break-even TP may have filled between the parent TP event and this cycle.
-        phys_qty = 0.0
-        try:
-            live_positions = ex.fetch_positions() or []
-            for pos in live_positions:
-                sym_match = (
-                    pos.get('symbol', '').replace('/', '').replace(':USDT', '').replace(':USDC', '')
-                    == pair.replace('/', '').replace(':USDT', '').replace(':USDC', '')
-                )
-                side_match = pos.get('side', '').upper() == direction.upper()
-                if sym_match and side_match:
-                    phys_qty += abs(float(pos.get('contracts', 0)))
-        except Exception as _pe:
-            logger.warning(f"  ⚠️ [HEDGE-FLATTEN] Could not fetch live positions for pre-check: {_pe}")
+            ex = self.exchange or (list(self.exchanges.values())[0] if self.exchanges else None)
+            if not ex:
+                raise RuntimeError("No exchange interface available on runner")
 
-        if phys_qty == 0.0:
-            logger.info(
-                f"[HEDGE-FLATTEN] Physical already flat for bot {bot_name} ({pair} {direction}) "
-                f"— skipping market close, wiping directly."
+            is_testnet = bool(getattr(ex, 'is_testnet', False) or
+                              getattr(getattr(ex, 'exchange', None), 'sandbox', False))
+            params = {'reduceOnly': True}
+            if is_testnet:
+                params['positionSide'] = 'BOTH'
+            else:
+                params.pop('positionSide', None)
+
+            order = ex.create_order(
+                pair, 'market', close_side, open_qty,
+                params=params
             )
-            try:
-                from engine.database import safe_wipe_bot
-                wiped = safe_wipe_bot(
-                    bot_id=bot_id, pair=pair, direction=direction,
-                    reason="HEDGE-FLATTEN: physical already flat before market close"
-                )
-                if wiped:
-                    self.pending_close_cycles.pop(bot_id, None)
-                    logger.info(f"✅ [HEDGE-FLATTEN] Bot {bot_name} wiped directly (exchange was already flat).")
-                else:
-                    logger.warning(
-                        f"⚠️ [HEDGE-FLATTEN] safe_wipe_bot blocked for {bot_name} even though exchange is flat. "
-                        f"Will remain in pending_flatten — reconciler will resolve."
-                    )
-            except Exception as _we:
-                logger.error(f"❌ [HEDGE-FLATTEN] safe_wipe_bot raised: {_we}")
-            return
+            filled_qty = float(order.get('filled') or open_qty)
+            fill_price = float(order.get('average') or order.get('price') or 0)
 
-        # ── Step 3: Compute close quantity from ledger ────────────────────────
-        close_qty = None
-        conn = get_connection()
-        try:
-            row = conn.execute(
-                "SELECT total_invested, avg_entry_price FROM trades WHERE bot_id=?", (bot_id,)
-            ).fetchone()
-            if row and row[0] and row[1] and float(row[1]) > 0:
-                close_qty = float(row[0]) / float(row[1])
-        except Exception as _qe:
-            logger.warning(f"  ⚠️ [HEDGE-FLATTEN] Could not read trade qty for bot {bot_name}: {_qe}")
+            # Update WAL receipt with real exchange result
+            conn.execute("""
+                UPDATE bot_orders SET status='filled', filled_amount=?,
+                price=?, order_id=?, updated_at=?
+                WHERE client_order_id=? AND bot_id=?
+            """, (filled_qty, fill_price, str(order.get('id','')),
+                  int(time.time()), cid, bot_id))
 
-        if not close_qty or close_qty <= 0:
+            # INV-15 Phase 2: DB update only after exchange confirmed
+            conn.execute("""
+                UPDATE trades SET open_qty=0, total_invested=0,
+                avg_entry_price=0, current_step=0, entry_confirmed=0
+                WHERE bot_id=?
+            """, (bot_id,))
+            conn.execute("""
+                UPDATE bots SET status='Scanning', cascade_started_at=0
+                WHERE id=?
+            """, (bot_id,))
+            conn.commit()
+
             logger.warning(
-                f"[HEDGE-FLATTEN] Bot {bot_name} has no virtual position in ledger "
-                f"(but physical exists — qty={phys_qty:.8f}). Falling back to physical qty."
+                f"[PENDING-FLATTEN] Bot {bot_id}: closed {filled_qty:.6f} "
+                f"@ {fill_price:.6f}. Reset to Scanning."
             )
-            close_qty = phys_qty
+            return True
 
-        # ── Step 4: Place reduceOnly market close ──────────────────────────────
-        exit_side = 'buy' if direction.upper() == 'SHORT' else 'sell'
-        cid = f"CQB_{bot_id}_FLATTEN_CLOSE_{int(time.time())}"
-        order_result = None
-        try:
-            order_result = ex.create_order(
-                pair, 'market', exit_side, close_qty,
-                params={'reduceOnly': True, 'clientOrderId': cid}
+        except Exception as e:
+            # Exchange call failed — update WAL receipt, set REQUIRE_MANUAL_PROOF
+            conn.execute("""
+                UPDATE bot_orders SET status='failed',
+                notes=?, updated_at=? WHERE client_order_id=? AND bot_id=?
+            """, (f"flatten failed: {e}", int(time.time()), cid, bot_id))
+            conn.execute("""
+                UPDATE bots SET status='REQUIRE_MANUAL_PROOF',
+                cascade_started_at=? WHERE id=?
+            """, (int(time.time()), bot_id))
+            conn.commit()
+            logger.error(
+                f"[PENDING-FLATTEN] Bot {bot_id}: exchange close FAILED: {e}. "
+                f"Set REQUIRE_MANUAL_PROOF."
             )
-            logger.info(
-                f"  ✅ [HEDGE-FLATTEN] Market close placed — CID={cid} "
-                f"side={exit_side} qty={close_qty:.6f} {pair}"
-            )
-        except Exception as _ord_err:
-            logger.error(f"  ❌ [HEDGE-FLATTEN] Market close order failed: {_ord_err}")
-            # Leave bot in pending_flatten — next cycle will retry the whole handler.
-            return
-
-        # ── Step 5: Write pending_close receipt to bot_orders ─────────────────
-        try:
-            exchange_order_id = str(order_result.get('id', '')) if order_result else ''
-            save_bot_order(
-                bot_id=bot_id,
-                order_type='flatten_close',
-                exchange_order_id=exchange_order_id,
-                price=0.0,
-                amount=close_qty,
-                step=0,
-                status='pending_close',
-                client_order_id=cid,
-                notes=f"ASYNC-FLATTEN market close for {pair} {direction}",
-            )
-        except Exception as _se:
-            logger.warning(f"  ⚠️ [HEDGE-FLATTEN] Could not save bot_order receipt: {_se}")
-
-        # ── Step 6: Set bot status → pending_close ────────────────────────────
-        try:
-            _c = get_connection()
-            _c.execute("UPDATE bots SET status='pending_close' WHERE id=?", (bot_id,))
-            _c.commit()
-            logger.info(f"  ⏳ [HEDGE-FLATTEN] Bot {bot_name} status → pending_close (awaiting fill).")
-        except Exception as _ue:
-            logger.error(f"  ❌ [HEDGE-FLATTEN] Could not update bot status: {_ue}")
-
-        # ── Step 7: Initialise cycle counter ──────────────────────────────────
-        self.pending_close_cycles[bot_id] = 0
+            return False
 
     def _handle_pending_close(self, bot_id: int, bot_name: str, pair: str, direction: str) -> None:
         """
@@ -1250,7 +1200,8 @@ class BotRunner:
                 from engine.database import safe_wipe_bot
                 wiped = safe_wipe_bot(
                     bot_id=bot_id, pair=pair, direction=direction,
-                    reason="HEDGE-FLATTEN: market close confirmed filled"
+                    reason="HEDGE-FLATTEN: market close confirmed filled",
+                    human_approved=True
                 )
                 if wiped:
                     self.pending_close_cycles.pop(bot_id, None)
@@ -1361,7 +1312,7 @@ class BotRunner:
         try:
             from engine.websocket_handler import get_websocket_handler, start_websocket_stream
             from engine.ws_event_handlers import handle_order_update, handle_position_update
-            
+
             ws_h = get_websocket_handler()
             if not ws_h or not ws_h.is_alive:
                 logger.warning("⚠️ WebSocket handler is DOWN or not initialized. Restarting...")
@@ -1381,13 +1332,37 @@ class BotRunner:
             all_bots = self.get_active_bots()
             bots = [b for b in all_bots if b[9] == 1] # Filter for active bots
 
+            # Handle pending_flatten bots
+            conn = get_connection()
+            flatten_bots = conn.execute("""
+                SELECT b.id, b.pair, b.direction, t.open_qty
+                FROM bots b JOIN trades t ON t.bot_id=b.id
+                WHERE b.status='pending_flatten' AND b.is_active=1
+            """).fetchall()
+
+            flatten_intercepted_ids = set()
+            for fb_id, fb_pair, fb_dir, fb_qty in flatten_bots:
+                flatten_intercepted_ids.add(fb_id)
+                if fb_qty > 0.0001:
+                    self._handle_pending_flatten(fb_id, fb_pair, fb_dir, fb_qty, conn)
+                else:
+                    # Already flat — just reset status
+                    conn.execute(
+                        "UPDATE bots SET status='Scanning', cascade_started_at=0 "
+                        "WHERE id=?", (fb_id,)
+                    )
+                    conn.commit()
+
+            # Exclude pending_flatten bots from normal cycle execution
+            bots = [b for b in bots if b[0] not in flatten_intercepted_ids]
+
             active_market_types = set()
             for bot in bots:
                 config_json = bot[5]
                 cfg = json.loads(config_json) if config_json else {}
                 mt = normalize_market_type(cfg.get('market_type', config.MARKET_TYPE))
                 active_market_types.add(mt)
-            
+
             if not active_market_types: active_market_types.add(config.MARKET_TYPE)
 
             # 🚀 Initializing snapshot variables to prevent UnboundLocalError
@@ -1398,41 +1373,41 @@ class BotRunner:
             for mt in active_market_types:
                 if mt in self.exchanges:
                     ex = self.exchanges[mt]
-                    
+
                     # 🚀 FAST-PATH: Use WebSocket Memory Cache if fresh
                     ws_cache = get_ws_cache()
-                    
+
                     if ws_cache.is_fresh(max_age_seconds=15):
                         logger.debug(f"⚡ [WS-CACHE] Reading positions and orders from memory for {mt}")
                         snap_pos = ws_cache.get_all_positions()
                         snap_orders = ws_cache.get_all_open_orders()
                     else:
                         snap_pos = ex.fetch_positions()
-                        
+
                         # 🚀 BUG FIX: Binance Demo FAPI truncates fetch_open_orders() without symbol to ~12 orders!
                         # We must fetch open orders explicitly for every active pair on this market type.
                         # 🔥 OPTIMIZATION: Do this in parallel to prevent API latency from crashing the engine loop!
                         snap_orders = []
                         mt_active_pairs = set([b[2] for b in bots if b[5] and normalize_market_type(json.loads(b[5]).get('market_type', config.MARKET_TYPE)) == mt])
                         if not mt_active_pairs: mt_active_pairs = set([b[2] for b in bots]) # Fallback
-                        
+
                         def _fetch_pair_orders(pair_symbol):
                             try:
                                 return ex.fetch_open_orders(pair_symbol)
                             except Exception:
                                 return []
-                                
+
                         with ThreadPoolExecutor(max_workers=5) as executor:
                             for pair_orders in executor.map(_fetch_pair_orders, mt_active_pairs):
                                 if pair_orders: snap_orders.extend(pair_orders)
-                        
+
                         # 🚀 PRE-POPULATE WS CACHE to avoid data loss on startup
                         if snap_pos is not None and snap_orders is not None:
                             ws_cache.populate_from_rest(snap_pos, snap_orders)
-                        
+
                     # Skip fetch_balance — circuit breaker is disabled, no consumer
                     snap_bal = None
-                    
+
                     # Position Fetch Trace
                     if snap_pos is not None:
                         logger.debug(f"{mt} fetch_positions returned {len(snap_pos)} items: {[p.get('symbol', 'UNK') for p in snap_pos]}")
@@ -1454,7 +1429,7 @@ class BotRunner:
                             logger.warning(f"⚠️ [SNAPSHOT-CHECK] DB expects {expected_count} positions but Exchange returned 0. Retrying with FORCE REFRESH...")
                             time.sleep(1.0) # Short wait
                             snap_pos = ex.fetch_positions()
-                            
+
                             if snap_pos is None: # Check if refresh also failed
                                 logger.warning(f"⚠️ [SNAPSHOT-FAIL] Force Refresh also failed. Skipping cycle.")
                                 return 5.0
@@ -1464,16 +1439,16 @@ class BotRunner:
                                 logger.warning(f"🔄 Allowing cycle to continue — ghost-bust will reconcile via net-sum check.")
                             else:
                                 logger.info(f"✅ [SNAPSHOT-RECOVERY] Force Refresh successful: Found {len(snap_pos)} positions.")
-                    
+
                     logger.debug(f"DEBUG: Processing {len(snap_pos)} positions for {mt}")
-                    
+
                     # 🚀 FUNDAMENTAL FIX: Ensure we actually populate the snapshot dict!
                     exchange_snapshot[mt] = {
                         'positions': snap_pos,
                         'orders': snap_orders,
                         'balance': snap_bal
                     }
-                    
+
                     # ── [v3.3.1] PRE-SNAPSHOT LEDGER SEAL ──────────────────────────
                     # Seal all active bot ledgers from confirmed bot_orders fills BEFORE
                     # writing the active_positions snapshot. Without this seal, a WS fill
@@ -1505,7 +1480,7 @@ class BotRunner:
                         update_active_positions_snapshot(snap_pos)
                     except Exception as _snap_ex:
                         logger.warning(f"⚠️ [active_positions] Failed to write snapshot: {_snap_ex}")
-                    
+
                     # POSITION MONITORING: Throttle to every 10 cycles (~50s)
                     # FLAG-ONLY: No state mutations. Reconciler handles all decisions with evidence.
                     if self.cycle_count % 10 != 0:
@@ -1519,24 +1494,24 @@ class BotRunner:
                             pos_symbol = pos['symbol']
                             pos_amt = pos['contracts']
                             if pos_amt == 0: continue
-                            
+
                             pos_side_real = 'LONG' if pos_amt > 0 else 'SHORT'
                             entry_price = float(pos['entryPrice'])
                             full_exch_notional = abs(float(pos_amt)) * entry_price
-                            
+
                             relevant_bots = [b for b in bots if normalize_symbol(b[2]) == normalize_symbol(pos_symbol)]
                             same_dir_bots = [b for b in relevant_bots if b[3].upper() == pos_side_real]
-                            
+
                             # Check if any bot claims this position (Threshold lowered to $0.01 for cent-level accuracy)
                             claimed = any(float(b[6] or 0) > 0.01 for b in same_dir_bots)
                             if not claimed and full_exch_notional > 0.01:
                                 logger.info(f"📋 [MONITOR] Unclaimed {pos_side_real} position on {pos_symbol}: ${full_exch_notional:.2f} @ {entry_price}. Reconciler will handle.")
-                        
+
                         # Flag bots that think they're invested but exchange disagrees
                         relevant_bots_for_mt = [b for b in bots if b[5] and normalize_market_type(json.loads(b[5]).get('market_type', config.MARKET_TYPE)) == mt]
                         if not relevant_bots_for_mt:
                              relevant_bots_for_mt = [b for b in bots if config.MARKET_TYPE == mt]
-    
+
                         for bot in relevant_bots_for_mt:
                             # Use index access — safe regardless of how many columns get_active_bots() returns
                             b_id      = bot[0]
@@ -1546,24 +1521,24 @@ class BotRunner:
                             b_invested = float(bot[6] or 0)  # col 6 = total_invested
                             if b_invested <= 0:
                                 continue
-                            
+
                             # Check if exchange has any position for this pair
                             found_pos = None
                             for p in snap_pos:
                                 if normalize_symbol(p['symbol']) == normalize_symbol(b_pair):
                                     found_pos = p
                                     break
-                            
+
                             if not found_pos or float(found_pos['contracts']) == 0:
                                 logger.warning(f"⚠️ [FLAG-ONLY] Bot {b_name} thinks it has ${b_invested} but exchange has 0 for {b_pair}. Reconciler will handle.")
 
 
-                    
+
                     # 🚀 NEW: Pre-fetch OHLCV (Price Data) for all active pairs to feed strategies
                     market_data = {}
                     multi_tf_data = {}  # { pair: { "15m": df, "1h": df, ... } }
                     active_pairs = set([b[2] for b in bots])
-                    
+
                     # TTL mapping: how many seconds before each TF's cache expires
                     _TF_TTL = {
                         '1m': 55, '5m': 280, '15m': 840, '30m': 1700,
@@ -1576,11 +1551,11 @@ class BotRunner:
                             if '/' not in norm_p:
                                 if 'USDC' in norm_p: norm_p = norm_p.replace('USDC', '/USDC')
                                 elif 'USDT' in norm_p: norm_p = norm_p.replace('USDT', '/USDT')
-                            
+
                             now_t = time.time()
                             c_key_1m = (p, '1m')
                             _cached_1m = self._tf_cache.get(c_key_1m)
-                            
+
                             # Cache 1m timeframe for 25 seconds to drastically cut REST API pings
                             if _cached_1m and (now_t - _cached_1m['fetched_at']) < 25:
                                 p_df = _cached_1m['data']
@@ -1588,7 +1563,7 @@ class BotRunner:
                                 p_ohlcv = ex.fetch_ohlcv(norm_p, timeframe='1m', limit=50)
                                 p_df = pd.DataFrame(p_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                                 self._tf_cache[c_key_1m] = {'data': p_df, 'fetched_at': now_t}
-                            
+
                             needed = set()
                             for b_bot in bots:
                                 if b_bot[2] == p and b_bot[5]:
@@ -1596,13 +1571,13 @@ class BotRunner:
                                     for key in ['cci_tf', 'rsi_tf', 'boll_tf', 'stoch_tf', 'pat_1_tf', 'pat_2_tf', 'pat_3_tf', 'pat_4_tf', 'MTF_Timeframe', 'ATR_Timeframe', 'ATRTimeframe', 'atr_tf']:
                                         if c_cfg.get(key) and c_cfg.get(key) != '1m':
                                             needed.add(c_cfg.get(key))
-                            
+
                             p_tf_d = {'1m': p_df}
                             for tf_val in needed:
                                 c_key = (p, tf_val)
                                 m_ttl = _TF_TTL.get(tf_val, 300)
                                 _cached = self._tf_cache.get(c_key)
-                                
+
                                 if _cached and (now_t - _cached['fetched_at']) < m_ttl:
                                     p_tf_d[tf_val] = _cached['data']
                                 else:
@@ -1613,7 +1588,7 @@ class BotRunner:
                                         self._tf_cache[c_key] = {'data': t_df, 'fetched_at': now_t}
                                     except Exception as tf_err:
                                         if _cached: p_tf_d[tf_val] = _cached['data']
-                            
+
                             return p, p_df, p_tf_d
                         except Exception as e:
                             logger.error(f"Failed to fetch market data for {p}: {e}")
@@ -1631,14 +1606,14 @@ class BotRunner:
                         os.makedirs(cache_dir, exist_ok=True)
                         cache_file = os.path.join(cache_dir, 'market_cache.json')
                         tmp_cache_file = os.path.join(cache_dir, 'market_cache_tmp.json')
-                        
+
                         # We need to convert Pandas DataFrames into simple JSON dicts
                         json_ready_cache = {}
                         for pair, tf_dict in multi_tf_data.items():
                             json_ready_cache[pair] = {}
                             for tf, df in tf_dict.items():
                                 json_ready_cache[pair][tf] = df.to_dict(orient='records')
-                        
+
                         # ATOMIC WRITE: Write to tmp file, then atomic rename
                         with open(tmp_cache_file, 'w') as f:
                             json.dump(json_ready_cache, f)
@@ -1659,11 +1634,11 @@ class BotRunner:
 
         # 🚀 FUNDAMENTAL FIX: Active Positions are now updated atomically in 'update_full_snapshot' below.
         # We removed the redundant call to 'update_active_positions_snapshot' here to prevent transaction races.
-        
+
         # 2. Safety Checks (using snapshots)
         # DISABLE CIRCUIT BREAKER FOR DEBUGGING (False Positives on Testnet)
         # self.check_circuit_breaker(exchange_snapshot=exchange_snapshot)
-        
+
         # Signal file checks are handled in the main while loop in __main__.
         # Keeping a lightweight in-cycle check here as a secondary safety net.
         from engine.shutdown_control import is_stop_requested
@@ -1708,23 +1683,23 @@ class BotRunner:
                             "SELECT total_invested, avg_entry_price FROM trades WHERE bot_id=?", (sl_bid,)
                         ).fetchone()
                         _sl_conn2.close()
-                        
+
                         api_success = False
                         if qty_row and qty_row[0] and qty_row[1] and float(qty_row[1]) > 0:
                             close_qty = float(qty_row[0]) / float(qty_row[1])
-                            
+
                             # 🚀 ROOT CAUSE FIX: Use the native exact tracking ID so WS handles the math.
                             client_order_id = f"CQB_{sl_bid}_TP_MARKETSL{int(time.time())}"
-                            
+
                             ex_sl.create_order(sl_pair, 'market', exit_side, close_qty,
                                                params={'reduceOnly': True, 'clientOrderId': client_order_id})
                             logger.info(f"  ✅ [FORCE-SL] Market close placed via ID {client_order_id}: {exit_side} {close_qty:.6f} {sl_pair}")
                             api_success = True
-                            
+
                     except Exception as _mc_err:
                         logger.warning(f"  ⚠️ [FORCE-SL] Market close rejected by exchange!: {_mc_err}")
-                
-                # 🚀 ROOT CAUSE FIX: NEVER wipe the bot manually bypassing proof. 
+
+                # 🚀 ROOT CAUSE FIX: NEVER wipe the bot manually bypassing proof.
                 # If API passed, we set status to pending_sl so the WS catches the fill and executes normal TP shutdown.
                 # Record audit but don't freeze the bot permanently
                 _r_conn = get_connection()
@@ -1732,7 +1707,7 @@ class BotRunner:
                     _r_conn.execute("UPDATE bots SET status='pending_sl' WHERE id=?", (sl_bid,))
                     logger.info(f"  ⏳ [FORCE-SL] Bot {sl_name} pending WS confirmation to formally close.")
                 else:
-                    # API failed (e.g. 0 qty locally, rejected order, etc). 
+                    # API failed (e.g. 0 qty locally, rejected order, etc).
                     # Do NOT blindly wipe the bot, as this creates Ghost positions if the DB is desynced.
                     logger.warning(f"  ⚠️ [FORCE-SL] Market close API failed or bypassed for {sl_name}. Reverting to normal state without forcing wiping.")
                     # If the bot has a ledger position, it remains IN TRADE. If flat, it scans.
@@ -1741,7 +1716,7 @@ class BotRunner:
                         _r_conn.execute("UPDATE bots SET status='IN TRADE' WHERE id=?", (sl_bid,))
                     else:
                         _r_conn.execute("UPDATE bots SET status='Scanning' WHERE id=?", (sl_bid,))
-                
+
                 _r_conn.commit()
                 pass # _r_conn.close() disabled for singleton safety
 
@@ -1754,7 +1729,6 @@ class BotRunner:
 
         # ================================================================
         # 🛑 ASYNC FLATTEN INTERCEPT  (v3.5.0)
-        # Bots flagged pending_flatten → fire async market-close flow.
         # Bots already pending_close   → poll for fill confirmation.
         # Both are removed from the normal process_bot run list.
         # ================================================================
@@ -1764,7 +1738,7 @@ class BotRunner:
             _f_cur = _f_conn.cursor()
             _f_cur.execute(
                 "SELECT id, name, pair, direction FROM bots "
-                "WHERE status IN ('pending_flatten', 'pending_close') AND is_active=1"
+                "WHERE status IN ('pending_close') AND is_active=1"
             )
             flatten_flagged = _f_cur.fetchall()
         except Exception as _ff_err:
@@ -1773,27 +1747,10 @@ class BotRunner:
 
         for f_bid, f_name, f_pair, f_dir in flatten_flagged:
             flatten_intercepted_ids.add(f_bid)
-            # Determine which status this bot is currently in.
-            # (We can look it up from flatten_flagged row but the query already gave us both statuses;
-            #  re-query the single row to get the exact current status cheaply.)
             try:
-                _s_row = get_connection().execute(
-                    "SELECT status FROM bots WHERE id=?", (f_bid,)
-                ).fetchone()
-                current_status = (_s_row[0] if _s_row else 'unknown') or 'unknown'
-            except Exception:
-                current_status = 'unknown'
-
-            if current_status == 'pending_flatten':
-                try:
-                    self._handle_pending_flatten(f_bid, f_name, f_pair, f_dir)
-                except Exception as _hpf_err:
-                    logger.error(f"[ASYNC-FLATTEN] _handle_pending_flatten raised for {f_name}: {_hpf_err}")
-            elif current_status == 'pending_close':
-                try:
-                    self._handle_pending_close(f_bid, f_name, f_pair, f_dir)
-                except Exception as _hpc_err:
-                    logger.error(f"[ASYNC-FLATTEN] _handle_pending_close raised for {f_name}: {_hpc_err}")
+                self._handle_pending_close(f_bid, f_name, f_pair, f_dir)
+            except Exception as _hpc_err:
+                logger.error(f"[ASYNC-FLATTEN] _handle_pending_close raised for {f_name}: {_hpc_err}")
 
         # Remove flatten-intercepted bots and pending_hedge_close bots so they skip normal strategy execution
         SKIP_STATUSES = {'pending_hedge_close'}
@@ -1847,7 +1804,7 @@ class BotRunner:
 
         # Update workers size
         max_workers = min(len(bots) + 2, 20)
-        
+
         if not hasattr(self, '_bot_executor') or self._bot_executor is None:
             self._bot_executor = BotExecutor(self)
         bot_executor = self._bot_executor
@@ -1861,22 +1818,22 @@ class BotRunner:
 
         # Process bots using the primed cache
         raw_results = list(self.bot_pool.map(lambda b: bot_executor.process_bot(b, exchange_snapshot=exchange_snapshot), bots))
-        
+
         # Filter out None results (bots skipped or errored)
         processed_bot_results = [r for r in raw_results if r is not None and r[0] is not None]
-        
+
         # 🚀 FUNDAMENTAL FIX: Aggregate all trade updates for atomic DB write
         trade_updates = [res[1] for res in processed_bot_results if res[1] is not None]
-        
+
         # Collect physical positions
         physical_positions = []
         for mt, snap in exchange_snapshot.items():
             physical_positions.extend(snap.get('positions', []))
 
         # Always update snapshot if we have data OR if we need to clear table (handled by empty list)
-        # But we want to avoid spamming empty updates if nothing changed? 
+        # But we want to avoid spamming empty updates if nothing changed?
         # For UI sync, we MUST update.
-        if True: # Always attempt sync to keep UI fresh 
+        if True: # Always attempt sync to keep UI fresh
             try:
                 update_full_snapshot(trade_updates, physical_positions)
                 if len(physical_positions) > 0:
@@ -1887,7 +1844,7 @@ class BotRunner:
         # 🚀 FUNDAMENTAL FIX: Active Positions are now updated atomically in 'update_full_snapshot' above.
         # We removed the redundant call here to prevent transaction races.
         # Ensure 'update_full_snapshot' is ALWAYS called even if no trade updates, if we have positions.
-        
+
         # Fallback: If update_full_snapshot wasn't called (no trades, no pos?), force one?
         # Actually, if we have positions, the block above (if trade_updates or snap_pos) RUNS.
         # If snap_pos is empty, we WANT the table cleared (but cautiously, see safety checks).
@@ -1924,8 +1881,34 @@ class BotRunner:
             enforce_integrity(self, exchange_snapshot)
         except Exception as e:
             logger.error(f"Integrity check failed: {e}")
-        
 
+        # INV-31: Run Ground Truth Reconciler periodically
+        self._gtr_cycle_counter += 1
+        if self._gtr_cycle_counter >= self._gtr.CYCLE_INTERVAL:
+            self._gtr_cycle_counter = 0
+            try:
+                with get_connection() as conn:
+                    gtr_results = self._gtr.run(self.exchange, conn)
+                
+                log_msg = (
+                    f"[GTR-INV31] Reconciliation pass: "
+                    f"ghost={gtr_results['ghost_virtual']} "
+                    f"stuck={gtr_results['stuck_cascade']} "
+                    f"stuck_pending_cleared={gtr_results.get('stuck_pending_cleared', [])} "
+                    f"orphan={gtr_results['orphan_physical']} "
+                    f"manual_proof={gtr_results.get('manual_proof', [])} "
+                    f"in_sync={gtr_results['in_sync_count']}"
+                )
+                if any([gtr_results['ghost_virtual'],
+                        gtr_results['stuck_cascade'],
+                        gtr_results.get('stuck_pending_cleared', []),
+                        gtr_results['orphan_physical'],
+                        gtr_results.get('manual_proof', [])]):
+                    logger.warning(log_msg)
+                else:
+                    logger.info(log_msg)
+            except Exception as e:
+                logger.error(f"[GTR-INV31] Reconciliation pass failed: {e}")
 
         # Publish cycle time
         end_time = time.time()
@@ -1935,7 +1918,7 @@ class BotRunner:
         # Find minimum requested sleep time. Default to 10s if no requests.
         valid_intervals = [r for r in results if isinstance(r, (int, float)) and r > 0]
         recommended_sleep = min(valid_intervals) if valid_intervals else 10.0
-        
+
         return recommended_sleep
 
     def handle_emergency_liquidation(self):
@@ -1950,25 +1933,25 @@ class BotRunner:
             config_dict = json.loads(config_json) if config_json else {}
             mt = normalize_market_type(config_dict.get('market_type', config.MARKET_TYPE))
             ex = self.exchanges.get(mt, self.exchange)
-            
+
             if not ex:
                 logger.error(f"Cannot liquidate {name}: No exchange interface available")
                 continue
 
             try:
                 ex.cancel_orders_by_bot_id(id, pair)
-                
+
                 if not config.DRY_RUN and mt in ['future', 'swap']:
                     # For futures, fetch positions properly
                     try:
                         positions = ex.exchange.fetch_positions()
                         # Normalize symbol for comparison
                         target_pair_clean = pair.replace('/', '').split(':')[0]
-                        
+
                         for pos in positions:
                             if not pos: continue
                             pos_symbol = pos.get('symbol', '').replace('/', '').split(':')[0]
-                            
+
                             if pos_symbol == target_pair_clean:
                                 if float(pos.get('contracts', 0) or pos.get('size', 0) or 0) != 0:
                                     qty = float(pos.get('contracts', 0) or pos.get('size', 0))
@@ -1982,21 +1965,22 @@ class BotRunner:
                                         emergency=True,
                                         _audit_cursor=_audit_cursor,
                                         _call_site="runner.emergency_liquidate:1476",
+                                        human_approved=True
                                     )
                                     _audit_conn.commit()
-                                    
+
                                     # CRITICAL FIX: Update DB to reflect closure
                                     # We use reset_bot_after_tp to clear the trade record
                                     # Passing 0 as exit price since it's a panic close (or use current price if available)
                                     try:
-                                        reset_bot_after_tp(id, exit_price=0.0, action_label='EMERGENCY_CLOSE')
+                                        reset_bot_after_tp(id, exit_price=0.0, action_label='EMERGENCY_CLOSE', human_approved=True)
                                         logger.warning(f"✅ Bot {name} Database Reset after Emergency Close")
                                     except Exception as db_err:
                                         logger.error(f"Failed to reset DB for {name}: {db_err}")
-                                        
+
                     except Exception as pos_err:
                         logger.error(f"Failed to fetch positions for {pair}: {pos_err}")
-                        
+
             except Exception as e: logger.error(f"Cleanup failed for {name}: {e}")
 
 
@@ -2017,6 +2001,22 @@ if __name__ == "__main__":
         sys.exit(1)
 
     init_db()
+
+    # --- STARTUP TIMESTAMP: System-wide grace period gate ---
+    # Written once here so the UI can suppress false-positive health alerts
+    # for the first 120 seconds while the engine places its first orders.
+    # All health checks in monitor.py read ENGINE_STARTED_AT from system_equity.
+    try:
+        _st_conn = sqlite3.connect(config.PATHS['DB_FILE'], timeout=10)
+        _st_conn.execute(
+            "INSERT OR REPLACE INTO system_equity (key, value) VALUES ('ENGINE_STARTED_AT', ?)",
+            (time.time(),)
+        )
+        _st_conn.commit()
+        _st_conn.close()
+        logger.info("✅ [STARTUP] ENGINE_STARTED_AT recorded in system_equity.")
+    except Exception as _st_err:
+        logger.error(f"Failed to record ENGINE_STARTED_AT (non-fatal): {_st_err}")
 
     # --- STEP 2: PREFLIGHT CHECK (Startup Gate) ---
     try:
@@ -2041,7 +2041,7 @@ if __name__ == "__main__":
         logger.error(f"FATAL: Failed to start Metrics Server on port {config.METRICS_PORT}: {e}")
         lock.release()
         sys.exit(1)
-    
+
     logger.info("Bot Service Started.")
     try:
         runner = BotRunner()
@@ -2075,7 +2075,7 @@ if __name__ == "__main__":
 
     signal.signal(signal.SIGTERM, _graceful_shutdown)
     signal.signal(signal.SIGINT, _graceful_shutdown)
-    
+
     # BUG FIX: Clear emergency file on successful startup (prevents false liquidation on restart)
     if os.path.exists(EMERGENCY):
         os.remove(EMERGENCY)
@@ -2141,9 +2141,9 @@ if __name__ == "__main__":
             if now - last_cleanup > 60:
                 cleanup_caches()
                 last_cleanup = now
-            
+
             result = runner.run_cycle()
-            
+
             # Broadcast State via WebSocket
             if ws_server and ws_server.is_alive() and ws_server.loop and not ws_server.loop.is_closed():
                 logger.debug(f"[WS_RUNNER] Attempting broadcast. WS server running: {ws_server.running}, loop running: {ws_server.loop.is_running()}")
@@ -2163,20 +2163,20 @@ if __name__ == "__main__":
 
 
             if result is False: break
-            
+
             # Update sleep time based on smart polling
             if isinstance(result, (int, float)) and result > 0:
                 cycle_sleep = result
             else:
                 cycle_sleep = 15.0
-                
+
             failures = 0
-            
+
             # Heartbeat every 60s to confirm system is alive
             if time.time() - last_heartbeat > 60:
                 logger.info("💓 System Heartbeat - Active")
                 last_heartbeat = time.time()
-                
+
         except Exception as e:
             failures += 1
             logger.error(f"Cycle failed ({failures}): {e}", exc_info=True)
@@ -2185,7 +2185,7 @@ if __name__ == "__main__":
         except BaseException as e:
             logger.critical(f"🛑 FATAL RUNNER ERROR: {e}", exc_info=True)
             break
-            
+
         if interruptible_sleep(cycle_sleep):
             shutdown_fast = True
             clear_stop_signal()

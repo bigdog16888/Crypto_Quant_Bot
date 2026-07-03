@@ -294,7 +294,7 @@ class ReconciliationResult:
 
     details: str
 
-    requires_manual_intervention: bool
+    requires_manual_intervention: bool = False
 
 
 
@@ -420,6 +420,9 @@ class StateReconciler:
                         continue
 
                     logger.info(f"🔎 [_audit_pending_exits] Fetching TP {tp_order_id} status via REST for Bot {bot_id} ({pair})...")
+                    if tp_order_id and any(str(tp_order_id).startswith(prefix) for prefix in ('PENDING_', 'PLACING_', 'GHOST_', 'VN_')):
+                        logger.info(f"🔎 [_audit_pending_exits] Skipping fetch_order for synthetic TP order {tp_order_id}")
+                        continue
                     order = exchange.fetch_order(tp_order_id, pair)
                     if not order:
                         logger.warning(f"[_audit_pending_exits] Fetch order returned None for order {tp_order_id} bot {bot_id}")
@@ -885,8 +888,13 @@ class StateReconciler:
 
                     try:
 
-                        exch_order = ex.fetch_order(cid, pair)
-                        lookup_succeeded = True
+                        if cid and any(str(cid).startswith(prefix) for prefix in ('PENDING_', 'PLACING_', 'GHOST_', 'VN_')):
+                            logger.info(f"🔎 [PRE-COMMIT-RESOLVE] Skipping lookup for synthetic CID {cid}")
+                            exch_order = None
+                            lookup_succeeded = True
+                        else:
+                            exch_order = ex.fetch_order(cid, pair)
+                            lookup_succeeded = True
 
                     except Exception as e_cid:
                         import ccxt
@@ -895,7 +903,7 @@ class StateReconciler:
 
                     # Fallback: scan recent closed+open orders
 
-                    if not exch_order:
+                    if not exch_order and not (cid and any(str(cid).startswith(prefix) for prefix in ('PENDING_', 'PLACING_', 'GHOST_', 'VN_'))):
 
                         try:
 
@@ -1133,20 +1141,19 @@ class StateReconciler:
 
 
 
-                # 🚀 NET-SUM GAP DETECTION:
-
-                # abs(Difference) > 0.001 identifies a desynced ticker.
-
                 if abs(pq_adjusted - vq) > 0.001:
-
-                    gap_pairs.append((p, pq, vq, pq_adjusted - vq, 'NET'))
-
+                    # If raw physical matches virtual without the whitelist (i.e. they are already in sync),
+                    # then the whitelist is stale and can be cleared.
+                    if abs(pq - vq) <= 0.001 and abs(wq) > 0.0:
+                        clear_manual_whitelists_for_pair(p)
+                        logger.info(f"🧹 [WHITELIST-CLEANUP] Raw physical matches virtual for {p} (phys={pq:.4f}, virt={vq:.4f}). Auto-cleared stale manual whitelists.")
+                        wq = 0.0
+                        pq_adjusted = pq
+                    else:
+                        gap_pairs.append((p, pq, vq, pq_adjusted - vq, 'NET'))
                 elif abs(pq) < 0.0001 and abs(wq) > 0:
-
                     # 🧹 AUTO-CLEANUP: If physical position is gone, clear whitelists for this pair.
-
                     clear_manual_whitelists_for_pair(p)
-
                     logger.info(f"🧹 [WHITELIST-CLEANUP] Physical position for {p} is zero. Auto-cleared manual whitelists.")
 
 
@@ -1179,9 +1186,45 @@ class StateReconciler:
 
             for gap_pair, phys_qty, v_qty, gap_qty, gap_side in gap_pairs:
 
+                # ── v4.1.5 CROSS-CYCLE ORPHAN HEAL (local, before API scan) ─────────
+                # For each gap pair, check if any bots have fills in cycles older than
+                # trades.cycle_id that are unbalanced (no matching exit).  These are
+                # invisible to standard recompute, causing a phantom gap.  Heal via
+                # seal_trade_state(cycle_floor=...) before spending API quota.
+                try:
+                    _heal_conn = get_connection()
+                    _heal_bots = _heal_conn.execute(
+                        "SELECT t.bot_id, t.cycle_id FROM trades t "
+                        "JOIN bots b ON b.id = t.bot_id "
+                        "WHERE b.normalized_pair = ? AND b.is_active = 1 AND t.cycle_id IS NOT NULL",
+                        (gap_pair,)
+                    ).fetchall()
+                    _healed_any = False
+                    for _hbot_id, _hcycle in _heal_bots:
+                        _healed = self._heal_local_crosscycle_orphans(_hbot_id, _hcycle)
+                        if _healed > 0:
+                            _healed_any = True
+                    if _healed_any:
+                        # Re-check virtual net after local heal to see if gap resolved
+                        from engine.database import get_pair_virtual_net
+                        _new_vq = get_pair_virtual_net(gap_pair)
+                        _wq_adj = merged_whitelists.get(gap_pair, 0.0)
+                        _new_gap = abs(phys_qty - _wq_adj - _new_vq)
+                        if _new_gap < 0.001:
+                            logger.info(
+                                f"[CROSSCYCLE-HEAL] ✅ {gap_pair}: gap resolved by local "
+                                f"cross-cycle heal (new_vq={_new_vq:.6f}, phys={phys_qty:.6f}). "
+                                f"Skipping exchange history API scan for this pair."
+                            )
+                            continue
+                except Exception as _ch_err:
+                    logger.error(f"[CROSSCYCLE-HEAL] {gap_pair}: pre-scan heal error (non-fatal): {_ch_err}")
+                # ─────────────────────────────────────────────────────────────────────
+
                 for mt, ex in self.exchanges.items():
 
                     if not ex: continue
+
 
                     try:
 
@@ -1415,9 +1458,11 @@ class StateReconciler:
                                     from engine.ledger import credit_fill, seal_trade_state
 
                                     _raw_otype = parts[2].upper() if len(parts) > 2 else 'GRID'
+                                    if _raw_otype == 'DUST':
+                                        _raw_otype = 'DUST_CLOSE'
                                     _heal_otype = (
                                         _raw_otype.lower()
-                                        if _raw_otype in ('ENTRY', 'GRID', 'TP', 'HEDGETP', 'HEDGE', 'DUST', 'SL', 'CLOSE')
+                                        if _raw_otype in ('ENTRY', 'GRID', 'TP', 'HEDGETP', 'HEDGE', 'DUST_CLOSE', 'SL', 'CLOSE')
                                         else 'grid'
                                     )
                                     if not gate_heal_exit_without_entry(
@@ -1467,8 +1512,10 @@ class StateReconciler:
                             else:
 
                                 raw_otype = parts[2].upper() if len(parts)>2 else 'GRID'
+                                if raw_otype == 'DUST':
+                                    raw_otype = 'DUST_CLOSE'
 
-                                otype_r = raw_otype if raw_otype in ('ENTRY','GRID','TP','HEDGETP','HEDGE','DUST') else 'GRID'
+                                otype_r = raw_otype if raw_otype in ('ENTRY','GRID','TP','HEDGETP','HEDGE','DUST_CLOSE') else 'GRID'
 
 
 
@@ -2997,7 +3044,7 @@ class StateReconciler:
 
                                             -- Including 'hedge' here causes double-subtraction.
 
-                                            WHEN order_type IN ('adoption_reduce', 'tp', 'close', 'dust_close', 'sl') THEN -filled_amount
+                                            WHEN order_type IN ('adoption_reduce', 'tp', 'close', 'dust_close', 'sl', 'flatten_close') THEN -filled_amount
 
                                             ELSE 0.0
 
@@ -3039,7 +3086,7 @@ class StateReconciler:
 
                                             -- Open TP/close orders waiting to fill
 
-                                            WHEN order_type IN ('tp', 'close', 'dust_close', 'sl', 'adoption_reduce') THEN (amount - filled_amount)
+                                            WHEN order_type IN ('tp', 'close', 'dust_close', 'sl', 'adoption_reduce', 'flatten_close') THEN (amount - filled_amount)
 
                                             ELSE 0.0
 
@@ -3740,7 +3787,7 @@ class StateReconciler:
 
                                     reason=f"STRUCTURAL_GHOST: ${b.total_invested:.2f} claimed, 0 cycle fills, 0 physical",
 
-                                    exit_price=0.0, bypass_ledger_guard=True, cursor=cursor
+                                    exit_price=0.0, bypass_ledger_guard=True, human_approved=True, cursor=cursor
 
                                 )
 
@@ -3957,7 +4004,7 @@ class StateReconciler:
 
                                     )
 
-                                safe_wipe_bot(d_bot.bot_id, d_bot.pair, d_bot.direction, reason="DUST_CHASER: Scenario A - Total Pair Wipe", exit_price=0.0, bypass_ledger_guard=True, cursor=cursor)
+                                safe_wipe_bot(d_bot.bot_id, d_bot.pair, d_bot.direction, reason="DUST_CHASER: Scenario A - Total Pair Wipe", exit_price=0.0, bypass_ledger_guard=True, human_approved=True, cursor=cursor)
 
                                 results.append(ReconciliationResult(
 
@@ -4211,11 +4258,8 @@ class StateReconciler:
                           if b.bot_status.upper() == 'REQUIRE_MANUAL_PROOF':
 
                               logger.warning(
-
                                   f"🛑 [GLOBAL-FLATTEN SKIPPED] {b.name}: Bot is in REQUIRE_MANUAL_PROOF state. "
-
                                   f"Skipping auto-wipe — human intervention required before ledger can be reset."
-
                               )
 
                               continue
@@ -4263,6 +4307,8 @@ class StateReconciler:
                               exit_price=0.0,
 
                               force=True,
+
+                              human_approved=True,
 
                               cursor=cursor
 
@@ -4592,7 +4638,7 @@ class StateReconciler:
 
                     tp_proof[claim_bot_id]['labels'].append(cid)
 
-                    if order_type_tag in ('TP', 'SL', 'STOP'):
+                    if order_type_tag in ('TP', 'SL', 'STOP', 'CLOSE', 'FLATTEN'):
 
                         tp_proof[claim_bot_id]['tp_qty'] += order_qty
 
@@ -4622,11 +4668,15 @@ class StateReconciler:
 
                                    SUM(CASE WHEN bo.order_type IN ('entry', 'grid', 'adoption_add', 'adoption') THEN bo.filled_amount ELSE 0 END) as entry_qty,
 
-                                   SUM(CASE WHEN bo.order_type IN ('tp', 'exit', 'close', 'adoption_reduce', 'dust_close', 'sl') THEN bo.filled_amount ELSE 0 END) as exit_qty
+                                   SUM(CASE WHEN bo.order_type IN ('tp', 'exit', 'close', 'adoption_reduce', 'dust_close', 'sl', 'flatten_close') THEN bo.filled_amount ELSE 0 END) as exit_qty
 
                             FROM bot_orders bo
+                            JOIN trades t ON t.bot_id = bo.bot_id
 
-                            WHERE bo.bot_id IN ({placeholders}) AND (bo.status IN ('filled','closed','auto_closed','hedge_exited','partially_filled') OR (bo.status IN ('canceled','cancelled') AND bo.filled_amount > 0)) AND bo.filled_amount > 0
+                            WHERE bo.bot_id IN ({placeholders})
+                              AND bo.cycle_id = t.cycle_id
+                              AND (bo.status IN ('filled','closed','auto_closed','hedge_exited','partially_filled') OR (bo.status IN ('cancelled','canceled') AND bo.filled_amount > 0))
+                              AND bo.filled_amount > 0
 
                             GROUP BY bo.bot_id
 
@@ -4956,9 +5006,31 @@ class StateReconciler:
 
                             _side_residual = _phys_side_qty - _virt_side_qty
 
+                            # Calculate pending reduce/close qty on this side
+                            _reduce_side = 'sell' if _orphan_side == 'LONG' else 'buy'
+                            _bots_this_side_ids = [str(b.bot_id) for b in bots if b.direction.upper() == _orphan_side]
+                            _pending_reduce_qty = 0.0
+                            if _bots_this_side_ids:
+                                for _ord in pair_open_orders:
+                                    _o_side = str(_ord.side or '').lower()
+                                    if _o_side != _reduce_side:
+                                        continue
+                                    _o_cid = str(_ord.client_order_id or '')
+                                    if not _o_cid.startswith('CQB_'):
+                                        continue
+                                    _o_parts = _o_cid.split('_')
+                                    if len(_o_parts) < 3:
+                                        continue
+                                    _o_bid = _o_parts[1]
+                                    _o_tag = _o_parts[2]
+                                    if _o_bid in _bots_this_side_ids and _o_tag in ('TP', 'SL', 'STOP', 'CLOSE', 'FLATTEN'):
+                                        _pending_reduce_qty += float(_ord.amount or 0)
+
+                            _side_residual -= _pending_reduce_qty
+
                             if _side_residual < QTY_EPSILON:
 
-                                continue  # Physical fully explained by virtual tracking
+                                continue  # Physical fully explained by virtual tracking and pending reduce orders
 
 
 
@@ -5365,7 +5437,7 @@ class StateReconciler:
 
                                     # safe_wipe_bot handles the ledger clearing correctly
 
-                                    safe_wipe_bot(d_bot.bot_id, d_bot.pair, d_bot.direction, reason=f"DUST_CHASER: Residue ${gap_notional:.2f} < ${min_notional:.2f}", force=True, cursor=cursor)
+                                    safe_wipe_bot(d_bot.bot_id, d_bot.pair, d_bot.direction, reason=f"DUST_CHASER: Residue ${gap_notional:.2f} < ${min_notional:.2f}", force=True, human_approved=True, cursor=cursor)
 
                                 continue
 
@@ -5538,7 +5610,6 @@ class StateReconciler:
                                 # (b) Bot's own TP limit order already covers the full position,
 
                                 #     so adding another reduceOnly SELL exceeds the position size.
-
                                 # In both cases, the gap is self-healing — don't block with REQUIRE_MANUAL.
 
                                 if '-2022' in str(_fe) or 'reduceonly' in str(_fe).lower() or 'reduce_only' in str(_fe).lower():
@@ -5593,7 +5664,11 @@ class StateReconciler:
 
                                                     str(o.get('clientOrderId', '')).startswith(f'CQB_{bid}_TP_') or
 
-                                                    str(o.get('clientOrderId', '')).startswith(f'CQB_{bid}_SL_')
+                                                    str(o.get('clientOrderId', '')).startswith(f'CQB_{bid}_SL_') or
+
+                                                    str(o.get('clientOrderId', '')).startswith(f'CQB_{bid}_CLOSE_') or
+
+                                                    str(o.get('clientOrderId', '')).startswith(f'CQB_{bid}_FLATTEN_CLOSE_')
 
                                                     for bid in _our_bot_ids
 
@@ -5717,6 +5792,8 @@ class StateReconciler:
                                 exit_price=0.0,
 
                                 force=True,
+
+                                human_approved=True,
 
                                 cursor=cursor
 
@@ -5912,7 +5989,11 @@ class StateReconciler:
 
                 # We need to use the exchange interface wrapper
 
-                order = ex.fetch_order(bot.entry_order_id, bot.pair)
+                if bot.entry_order_id and any(str(bot.entry_order_id).startswith(prefix) for prefix in ('PENDING_', 'PLACING_', 'GHOST_', 'VN_')):
+                    logger.info(f"🔎 [PHANTOM-CHECK] Skipping fetch_order for synthetic entry ID {bot.entry_order_id}")
+                    order = None
+                else:
+                    order = ex.fetch_order(bot.entry_order_id, bot.pair)
 
                 if order:
 
@@ -6052,11 +6133,11 @@ class StateReconciler:
             logger.error(f"❌ [AUTO-CLEAR-MANUAL-PROOF] Failed: {_clear_err}")
 
 
-        # INV-26: Per-bot hedge child ghost check
+        # INV-26: Per-bot ghost check (all active bots)
 
         try:
 
-            from engine.oneway_netting import detect_hedge_child_ghost, wipe_hedge_child_ghost
+            from engine.oneway_netting import detect_bot_ghost, wipe_bot_ghost
 
             from engine.database import get_connection
 
@@ -6066,21 +6147,21 @@ class StateReconciler:
 
             if _ex:
 
-                _hedge_children = _conn.execute(
+                _active_bots = _conn.execute(
 
-                    "SELECT id FROM bots WHERE is_active=1 AND bot_type='hedge_child'"
+                    "SELECT id FROM bots WHERE is_active=1"
 
                 ).fetchall()
 
-                for (_child_id,) in _hedge_children:
+                for (_bot_id,) in _active_bots:
 
-                    if detect_hedge_child_ghost(_ex, _child_id, _conn):
+                    if detect_bot_ghost(_ex, _bot_id, _conn):
 
-                        wipe_hedge_child_ghost(_ex, _child_id, _conn)
+                        wipe_bot_ghost(_ex, _bot_id, _conn)
 
-        except Exception as _hcg_err:
+        except Exception as _ghost_err:
 
-            logger.error(f"❌ [RECON-HEDGE-CHILD-GHOST] Failed check: {_hcg_err}")
+            logger.error(f"❌ [RECON-BOT-GHOST] Failed check: {_ghost_err}")
 
         
 
@@ -6126,8 +6207,9 @@ class StateReconciler:
 
         # Phase B: Sync pair to exchange during reconciler cycle
         try:
-            from engine.oneway_netting import sync_pair_to_exchange
+            from engine.oneway_netting import sync_pair_to_exchange, detect_unowned_exchange_positions
             from engine.database import get_connection
+            from config.settings import config as _pa_cfg
             _conn = get_connection()
             _ex = self.exchanges.get('future') or (list(self.exchanges.values())[0] if self.exchanges else None)
             if _ex:
@@ -6135,6 +6217,9 @@ class StateReconciler:
                 _active_pairs = [r[0] for r in _conn.execute("SELECT DISTINCT pair FROM bots WHERE is_active=1").fetchall()]
                 for _pair in _active_pairs:
                     sync_pair_to_exchange(_pair, _ex, _conn)
+                # Run auto-detection for unowned exchange positions
+                detect_unowned_exchange_positions(_conn, _ex)
+
         except Exception as _sync_err:
             logger.error(f"❌ [RECON-EXCHANGE-SYNC] Failed exchange sync check: {_sync_err}")
 
@@ -6196,7 +6281,7 @@ class StateReconciler:
 
             # is correctly marked with 'reset_cleared'.
 
-            safe_wipe_bot(bot_id, pair, "LONG" if "LONG" in bot_name.upper() else "SHORT", "RESET_PHANTOM_ENTRY", force=True, cursor=cursor)
+            safe_wipe_bot(bot_id, pair, "LONG" if "LONG" in bot_name.upper() else "SHORT", "RESET_PHANTOM_ENTRY", force=True, human_approved=True, cursor=cursor)
 
             
 
@@ -6940,7 +7025,7 @@ class StateReconciler:
 
                                 # 🚀 ARCHITECTURAL GATE (v2.3.7): Use safe_wipe_bot
 
-                                safe_wipe_bot(b_id, norm_pair, _bot_direction, "DNA_ALIGN_IDLE", cursor=cursor)
+                                safe_wipe_bot(b_id, norm_pair, _bot_direction, "DNA_ALIGN_IDLE", human_approved=True, cursor=cursor)
 
                             else:
 
@@ -7006,7 +7091,7 @@ class StateReconciler:
 
                                 _bot_direction = str(_dir_row[0]).upper() if _dir_row and _dir_row[0] else "LONG"
 
-                                safe_wipe_bot(b_id, norm_pair, _bot_direction, "DNA_ALIGN_RESET", cursor=cursor)
+                                safe_wipe_bot(b_id, norm_pair, _bot_direction, "DNA_ALIGN_RESET", human_approved=True, cursor=cursor)
 
                     else:
 
@@ -7096,7 +7181,118 @@ class StateReconciler:
 
 
 
+
+    def _heal_local_crosscycle_orphans(self, bot_id: int, current_cycle: int) -> int:
+        """
+        v4.1.5 — Cross-Cycle Orphan Healer.
+
+        Before the exchange history API scan, checks local bot_orders for fills
+        in cycles < current_cycle that have positive net qty (entries with no
+        matching exit in the same cycle, still status='filled').  These are fills
+        the bot acquired in an older cycle whose cycle_id != trades.cycle_id,
+        making them invisible to the standard recompute_invested_from_orders call.
+
+        Healing strategy (Approach B — non-mutating, per user decision):
+            - Identify the lowest orphaned cycle_id (cycle_floor).
+            - Call seal_trade_state(bot_id, force_recompute=True, cycle_floor=cycle_floor).
+            - seal_trade_state threads cycle_floor through WriteQueue into
+              _seal_trade_state_internal → recompute_invested_from_orders(cycle_floor=...).
+            - recompute spans [cycle_floor, trades.cycle_id], making orphaned fills visible.
+            - trades.open_qty / total_invested / avg_entry_price are corrected in a
+              single authoritative write via the normal seal path.
+
+        INV-19+ guarantee: bot_orders.cycle_id is NEVER mutated.  Historical fill
+        attribution is preserved exactly as it was written at order creation.
+
+        Returns count of orphaned cycles found and healed (0 if none).
+        """
+        conn = get_connection()
+        cursor = conn.cursor()
+
+        try:
+            orphan_cycles = cursor.execute("""
+                SELECT bo.cycle_id,
+                       SUM(CASE WHEN bo.order_type IN
+                               ('entry','grid','adoption','adoption_add','carry')
+                               THEN bo.filled_amount ELSE 0 END) AS entry_qty,
+                       SUM(CASE WHEN bo.order_type IN
+                               ('tp','close','dust_close','sl','adoption_reduce','flatten_close')
+                               THEN bo.filled_amount ELSE 0 END) AS exit_qty
+                FROM bot_orders bo
+                WHERE bo.bot_id = ?
+                  AND bo.cycle_id < ?
+                  AND bo.cycle_id IS NOT NULL
+                  AND bo.filled_amount > 0
+                  AND bo.status = 'filled'
+                GROUP BY bo.cycle_id
+                HAVING (entry_qty - exit_qty) > 1e-6
+                ORDER BY bo.cycle_id ASC
+            """, (bot_id, current_cycle)).fetchall()
+        except Exception as _qe:
+            logger.error(f"[CROSSCYCLE-HEAL] Bot {bot_id}: orphan scan query failed: {_qe}")
+            return 0
+
+        if not orphan_cycles:
+            return 0
+
+        lowest_orphan_cycle = orphan_cycles[0][0]
+        total_orphan_qty = sum(abs(float(r[1]) - float(r[2])) for r in orphan_cycles)
+        orphan_cycle_ids = [r[0] for r in orphan_cycles]
+
+        # 🚀 [v4.1.5 CROSSCYCLE HEAL AVOID DUPLICATE]
+        # Check current trades cache first to see if it is already healed.
+        # If the trades table open_qty already matches the recomputed quantity with the cycle_floor,
+        # we bypass calling seal_trade_state to avoid redundant DB writes/log pollution.
+        try:
+            curr_trade = cursor.execute("SELECT open_qty FROM trades WHERE bot_id = ?", (bot_id,)).fetchone()
+            if curr_trade:
+                curr_qty = float(curr_trade[0] or 0.0)
+                from engine.database import recompute_invested_from_orders
+                _, _, healed_qty, _ = recompute_invested_from_orders(bot_id, cycle_floor=lowest_orphan_cycle)
+                if abs(curr_qty - healed_qty) < 1e-6:
+                    return 0
+        except Exception as _check_err:
+            logger.warning(f"[CROSSCYCLE-HEAL] Bot {bot_id}: already-healed check failed: {_check_err}")
+
+        logger.critical(
+            f"[CROSSCYCLE-HEAL] ⚠️ Bot {bot_id}: {len(orphan_cycles)} cross-cycle orphan "
+            f"cycle(s) detected: {orphan_cycle_ids}. "
+            f"Total uncredited qty={total_orphan_qty:.6f}. "
+            f"Healing via seal_trade_state(cycle_floor={lowest_orphan_cycle})."
+        )
+
+        try:
+            from engine.ledger import seal_trade_state
+            result = seal_trade_state(
+                bot_id,
+                force_recompute=True,
+                cycle_floor=lowest_orphan_cycle,
+            )
+            if result:
+                logger.info(
+                    f"[CROSSCYCLE-HEAL] ✅ Bot {bot_id}: seal complete — "
+                    f"open_qty={result.get('qty', '?'):.6f} "
+                    f"cost={result.get('cost', '?'):.4f} "
+                    f"avg={result.get('avg', '?'):.4f} "
+                    f"step={result.get('step', '?')} "
+                    f"(cycles {lowest_orphan_cycle}..{current_cycle} included)."
+                )
+            else:
+                logger.warning(
+                    f"[CROSSCYCLE-HEAL] Bot {bot_id}: seal_trade_state returned empty "
+                    f"result. Orphan may not be fully healed — check SEAL logs."
+                )
+        except Exception as _seal_err:
+            logger.error(
+                f"[CROSSCYCLE-HEAL] Bot {bot_id}: seal_trade_state failed: {_seal_err}. "
+                f"Orphan cycles {orphan_cycle_ids} remain unhealed."
+            )
+            return 0
+
+        return len(orphan_cycles)
+
     def perform_forensic_reconstruction(self, pair: str) -> dict:
+
 
         """
 
@@ -7450,7 +7646,7 @@ class StateReconciler:
 
                     # Adoption loop remains bot-specific, but uses the ticker-wide grouped_fills
 
-                    sys_orders = cursor.execute("SELECT id, order_id, client_order_id, order_type, price, amount, filled_amount, status, step FROM bot_orders WHERE bot_id=? AND status NOT IN ('cancelled','canceled','reset_cleared', 'failed', 'rejected', 'auto_closed', 'audit') AND client_order_id LIKE ?", (bot_id, dna_prefix + "%")).fetchall()
+                    sys_orders = cursor.execute("SELECT id, order_id, client_order_id, order_type, price, amount, filled_amount, status, step FROM bot_orders WHERE bot_id=? AND status NOT IN ('cancelled','canceled','reset_cleared', 'failed', 'rejected', 'auto_closed', 'audit', 'pending_placement') AND client_order_id LIKE ?", (bot_id, dna_prefix + "%")).fetchall()
 
                     for row in sys_orders:
 
@@ -7458,7 +7654,11 @@ class StateReconciler:
 
                             try:
 
-                                ex_order = ex.fetch_order(row[1], symbol)
+                                if row[1] and any(str(row[1]).startswith(prefix) for prefix in ('PENDING_', 'PLACING_', 'GHOST_', 'VN_')):
+                                    logger.info(f"🔎 [ADOPT-SCAN] Skipping fetch_order for synthetic order ID {row[1]}")
+                                    ex_order = None
+                                else:
+                                    ex_order = ex.fetch_order(row[1], symbol)
 
                                 ex_f = float(ex_order.get('filled') or 0)
                                 if ex_f > 0:
@@ -7593,7 +7793,7 @@ class StateReconciler:
                         SELECT COALESCE(SUM(filled_amount), 0.0)
                         FROM bot_orders
                         WHERE bot_id=? AND filled_amount > 0
-                        AND order_type IN ('tp','close','exit','adoption_reduce','dust_close','sl')
+                        AND order_type IN ('tp','close','exit','adoption_reduce','dust_close','sl','flatten_close')
                     """, (bot_id,)).fetchone()[0] or 0.0
 
 
@@ -8081,11 +8281,13 @@ class StateReconciler:
 
                                     for b_info in bots_on_ticker:
 
+                                        sym_short = symbol.split(':')[0].replace('/', '')[:7]
+
                                         _note_cid = (
 
-                                            f"CQB_{b_info['bot_id']}_DRIFT_"
+                                            f"CQB_{b_info['bot_id']}_DF_"
 
-                                            f"{symbol.replace('/','').replace(':','')}_{_drift_ts}"
+                                            f"{sym_short}_{_drift_ts}"
 
                                         )
 

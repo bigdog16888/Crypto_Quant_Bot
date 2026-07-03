@@ -51,6 +51,15 @@ dist/
 # Scratch investigation scripts (not deployable source)
 scratch/
 
+# AI tool artifacts
+.gemini/
+
+# Editor backups
+*.bak
+
+# Ephemeral pytest cache dirs
+pytest-cache-files-*/
+
 # Backup snapshots
 backups/
 

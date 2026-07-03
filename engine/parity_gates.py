@@ -98,8 +98,9 @@ def gate_heal_exit_without_entry(bot_id: int, order_type: str, proposed_qty: flo
     """
     otype = (order_type or '').lower()
     exit_types = frozenset({
-        'tp', 'close', 'dust_close', 'sl', 'virtual_netting',
+        'tp', 'close', 'dust_close', 'sl',
         'adoption_reduce', 'forensic_adoption_reduce', 'hedgetp',
+        'flatten_close',
     })
     if otype not in exit_types:
         return True

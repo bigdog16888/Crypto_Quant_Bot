@@ -89,6 +89,10 @@ class TestHedgeGhostDetection(unittest.TestCase):
             client_order_id='CQB_99001_ENTRY_1_ETH', cycle_id=1
         )
         save_bot_order(
+            99001, 'tp', 'ORDER_1B_ETH', price=1750.0, amount=0.415, step=1, status='filled',
+            client_order_id='CQB_99001_TP_1B_ETH', cycle_id=1
+        )
+        save_bot_order(
             99001, 'tp', 'ORDER_2_ETH', price=1750.0, amount=0.415, step=0, status='open',
             client_order_id='CQB_99001_TP_1_ETH', cycle_id=1
         )
@@ -165,22 +169,30 @@ class TestHedgeGhostDetection(unittest.TestCase):
 
         mock_exchange = MagicMock()
         # Case A: Child is a ghost.
-        # Parent = 0.028 LONG, Other standard = 0.042 SHORT
-        # Expected exchange net if child is gone = 0.028 + (-0.042) = -0.014
-        with patch('engine.parity_gates.get_exchange_signed_net', return_value=-0.014), \
-             patch('engine.parity_gates.qty_tolerance', return_value=0.0001):
-            
-            is_ghost = detect_hedge_child_ghost(mock_exchange, 99001, self.conn)
-            self.assertTrue(is_ghost)
+        # Seed matching entry and exit fills to sum to 0.0
+        save_bot_order(
+            99001, 'entry', 'ORDER_G1_ETH', price=1800.0, amount=0.415, step=1, status='filled',
+            client_order_id='CQB_99001_GENTRY_1_ETH', cycle_id=1
+        )
+        save_bot_order(
+            99001, 'tp', 'ORDER_G2_ETH', price=1750.0, amount=0.415, step=1, status='filled',
+            client_order_id='CQB_99001_GTP_1_ETH', cycle_id=1
+        )
+        
+        is_ghost = detect_hedge_child_ghost(mock_exchange, 99001, self.conn)
+        self.assertTrue(is_ghost)
 
         # Case B: Child is NOT a ghost.
-        # Parent = 0.028 LONG, Child = 0.415 SHORT, Other standard = 0.042 SHORT
-        # Expected exchange net = 0.028 - 0.415 - 0.042 = -0.429
-        with patch('engine.parity_gates.get_exchange_signed_net', return_value=-0.429), \
-             patch('engine.parity_gates.qty_tolerance', return_value=0.0001):
-            
-            is_ghost = detect_hedge_child_ghost(mock_exchange, 99001, self.conn)
-            self.assertFalse(is_ghost)
+        # Clear/wipe orders for this bot and seed only entry fill so it recomputes to 0.415
+        self.conn.execute("DELETE FROM bot_orders WHERE bot_id=99001")
+        self.conn.commit()
+        save_bot_order(
+            99001, 'entry', 'ORDER_L1_ETH', price=1800.0, amount=0.415, step=1, status='filled',
+            client_order_id='CQB_99001_LENTRY_1_ETH', cycle_id=1
+        )
+        
+        is_ghost = detect_hedge_child_ghost(mock_exchange, 99001, self.conn)
+        self.assertFalse(is_ghost)
 
 
 class TestMissedBETPSelfHealing(unittest.TestCase):

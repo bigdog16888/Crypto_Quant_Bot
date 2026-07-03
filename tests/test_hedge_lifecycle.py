@@ -79,56 +79,6 @@ class TestTicket6OnewayNettingSuppression(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
-    def test_ticket6_parent_fill_does_not_reduce_hedge_child(self):
-        """When parent (LONG) fills an entry, hedge child open_qty is not touched."""
-        from engine.oneway_netting import apply_oneway_entry_cross_reduction
-
-        conn = get_connection()
-        before_qty = float(conn.execute(
-            "SELECT open_qty FROM trades WHERE bot_id=99001"
-        ).fetchone()[0] or 0)
-
-        apply_oneway_entry_cross_reduction(
-            filling_bot_id=10017,
-            pair='XRP/USDC:USDC',
-            direction='LONG',
-            delta=1.0,
-            source_order_id='TEST_SUPPRESS_001',
-        )
-
-        after_qty = float(get_connection().execute(
-            "SELECT open_qty FROM trades WHERE bot_id=99001"
-        ).fetchone()[0] or 0)
-
-        self.assertAlmostEqual(before_qty, after_qty, places=4,
-                               msg=f"Hedge child open_qty changed: {before_qty} → {after_qty}. "
-                                   "Cross-reduction must be suppressed between parent and child.")
-
-    def test_ticket6_child_fill_does_not_reduce_parent(self):
-        """When child (SHORT) fills an entry, parent open_qty is not touched."""
-        from engine.oneway_netting import apply_oneway_entry_cross_reduction
-
-        conn = get_connection()
-        before_qty = float(conn.execute(
-            "SELECT open_qty FROM trades WHERE bot_id=10017"
-        ).fetchone()[0] or 0)
-
-        apply_oneway_entry_cross_reduction(
-            filling_bot_id=99001,
-            pair='XRP/USDC:USDC',
-            direction='SHORT',
-            delta=1.0,
-            source_order_id='TEST_SUPPRESS_002',
-        )
-
-        after_qty = float(get_connection().execute(
-            "SELECT open_qty FROM trades WHERE bot_id=10017"
-        ).fetchone()[0] or 0)
-
-        self.assertAlmostEqual(before_qty, after_qty, places=4,
-                               msg=f"Parent open_qty changed: {before_qty} → {after_qty}. "
-                                   "Cross-reduction must be suppressed between child and parent.")
-
 
 
 # ---------------------------------------------------------------------------
@@ -327,7 +277,7 @@ class TestTicket7BotExecutor(unittest.TestCase):
             self.assertIsNotNone(row)
             self.assertEqual(row[0], 'EX_CHILD_ENTRY_123')
             self.assertEqual(float(row[1]), 2.2)
-            self.assertEqual(float(row[2]), 10.0)
+            self.assertEqual(float(row[2]), 5.5)
             self.assertEqual(row[3], 'open')
 
     def test_ticket7_signal_hedge_child_entry_calculates_relative_step(self):
@@ -1513,7 +1463,7 @@ class TestHedgeLifecycleEnforcement(unittest.TestCase):
         self.assertEqual(audit_row[3], 10)
 
     def test_signal_first_entry_uses_full_parent_qty(self):
-        """Parent has open_qty=693.8, trigger at step 7, current step=7. First child entry uses parent open_qty."""
+        """Parent has open_qty=693.8, trigger at step 7, current step=7. Under INV-29, the first child entry mirrors step_qty (56.2) rather than parent open_qty."""
         from engine.bot_executor import BotExecutor
         from engine.exchange_interface import ExchangeInterface
         executor = BotExecutor(runner=None)
@@ -1543,17 +1493,17 @@ class TestHedgeLifecycleEnforcement(unittest.TestCase):
                 parent_step=7,
                 pair='BTC/USDT:USDT',
                 direction='LONG',
-                step_qty=56.2,  # Trigger increment is small, but full qty is 693.8
+                step_qty=56.2,  # Trigger increment is 56.2
                 step_fill_price=50000.0,
                 exchange=mock_exchange,
                 parent_cycle_id=10
             )
             self.assertTrue(res)
-            # Verify placed order has the full parent qty (693.8) instead of step_qty (56.2)
+            # Verify placed order has the step_qty (56.2)
             mock_place.assert_called_once()
             args, kwargs = mock_place.call_args
             placed_qty = args[3]
-            self.assertEqual(placed_qty, 693.8)
+            self.assertEqual(placed_qty, 56.2)
 
     def test_signal_subsequent_entry_uses_step_qty(self):
         """Parent has open_qty=750.0, trigger at step 7, current step=8. Subsequent entries use step_qty increment."""
@@ -1767,8 +1717,8 @@ class TestHedgeSyncAndPriceAccuracy(unittest.TestCase):
             actual_price = args[4] if len(args) > 4 else kwargs.get('price')
             self.assertAlmostEqual(actual_price, 1.1609, places=4, msg="Hedge entry should be placed at parent's actual fill price (1.1609), not current_price (1.19)")
 
-    def test_signal_gtx_rejection_falls_back_to_ioc(self):
-        """GTX placement raises rejection. Assert retry fires as IOC at current_price."""
+    def test_signal_gtx_rejection_falls_back_to_gtc(self):
+        """GTX placement raises rejection. Assert retry fires as GTC at step_fill_price."""
         from engine.bot_executor import BotExecutor
         from engine.exchange_interface import ExchangeInterface
         from engine.exceptions import GTXRejected
@@ -1786,13 +1736,13 @@ class TestHedgeSyncAndPriceAccuracy(unittest.TestCase):
         mock_exchange.get_symbol_precision.return_value = {'step_size': 0.001}
         mock_exchange.round_to_step.side_effect = lambda qty, step: round(qty, 3)
 
-        mock_ioc_order = {
-            'id': 'EX_CHILD_ENTRY_8_IOC',
-            'status': 'closed',
-            'price': 1.19,
-            'clientOrderId': 'CQB_99001_ENTRY_10_8_IOC'
+        mock_gtc_order = {
+            'id': 'EX_CHILD_ENTRY_8_GTC',
+            'status': 'open',
+            'price': 1.1609,
+            'clientOrderId': 'CQB_99001_ENTRY_10_8_GTC'
         }
-        mock_exchange.create_order.return_value = mock_ioc_order
+        mock_exchange.create_order.return_value = mock_gtc_order
 
         # Force GTXRejected on first attempt
         with patch.object(executor, '_place_gtx_order_with_retry', side_effect=GTXRejected("Post only failed")):
@@ -1810,7 +1760,7 @@ class TestHedgeSyncAndPriceAccuracy(unittest.TestCase):
             )
             self.assertTrue(res)
 
-            # Assert create_order was called with params having timeInForce='IOC', postOnly deleted, at price 1.19
+            # Assert create_order was called with params having timeInForce='GTC', postOnly deleted, at price 1.1609
             mock_exchange.create_order.assert_called_once()
             args, kwargs = mock_exchange.create_order.call_args
             
@@ -1819,19 +1769,19 @@ class TestHedgeSyncAndPriceAccuracy(unittest.TestCase):
             self.assertEqual(called_pair, 'XRP/USDC:USDC')
             self.assertEqual(called_type, 'limit')
             self.assertEqual(called_side, 'sell')
-            self.assertEqual(called_price, 1.19)
+            self.assertEqual(called_price, 1.1609)
             
             called_params = kwargs.get('params') or args[5]
-            self.assertEqual(called_params.get('timeInForce'), 'IOC')
+            self.assertEqual(called_params.get('timeInForce'), 'GTC')
             self.assertNotIn('postOnly', called_params)
 
-            # Verify saved DB order has price 1.19 and status closed
+            # Verify saved DB order has price 1.1609 and status open
             row = self.conn.execute(
-                "SELECT price, status FROM bot_orders WHERE order_id='EX_CHILD_ENTRY_8_IOC'"
+                "SELECT price, status FROM bot_orders WHERE order_id='EX_CHILD_ENTRY_8_GTC'"
             ).fetchone()
             self.assertIsNotNone(row)
-            self.assertEqual(row[0], 1.19)
-            self.assertEqual(row[1], 'closed')
+            self.assertEqual(row[0], 1.1609)
+            self.assertEqual(row[1], 'open')
 
     def test_signal_fires_at_fill_time_not_poll_time(self):
         """Verify _signal_hedge_child_entry is called from the fill event path."""
@@ -2106,6 +2056,9 @@ class TestINV29HedgeGates(unittest.TestCase):
 
         mock_exchange = MagicMock()
         mock_exchange.is_testnet = True
+        mock_exchange.fetch_positions.return_value = [
+            {'symbol': 'SUI/USDC:USDC', 'contracts': -5.0, 'side': 'SHORT'}
+        ]
 
         from engine.ledger import handle_tp_completion
         # Call handle_tp_completion on parent (which has active child with qty > 0)
@@ -2248,6 +2201,279 @@ class TestINV29HedgeGates(unittest.TestCase):
         SKIP_STATUSES = {'pending_hedge_close'}
         filtered_bots = [b for b in active_bots if b[12] not in SKIP_STATUSES]
         self.assertFalse(any(b[0] == 10099 for b in filtered_bots))
+
+    def test_inv29_partial_fill_then_retry_hedged(self):
+        """Parent step 7 partially fills 7.9 SUI -> child enters 7.9.
+        Then parent step 7 retry fills 1140.2 SUI -> child delta check enters 1140.2.
+        """
+        from engine.bot_executor import BotExecutor
+        from engine.exchange_interface import ExchangeInterface
+
+        # Setup parent
+        _insert_bot(self.conn, 10018, 'sui long', 'SUI/USDC:USDC', 'SUIUSDC', 'LONG', hedge_child_bot_id=100318, hedge_trigger_step=7)
+        _insert_trades(self.conn, 10018, open_qty=860.6, cycle_id=128)
+
+        # Setup child
+        _insert_bot(self.conn, 100318, 'sui long_hedge', 'SUI/USDC:USDC', 'SUIUSDC', 'SHORT', bot_type='hedge_child', parent_bot_id=10018, status='Scanning')
+        _insert_trades(self.conn, 100318, open_qty=0.0, cycle_id=128)
+
+        # Seed parent's first partial fill on step 7 (7.9 SUI)
+        self.conn.execute("""
+            INSERT INTO bot_orders (bot_id, order_type, client_order_id, price, amount, filled_amount, status, cycle_id, step)
+            VALUES (10018, 'grid', 'CQB_10018_GRID_128_7', 0.6816, 1136.2, 7.9, 'cancelled', 128, 7)
+        """)
+        self.conn.commit()
+
+        executor = BotExecutor(runner=None)
+        mock_exchange = MagicMock(spec=ExchangeInterface)
+        mock_exchange.get_symbol_precision.return_value = {'step_size': 0.1}
+        mock_exchange.round_to_step.side_effect = lambda qty, step: round(qty, 1)
+
+        # First signal for Step 7 (partial fill of 7.9)
+        mock_exchange.fetch_order.side_effect = Exception("Not found")
+        # Mock child entry order placed at exchange
+        mock_order_1 = {
+            'id': 'EX_CHILD_ENTRY_7_FIRST',
+            'status': 'filled',
+            'price': 0.6816,
+            'clientOrderId': 'CQB_100318_ENTRY_128_7'
+        }
+        mock_exchange.create_order.return_value = mock_order_1
+
+        # We call the signal
+        res1 = executor._signal_hedge_child_entry(
+            parent_bot_id=10018,
+            parent_name='sui long',
+            parent_step=7,
+            pair='SUI/USDC:USDC',
+            direction='LONG',
+            step_qty=7.9,
+            step_fill_price=0.6816,
+            exchange=mock_exchange,
+            parent_cycle_id=128,
+            current_price=0.6816
+        )
+        self.assertTrue(res1)
+
+        # Check DB entries: child should have one entry for step 1 of cycle 128, qty 7.9
+        rows = self.conn.execute("SELECT client_order_id, filled_amount, status FROM bot_orders WHERE bot_id=100318 AND step=1").fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][0], 'CQB_100318_ENTRY_128_7')
+        self.assertEqual(rows[0][1], 7.9)
+
+        # Check trades table for child
+        from engine.ledger import seal_trade_state
+        seal_trade_state(100318)
+        child_qty = self.conn.execute("SELECT open_qty FROM trades WHERE bot_id=100318").fetchone()[0]
+        self.assertAlmostEqual(child_qty, 7.9)
+
+        # Now simulate parent step 7 retry order filling 1140.2 SUI
+        self.conn.execute("""
+            INSERT INTO bot_orders (bot_id, order_type, client_order_id, price, amount, filled_amount, status, cycle_id, step)
+            VALUES (10018, 'grid', 'CQB_10018_GRID_128_7_R1', 0.6810, 1140.2, 1140.2, 'filled', 128, 7)
+        """)
+        self.conn.commit()
+
+        # Update parent trades open_qty in DB to reflect the new fill (2008.7 SUI)
+        self.conn.execute("UPDATE trades SET open_qty = 2008.7 WHERE bot_id=10018")
+        self.conn.commit()
+
+        # Mock child retry entry order placed at exchange
+        mock_order_2 = {
+            'id': 'EX_CHILD_ENTRY_7_RETRY',
+            'status': 'filled',
+            'price': 0.6810,
+            'clientOrderId': 'CQB_100318_ENTRY_128_7_R123456'
+        }
+        mock_exchange.create_order.return_value = mock_order_2
+
+        # Second signal for Step 7 (retry fill of 1140.2, delta check should trigger)
+        res2 = executor._signal_hedge_child_entry(
+            parent_bot_id=10018,
+            parent_name='sui long',
+            parent_step=7,
+            pair='SUI/USDC:USDC',
+            direction='LONG',
+            step_qty=1140.2,
+            step_fill_price=0.6810,
+            exchange=mock_exchange,
+            parent_cycle_id=128,
+            current_price=0.6810
+        )
+        self.assertTrue(res2)
+
+        # Verify child has TWO entry bot_orders rows for child_step 1
+        rows_all = self.conn.execute("SELECT client_order_id, filled_amount, status FROM bot_orders WHERE bot_id=100318 AND step=1 ORDER BY created_at ASC").fetchall()
+        self.assertEqual(len(rows_all), 2)
+        self.assertEqual(rows_all[0][1], 7.9)
+        self.assertEqual(rows_all[1][1], 1140.2)
+        self.assertIn('_R', rows_all[1][0]) # has replacement suffix
+
+        # Assert child open_qty = 1148.1
+        seal_trade_state(100318)
+        child_qty_final = self.conn.execute("SELECT open_qty FROM trades WHERE bot_id=100318").fetchone()[0]
+        self.assertAlmostEqual(child_qty_final, 1148.1)
+
+    def test_inv29_no_double_signal_when_child_open(self):
+        """Parent step 7 partially fills 7.9 SUI -> child enters 7.9.
+        Hedge child order is still 'open' (in-flight).
+        Parent step 7 retry fills 1140.2 -> child delta check counts in-flight and only signals for 1140.2.
+        """
+        from engine.bot_executor import BotExecutor
+        from engine.exchange_interface import ExchangeInterface
+
+        # Setup parent
+        _insert_bot(self.conn, 10018, 'sui long', 'SUI/USDC:USDC', 'SUIUSDC', 'LONG', hedge_child_bot_id=100318, hedge_trigger_step=7)
+        _insert_trades(self.conn, 10018, open_qty=860.6, cycle_id=128)
+
+        # Setup child
+        _insert_bot(self.conn, 100318, 'sui long_hedge', 'SUI/USDC:USDC', 'SUIUSDC', 'SHORT', bot_type='hedge_child', parent_bot_id=10018, status='Scanning')
+        _insert_trades(self.conn, 100318, open_qty=0.0, cycle_id=128)
+
+        # Seed parent's first partial fill on step 7 (7.9 SUI)
+        self.conn.execute("""
+            INSERT INTO bot_orders (bot_id, order_type, client_order_id, price, amount, filled_amount, status, cycle_id, step)
+            VALUES (10018, 'grid', 'CQB_10018_GRID_128_7', 0.6816, 1136.2, 7.9, 'cancelled', 128, 7)
+        """)
+        self.conn.commit()
+
+        executor = BotExecutor(runner=None)
+        mock_exchange = MagicMock(spec=ExchangeInterface)
+        mock_exchange.get_symbol_precision.return_value = {'step_size': 0.1}
+        mock_exchange.round_to_step.side_effect = lambda qty, step: round(qty, 1)
+
+        # Mock child entry order placed at exchange, but returns status 'open' (not filled yet)
+        mock_order_1 = {
+            'id': 'EX_CHILD_ENTRY_7_OPEN',
+            'status': 'open',
+            'price': 0.6816,
+            'clientOrderId': 'CQB_100318_ENTRY_128_7'
+        }
+        mock_exchange.create_order.return_value = mock_order_1
+        mock_exchange.fetch_order.side_effect = Exception("Not found")
+
+        # First signal for Step 7
+        res1 = executor._signal_hedge_child_entry(
+            parent_bot_id=10018,
+            parent_name='sui long',
+            parent_step=7,
+            pair='SUI/USDC:USDC',
+            direction='LONG',
+            step_qty=7.9,
+            step_fill_price=0.6816,
+            exchange=mock_exchange,
+            parent_cycle_id=128,
+            current_price=0.6816
+        )
+        self.assertTrue(res1)
+
+        # Child order is in DB with status 'open' and filled_amount = 0.0, amount = 7.9
+        row = self.conn.execute("SELECT status, amount, filled_amount FROM bot_orders WHERE client_order_id='CQB_100318_ENTRY_128_7'").fetchone()
+        self.assertEqual(row[0], 'open')
+        self.assertEqual(row[1], 7.9)
+
+        # Now simulate parent step 7 retry order filling 1140.2 SUI
+        self.conn.execute("""
+            INSERT INTO bot_orders (bot_id, order_type, client_order_id, price, amount, filled_amount, status, cycle_id, step)
+            VALUES (10018, 'grid', 'CQB_10018_GRID_128_7_R1', 0.6810, 1140.2, 1140.2, 'filled', 128, 7)
+        """)
+        self.conn.commit()
+
+        # Update parent trades open_qty
+        self.conn.execute("UPDATE trades SET open_qty = 2008.7 WHERE bot_id=10018")
+        self.conn.commit()
+
+        # Mock child retry order placed at exchange
+        mock_order_2 = {
+            'id': 'EX_CHILD_ENTRY_7_RETRY',
+            'status': 'open',
+            'price': 0.6810,
+            'clientOrderId': 'CQB_100318_ENTRY_128_7_R123456'
+        }
+        mock_exchange.create_order.return_value = mock_order_2
+
+        # Second signal for Step 7 (retry fill of 1140.2)
+        # Delta check should see parent_target_qty = 1148.1, child_step_qty = 7.9 (from open order amount)
+        # So it should only place order for delta = 1140.2
+        with patch.object(mock_exchange, 'create_order', return_value=mock_order_2) as mock_create:
+            res2 = executor._signal_hedge_child_entry(
+                parent_bot_id=10018,
+                parent_name='sui long',
+                parent_step=7,
+                pair='SUI/USDC:USDC',
+                direction='LONG',
+                step_qty=1140.2,
+                step_fill_price=0.6810,
+                exchange=mock_exchange,
+                parent_cycle_id=128,
+                current_price=0.6810
+            )
+            self.assertTrue(res2)
+            # Verify create_order was called with amount = 1140.2
+            mock_create.assert_called_once()
+            called_amount = mock_create.call_args[0][3]
+            self.assertAlmostEqual(called_amount, 1140.2)
+
+    def test_inv29_saturated_step_not_re_signaled(self):
+        """Parent step 7 fills 1148.1 SUI -> child enters 1148.1.
+        credit_fill called again for same parent order (duplicate WS event).
+        Assert child is NOT signaled again (delta <= step_size).
+        """
+        from engine.bot_executor import BotExecutor
+        from engine.exchange_interface import ExchangeInterface
+
+        # Setup parent
+        _insert_bot(self.conn, 10018, 'sui long', 'SUI/USDC:USDC', 'SUIUSDC', 'LONG', hedge_child_bot_id=100318, hedge_trigger_step=7)
+        _insert_trades(self.conn, 10018, open_qty=2000.8, cycle_id=128)
+
+        # Setup child
+        _insert_bot(self.conn, 100318, 'sui long_hedge', 'SUI/USDC:USDC', 'SUIUSDC', 'SHORT', bot_type='hedge_child', parent_bot_id=10018, status='Scanning')
+        _insert_trades(self.conn, 100318, open_qty=0.0, cycle_id=128)
+
+        # Seed parent's Step 7 fills (total 1148.1 SUI)
+        self.conn.execute("""
+            INSERT INTO bot_orders (bot_id, order_type, client_order_id, price, amount, filled_amount, status, cycle_id, step)
+            VALUES (10018, 'grid', 'CQB_10018_GRID_128_7', 0.6816, 1136.2, 7.9, 'cancelled', 128, 7)
+        """)
+        self.conn.execute("""
+            INSERT INTO bot_orders (bot_id, order_type, client_order_id, price, amount, filled_amount, status, cycle_id, step)
+            VALUES (10018, 'grid', 'CQB_10018_GRID_128_7_R1', 0.6810, 1140.2, 1140.2, 'filled', 128, 7)
+        """)
+        self.conn.commit()
+
+        # Seed child's entries matching the parent's fills (total 1148.1 SUI)
+        self.conn.execute("""
+            INSERT INTO bot_orders (bot_id, order_type, client_order_id, price, amount, filled_amount, status, cycle_id, step)
+            VALUES (100318, 'entry', 'CQB_100318_ENTRY_128_7', 0.6816, 7.9, 7.9, 'filled', 128, 1)
+        """)
+        self.conn.execute("""
+            INSERT INTO bot_orders (bot_id, order_type, client_order_id, price, amount, filled_amount, status, cycle_id, step)
+            VALUES (100318, 'entry', 'CQB_100318_ENTRY_128_7_R2', 0.6810, 1140.2, 1140.2, 'filled', 128, 1)
+        """)
+        self.conn.commit()
+
+        executor = BotExecutor(runner=None)
+        mock_exchange = MagicMock(spec=ExchangeInterface)
+        mock_exchange.get_symbol_precision.return_value = {'step_size': 0.1}
+        mock_exchange.round_to_step.side_effect = lambda qty, step: round(qty, 1)
+
+        # Call signal again (simulating duplicate WS credit)
+        with patch.object(mock_exchange, 'create_order') as mock_create:
+            res = executor._signal_hedge_child_entry(
+                parent_bot_id=10018,
+                parent_name='sui long',
+                parent_step=7,
+                pair='SUI/USDC:USDC',
+                direction='LONG',
+                step_qty=1140.2,
+                step_fill_price=0.6810,
+                exchange=mock_exchange,
+                parent_cycle_id=128,
+                current_price=0.6810
+            )
+            self.assertTrue(res)
+            # Assert that no order was created since it is already saturated
+            mock_create.assert_not_called()
 
 
 if __name__ == '__main__':

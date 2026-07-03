@@ -126,7 +126,7 @@ def _check_position_match(exchanges: Dict[str, ExchangeInterface]):
         cursor.execute("""
             SELECT b.pair, b.direction, 
                    SUM(CASE WHEN bo.order_type IN ('entry','grid','adoption','adoption_entry') THEN bo.filled_amount
-                            WHEN bo.order_type IN ('tp','close','adoption_reduce') THEN -bo.filled_amount
+                            WHEN bo.order_type IN ('tp','close','adoption_reduce','sl','dust_close','flatten_close') THEN -bo.filled_amount
                             ELSE 0 END) as net_qty
             FROM bots b
             LEFT JOIN bot_orders bo ON b.id = bo.bot_id 

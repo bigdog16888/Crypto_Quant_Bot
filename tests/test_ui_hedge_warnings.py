@@ -275,3 +275,94 @@ def test_ui_hedge_child_ee_status():
     assert "🔥" in parent_info['EE_Status']
     # Child (hedge child bot) should show parent TP pending
     assert child_info['EE_Status'] == "⏳ Parent TP pending"
+
+
+def test_health_check_flags_missing_tp_even_with_active_grid():
+    # Simulate a bot IN TRADE that has a grid order but no TP order
+    df_pos_f = pd.DataFrame([
+        {
+            'id': 10011,
+            'name': "eth",
+            'status': "IN TRADE",
+            'bot_type': 'standard',
+            'parent_bot_id': None,
+            'parent_name': None,
+            'total_invested': 18.94,
+            'cycle_phase': 'ACTIVE',
+            'current_step': 1,
+            'direction': 'SHORT',
+            'pair': 'ETH/USDC:USDC',
+            'config': '{}'
+        }
+    ])
+
+    hedged_bot_ids = set()
+
+    # Active orders from the exchange has only grid, no TP
+    market_orders_f = [
+        {
+            'clientOrderId': 'CQB_10011_GRID_122_2',
+            'order_type': 'grid',
+            'id': '111095'
+        }
+    ]
+
+    physical_orders_for_bot = {}
+    physical_order_counts = {}
+    for o in market_orders_f:
+        cid = str(o.get('clientOrderId') or '')
+        if cid.startswith('CQB_'):
+            try:
+                parts = cid.split('_')
+                if len(parts) >= 2:
+                    bid_parsed = int(parts[1])
+                    physical_order_counts[bid_parsed] = physical_order_counts.get(bid_parsed, 0) + 1
+                    if bid_parsed not in physical_orders_for_bot:
+                        physical_orders_for_bot[bid_parsed] = []
+                    physical_orders_for_bot[bid_parsed].append(o)
+            except: pass
+
+    bots_with_missing_orders = []
+    bots_with_no_exit_orders = []
+    critical_gap_type = None
+
+    for _, row in df_pos_f.iterrows():
+        bid, bot_inv, c_step = int(row['id']), float(row['total_invested'] or 0), int(row.get('current_step', 0))
+        actual_ph = physical_order_counts.get(bid, 0)
+        bot_status = str(row.get('status',''))
+        
+        if "EXITING" in bot_status.upper() or ("SCANNING" in bot_status.upper() and bot_inv <= 0.01):
+            continue
+             
+        cycle_phase = str(row.get('cycle_phase', 'IDLE')).upper()
+
+        if bid not in hedged_bot_ids:
+            has_tp = any(
+                o for o in physical_orders_for_bot.get(bid, [])
+                if o.get('order_type') == 'tp' or 'TP' in str(o.get('clientOrderId') or '')
+            )
+            if not has_tp and bot_inv > 0.01 and bot_status == 'IN TRADE':
+                bots_with_no_exit_orders.append(row['name'])
+                bots_with_missing_orders.append(row['name'])
+                critical_gap_type = 'NO_TP'
+
+        if bid in hedged_bot_ids:
+            if cycle_phase == 'HEDGE_EXIT_PENDING' and actual_ph == 0:
+                bots_with_missing_orders.append(row['name'])
+        elif cycle_phase == 'MARGIN_HELD':
+            pass
+        else:
+            is_missing = False
+            if actual_ph == 0 and bot_inv > 0.01 and cycle_phase != 'CARRY_PENDING' and critical_gap_type != 'NO_TP':
+                is_missing = True
+            if is_missing:
+                bots_with_missing_orders.append(row['name'])
+
+    assert len(bots_with_no_exit_orders) == 1
+    assert bots_with_no_exit_orders[0] == "eth"
+    assert len(bots_with_missing_orders) == 1
+    assert bots_with_missing_orders[0] == "eth"
+    assert critical_gap_type == 'NO_TP'
+
+
+

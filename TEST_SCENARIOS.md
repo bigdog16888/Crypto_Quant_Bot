@@ -1,7 +1,7 @@
 # TEST_SCENARIOS.md — ADR-002 Hedge Child Bot
 **Version:** 1.0  
 **Target:** v3.6.0  
-**Companion to:** ADR_002_hedge_child_bot.md, TICKETS.md
+**Companion to:** docs/adr/ADR_002_hedge_child_bot.md, TICKETS.md
 
 Run these scenarios after all 10 tickets pass individually.
 Each scenario is a complete end-to-end lifecycle check.
