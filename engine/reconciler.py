@@ -472,6 +472,102 @@ class StateReconciler:
         except Exception as err:
             logger.error(f"Error in continuous fill audit: {err}")
 
+    def _audit_pending_grids(self) -> None:
+        """
+        Continuous Grid Audit:
+        Checks for active bots with pending/new grid or entry orders that filled on the exchange
+        but were missed by the WebSocket. Caps REST calls at 20 per run.
+        """
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT b.id, b.pair, b.name, bo.order_id, bo.client_order_id, bo.order_type, b.config, bo.created_at
+                FROM bots b
+                JOIN trades t ON b.id = t.bot_id
+                JOIN bot_orders bo ON b.id = bo.bot_id
+                WHERE bo.status IN ('new', 'open', 'partially_filled', 'placing', 'cancelling')
+                  AND bo.order_type IN ('grid', 'entry')
+                  AND bo.cycle_id = t.cycle_id
+                  AND b.is_active = 1
+                  AND bo.order_id IS NOT NULL
+                  AND bo.order_id != ''
+                  AND bo.order_id NOT LIKE 'PENDING_%'
+                ORDER BY bo.created_at ASC
+            """)
+            rows = cursor.fetchall()
+            if not rows:
+                return
+
+            now = int(time.time())
+            older_orders = [r for r in rows if now - (r[7] or 0) > 60]
+            newer_orders = [r for r in rows if now - (r[7] or 0) <= 60]
+            qualifying_rows = older_orders + newer_orders
+
+            if len(qualifying_rows) > 20:
+                logger.warning(f"⚠️ [GRID-AUDIT-CAP] Truncated grid fill audit. Processing oldest 20 of {len(qualifying_rows)} orders.")
+                qualifying_rows = qualifying_rows[:20]
+
+            for row in qualifying_rows:
+                bot_id, pair, name, order_id, client_order_id, order_type, config_json, created_at = row
+                try:
+                    import json
+                    from config.settings import config as app_config
+                    from engine.exchange_interface import normalize_market_type
+                    
+                    cfg = json.loads(config_json) if config_json else {}
+                    mt = normalize_market_type(cfg.get('market_type', app_config.MARKET_TYPE))
+                    exchange = self.exchanges.get(mt)
+                    if not exchange:
+                        logger.warning(f"[_audit_pending_grids] No exchange instance for market_type '{mt}' (bot={bot_id})")
+                        continue
+
+                    logger.info(f"🔎 [_audit_pending_grids] Fetching grid/entry {order_id} status via REST for Bot {bot_id} ({pair})...")
+                    if order_id and any(str(order_id).startswith(prefix) for prefix in ('PENDING_', 'PLACING_', 'GHOST_', 'VN_')):
+                        continue
+
+                    order = exchange.fetch_order(order_id, pair)
+                    if not order:
+                        logger.warning(f"[_audit_pending_grids] Fetch order returned None for order {order_id} bot {bot_id}")
+                        continue
+
+                    if order.get('status') == 'filled':
+                        fill_price = float(order.get('average') or order.get('price') or 0)
+                        fill_qty = float(order.get('filled') or 0)
+                        fill_ts_ms = order.get('lastTradeTimestamp') or order.get('timestamp') or 0
+                        fill_ts = int(fill_ts_ms // 1000) if fill_ts_ms else int(time.time())
+
+                        if fill_qty <= 0 or fill_price <= 0:
+                            logger.warning(f"[_audit_pending_grids] Order {order_id} filled but filled_qty/avg_price invalid: qty={fill_qty}, price={fill_price}")
+                            continue
+
+                        from engine.ledger import credit_fill, seal_trade_state
+                        
+                        logger.info(
+                            f"🚨 [GRID-AUDIT-RECOVERY] Bot {bot_id}: Grid/Entry {order_id} confirmed filled on exchange, "
+                            f"crediting missed fill (qty={fill_qty} @ price={fill_price})."
+                        )
+                        
+                        credited = credit_fill(
+                            bot_id=bot_id,
+                            order_id=order_id,
+                            cumulative_qty=fill_qty,
+                            avg_price=fill_price,
+                            order_type=order_type.lower(),
+                            is_cumulative=True,
+                            fill_ts=fill_ts
+                        )
+                        if credited:
+                            seal_trade_state(bot_id)
+                    elif order.get('status') in ('canceled', 'cancelled', 'expired', 'rejected'):
+                        from engine.database import update_order_status
+                        logger.info(f"🚨 [GRID-AUDIT-RECOVERY] Bot {bot_id}: Grid/Entry {order_id} confirmed canceled on exchange. Updating DB.")
+                        update_order_status(order_id, 'cancelled', bot_id, 0.0)
+                except Exception as ex_err:
+                    logger.error(f"[_audit_pending_grids] Failed checking order {order_id} for bot {bot_id}: {ex_err}")
+        except Exception as err:
+            logger.error(f"Error in continuous grid fill audit: {err}")
+
 
 
 
@@ -2498,14 +2594,92 @@ class StateReconciler:
 
 
 
-            conn.commit()
+            # ── STARTUP VERIFICATION OF PENDING/NEW ORDERS FROM PREVIOUS SESSION ────
+            try:
+                cursor.execute("""
+                    SELECT bo.id, bo.bot_id, bo.order_id, bo.client_order_id, bo.order_type, bo.amount, bo.status, bo.price, bo.step, bo.cycle_id, b.pair, b.config
+                    FROM bot_orders bo
+                    JOIN bots b ON bo.bot_id = b.id
+                    WHERE bo.status IN ('new', 'open', 'partially_filled', 'placing', 'cancelling')
+                      AND bo.order_id IS NOT NULL
+                      AND bo.order_id != ''
+                      AND bo.order_id NOT LIKE 'PENDING_%'
+                      AND bo.created_at < ?
+                      AND b.is_active = 1
+                """, (int(ENGINE_START_TIME),))
+                stale_rows = cursor.fetchall()
+                if stale_rows:
+                    logger.info(f"🔎 [STARTUP-STALE-CHECK] Found {len(stale_rows)} pending/new orders from previous session. Verifying against exchange...")
+                    for row in stale_rows:
+                        db_row_id, bot_id, order_id, client_order_id, order_type, amount, status, price, step, cycle_id, pair, config_json = row
+                        try:
+                            import json
+                            from config.settings import config as app_config
+                            from engine.exchange_interface import normalize_market_type
+                            
+                            cfg = json.loads(config_json) if config_json else {}
+                            mt = normalize_market_type(cfg.get('market_type', app_config.MARKET_TYPE))
+                            exchange = self.exchanges.get(mt)
+                            if not exchange:
+                                continue
+                            
+                            if order_id and any(str(order_id).startswith(prefix) for prefix in ('PENDING_', 'PLACING_', 'GHOST_', 'VN_')):
+                                continue
 
+                            logger.info(f"🔎 [STARTUP-STALE-CHECK] Verifying {order_type} {order_id} ({pair})...")
+                            order = exchange.fetch_order(order_id, pair)
+                            if not order:
+                                continue
+
+                            # Always use the real exchange order_id from CCXT response
+                            exchange_order_id = str(order.get('id') or order_id)
+
+                            if order.get('status') == 'filled':
+                                fill_price = float(order.get('average') or order.get('price') or 0)
+                                fill_qty = float(order.get('filled') or 0)
+                                fill_ts_ms = order.get('lastTradeTimestamp') or order.get('timestamp') or 0
+                                fill_ts = int(fill_ts_ms // 1000) if fill_ts_ms else int(time.time())
+
+                                if fill_qty <= 0 or fill_price <= 0:
+                                    continue
+
+                                from engine.ledger import credit_fill, seal_trade_state
+                                logger.info(
+                                    f"🚨 [STARTUP-STALE-RECOVERY] Bot {bot_id}: Order {exchange_order_id} confirmed filled on exchange. Crediting fill."
+                                )
+                                credited = credit_fill(
+                                    bot_id=bot_id,
+                                    order_id=exchange_order_id,
+                                    cumulative_qty=fill_qty,
+                                    avg_price=fill_price,
+                                    order_type=order_type.lower(),
+                                    is_cumulative=True,
+                                    fill_ts=fill_ts
+                                )
+                                if credited:
+                                    if order_type.upper() == 'TP':
+                                        from engine.ledger import register_tp_cascade
+                                        register_tp_cascade(bot_id, pair, fill_price, exit_fill_ts=fill_ts)
+                                    seal_trade_state(bot_id)
+                                    if order_type.lower() == 'grid':
+                                        stats['grid_fills'] += 1
+                                    elif order_type.lower() == 'entry':
+                                        stats['entry_fills'] += 1
+                                    elif order_type.lower() == 'tp':
+                                        stats['tp_fills'] += 1
+                            elif order.get('status') in ('canceled', 'cancelled', 'expired', 'rejected'):
+                                from engine.database import update_order_status
+                                logger.info(f"🚨 [STARTUP-STALE-RECOVERY] Bot {bot_id}: Order {exchange_order_id} confirmed canceled on exchange. Updating DB status.")
+                                update_order_status(order_id, 'cancelled', bot_id, 0.0)
+                        except Exception as ex_err:
+                            logger.error(f"[STARTUP-STALE-CHECK] Failed verifying order {order_id} for bot {bot_id}: {ex_err}")
+            except Exception as err:
+                logger.error(f"[STARTUP-STALE-CHECK] Outer error: {err}")
+
+            conn.commit()
             pass # conn.close() disabled for singleton safety
 
-
-
         stats['total'] = stats['grid_fills'] + stats['tp_fills'] + stats['entry_fills']
-
         return stats
 
 
@@ -4062,6 +4236,22 @@ class StateReconciler:
                                     )
                         except Exception as e_dust:
                             logger.error(f"[DUST-CHASER] Failed to place close for {b.name}: {e_dust}", exc_info=True)
+                            # Escalate cycle_phase so the health check and UI banner surface this. [INV-35]
+                            try:
+                                cursor.execute(
+                                    "UPDATE trades SET cycle_phase='STUCK_DUST_NO_EXIT' WHERE bot_id=?",
+                                    (b.bot_id,)
+                                )
+                                logger.critical(
+                                    f"🚨 [STUCK_DUST_NO_EXIT] {b.name} (bot {b.bot_id}): dust-chaser GTC close "
+                                    f"placement failed ({e_dust}). Manual exchange close required. "
+                                    f"cycle_phase set to STUCK_DUST_NO_EXIT."
+                                )
+                            except Exception as _e_escalate:
+                                logger.error(
+                                    f"[DUST-CHASER] Failed to set STUCK_DUST_NO_EXIT "
+                                    f"for bot {b.bot_id}: {_e_escalate}"
+                                )
                         # Do NOT call safe_wipe_bot — the PARTIAL_CLOSE_PENDING handler in
                         # maintain_orders will reset the bot after the close fills
                         results.append(ReconciliationResult(

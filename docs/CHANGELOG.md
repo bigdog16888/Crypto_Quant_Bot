@@ -2,6 +2,30 @@
 
 All notable **architecture** changes are documented here. Version numbers match `CODEBASE_GUIDE.md`, `config/settings.py`, and `docs/ARCHITECTURE_v3.x.md`.
 
+## v5.2.0 — 2026-07-07 — Netting-Aware Close Recovery (INV-38) & Write-Queue Deadlock Resolution
+
+- **engine/recovery.py (new module)**:
+  - Implemented `compute_closeable_qty()` to calculate netting-aware closeable sizes:
+    $$\text{closeable\_qty} = \min(\text{virtual\_qty}, \max(0, \text{signed\_physical\_qty} \times \text{bot\_direction\_sign}))$$
+  - Implemented `resolve_gated_bot()` universal recovery function to resolve gated bots: places close orders on the exchange if `closeable_qty > 0`, or executes a database-only clean wipe (`safe_wipe_bot`) if `closeable_qty = 0`.
+- **engine/database.py**:
+  - Fixed a critical write-queue deadlock on startup phantom purges by storing `has_external_cursor = (cursor is not None)` on entry. Only bypasses the WriteQueue if an active transaction cursor is explicitly passed (nested transaction safety).
+  - Forwarded the `notes=reason` argument to all reset calls inside the `force=True` wipe path, ensuring audit trail notes are never written as empty.
+- **engine/parity_gates.py**:
+  - Upgraded the startup phantom ledger purge routine (`purge_phantom_ledger_when_exchange_flat`) to execute `safe_wipe_bot` with `force=False` and `action_label='MANUAL_CLOSE'`, running Guard 2.0 per-bot live exchange verification before allowing any startup wipe.
+- **engine/reconciler.py**:
+  - Integrated `resolve_gated_bot()` inside the stale check loop to automatically recover gated bots.
+- **engine/bot_executor.py**:
+  - Modified the martingale catch-up entry logic to check only the current cycle fills inside `bot_orders`, preventing duplicate catch-up placements.
+- **engine/runner.py**:
+  - Modified `_handle_pending_flatten` to compute the signed live exchange net position of the pair before submitting reduceOnly orders.
+- **ui/views/monitor.py**:
+  - Added warning banners to display gated sibling bots and drift windows on the dashboard.
+- **tests/**:
+  - Added `tests/test_inv38_netting_aware_close.py` to verify compute_closeable_qty and resolve_gated_bot.
+  - Added `tests/test_inv35_stuck_dust_no_exit.py` to verify STUCK_DUST_NO_EXIT escalation.
+  - Added `tests/test_pending_flatten_handler.py` to verify netting-aware flattens.
+
 ## v4.3.8 — 2026-07-02 — Authoritative Health State & Project Cleanup
 
 - **engine/health.py (new module)**:

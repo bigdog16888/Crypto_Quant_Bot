@@ -468,7 +468,10 @@ def purge_phantom_ledger_when_exchange_flat(
             raw_pair,
             direction or 'LONG',
             reason='PHANTOM_LEDGER_PURGE',
-            force=True,
+            force=False,
+            action_label='MANUAL_CLOSE',
+            exchange=exchange,
+            bypass_ledger_guard=True,
             human_approved=True,
         )
         if ok:

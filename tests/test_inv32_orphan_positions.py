@@ -137,3 +137,29 @@ def test_detect_unowned_exchange_positions_no_match_fallback(temp_db):
     assert alert[1] == 'BTC/USDC:USDC'
     assert alert[2] == -0.05
     assert "no matching flat bot could be found" in alert[5]
+
+def test_exact_tolerance_gap_triggers_alert(temp_db):
+    conn = temp_db
+    from engine.parity_gates import qty_tolerance
+    tol = qty_tolerance()
+    
+    # Insert active bot
+    conn.execute("INSERT INTO bots VALUES (10022, 'short btc', 'SHORT', 'standard', 1, 'BTCUSDC', 'BTC/USDC:USDC', 'Scanning', NULL)")
+    conn.execute("INSERT INTO trades VALUES (10022, 51, 0.0, 'IDLE', 0, 'BOTH')")
+    
+    # Mock exchange with an unowned position equal to exactly the negative tolerance (e.g., -0.002)
+    mock_exchange = MagicMock()
+    mock_exchange.fetch_positions.return_value = [
+        {'symbol': 'BTC/USDC:USDC', 'contracts': -tol, 'side': 'SHORT', 'entryPrice': 60000.0}
+    ]
+    
+    # Run detector
+    detect_unowned_exchange_positions(conn, mock_exchange)
+    
+    # Assert that an alert was generated
+    alert = conn.execute("SELECT bot_id, pair, exchange_qty, db_qty, status FROM unowned_position_alerts").fetchone()
+    assert alert is not None
+    assert alert[0] == 10022
+    assert alert[1] == 'BTC/USDC:USDC'
+    assert alert[2] == -tol
+

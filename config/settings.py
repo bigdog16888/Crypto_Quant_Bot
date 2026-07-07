@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 class Config:
-    VERSION = "5.0.0"  # v5.0.0: First Stable Green Release
+    VERSION = "5.1.1"  # v5.1.1: UI single-page layout, fixed-height alert banner, GTR health keys
     ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
     def __init__(self):

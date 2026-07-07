@@ -12,13 +12,17 @@ Keys returned
   startup_suppression    bool   - True if within 120 s of ENGINE_STARTED_AT
   startup_remaining_s    float  - seconds left in grace period
   engine_started_at      float  - ENGINE_STARTED_AT value (0 if missing)
-  system_status          str    - STARTING | HEALTHY | WARNING | MISMATCH
+  system_status          str    - STARTING | HEALTHY | WARNING | MISMATCH | CRITICAL
   worst_gap_usd          float
   mismatched_pair_count  int
   netting_status_per_pair dict  - keyed by normalised pair string
   order_health           dict   - {status_color, message, bot_statuses}
   header_metrics         dict   - all header tile values
   orphan_positions       list   - exchange positions with no bot ownership
+  stuck_cascade_bots     list   - bot names currently in stuck cascade (pending_flatten etc.)
+                                  that have exceeded GTR.CASCADE_TIMEOUT
+  manual_proof_bots      list   - bot names locked to REQUIRE_MANUAL_PROOF status
+                                  requiring human resolution before engine can proceed
 """
 
 from __future__ import annotations
@@ -333,7 +337,60 @@ def _compute_order_health(
     else:
         msg, color = f"ORDERS SYNCED: {len(open_exchange_orders)} active orders.", "green"
 
-    return dict(status_color=color, message=msg, bot_statuses=bot_statuses)
+    return dict(status_color=color, message=msg, bot_statuses=bot_statuses, dust_bots=dust)
+
+
+# ---------------------------------------------------------------------------
+# GTR Critical State Detector  (improvements #1 and #4)
+# ---------------------------------------------------------------------------
+
+_GTR_CASCADE_TIMEOUT: int = 300  # matches GroundTruthReconciler.CASCADE_TIMEOUT
+_GTR_CASCADE_STATUSES = (
+    "pending_close", "pending_hedge_close", "FLATTENING", "pending_flatten"
+)
+
+
+def _compute_critical_bot_states(db_path: str) -> Dict[str, List[str]]:
+    """
+    Query the DB for bots that are in a GTR-critical state.
+
+    Returns a dict with two lists of bot *names*:
+      stuck_cascade_bots  – stuck in a cascade status longer than CASCADE_TIMEOUT
+      manual_proof_bots   – locked to REQUIRE_MANUAL_PROOF (human action required)
+
+    This does NOT call the exchange; it reads only the bots table so it is fast
+    and safe to call on every health computation cycle.
+    """
+    stuck: List[str] = []
+    proof: List[str] = []
+    try:
+        conn = sqlite3.connect(db_path, timeout=5)
+        now = int(time.time())
+        # Stuck cascade: status in cascade statuses AND cascade_started_at exceeded timeout
+        cascade_rows = conn.execute(
+            f"""
+            SELECT b.name, b.status, b.cascade_started_at, t.basket_start_time
+            FROM bots b
+            LEFT JOIN trades t ON b.id = t.bot_id
+            WHERE b.is_active = 1
+              AND b.status IN ({','.join('?' * len(_GTR_CASCADE_STATUSES))})
+            """,
+            _GTR_CASCADE_STATUSES,
+        ).fetchall()
+        for name, status, cascade_ts, basket_ts in cascade_rows:
+            start = cascade_ts if (cascade_ts and cascade_ts > 0) else (basket_ts or 0)
+            if (now - int(start)) > _GTR_CASCADE_TIMEOUT:
+                stuck.append(name)
+
+        # Manual proof: any bot locked to REQUIRE_MANUAL_PROOF
+        proof_rows = conn.execute(
+            "SELECT name FROM bots WHERE is_active = 1 AND status = 'REQUIRE_MANUAL_PROOF'"
+        ).fetchall()
+        proof = [r[0] for r in proof_rows]
+        conn.close()
+    except Exception as e:
+        logger.warning(f"[health] _compute_critical_bot_states error: {e}")
+    return dict(stuck_cascade_bots=stuck, manual_proof_bots=proof)
 
 
 # ---------------------------------------------------------------------------
@@ -401,8 +458,21 @@ def compute_system_health(
         db_path, open_exchange_orders, bot_df_rows, suppression
     )
 
+    # ── Improvement #1 / #4: detect GTR-critical bot states ────────────────
+    critical_states = _compute_critical_bot_states(db_path)
+    stuck_cascade_bots = critical_states["stuck_cascade_bots"]
+    manual_proof_bots  = critical_states["manual_proof_bots"]
+
+    dust_bots: List[str] = order_health.get("dust_bots", [])
+
+    # system_status priority: STARTING > CRITICAL > MISMATCH > WARNING > HEALTHY
     if suppression:
         system_status = "STARTING"
+    elif stuck_cascade_bots or manual_proof_bots or dust_bots:
+        # Stuck cascade, unresolved manual-proof, or STUCK_DUST_NO_EXIT are all
+        # engine-blocking conditions that cannot be auto-healed and require human
+        # intervention. All three escalate to CRITICAL. [INV-35]
+        system_status = "CRITICAL"
     elif mismatch_count > 0:
         system_status = "MISMATCH"
     elif order_health["status_color"] == "red":
@@ -422,6 +492,9 @@ def compute_system_health(
         order_health=order_health,
         header_metrics=header,
         orphan_positions=orphans,
+        stuck_cascade_bots=stuck_cascade_bots,
+        manual_proof_bots=manual_proof_bots,
+        dust_bots=dust_bots,
     )
 
 
@@ -450,6 +523,11 @@ def get_system_health(
     Returns stale cache data if a fresh computation raises an exception.
     """
     global _health_cache
+    db_engine_started_at = _get_engine_started_at(db_path)
+    cached_engine_started_at = _health_cache.get("engine_started_at", 0.0)
+    if db_engine_started_at != cached_engine_started_at:
+        force_refresh = True
+
     age = time.time() - _health_cache.get("timestamp", 0.0)
     if not force_refresh and age < _CACHE_TTL and _health_cache:
         return _health_cache

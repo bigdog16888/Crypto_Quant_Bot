@@ -1044,95 +1044,162 @@ class BotRunner:
     # ================================================================
     def _handle_pending_flatten(self, bot_id, pair, direction, open_qty, conn):
         """
-        Execute a reduceOnly market close for a bot in pending_flatten state.
+        Execute a netting-aware forced close for a bot in pending_flatten state.
         Follows INV-15: exchange first, DB second.
         Follows INV-16: writes exchange_order_audit WAL receipt before order.
+
+        Uses compute_closeable_qty to determine how much of the virtual position is
+        physically backed by live exchange net exposure before placing any reduceOnly
+        order. This prevents Binance 400 ReduceOnly rejections caused by One-Way
+        Netting when sibling bots hold the opposing net position.
         """
         import time
+        from engine.recovery import compute_closeable_qty, resolve_gated_bot
+        from engine.parity_gates import get_exchange_signed_net
 
         logger.warning(
-            f"[PENDING-FLATTEN] Bot {bot_id} ({pair}): executing forced "
-            f"close for open_qty={open_qty:.6f}. Writing WAL receipt first."
+            f"[PENDING-FLATTEN] Bot {bot_id} ({pair}): executing netting-aware forced "
+            f"close for open_qty={open_qty:.6f}. Checking live exchange net first."
         )
 
-        # INV-15 Phase 1: Write WAL receipt before exchange call
-        cid = f"CQB_{bot_id}_FLATTEN_{int(time.time())}"
-        conn.execute("""
-            INSERT INTO bot_orders 
-            (bot_id, order_type, status, amount, filled_amount, price,
-             client_order_id, cycle_id, created_at, updated_at)
-            SELECT ?, 'flatten_close', 'placing', ?, 0, 0, ?, cycle_id,
-                   ?, ?
-            FROM trades WHERE bot_id=?
-        """, (bot_id, open_qty, cid, int(time.time()), int(time.time()), 
-              bot_id))
-        conn.commit()
+        ex = self.exchange or (list(self.exchanges.values())[0] if self.exchanges else None)
+        if not ex:
+            raise RuntimeError("No exchange interface available on runner")
 
-        # INV-15 Phase 2: Execute exchange close
-        try:
-            close_side = 'sell' if direction.upper() == 'LONG' else 'buy'
-
-            ex = self.exchange or (list(self.exchanges.values())[0] if self.exchanges else None)
-            if not ex:
-                raise RuntimeError("No exchange interface available on runner")
-
-            is_testnet = bool(getattr(ex, 'is_testnet', False) or
-                              getattr(getattr(ex, 'exchange', None), 'sandbox', False))
-            params = {'reduceOnly': True}
-            if is_testnet:
-                params['positionSide'] = 'BOTH'
-            else:
-                params.pop('positionSide', None)
-
-            order = ex.create_order(
-                pair, 'market', close_side, open_qty,
-                params=params
+        # Fetch live signed net before any exchange order or DB change
+        live_net = get_exchange_signed_net(ex, pair)
+        if live_net is None:
+            logger.error(
+                f"[PENDING-FLATTEN] Bot {bot_id}: fetch_positions failed for {pair}. "
+                f"Cannot determine closeable_qty — leaving bot gated."
             )
-            filled_qty = float(order.get('filled') or open_qty)
-            fill_price = float(order.get('average') or order.get('price') or 0)
+            return False
 
-            # Update WAL receipt with real exchange result
-            conn.execute("""
-                UPDATE bot_orders SET status='filled', filled_amount=?,
-                price=?, order_id=?, updated_at=?
-                WHERE client_order_id=? AND bot_id=?
-            """, (filled_qty, fill_price, str(order.get('id','')),
-                  int(time.time()), cid, bot_id))
+        closeable_qty = compute_closeable_qty(direction, open_qty, live_net)
+        unphysical_remainder = round(open_qty - closeable_qty, 8)
 
-            # INV-15 Phase 2: DB update only after exchange confirmed
+        logger.warning(
+            f"[PENDING-FLATTEN] Bot {bot_id}: live_net={live_net:.6f} "
+            f"virtual={open_qty:.6f} closeable={closeable_qty:.6f} "
+            f"unphysical_remainder={unphysical_remainder:.6f}"
+        )
+
+        if closeable_qty > 1e-8:
+            # INV-15 Phase 1: Write WAL receipt before exchange call
+            cid = f"CQB_{bot_id}_FLATTEN_{int(time.time())}"
             conn.execute("""
-                UPDATE trades SET open_qty=0, total_invested=0,
-                avg_entry_price=0, current_step=0, entry_confirmed=0
-                WHERE bot_id=?
-            """, (bot_id,))
-            conn.execute("""
-                UPDATE bots SET status='Scanning', cascade_started_at=0
-                WHERE id=?
-            """, (bot_id,))
+                INSERT INTO bot_orders
+                (bot_id, order_type, status, amount, filled_amount, price,
+                 client_order_id, cycle_id, created_at, updated_at)
+                SELECT ?, 'flatten_close', 'placing', ?, 0, 0, ?, cycle_id,
+                       ?, ?
+                FROM trades WHERE bot_id=?
+            """, (bot_id, closeable_qty, cid,
+                  int(time.time()), int(time.time()), bot_id))
             conn.commit()
 
-            logger.warning(
-                f"[PENDING-FLATTEN] Bot {bot_id}: closed {filled_qty:.6f} "
-                f"@ {fill_price:.6f}. Reset to Scanning."
-            )
-            return True
+            # INV-15 Phase 2: Execute exchange close for physical portion
+            try:
+                close_side = 'sell' if direction.upper() == 'LONG' else 'buy'
+                is_testnet = bool(
+                    getattr(ex, 'is_testnet', False) or
+                    getattr(getattr(ex, 'exchange', None), 'sandbox', False)
+                )
+                params = {'reduceOnly': True}
+                if is_testnet:
+                    params['positionSide'] = 'BOTH'
+                else:
+                    params.pop('positionSide', None)
+                params['newClientOrderId'] = cid
 
-        except Exception as e:
-            # Exchange call failed — update WAL receipt, set REQUIRE_MANUAL_PROOF
-            conn.execute("""
-                UPDATE bot_orders SET status='failed',
-                notes=?, updated_at=? WHERE client_order_id=? AND bot_id=?
-            """, (f"flatten failed: {e}", int(time.time()), cid, bot_id))
+                order = ex.create_order(
+                    pair, 'market', close_side, closeable_qty, params=params
+                )
+                filled_qty = float(order.get('filled') or closeable_qty)
+                fill_price = float(order.get('average') or order.get('price') or 0)
+
+                conn.execute("""
+                    UPDATE bot_orders SET status='filled', filled_amount=?,
+                    price=?, order_id=?, updated_at=?
+                    WHERE client_order_id=? AND bot_id=?
+                """, (filled_qty, fill_price, str(order.get('id', '')),
+                      int(time.time()), cid, bot_id))
+                conn.commit()
+                logger.warning(
+                    f"[PENDING-FLATTEN] Bot {bot_id}: exchange close confirmed "
+                    f"{filled_qty:.6f} @ {fill_price:.4f}"
+                )
+
+            except Exception as e:
+                conn.execute("""
+                    UPDATE bot_orders SET status='failed',
+                    notes=?, updated_at=? WHERE client_order_id=? AND bot_id=?
+                """, (f"flatten failed: {e}", int(time.time()), cid, bot_id))
+                conn.execute("""
+                    UPDATE bots SET status='REQUIRE_MANUAL_PROOF',
+                    cascade_started_at=? WHERE id=?
+                """, (int(time.time()), bot_id))
+                conn.commit()
+                logger.error(
+                    f"[PENDING-FLATTEN] Bot {bot_id}: exchange close FAILED: {e}. "
+                    f"Set REQUIRE_MANUAL_PROOF."
+                )
+                return False
+        else:
+            logger.info(
+                f"[PENDING-FLATTEN] Bot {bot_id}: closeable_qty=0 — virtual position "
+                f"is unphysical (net on wrong side). Routing to direct unphysical wipe."
+            )
+
+        # After exchange order (or skipped), wipe full virtual DB position via safe_wipe_bot.
+        # safe_wipe_bot Guard 2.0 will live-verify exchange flat for this direction.
+        try:
+            from engine.database import safe_wipe_bot
+            wipe_ok = safe_wipe_bot(
+                bot_id=bot_id,
+                pair=pair,
+                direction=direction,
+                reason=(
+                    f"pending_flatten: closeable={closeable_qty:.6f} "
+                    f"unphysical={unphysical_remainder:.6f}"
+                ),
+                bypass_ledger_guard=True,
+                human_approved=True,
+            )
+
+            if wipe_ok:
+                logger.warning(
+                    f"[PENDING-FLATTEN] Bot {bot_id}: fully resolved. "
+                    f"closeable={closeable_qty:.6f} "
+                    f"unphysical={unphysical_remainder:.6f}"
+                )
+                return True
+            else:
+                # safe_wipe_bot refused (Guard 2.0 found residual position) — stay gated
+                conn.execute("""
+                    UPDATE bots SET status='REQUIRE_MANUAL_PROOF',
+                    cascade_started_at=? WHERE id=?
+                """, (int(time.time()), bot_id))
+                conn.commit()
+                logger.error(
+                    f"[PENDING-FLATTEN] Bot {bot_id}: safe_wipe_bot refused after close. "
+                    f"Set REQUIRE_MANUAL_PROOF."
+                )
+                return False
+
+        except Exception as e_wipe:
             conn.execute("""
                 UPDATE bots SET status='REQUIRE_MANUAL_PROOF',
                 cascade_started_at=? WHERE id=?
             """, (int(time.time()), bot_id))
             conn.commit()
             logger.error(
-                f"[PENDING-FLATTEN] Bot {bot_id}: exchange close FAILED: {e}. "
-                f"Set REQUIRE_MANUAL_PROOF."
+                f"[PENDING-FLATTEN] Bot {bot_id}: safe_wipe_bot raised: "
+                f"{e_wipe}. Set REQUIRE_MANUAL_PROOF."
             )
             return False
+
+
 
     def _handle_pending_close(self, bot_id: int, bot_name: str, pair: str, direction: str) -> None:
         """
@@ -1238,11 +1305,12 @@ class BotRunner:
         self.orders_this_cycle = 0
         self.cycle_count += 1
 
-        # 🚨 Continuous Fill Audit: Runs every cycle to check for active bots with TP orders
+        # 🚨 Continuous Fill Audit: Runs every cycle to check for active bots with TP or Grid orders
         # that filled on the exchange but were missed by the WebSocket.
         if self._reconciler:
             try:
                 self._reconciler._audit_pending_exits()
+                self._reconciler._audit_pending_grids()
             except Exception as _audit_err:
                 logger.warning(f"Continuous fill audit failed (non-fatal): {_audit_err}")
 
@@ -2209,6 +2277,14 @@ if __name__ == "__main__":
         logger.error(f"Failed to flush DB write queue: {e}")
 
     if not shutdown_fast:
+        try:
+            if 'runner' in locals() and runner and runner._reconciler:
+                logger.info("Executing final pre-shutdown fill audit...")
+                runner._reconciler._audit_pending_exits()
+                runner._reconciler._audit_pending_grids()
+        except Exception as e:
+            logger.error(f"[SHUTDOWN-AUDIT] Failed executing pending exits/grids audit on exit: {e}")
+
         try:
             from engine.ledger import seal_all_active_bots
             corrected = seal_all_active_bots()

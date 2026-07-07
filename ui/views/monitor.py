@@ -174,28 +174,37 @@ def _fetch_fresh_monitor_data():
 
 
 def _render_header_ui(data):
-    # Display Metrics Grid
-    m1, m2, m3, m4 = st.columns(4)
-    with m1: st.metric("Total Equity", f"${data['total_equity']:,.2f}")
-    with m2: st.metric("Futures Balance", f"${data['futures_balance']:,.2f}")
-    with m3: st.metric("Active PnL", f"${data['global_pnl_usd']:,.2f}")
-    with m4: st.metric("Total Invested", f"${data['total_invested_db']:,.2f}",
-                      help="Sum of trades.total_invested across active bots (ledger exposure).")
+    # ── Compact 5-tile single-row header ──────────────────────────────────────
+    # Tile 5 = live system status pill (STARTING/HEALTHY/WARNING/MISMATCH/CRITICAL)
+    # with worst-gap inline when non-zero.  Second bots-count row removed —
+    # that info is already visible per-row in the bot table below.
+    _STATUS_ICONS = {
+        'HEALTHY':  '🟢', 'WARNING': '🟡', 'MISMATCH': '🔴',
+        'CRITICAL': '🔴', 'STARTING': '⏳',
+    }
+    sys_status  = data.get('system_status', 'UNKNOWN')
+    worst_gap   = data.get('worst_gap_usd', 0.0)
+    icon        = _STATUS_ICONS.get(sys_status, '⚪')
+    gap_label   = f"  ·  Gap ${worst_gap:,.2f}" if worst_gap > 0.01 else ""
+    status_str  = f"{icon} {sys_status}{gap_label}"
 
-    r2a, r2b, r2c, r2d = st.columns(4)
-    with r2a: st.metric("Active Bots", f"{data['active_count']}")
-    with r2b: st.metric("In Trade", f"{data['bots_in_trade']}")
-    with r2c: st.metric("Scanning", f"{data['scanning_count']}")
-    with r2d: st.metric("Open Qty (Notional)", f"${data['open_qty_notional']:,.2f}",
-                      help="open_qty × avg_entry_price from trades table.")
+    m1, m2, m3, m4, m5 = st.columns(5)
+    with m1: st.metric("💰 Equity",   f"${data['total_equity']:,.2f}")
+    with m2: st.metric("🏦 Balance",  f"${data['futures_balance']:,.2f}")
+    with m3: st.metric("📈 PnL",      f"${data['global_pnl_usd']:,.2f}")
+    with m4: st.metric("💼 Invested", f"${data['total_invested_db']:,.2f}",
+                       help="Sum of trades.total_invested across active bots (ledger exposure).")
+    with m5: st.metric("⚡ Status",   status_str,
+                       help=f"In Trade: {data['bots_in_trade']}/{data['active_count']} | "
+                            f"Adoptions(24h): {data['adoptions_today']}")
 
     if data['assets_breakdown']:
-        with st.expander("💰 Detailed Asset Breakdown"):
+        with st.expander("💰 Detailed Asset Breakdown", expanded=False):
             st.table(pd.DataFrame(data['assets_breakdown']))
     st.divider()
 
-    # Integrated Status Ribbon
-    st.info(f"⚡ CORE: ONLINE | ACTIVE: {data['active_count']} | ADOPTIONS (24h): {data['adoptions_today']} | LAST: {data['last_act_str']}")
+    # Compact status ribbon — last activity only
+    st.caption(f"⚡ CORE: ONLINE  |  LAST: {data['last_act_str']}")
 
 
 @st.fragment(run_every=30)
@@ -230,6 +239,9 @@ def _header_metrics_fragment():
                 'assets_breakdown':  hm.get('assets_breakdown', []),
                 'adoptions_today':   hm.get('adoptions_today', 0),
                 'last_act_str':      hm.get('last_act_str', 'NO RECENT ACTIVITY'),
+                # Status pill fields — sourced from health_data root, not header_metrics
+                'system_status':     health_data.get('system_status', 'UNKNOWN'),
+                'worst_gap_usd':     health_data.get('worst_gap_usd', 0.0),
             }
         else:
             # Fallback: compute locally if health_data not yet available
@@ -270,6 +282,8 @@ def _header_metrics_fragment():
                 'scanning_count': max(0, active_count - bots_in_trade),
                 'open_qty_notional': open_qty_notional, 'assets_breakdown': [],
                 'adoptions_today': adoptions_today, 'last_act_str': last_act_str,
+                # Fallback: status unknown until health_data is populated
+                'system_status': 'UNKNOWN', 'worst_gap_usd': 0.0,
             }
 
         st.session_state["cached_header_data"] = data
@@ -501,17 +515,45 @@ def _bot_positions_fragment():
                 mismatched_pairs.append((f"{p} NET", v_net_qty * ref_price, ph_net_qty * ref_price, net_usd_diff, v_net_qty, ph_net_qty, ph_net_qty - v_net_qty, ref_price))
 
         # --- FRAGMENT UI RENDERING ---
-        # Do NOT sum virtual USD across unrelated symbols — that produces nonsense
-        # totals (e.g. BTC qty * BTC price + LINK qty * LINK price).
-        m_col1, m_col2, m_col3 = st.columns(3)
-        with m_col1: st.metric("Mismatched Pairs", mismatched_pair_count)
-        with m_col2: st.metric("Worst Pair Gap (USD)", f"${worst_pair_usd:,.2f}")
-        with m_col3:
-            _status = "HEALTHY" if mismatched_pair_count == 0 else "MISMATCH"
-            _color = "green" if _status == "HEALTHY" else "red"
-            st.markdown(f"**System Status:** <span style='color:{_color}; font-weight:bold;'>{_status}</span>", unsafe_allow_html=True)
-        
-        st.divider()
+        # ── FIXED-HEIGHT ALERT BANNER ──────────────────────────────────────────
+        # Pre-collect all alert parts so we can decide healthy vs error BEFORE
+        # rendering.  The banner container is ALWAYS rendered at a fixed height
+        # (58 px) so the bot table below never shifts position when alerts appear
+        # or disappear between refresh cycles.
+        #
+        # _banner_parts is populated here (mismatch) and extended after the
+        # order-health loop below, then rendered as a single HTML block.
+        # ──────────────────────────────────────────────────────────────────────
+        _banner_parts = []
+        if mismatched_pair_count > 0:
+            _banner_parts.append(
+                f"🔴 {mismatched_pair_count} pair(s) mismatched  ·  "
+                f"Worst gap: ${worst_pair_usd:,.2f}"
+            )
+        # Critical bot states from health_data (GTR #1 + #4) — surfaced inside
+        # the 15 s fragment so operators see them without waiting for header refresh.
+        _hd = st.session_state.get("system_health_data") or {}
+        for _bot_name in _hd.get("manual_proof_bots", []):
+            is_netting_mismatch = False
+            try:
+                bot_row = df_pos_f[df_pos_f['name'] == _bot_name]
+                if not bot_row.empty:
+                    pair_raw = bot_row.iloc[0]['pair']
+                    pair_norm = _norm_universal(pair_raw)
+                    net_status = _hd.get("netting_status_per_pair", {}).get(pair_norm, {})
+                    if net_status.get("drift_detected"):
+                        is_netting_mismatch = True
+            except:
+                pass
+            
+            if is_netting_mismatch:
+                _banner_parts.append(f"🔴 REQUIRE_MANUAL_PROOF: {_bot_name} — ⚠️ 軋平差額偏離（Netting Mismatch），請手動平倉或核對倉位")
+            else:
+                _banner_parts.append(f"🔴 REQUIRE_MANUAL_PROOF: {_bot_name} — human intervention needed")
+        for _bot_name in _hd.get("stuck_cascade_bots", []):
+            _banner_parts.append(f"⚠️ STUCK CASCADE >5m: {_bot_name}")
+        # _order_alert will be appended after the order-health loop
+        # (see 'Render fixed-height banner' section below)
 
         # Order Health Alerts
         order_health_msg = ""
@@ -655,19 +697,43 @@ def _bot_positions_fragment():
                                     bots_with_partial_orders.append(f"{row['name']} ({actual_ph}/2)")
 
         if bots_with_stuck_dust:
-            order_health_msg, order_status_color = f"⚠️ STUCK DUST NO EXIT: {', '.join(bots_with_stuck_dust)} — Exit order blocked by multi-bot net exposure limits (Testnet Catch-22)!", "red"
+            for _dust_bot in bots_with_stuck_dust:
+                _banner_parts.append(
+                    f"🔴 【殘餘部位無法自動平倉】{_dust_bot}｜"
+                    f"請至交易所手動平倉後，執行 safe_wipe_bot(action_label='MANUAL_CLOSE') 重置狀態。"
+                )
         elif bots_with_no_exit_orders:
-            order_health_msg, order_status_color = f"⚠️ NO EXIT ORDER: {', '.join(bots_with_no_exit_orders)}!", "red"
+            _banner_parts.append(f"⚠️ NO EXIT ORDER: {', '.join(bots_with_no_exit_orders)}")
         elif bots_with_missing_orders:
-            order_health_msg, order_status_color = f"⚠️ MISSING CRITICAL ORDERS: {', '.join(bots_with_missing_orders)}!", "red"
+            _banner_parts.append(f"⚠️ MISSING ORDERS: {', '.join(bots_with_missing_orders)}")
         elif bots_with_margin_held:
-            order_health_msg, order_status_color = f"⚠️ MARGIN HELD: {', '.join(bots_with_margin_held)} — TP blocked by account margin limit. Free margin to allow TP placement.", "orange"
+            _banner_parts.append(f"⚠️ MARGIN HELD: {', '.join(bots_with_margin_held)}")
         elif bots_with_partial_orders:
-            order_health_msg, order_status_color = f"⚠️ MISSING GRIDS: {', '.join(bots_with_partial_orders)}", "orange"
-        else:
-            order_health_msg = f"✅ ORDERS SYNCED: {len(market_orders_f)} active orders."
+            _banner_parts.append(f"⚠️ MISSING GRIDS: {', '.join(bots_with_partial_orders)}")
+        # If _banner_parts is empty → system is fully healthy → show nothing but
+        # keep an identical-height spacer so the table below does not shift.
 
-        st.caption(f"  🩺 Order Health: :{order_status_color}[{order_health_msg}]")
+        # ── Render fixed-height banner ──────────────────────────────────────
+        # DESIGN CONTRACT: both branches produce a 58-px-tall block so that
+        # the bot table anchor point is stable across every refresh tick.
+        _BANNER_H = "58px"
+        if _banner_parts:
+            _alert_html = (
+                f'<div style="height:{_BANNER_H};background:rgba(255,75,75,0.12);'
+                f'border:1px solid rgba(255,75,75,0.6);border-radius:0.5rem;'
+                f'padding:0 1rem;display:flex;align-items:center;'
+                f'color:#FF4B4B;font-size:0.88rem;font-weight:500;'
+                f'margin-bottom:0.75rem;overflow:hidden;white-space:nowrap;'
+                f'text-overflow:ellipsis">'
+                f"🚨&nbsp;&nbsp;" + "&nbsp;&nbsp;|&nbsp;&nbsp;".join(_banner_parts)
+                + "</div>"
+            )
+        else:
+            # Invisible spacer — identical height to alert div
+            _alert_html = (
+                f'<div style="height:{_BANNER_H};margin-bottom:0.75rem"></div>'
+            )
+        st.markdown(_alert_html, unsafe_allow_html=True)
 
         # --- Global Netting Diagnostics (Restored to Fragment) ---
         try:
@@ -1281,8 +1347,6 @@ def _bot_positions_fragment():
 
 @st.fragment(run_every=15)
 def _exchange_sync_diagnostics_fragment():
-    st.subheader("🔍 Exchange Sync Diagnostics")
-    
     import json
     import os
     import time
@@ -1304,42 +1368,51 @@ def _exchange_sync_diagnostics_fragment():
         st.info("No exchange sync data in cache.")
         return
         
-    # We want to display each pair's diagnostics in a clean, professional way.
-    for pair, sync_data in data.items():
-        ts = sync_data.get('timestamp', 0)
-        time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts))
-        drift_detected = sync_data.get('drift_detected', False)
-        exchange_net = sync_data.get('exchange_net', 0.0)
-        db_sum_qty = sync_data.get('db_sum_qty', 0.0)
-        diff = sync_data.get('diff', 0.0)
-        tolerance = sync_data.get('tolerance', 0.0)
-        
-        status_color = "red" if drift_detected else "green"
-        status_text = "DRIFT DETECTED" if drift_detected else "IN SYNC"
-        
-        st.markdown(
-            f"### {pair} : :{status_color}[{status_text}]"
-        )
-        st.markdown(
-            f"**Last Checked:** {time_str} | **Tolerance:** {tolerance:.6f}\n\n"
-            f"**Exchange Net:** `{exchange_net:.8f}` | **DB sum(open_qty):** `{db_sum_qty:.8f}` | **Diff:** `{diff:.8f}`"
-        )
-        
-        bots = sync_data.get('bots', [])
-        if bots:
-            with st.expander(f"Contributing Bots for {pair} ({len(bots)} active)", expanded=drift_detected):
-                import pandas as pd
-                df = pd.DataFrame(bots)
-                df = df.rename(columns={
-                    'bot_id': 'Bot ID',
-                    'name': 'Bot Name',
-                    'direction': 'Direction',
-                    'open_qty': 'Open Qty',
-                    'signed_qty': 'Signed Qty (Contribution)'
-                })
-                st.dataframe(df, width='stretch', hide_index=True)
+    # Count drifting pairs
+    drifting_pairs = [pair for pair, sync_data in data.items() if sync_data.get('drift_detected', False)]
+    num_drifting = len(drifting_pairs)
+    
+    label = "🔍 Exchange Sync Diagnostics" if num_drifting == 0 else f"⚠️ Exchange Sync Diagnostics ({num_drifting} pairs drifting)"
+    
+    with st.expander(label, expanded=num_drifting > 0):
+        if num_drifting == 0:
+            st.markdown("✅ All pairs in sync")
+        else:
+            for pair in drifting_pairs:
+                sync_data = data[pair]
+                ts = sync_data.get('timestamp', 0)
+                time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts))
+                drift_detected = sync_data.get('drift_detected', False)
+                exchange_net = sync_data.get('exchange_net', 0.0)
+                db_sum_qty = sync_data.get('db_sum_qty', 0.0)
+                diff = sync_data.get('diff', 0.0)
+                tolerance = sync_data.get('tolerance', 0.0)
                 
-        st.markdown("---")
+                status_color = "red" if drift_detected else "green"
+                status_text = "DRIFT DETECTED" if drift_detected else "IN SYNC"
+                
+                st.markdown(
+                    f"### {pair} : :{status_color}[{status_text}]"
+                )
+                st.markdown(
+                    f"**Last Checked:** {time_str} | **Tolerance:** {tolerance:.6f}\n\n"
+                    f"**Exchange Net:** `{exchange_net:.8f}` | **DB sum(open_qty):** `{db_sum_qty:.8f}` | **Diff:** `{diff:.8f}`"
+                )
+                
+                bots = sync_data.get('bots', [])
+                if bots:
+                    with st.expander(f"Contributing Bots for {pair} ({len(bots)} active)", expanded=drift_detected):
+                        import pandas as pd
+                        df = pd.DataFrame(bots)
+                        df = df.rename(columns={
+                            'bot_id': 'Bot ID',
+                            'name': 'Bot Name',
+                            'direction': 'Direction',
+                            'open_qty': 'Open Qty',
+                            'signed_qty': 'Signed Qty (Contribution)'
+                        })
+                        st.dataframe(df, width='stretch', hide_index=True)
+                st.markdown("---")
 
 
 @st.fragment(run_every=10)
@@ -1614,71 +1687,50 @@ def render_monitor_view():
     # --- Notifications (Phase 9.3) ---
     # Moved to _notifications_fragment() at the root of render_monitor_view()
     
-    # --- Risk Heatmap (Phase 10.2) ---
-    if st.checkbox("Show Portfolio Heatmap", value=True):
-        try:
-            import plotly.express as px
-            # Fetch active bots for visualization
-            conn = get_connection()
-            df_risk = pd.read_sql("SELECT name, total_invested, current_step, avg_entry_price, last_exit_price FROM trades JOIN bots ON trades.bot_id = bots.id WHERE total_invested > 0", conn)
-            # conn.close() # We don't close get_connection() results usually? 
-            # In database.py: get_connection uses thread local. closing it might perform actual close or skip. 
-            # The pattern seems to be to rely on reuse.
-            
-            if not df_risk.empty:
-               fig = px.treemap(
-                   df_risk, 
-                   path=['name'], 
-                   values='total_invested',
-                   color='current_step',
-                   color_continuous_scale='RdYlGn_r', # Red for high step (high risk)
-                   title="Active Risk Map (Size=Invested, Color=Step/Risk)"
-               )
-               st.plotly_chart(fig, width="stretch")
-            else:
-               st.info("No active positions to display in Heatmap.")
-        except Exception as e:
-            st.error(f"Heatmap Error: {e}")
+    # --- Header Fragment (30 s refresh cycle, independent of bot grid) ---
+    _header_metrics_fragment()
 
-    # --- Auto-Refresh Toggle (Default ON) ---
-    auto_refresh = st.toggle("⚡ Auto-Refresh (15s) [ASync]", value=True, key="auto_refresh_toggle")
-    # Cache is managed by the fragments themselves (written on fetch, served between ticks).
-    # Only clear it when the user explicitly turns auto-refresh OFF→ON to force a fresh load.
-    if auto_refresh and not st.session_state.get("_prev_auto_refresh", True):
-        st.session_state.pop("cached_monitor_data", None)
-        st.session_state.pop("cached_header_data", None)
-    st.session_state["_prev_auto_refresh"] = auto_refresh
-    
+    # --- Auto-Refresh + Refresh Now (compact single row) ---
+    _ar_col, _rn_col = st.columns([3, 1])
+    with _ar_col:
+        auto_refresh = st.toggle("⚡ Auto-Refresh (15s)", value=True, key="auto_refresh_toggle")
+        # Only clear cache when user flips OFF→ON to force an immediate fresh load.
+        if auto_refresh and not st.session_state.get("_prev_auto_refresh", True):
+            st.session_state.pop("cached_monitor_data", None)
+            st.session_state.pop("cached_header_data", None)
+        st.session_state["_prev_auto_refresh"] = auto_refresh
+    with _rn_col:
+        if st.button("🔄 Refresh Now", width="stretch"):
+            st.cache_data.clear()
+            st.session_state["_force_health_refresh"] = True
+            st.rerun()
+
     # Detect if the Reconciler / Forensic Wizard is actively in use.
     wizard_active = any(bool(st.session_state[k]) for k in st.session_state if k.startswith(("forensic_trades_", "adopt_force_sel_", "trade_sel_", "_confirm_")))
 
-    # --- PERFORMANCE: SHARED DATA LOADER ---
-    # --- Fragment: Header Metrics (Command Center) ---
-    # Invoke Header Fragment
-    _header_metrics_fragment()
 
-
-    # --- Control Bar ---
+    # --- Chart Control Bar (symbol + timeframe drive data fetch + chart tab) ---
     try:
         conn_b = get_connection()
         cur_b = conn_b.cursor()
         cur_b.execute("SELECT id, name, pair FROM bots WHERE is_active = 1")
         active_bots_list = cur_b.fetchall()
-        # conn_b.close()
     except:
         active_bots_list = []
-    
+
     bot_options = ["None (Symbol View)"] + [f"{b[1]} ({b[2]})" for b in active_bots_list]
 
-    col1, col2, col3 = st.columns([2, 1, 1])
-    with col1:
-        c1a, c1b = st.columns(2)
-        with c1a:
+    # Compact 3-column control bar: [FocusBot + Symbol]  [Timeframe]
+    # (Refresh Now button moved to the auto-refresh row above)
+    _cb1, _cb2 = st.columns([3, 1])
+    with _cb1:
+        _c1a, _c1b = st.columns(2)
+        with _c1a:
             selected_bot_str = st.selectbox("Focus Bot", bot_options, index=0, key="monitor_bot_select")
-        
+
         target_symbol_list = list(global_config.ALLOWED_SYMBOLS)
         selected_bot_id = None
-        
+
         if selected_bot_str != "None (Symbol View)":
             bot_name_sel = selected_bot_str.split(" (")[0]
             for b in active_bots_list:
@@ -1690,19 +1742,10 @@ def render_monitor_view():
             active_pairs = list(set([b[2] for b in active_bots_list]))
             target_symbol_list = list(dict.fromkeys(active_pairs + target_symbol_list))
 
-        with c1b:
+        with _c1b:
             symbol = st.selectbox("Symbol", target_symbol_list, key="monitor_symbol")
-
-    with col2:
+    with _cb2:
         timeframe = st.selectbox("Timeframe", ["1m", "5m", "15m", "30m", "1h", "4h", "1d"], index=4, key="monitor_tf")
-    with col3:
-        # Layout hack to align button with selectboxes
-        st.write("")
-        st.write("")
-        if st.button("🔄 Refresh Now", width='stretch'):
-            st.cache_data.clear()
-            st.session_state["_force_health_refresh"] = True
-            st.rerun()
 
     # --- Data Fetching (Parallel) ---
     with st.spinner("Fetching market data..."):
@@ -1748,6 +1791,28 @@ def render_monitor_view():
         _exchange_sync_diagnostics_fragment()
 
     with tab_charts:
+        # --- Portfolio Risk Heatmap (Phase 10.2) — collapsed by default -------
+        with st.expander("📊 Portfolio Risk Heatmap", expanded=False):
+            try:
+                import plotly.express as px
+                conn = get_connection()
+                df_risk = pd.read_sql(
+                    "SELECT name, total_invested, current_step, avg_entry_price "
+                    "FROM trades JOIN bots ON trades.bot_id = bots.id WHERE total_invested > 0",
+                    conn
+                )
+                if not df_risk.empty:
+                    fig_hm = px.treemap(
+                        df_risk, path=['name'], values='total_invested',
+                        color='current_step', color_continuous_scale='RdYlGn_r',
+                        title="Risk Map (Size=Invested, Colour=Step/Risk)"
+                    )
+                    st.plotly_chart(fig_hm, width="stretch")
+                else:
+                    st.info("No active positions to display.")
+            except Exception as _hm_err:
+                st.error(f"Heatmap Error: {_hm_err}")
+
         st.subheader(f"📈 Live Market Chart: {symbol} ({timeframe})")
         if ohlcv_data:
             try:
@@ -1900,14 +1965,17 @@ def render_monitor_view():
                 # Distinguish Auto-Reconcile from actual operator SYSTEM_WIPEs
                 def format_action(row):
                     act = row['Action']
-                    details = str(row.get('Details') or '')
-                    price_val = row.get('Price')
+                    details = str(row.get('Details') or '').lower()
                     if act == 'SYSTEM_WIPE':
-                        if price_val == 0.0 or not details or 'manual' not in details.lower():
+                        # Default to loud SYSTEM_WIPE unless details confirm it was an automated background cleanup
+                        is_auto = any(term in details for term in ['auto', 'reconcile', 'startup', 'zombie', 'ghost'])
+                        is_manual = any(term in details for term in ['manual', 'operator', 'human', 'cleanup'])
+                        if is_auto and not is_manual:
                             return '🧹 Auto-Reconcile'
                         else:
                             return '⚠️ SYSTEM_WIPE'
                     return act
+
                 
                 df_hist['Action'] = df_hist.apply(format_action, axis=1)
 

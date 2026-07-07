@@ -1633,6 +1633,8 @@ def _reset_bot_after_tp_internal(cursor, bot_id, exit_price, direction=None, act
         try:
             from engine.ledger import seal_trade_state
             seal_trade_state(bot_id, force_recompute=True)
+
+
         except Exception as _seal_ex:
             logger.error(
                 f"[PRE-ADVANCE-INVARIANT] Bot {bot_id}: seal failed: {_seal_ex}. "
@@ -1844,7 +1846,9 @@ def safe_wipe_bot(
     force: bool = False,                         # Override all guards — manual wipe only
     bypass_ledger_guard: bool = False,           # Top-down override: true if physical == 0
     human_approved: bool = False,                # Human approval gate
-    cursor=None                                  # Active cursor: skip BEGIN IMMEDIATE (nested tx safety)
+    cursor=None,                                 # Active cursor: skip BEGIN IMMEDIATE (nested tx safety)
+    exchange=None,                               # Live exchange object — REQUIRED for action_label='MANUAL_CLOSE'
+    action_label: str = 'SYSTEM_WIPE',          # Caller intent: MANUAL_CLOSE triggers live position check
 ) -> bool:
     """
     Centralized gate for all destructive bot resets.
@@ -1855,6 +1859,7 @@ def safe_wipe_bot(
     MIN_NOTIONAL_THRESHOLD = 0.01  # Absolute zero-tolerance ($0.01)
     MIN_PHYSICAL_QTY_THRESHOLD = 1e-8 # Scientific dust floor
 
+    has_external_cursor = (cursor is not None)
     if cursor is None:
         conn = get_connection()
         cursor = conn.cursor()
@@ -1903,16 +1908,68 @@ def safe_wipe_bot(
         if cursor is not None:
             _reset_bot_after_tp_internal(
                 cursor, bot_id, exit_price, direction=direction,
-                action_label='SYSTEM_WIPE', human_approved=True
+                action_label='SYSTEM_WIPE', notes=reason, human_approved=True
             )
         else:
             reset_bot_after_tp(
                 bot_id, exit_price, direction=direction, action_label='SYSTEM_WIPE',
-                human_approved=True,
+                notes=reason, human_approved=True,
             )
+
         return True
 
-    # ── Guard 2: Physical position on exchange ───────────────────────────
+    # ── Guard 2.0: Live exchange verification for MANUAL_CLOSE ───────────
+    # active_positions (Guard 2 below) is a cached DB snapshot that may lag
+    # behind actual exchange state by up to one WS polling interval.
+    # For MANUAL_CLOSE, where an operator just closed the position and is
+    # immediately calling this function, that cache is untrustworthy.
+    # We call fetch_positions() live and refuse loudly if the position is
+    # non-flat — catching operator timing errors (wrong side, wrong amount,
+    # close not yet settled) before they corrupt the DB.
+    if action_label == 'MANUAL_CLOSE':
+        if exchange is None:
+            logger.critical(
+                f"🚨 [SAFE-WIPE BLOCKED] Bot {bot_id} ({pair} {direction}): "
+                f"action_label='MANUAL_CLOSE' requires a live exchange object "
+                f"to verify position flatness, but exchange=None was passed. "
+                f"Wipe REFUSED. Pass the exchange instance to safe_wipe_bot()."
+            )
+            return False
+        try:
+            from engine.exchange_interface import normalize_symbol as _nsym
+            _live_positions = exchange.fetch_positions() or []
+            _live_qty = 0.0
+            _clean = _nsym(pair).upper()
+            _side_check = direction.upper()
+            for _p in _live_positions:
+                _sym = _nsym(_p.get('symbol', '')).upper()
+                _pside = (_p.get('side') or '').upper()
+                if _sym == _clean and _pside == _side_check:
+                    _live_qty += abs(float(_p.get('contracts', 0) or 0))
+
+            if _live_qty > 1e-8:
+                logger.critical(
+                    f"🚨 [SAFE-WIPE BLOCKED] Bot {bot_id} ({pair} {direction}): "
+                    f"MANUAL_CLOSE requested but exchange still holds "
+                    f"{_live_qty:.8f} {_side_check} contracts. "
+                    f"Close the position on the exchange first, then retry. "
+                    f"Wipe REFUSED to prevent DB/exchange state divergence."
+                )
+                return False
+            logger.info(
+                f"✅ [MANUAL-CLOSE VERIFIED] Bot {bot_id} ({pair} {direction}): "
+                f"Live fetch_positions() confirms exchange is flat (qty={_live_qty:.8f}). "
+                f"Proceeding with wipe."
+            )
+        except Exception as _e_fetch:
+            logger.critical(
+                f"🚨 [SAFE-WIPE BLOCKED] Bot {bot_id} ({pair} {direction}): "
+                f"MANUAL_CLOSE live position check raised an exception: {_e_fetch}. "
+                f"Cannot verify exchange flatness — wipe REFUSED."
+            )
+            return False
+
+    # ── Guard 2: Physical position on exchange (cached snapshot) ─────────
     # First check active_positions table (fast, cached from last snapshot)
     from engine.exchange_interface import normalize_symbol
     clean_pair = normalize_symbol(pair)
@@ -1937,14 +1994,22 @@ def safe_wipe_bot(
                 snapshot_phys_qty += abs(float(pos.get('contracts', 0) or pos.get('positionAmt', 0)))
 
     phys_qty = max(cached_phys_qty, snapshot_phys_qty)
+    if action_label == 'MANUAL_CLOSE':
+        # Live fetch_positions already verified it is flat. Ignore stale DB cache.
+        phys_qty = 0.0
+        try:
+            clear_active_position_for_bot(bot_id, pair, cursor=cursor)
+        except Exception as _e_ap:
+            logger.warning(f"[SAFE-WIPE] Could not clear stale active_positions for bot {bot_id}: {_e_ap}")
 
     if phys_qty > MIN_PHYSICAL_QTY_THRESHOLD:
         logger.warning(
             f"🛡️ [SAFE-WIPE BLOCKED] Bot {bot_id} ({clean_pair} {side_check}): "
-            f"Physical Inventory {phys_qty:.8f} exists on exchange. "
+            f"Physical Inventory {phys_qty:.8f} exists on exchange (cached check). "
             f"Wipe FORBIDDEN under Proof-Only Protocol. Reason: {reason}"
         )
         return False
+
 
     # ── Guard 2.1: Price-Aware Notional Calculation ──────────────────────
     cursor.execute("SELECT avg_entry_price FROM trades WHERE bot_id=?", (bot_id,))
@@ -2008,16 +2073,17 @@ def safe_wipe_bot(
         f"phys_qty={phys_qty:.6f}, ledger_net={ledger_net_qty:.6f}, "
         f"cycle_phase={row[0] if row else 'N/A'}. Executing wipe. Reason: {reason}"
     )
-    if cursor is not None:
+    if has_external_cursor:
         _reset_bot_after_tp_internal(
             cursor, bot_id, exit_price, direction=direction,
-            action_label='SYSTEM_WIPE', human_approved=human_approved
+            action_label='SYSTEM_WIPE', notes=reason, human_approved=human_approved
         )
     else:
         reset_bot_after_tp(
             bot_id, exit_price, direction=direction,
-            action_label='SYSTEM_WIPE', human_approved=human_approved
+            action_label='SYSTEM_WIPE', notes=reason, human_approved=human_approved
         )
+
     return True
 
 

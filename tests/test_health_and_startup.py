@@ -245,7 +245,9 @@ class TestHealthObjectStructure:
 
 class TestGetSystemHealthCaching:
     def _call(self, mem_db, force_refresh: bool = False):
-        _set_engine_started_at(mem_db, time.time() - 200)
+        cursor = mem_db.execute("SELECT value FROM system_equity WHERE key='ENGINE_STARTED_AT'")
+        if not cursor.fetchone():
+            _set_engine_started_at(mem_db, time.time() - 200)
         return get_system_health(
             db_path=database.DB_PATH,
             exchange_instance=_make_exchange(),

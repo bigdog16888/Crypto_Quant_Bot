@@ -1,5 +1,5 @@
 # Crypto Quant Bot — AI Agent Codebase Guide
-**Version: 5.0.0 | Last Updated: 2026-07-03**
+**Version: 5.2.0 | Last Updated: 2026-07-07**
 
 > **READ THIS FIRST** before touching any code. This is the single authoritative guide.
 > It supersedes `UNIFIED_BOT_DOCUMENTATION.md` and all older session notes.
@@ -12,6 +12,30 @@
 
 ## 🏗️ High-Level Engine Architecture
 The Crypto Quant Bot uses a **Proof-Only Reconciliation Architecture** (v3.5.0 enforces v3.4 design).
+
+### The Three-Layer State Model
+The engine keeps states aligned across three distinct boundaries:
+
+| Layer | Component | Source of Truth | Sync Guarantee |
+| :--- | :--- | :--- | :--- |
+| **1. Exchange Physical Position** | Binance REST API & Websocket Streams | Actual physical contracts held on the exchange account. | **Authority for Reality**: Read live during manual interventions, startup repairs, and gating checks. |
+| **2. Bot Orders Ledger** | SQLite `bot_orders` table | Direction-signed database ledger of all individual grid, TP, and catch-up order fills. | **Authority for History**: Write-heavy. Appends fills asynchronously from websocket event streams. |
+| **3. Trades Cache** | SQLite `trades` table | Aggregated metrics (`open_qty`, `avg_entry_price`, `total_invested`) for fast reads by the UI and the execution loop. | **Eventually Consistent**: Computed from the `bot_orders` ledger via `seal_trade_state()`. |
+
+```mermaid
+graph TD
+    Exchange["1. Exchange Physical Position (Binance REST/WS)"]
+    Ledger["2. Bot Orders Ledger (SQLite bot_orders table)"]
+    Cache["3. Trades Cache (SQLite trades table)"]
+    
+    Exchange -- Websocket Fills --> Ledger
+    Ledger -- seal_trade_state() --> Cache
+    Cache -- BotExecutor Loop --> Exchange
+```
+
+### Transactional Consistency & Write Serialization
+* **Single-Threaded Database Writes (INV-31)**: All database writes targeting the `trades` and `bot_orders` tables must run through the `WriteQueue` singleton to ensure single-threaded execution and prevent concurrent write race conditions. Direct `conn.execute/commit` calls for mutations are prohibited outside of the `WriteQueue`.
+* **Write Queue Bypassing**: When inside an active database transaction block (e.g. from an outer loop that passed an explicit `cursor` instance), nested calls to `seal_trade_state` bypass the write queue and run synchronously on the same thread, preventing nested transaction lockups.
 
 **Parity pass (exact):** For every pair, `abs(virtual_qty - exchange_qty) <= PAIR_PARITY_QTY_TOLERANCE` (default 0.002). UI **HEALTHY** only when `audit_pair_ledger_vs_exchange()` returns zero rows. No “close enough.”
 
@@ -122,10 +146,45 @@ The dashboard (`monitor.py`) utilizes **native Streamlit Fragments** (`@st.fragm
 - **FLATTENING** — force-close in progress (transitional cascade state, trigger timestamp in `cascade_started_at`)
 - **pending_flatten** — queued for force-close (transitional cascade state, trigger timestamp in `cascade_started_at`)
 - **pending_close** — cascade close in progress (transitional cascade state, trigger timestamp in `cascade_started_at`)
-- **REQUIRE_MANUAL_PROOF** — locked, human intervention required. Fills arriving while gated are still credited to bot_orders and trades.open_qty via credit_fill (INV-34), and Take Profit (TP) exit cascades still run and reset the bot to Scanning once flat. Only new order placement and new entry signals are blocked.
+- **REQUIRE_MANUAL_PROOF** — locked, human intervention required. Fills arriving while gated are still credited to `bot_orders` and `trades.open_qty` via `credit_fill` (INV-34), and Take Profit (TP) exit cascades still run and reset the bot to `Scanning` once flat. Only new order placement and new entry signals are blocked.
 
-### 🔧 REQUIRE_MANUAL_PROOF Resolution Procedure
-When a bot enters the `REQUIRE_MANUAL_PROOF` status, it is locked from trading. GTR monitors this status and fires a CRITICAL alert after 1 hour with the unresolved USD value. Use the following step-by-step procedure to resolve it:
+### Cycle Phases
+- **`ACTIVE`**: Standard trading cycle.
+- **`PARTIAL_CLOSE_PENDING`**: A reduction or dust-clearing close order is currently open on the exchange.
+- **`STUCK_DUST_NO_EXIT`**: Escalation phase. The bot has a remaining position size below the exchange minimum notional (typically ~$5, e.g. SUI dust of 0.37 units) and its reduction order has failed. Requires operator attention or auto-wipe.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Scanning
+    Scanning --> IN_TRADE : Grid/Entry Order Fills
+    IN_TRADE --> Scanning : Take Profit (TP) Fills
+    IN_TRADE --> REQUIRE_MANUAL_PROOF : Order Rejection / Desync Loop
+    IN_TRADE --> STUCK_DUST_NO_EXIT : Dust Reduction Failure (<$5)
+    IN_TRADE --> pending_flatten : Operator / Parent Triggered Exit
+    pending_flatten --> Scanning : resolve_gated_bot() Wipe
+    REQUIRE_MANUAL_PROOF --> Scanning : resolve_gated_bot() Clean Wipe
+    
+    state "Hedge Sub-State" as H {
+        [*] --> hedge_standby
+        hedge_standby --> HEDGE_ACTIVE : Parent Triggered step
+        HEDGE_ACTIVE --> hedge_standby : Step Completed
+    }
+```
+
+### 🔧 Gated Bot Resolution & Recovery Procedures
+
+#### 1. Universal Automated Recovery: `resolve_gated_bot()`
+For any bot stuck in `REQUIRE_MANUAL_PROOF`, `STUCK_DUST_NO_EXIT`, or `pending_flatten`, the reconciler automatically attempts to execute **`resolve_gated_bot()`** from `engine/recovery.py`.
+
+* **Algorithm**:
+  1. Computes the netting-aware closeable quantity based on the signed net exchange position:
+     $$\text{closeable\_qty} = \min(\text{virtual\_qty}, \max(0, \text{physical\_qty} \times \text{dir\_sign}))$$
+  2. If `closeable_qty > 0`, it places a matching `reduceOnly` close order on the exchange and waits for confirmation.
+  3. If `closeable_qty = 0` (e.g. position is flat on the exchange or held by a sibling), it skips the exchange order and directly calls `safe_wipe_bot(..., bypass_ledger_guard=True)` to wipe the virtual database state and reset the bot.
+* **Limitations**: If `closeable_qty = 0` is wiped, the database goes flat, but the opposing sibling bot's virtual accounting is left out of sync. This drift is highlighted via warning banners on the monitor dashboard.
+
+#### 2. Manual REQUIRE_MANUAL_PROOF Resolution Procedure
+If the automated recovery is bypassed or manual operator override is required:
 
 > [!IMPORTANT]
 > **Independent Bot Position Verification (v4.3.1):** 
@@ -206,6 +265,7 @@ LAYER 3 — Position Integrity (virtual must match physical)
   INV-30: hedge child continuous qty reconciliation in maintain_orders
   INV-32: safe_wipe_bot bot-attributed check — safe_wipe_bot queries active_positions by bot_id with fallback to trades.open_qty to prevent sibling bots from blocking resets.
   INV-35: Authoritative Exit Order (TP) Presence Invariant — active TP must exist for standard in-trade bots.
+  INV-37: Shutdown Grid and Exit Auditing — REST audit of open orders before final DB seal.
   DEPENDS ON: INV-18, INV-29 (signals must be correct before qty can be reconciled)
 
 LAYER 4 — Ground Truth Safety Net (detects what layers 1-3 missed)
@@ -748,6 +808,10 @@ INVARIANT (INV-34): Fills recorded by `credit_fill()` must never be blocked or d
 - **Gated Behavior**: If a bot is gated (`REQUIRE_MANUAL_PROOF`), entry signals (new order placements, child hedge triggers) remain blocked to prevent position expansion, but exit cascades (TP completion, resets to Scanning) are permitted to run to completion once the position is flat.
 - **Wipe/Reset Integration**: When `seal_trade_state()` recomputes a bot's state, if the bot is currently in `REQUIRE_MANUAL_PROOF` and the position is flat (`main_open_qty <= step_size_tolerance`), the gate status must be cleared, resetting the bot back to `Scanning` automatically.
 
+### 3.70. Shutdown Grid and Exit Auditing (INV-37) (v5.1.0)
+INVARIANT (INV-37): During the graceful shutdown sequence of the engine, the reconciler must execute active REST audits for all open/new grid, entry, and take-profit (exit) orders via `_audit_pending_exits()` and `_audit_pending_grids()`. Fills confirmed by the exchange must be credited and the bot's trade state sealed in the DB before the final `seal_all_active_bots()` is executed. This prevents writing a stale virtual trade state to the database on shutdown.
+- **REST rate-limit safety guard**: `_audit_pending_grids()` must cap CCXT `fetch_order` calls to 20 per run. If more than 20 qualifying orders exist, it prioritizes orders older than 60 seconds, logs a WARNING, and processes only the oldest 20.
+
 ---
 
 ## 4. Reconciler Architecture
@@ -913,6 +977,33 @@ After restart, watch for:
 
 ## 8. Version History (Change Log)
 
+### v5.1.1 — 2026-07-06
+UI single-page layout overhaul, fixed-height alert banner, GTR critical-state health keys, and engine/UI stability fixes.
+
+- **UI Layout (`ui/views/monitor.py`)**: Promoted bot table to the first visible element in the Overview tab by removing the always-visible treemap from the pre-tab section. Header condensed from 8 tiles (2 rows × 4) to 5 tiles (1 row): Equity / Balance / PnL / Invested / **⚡ Status** pill. Status pill shows `system_status` + worst-gap inline; hover reveals In-Trade count.
+- **Heatmap moved to Charts tab**: Portfolio Risk Heatmap (`plotly` treemap) relocated from the main render path to a `st.expander(..., expanded=False)` inside the Charts tab — not rendered until explicitly opened.
+- **Compact control bar**: Auto-Refresh toggle and Refresh Now button share a single two-column row; removed `st.write("")` spacer hacks.
+- **Fixed-height alert banner (no layout shift)**: Replaced the 3-metric row (`st.metric` columns for Mismatched Pairs / Worst Gap / System Status) and the `st.caption` order-health line with a single `58 px` HTML container that is **always rendered** regardless of health state. Healthy state → invisible spacer of identical height. Error state → red-bordered alert div. Bot table anchor point is stable across every fragment refresh tick.
+- **GTR health keys wired into banner**: `manual_proof_bots` and `stuck_cascade_bots` from `health_data` feed into the same fixed-height banner inside `_bot_positions_fragment` (15 s cycle), so operators see critical states without waiting for the 30 s header fragment.
+- **`_bot_positions_fragment` independence preserved**: `@st.fragment(run_every=15)` decorator left completely untouched — only internal rendering logic changed. Header fragment remains on its independent 30 s cycle.
+- **`engine/health.py` — GTR critical-state detection (Improvements #1 and #4)**:
+  - Added `_compute_critical_bot_states(db_path)` helper: queries `bots` table for `REQUIRE_MANUAL_PROOF` and stuck-cascade statuses (timed out past 300 s). No exchange calls — DB-only, safe on every health cycle.
+  - Added `stuck_cascade_bots` (list of bot names) and `manual_proof_bots` (list of bot names) to `health_data` return dict.
+  - `system_status` priority order updated: `STARTING > CRITICAL > MISMATCH > WARNING > HEALTHY`. `CRITICAL` fires when either list is non-empty, taking precedence over parity mismatches.
+- **`basket_start_time` LEFT JOIN Fix (`engine/health.py`)**: Resolved query failures logging `no such column: basket_start_time` by correctly LEFT JOINing the `trades` table in `_compute_critical_bot_states` check.
+- **Streamlit Deprecation Warning Fixes (`ui/views/monitor.py`)**: Replaced deprecated `use_container_width=True` parameters with standard `width="stretch"` for button and chart elements.
+- **Exchange Sync Diagnostics Expander (`ui/views/monitor.py`)**: Refined to collapse when clean (`expanded=num_drifting > 0`), display `"✅ All pairs in sync"`, and only display details for drifting pairs to eliminate screen noise.
+- **Automated Tests**: 388 passed, 0 failed.
+- **Bumped version** to `5.1.1`.
+
+### v5.1.0 — 2026-07-03
+Continuous Grid and Exit Auditing on Shutdown and Startup.
+- Added `_audit_pending_grids()` to continuously check open grid/entry orders via REST (capped at 20 calls).
+- Added pre-shutdown audits for exits and grids before the final DB state seal.
+- Added startup stale verification to reconstruct and credit/cancel any open/new orders from a previous session using real exchange order IDs.
+- Added unit tests in `tests/test_shutdown_grid_audit.py`.
+- Bumped version to `5.1.0`.
+
 ### v5.0.0 — 2026-07-03
 **First Stable Green Release**
 - System confirmed green across all pairs for sustained period.
@@ -963,6 +1054,22 @@ Schema Migrations Tracking & INV-33 Startup False-Alarm Suppression.
 Single Authoritative Health State & Startup False-Alarm Suppression.
 
 - **`engine/health.py` (new module)**: Implemented `compute_system_health()` — a single authoritative aggregator that computes all health metrics in one pass: netting status per pair (`netting_status_per_pair`), order health (`order_health`), header metrics (`header_metrics`), orphan positions (`orphan_positions`), startup suppression flag, and `ENGINE_STARTED_AT`. Introduced `get_system_health()` with a 10 s module-level TTL cache and `force_refresh` override.
+  **`health_data` key schema** (all keys returned by `compute_system_health`):
+  | Key | Type | Description |
+  |-----|------|-------------|
+  | `timestamp` | float | Unix time of this computation |
+  | `startup_suppression` | bool | True if within 120 s of ENGINE_STARTED_AT |
+  | `startup_remaining_s` | float | Seconds left in grace period |
+  | `engine_started_at` | float | ENGINE_STARTED_AT value (0 if missing) |
+  | `system_status` | str | `STARTING` \| `HEALTHY` \| `WARNING` \| `MISMATCH` \| `CRITICAL` |
+  | `worst_gap_usd` | float | Largest netting gap across all pairs in USD |
+  | `mismatched_pair_count` | int | Count of pairs with qty drift > tolerance |
+  | `netting_status_per_pair` | dict | Per-pair netting detail keyed by normalised symbol |
+  | `order_health` | dict | `{status_color, message, bot_statuses}` |
+  | `header_metrics` | dict | All header tile values (equity, balance, PnL, invested, …) |
+  | `orphan_positions` | list | Exchange positions with no bot ownership |
+  | `stuck_cascade_bots` | list | Bot **names** stuck in a cascade status (`pending_close`, `FLATTENING`, `pending_flatten`, etc.) longer than `CASCADE_TIMEOUT` (300 s). Raises `system_status` to `CRITICAL`. Added v5.1.1. |
+  | `manual_proof_bots` | list | Bot **names** locked to `REQUIRE_MANUAL_PROOF` — human intervention required before the engine can proceed. Raises `system_status` to `CRITICAL`. Added v5.1.1. |
 - **Startup Grace Period**: Engine now writes `ENGINE_STARTED_AT` to `system_equity` on startup (`engine/runner.py`). `compute_system_health()` reads this timestamp and sets `startup_suppression=True` for the first 120 s, forcing `drift_detected=False` on all pairs and `system_status="STARTING"`, eliminating false-positive netting alerts during engine initialization.
 - **UI Integration (`ui/views/monitor.py`)**: `render_monitor_view()` computes health once per render cycle and stores it in `st.session_state["system_health_data"]`. `_header_metrics_fragment` consumes `health_data["header_metrics"]` (falls back to direct SQL only when health_data is absent). Startup banner displays remaining grace-period seconds when `startup_suppression=True`. `render_unowned_positions_banner()` reads `health_data["orphan_positions"]` and filters stale DB alerts by `engine_started_at`.
 - **INV-17 Extension (pending_placement Stale Order Recovery)**: Added `pending_placement` orders older than 30s to the stale order sync logic in `sync_stale_open_orders` (`engine/bot_executor.py`). If they are not found on the exchange, they are marked `cancelled` to unblock `PARTIAL_CLOSE_PENDING` loops.
@@ -1749,7 +1856,7 @@ All previously known open items have been resolved and closed:
 Run before every restart:
 ```powershell
 python -m pytest tests/ -x -q --tb=short
-# Expected: 385 passed, 0 failed
+# Expected: 388 passed, 0 failed
 ```
 
 Then verify in logs:

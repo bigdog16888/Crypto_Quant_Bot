@@ -188,7 +188,9 @@ class TestV390Fixes(unittest.TestCase):
             self.assertIn("purged bots", msg)
 
             mock_wipe.assert_called_once_with(
-                10050, 'SUI/USDC:USDC', 'LONG', reason='PHANTOM_LEDGER_PURGE', force=True, human_approved=True
+                10050, 'SUI/USDC:USDC', 'LONG', reason='PHANTOM_LEDGER_PURGE',
+                force=False, action_label='MANUAL_CLOSE', exchange=ex,
+                bypass_ledger_guard=True, human_approved=True
             )
 
             # Check that ghost_order_cancel was written with the expected CIDs list

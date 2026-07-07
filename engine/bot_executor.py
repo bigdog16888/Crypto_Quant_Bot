@@ -2678,7 +2678,7 @@ class BotExecutor:
                 try:
                     # 1. Fetch parent details
                     parent_row = _hc_enforce_conn.execute(
-                        "SELECT p.id, p.hedge_trigger_step, t.open_qty, t.cycle_id, t.current_step "
+                        "SELECT p.id, p.hedge_trigger_step, t.open_qty, t.cycle_id, t.current_step, c.status "
                         "FROM bots c "
                         "JOIN bots p ON p.id = c.parent_bot_id "
                         "JOIN trades t ON t.bot_id = p.id "
@@ -2686,7 +2686,7 @@ class BotExecutor:
                         (bot_id,)
                     ).fetchone()
                     if parent_row:
-                        parent_id, hedge_trigger, parent_open_qty, parent_cycle_id, parent_step = parent_row
+                        parent_id, hedge_trigger, parent_open_qty, parent_cycle_id, parent_step, child_status = parent_row
                         hedge_trigger = int(hedge_trigger or 0)
                         parent_open_qty = float(parent_open_qty or 0.0)
                         parent_cycle_id = int(parent_cycle_id or 1)
@@ -2722,16 +2722,23 @@ class BotExecutor:
 
                         # 4. Check if over-hedged first
                         if aggregate_drift < -tolerance:
-                            logger.warning(
-                                f"[INV-30] Hedge drift detected: child {bot_id} over-hedged "
-                                f"by {abs(aggregate_drift):.6f} {pair}. Parent hedgeable={parent_hedgeable_qty:.6f}, "
-                                f"child={child_open_qty:.6f}. Transitioning to pending_flatten."
-                            )
-                            _hc_enforce_conn.execute(
-                                "UPDATE bots SET status = 'pending_flatten', cascade_started_at = ? WHERE id = ?",
-                                (int(time.time()), bot_id)
-                            )
-                            _hc_enforce_conn.commit()
+                            if child_status == 'REQUIRE_MANUAL_PROOF':
+                                logger.info(
+                                    f"[INV-30] Bot {bot_id} is over-hedged but already gated in "
+                                    f"REQUIRE_MANUAL_PROOF. Skipping status overwrite."
+                                )
+                            else:
+                                logger.warning(
+                                    f"[INV-30] Hedge drift detected: child {bot_id} over-hedged "
+                                    f"by {abs(aggregate_drift):.6f} {pair}. Parent hedgeable={parent_hedgeable_qty:.6f}, "
+                                    f"child={child_open_qty:.6f}. Transitioning to pending_flatten."
+                                )
+                                _hc_enforce_conn.execute(
+                                    "UPDATE bots SET status = 'pending_flatten', cascade_started_at = ? WHERE id = ?",
+                                    (int(time.time()), bot_id)
+                                )
+                                _hc_enforce_conn.commit()
+
                         else:
                             # Iterate step S from hedge_trigger to parent_step
                             # checking saturation independently per step
@@ -3439,7 +3446,11 @@ class BotExecutor:
                     except Exception as e_close:
                         logger.error(f"[PARTIAL_CLOSE_PENDING] Fallback place close failed: {e_close}")
                         # FIX 2 — ReduceOnly rejection triggers ghost detection immediately:
-                        if any(phrase in str(e_close) for phrase in ["ReduceOnly", "-2022", "reduceOnly", "reduce-only"]):
+                        _is_reduce_only_err = any(
+                            phrase in str(e_close)
+                            for phrase in ["ReduceOnly", "-2022", "reduceOnly", "reduce-only"]
+                        )
+                        if _is_reduce_only_err:
                             logger.warning(f"⚠️ [PARTIAL_CLOSE_PENDING] ReduceOnly rejection detected for bot {name} ({bot_id}): {e_close}")
                             from engine.oneway_netting import detect_bot_ghost, wipe_bot_ghost
                             if detect_bot_ghost(exchange, bot_id, _conn_partial):
@@ -3447,6 +3458,31 @@ class BotExecutor:
                                 wipe_bot_ghost(exchange, bot_id, _conn_partial)
                                 _conn_partial.commit()
                                 return None
+                            # Position is real but unreachable: reduceOnly catch-22 + min notional.
+                            # Fall through to escalation below.
+                            logger.critical(
+                                f"🚨 [STUCK_DUST_NO_EXIT] Bot {name} ({bot_id}): fallback close rejected "
+                                f"(ReduceOnly catch-22) and position is confirmed real (ghost=False). "
+                                f"open_qty={current_open_qty:.8f}. Manual exchange close required."
+                            )
+                        else:
+                            logger.critical(
+                                f"🚨 [STUCK_DUST_NO_EXIT] Bot {name} ({bot_id}): fallback close failed "
+                                f"with non-ReduceOnly error: {e_close}. "
+                                f"open_qty={current_open_qty:.8f}. Manual intervention required."
+                            )
+                        # Escalate cycle_phase so health checks and the UI banner surface this. [INV-35]
+                        try:
+                            _conn_partial.execute(
+                                "UPDATE trades SET cycle_phase='STUCK_DUST_NO_EXIT' WHERE bot_id=?",
+                                (bot_id,)
+                            )
+                            _conn_partial.commit()
+                        except Exception as _e_stuck:
+                            logger.error(
+                                f"[PARTIAL_CLOSE_PENDING] Failed to set STUCK_DUST_NO_EXIT "
+                                f"for bot {bot_id}: {_e_stuck}"
+                            )
             return None
 
         pass

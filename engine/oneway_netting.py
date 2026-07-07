@@ -525,6 +525,12 @@ def sync_pair_to_exchange(pair, exchange, conn):
             except Exception:
                 pass
         data[pair] = sync_data
+        # Purge stale/inactive pairs from cache
+        try:
+            active_pairs = {r[0] for r in conn.execute("SELECT DISTINCT pair FROM bots WHERE is_active = 1").fetchall()}
+            data = {k: v for k, v in data.items() if k in active_pairs}
+        except Exception as pe:
+            logger.warning(f"Failed to purge stale pairs from diagnostics cache: {pe}")
         with open(cache_file, 'w') as f:
             json.dump(data, f, indent=4)
     except Exception as e:
@@ -846,7 +852,7 @@ def detect_unowned_exchange_positions(conn, exchange):
         shortfall = round(exchange_qty - pair_db_qty, 8)
 
         # 4. If drift exceeds tolerance, identify candidates and log alert
-        if abs(shortfall) > tolerance:
+        if abs(shortfall) >= tolerance:
             # Look for flat bots (open_qty = 0)
             flat_bots = conn.execute(f"""
                 SELECT b.id, b.name, b.direction, t.cycle_id 
