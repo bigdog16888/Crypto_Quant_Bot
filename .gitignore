@@ -1,73 +1,42 @@
-# Environment variables
-.env
-
-# Python Bytecode
+# Byte-compiled / cache
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
 
-# Databases
-*.db
-*.db-shm
-*.db-wal
-
-# Logs
-logs/*.log
-*.log
-engine.log
-engine_runner_debug.log
-startup_error.log
-
-# Runtime files
-*.pid
-engine.pid
-
-# IDEs
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Test cache
-.pytest_cache/
-.coverage
-
-# Virtual environments
+# Environments
+.env
+.venv/
 venv/
 env/
-ENV/
 
-# Build artifacts
+# Editor
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Logs and data
+*.log
+engine.log
+engine.emergency
+file
+data/
+logs/
+*.sqlite3
+
+# Python packaging
 build/
 dist/
 *.egg-info/
 
-# Scratch investigation scripts (not deployable source)
-scratch/
+# pytest
+.pytest_cache/
 
-# AI tool artifacts
-.gemini/
+# Misc
+.DS_Store
+coverage.xml
+htmlcov/
 
-# Editor backups
-*.bak
-
-# Ephemeral pytest cache dirs
-pytest-cache-files-*/
-
-# Backup snapshots
-backups/
-
-# Output dumps
-*.out
-
-# Runtime data cache (volatile, regenerated on startup)
-data/market_cache.json
-
-# Rotated log files
-engine.log.*
+# Archives
+archive/
+docs/archive/
