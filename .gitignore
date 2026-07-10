@@ -68,6 +68,9 @@ backups/
 
 # Runtime data cache (volatile, regenerated on startup)
 data/market_cache.json
+data/exchange_sync_diagnostics.json
+recovery_session.lock
+engine.emergency
 
 # Rotated log files
 engine.log.*

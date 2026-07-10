@@ -24,6 +24,10 @@ def main():
     print("CRYPTO QUANT BOT — STARTUP HEAL (no trading loop)")
     print("=" * 60)
 
+    # Bypass WriteQueue background thread deadlock for single-threaded startup heal
+    from engine.write_queue import WriteQueue
+    WriteQueue()._bypass = True
+
     from engine.database import (
         init_db,
         heal_inflated_filled_amounts,
@@ -105,8 +109,13 @@ def main():
             if normalize_symbol(pos.get("symbol", "")).upper() == norm:
                 phys += float(pos.get("contracts", 0) or pos.get("size", 0) or 0)
         ok = abs(v - phys) <= tol
-        flag = "OK" if ok else "MISMATCH"
-        print(f"  [{flag}] {norm}: virtual={v:+.4f}  exchange={phys:+.4f}  delta={phys - v:+.4f}")
+        if abs(v - phys) < 1e-9:
+            flag = "OK"
+        elif ok:
+            flag = "TOLERATED"
+        else:
+            flag = "MISMATCH"
+        print(f"  [{flag:<8}] {norm}: virtual={v:+.4f}  exchange={phys:+.4f}  delta={phys - v:+.4f}")
 
     if mismatches:
         print("\nACTION REQUIRED before Start Monitoring:")

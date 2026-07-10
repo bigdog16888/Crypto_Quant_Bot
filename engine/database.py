@@ -266,11 +266,27 @@ def heal_zombie_bots(conn):
                     trades_cycle_row = c.execute("SELECT cycle_id FROM trades WHERE bot_id=?", (bot_id,)).fetchone()
                     trades_cycle_id = trades_cycle_row[0] if trades_cycle_row else None
                     if trades_cycle_id is None:
+                        # Find highest non-reset filled cycle (for active bots with genuine NULL)
                         backing_cycle = c.execute(
                             "SELECT MAX(cycle_id) FROM bot_orders WHERE bot_id=? AND filled_amount > 0 "
                             "AND (status NOT IN ('reset_cleared','auto_closed','cancelled','canceled','failed') OR (status IN ('cancelled','canceled') AND filled_amount > 0))",
                             (bot_id,)
                         ).fetchone()[0]
+                        # Safety floor: never regress below the highest cycle ever recorded.
+                        # After a wipe, recent orders are reset_cleared, so backing_cycle can
+                        # regress to an ancient cycle whose old fills then get recomputed as live
+                        # position (phantom accumulation). Using the absolute MAX prevents this:
+                        # recompute against a cycle with all-reset_cleared orders returns 0. ✅
+                        max_ever_cycle = c.execute(
+                            "SELECT MAX(cycle_id) FROM bot_orders WHERE bot_id=?", (bot_id,)
+                        ).fetchone()[0]
+                        if max_ever_cycle is not None and (backing_cycle is None or backing_cycle < max_ever_cycle):
+                            logger.warning(
+                                f"🩹 [CYCLE-RESTORE] Bot {bot_id} ({pair}): non-reset backing_cycle={backing_cycle} "
+                                f"< max_ever_cycle={max_ever_cycle}. Advancing to {max_ever_cycle} to prevent "
+                                f"phantom accumulation from stale historical fills."
+                            )
+                            backing_cycle = max_ever_cycle
                         if backing_cycle is not None:
                             c.execute("UPDATE trades SET cycle_id=? WHERE bot_id=?", (backing_cycle, bot_id))
                             conn.commit()
@@ -1410,6 +1426,59 @@ def calculate_step_from_position(total_invested: float, base_size: float, multip
         
     return max(0, int(round(step)))
 
+def compute_realized_pnl_fifo(cursor, bot_id: int, cycle_id: int, bot_direction: str, exit_price: float = 0.0) -> tuple:
+    """
+    Calculate the realized PnL and trade metrics for a bot's specific cycle 
+    directly from the bot_orders ledger (immutable source of truth).
+    
+    Returns:
+        (pnl, entry_qty, entry_avg, exit_qty, exit_avg)
+    """
+    # 1. Fetch entries (increasing position)
+    cursor.execute("""
+        SELECT COALESCE(SUM(filled_amount), 0.0),
+               COALESCE(SUM(filled_amount * price), 0.0)
+        FROM bot_orders
+        WHERE bot_id = ? AND cycle_id = ? AND filled_amount > 0
+          AND order_type IN ('entry', 'grid', 'adoption', 'adoption_add', 'carry')
+          AND status NOT IN ('cancelled', 'canceled', 'failed', 'rejected')
+    """, (bot_id, cycle_id))
+    entry_qty, entry_cost = cursor.fetchone()
+
+    if entry_qty <= 0:
+        return 0.0, 0.0, 0.0, 0.0, 0.0
+
+    entry_avg = entry_cost / entry_qty
+
+    # 2. Fetch exits (decreasing position)
+    cursor.execute("""
+        SELECT COALESCE(SUM(filled_amount), 0.0),
+               COALESCE(SUM(filled_amount * price), 0.0)
+        FROM bot_orders
+        WHERE bot_id = ? AND cycle_id = ? AND filled_amount > 0
+          AND order_type IN ('adoption_reduce', 'tp', 'close', 'dust_close', 'sl', 'flatten_close')
+          AND status NOT IN ('cancelled', 'canceled', 'failed', 'rejected')
+    """, (bot_id, cycle_id))
+    exit_qty, exit_value = cursor.fetchone()
+
+    # If exits are less than entries, value the remaining part at exit_price
+    effective_exit_qty = exit_qty
+    effective_exit_value = exit_value
+    if exit_qty < entry_qty:
+        missing_qty = entry_qty - exit_qty
+        effective_exit_qty = entry_qty
+        use_exit_price = exit_price if exit_price > 0.0 else entry_avg
+        effective_exit_value += missing_qty * use_exit_price
+
+    exit_avg = effective_exit_value / effective_exit_qty if effective_exit_qty > 0 else 0.0
+
+    if bot_direction.upper() == 'LONG':
+        pnl = effective_exit_value - entry_cost
+    else:
+        pnl = entry_cost - effective_exit_value
+
+    return pnl, entry_qty, entry_avg, exit_qty, (exit_value / exit_qty if exit_qty > 0 else 0.0)
+
 def _reset_bot_after_tp_internal(cursor, bot_id, exit_price, direction=None, action_label='TP_HIT', notes='', exit_fill_ts: int = 0, human_approved: bool = False, exchange=None, skip_cycle_increment: bool = False):
     excluded_carry_labels = ['SYSTEM_WIPE', 'MANUAL_CLOSE', 'PARTIAL_MANUAL', 'CARRY_WIPE',
                               'ORPHAN_EXCHANGE_REPAIR', 'HEDGE_UNBLOCK']  # Orphan repair: caller verified exchange flat
@@ -1435,32 +1504,44 @@ def _reset_bot_after_tp_internal(cursor, bot_id, exit_price, direction=None, act
             bot_id, pair, action_label, human_approved=human_approved, exchange=exchange,
         )
     except CycleResetBlockedError as e:
-        cursor.execute(
-            "UPDATE bots SET status='REQUIRE_MANUAL_PROOF' WHERE id=? AND status NOT IN ('STOPPED')",
-            (bot_id,),
-        )
+        # Use _set_bot_require_manual_proof (separate connection + grace check) instead of
+        # cursor.execute() here.  The outer _reset_bot_after_tp_public_internal will call
+        # conn.rollback() when it catches this re-raised exception, which would have silently
+        # undone any cursor-based write.  A separate connection write survives the rollback.
+        # The centralized grace guard in _set_bot_require_manual_proof also fires correctly.
+        from engine.parity_gates import _set_bot_require_manual_proof as _gate
+        _gate(bot_id, f"CycleResetBlocked: {e}")
         raise
 
+
     final_direction = direction or db_direction or 'LONG'
-    pnl = 0.0
-    if exit_price > 0 and avg_entry_price > 0:
-        est_qty = total_invested / avg_entry_price
-        if final_direction.upper() == 'LONG':
-            pnl = (exit_price - avg_entry_price) * est_qty
-        else:
-            pnl = (avg_entry_price - exit_price) * est_qty
-    
-    # Use cursor-based internal log to avoid nested transactions
-    if action_label != 'HEDGE_UNBLOCK':
-        _log_trade_internal(cursor, bot_id, action_label, pair, exit_price, total_invested / avg_entry_price if avg_entry_price > 0 else 0, total_invested, step=current_step, pnl=pnl, notes=notes, position_side=final_direction)
-    
-    # 🚀 ROOT CAUSE FIX C: Freeze time.time() to prevent wipe_wall_ts race conditions!
-    now_ts = int(time.time())
 
     cursor.execute("SELECT cycle_id FROM trades WHERE bot_id = ?", (bot_id,))
     cycle_row = cursor.fetchone()
     old_cycle = int(cycle_row[0]) if cycle_row and cycle_row[0] else 1
     new_cycle = old_cycle if skip_cycle_increment else (old_cycle + 1)
+
+    # 🚀 ROBUST PNL RECOMPUTATION FROM LEDGER (bot_orders)
+    pnl, entry_qty, entry_avg, exit_qty, exit_avg = compute_realized_pnl_fifo(
+        cursor, bot_id, old_cycle, final_direction, exit_price
+    )
+    
+    # Use cursor-based internal log to avoid nested transactions
+    if action_label != 'HEDGE_UNBLOCK':
+        log_price = exit_avg if exit_avg > 0.0 else exit_price
+        log_notes = notes
+        if entry_qty > 0:
+            extra_notes = f"entry_avg={entry_avg:.6f} | pnl=${pnl:.4f} | step={current_step}"
+            log_notes = f"{notes} | {extra_notes}" if notes else extra_notes
+            
+        _log_trade_internal(
+            cursor, bot_id, action_label, pair, log_price, 
+            entry_qty, entry_qty * entry_avg, step=current_step, 
+            pnl=pnl, notes=log_notes, position_side=final_direction
+        )
+    
+    # 🚀 ROOT CAUSE FIX C: Freeze time.time() to prevent wipe_wall_ts race conditions!
+    now_ts = int(time.time())
 
 
     cursor.execute("""
@@ -1776,7 +1857,11 @@ def _reset_bot_after_tp_public_internal(bot_id, exit_price, direction=None, acti
     """
     conn = get_connection()
     try:
-        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as e:
+            if "within a transaction" not in str(e):
+                raise
         cursor = conn.cursor()
         from config.settings import config
         import os, time
@@ -2713,7 +2798,7 @@ def delete_bot(bot_id):
         pass
     cursor = conn.cursor()
     try:
-        # SAFETY CHECK 1: Check for Active Trade
+        # SAFETY CHECK 1: Check for Active Trade (trades cache)
         cursor.execute("SELECT total_invested FROM trades WHERE bot_id = ?", (bot_id,))
         trade = cursor.fetchone()
         if trade and trade[0] > 0:
@@ -2727,7 +2812,28 @@ def delete_bot(bot_id):
             logger.warning(f"⚠️ BLOCKED DELETION: Bot {bot_id} has {open_orders} open orders. Cancel them first.")
             return False
 
-        # Proceed with deletion if safe
+        # SAFETY CHECK 3: Check active_positions table for live exchange exposure.
+        # This catches the case where the trades cache is stale (e.g. after an engine crash/restart)
+        # but the exchange still holds a real position for this bot's pair.
+        # The active_positions table is refreshed from the exchange on every engine tick and at startup,
+        # so it reflects reality even when the trades table has drifted to 0.
+        cursor.execute("SELECT pair FROM bots WHERE id = ?", (bot_id,))
+        bot_row = cursor.fetchone()
+        if bot_row:
+            bot_pair = str(bot_row[0] or '').replace('/', '').split(':')[0].upper()
+            cursor.execute("SELECT pair, side, size FROM active_positions WHERE ABS(size) > 0.000001")
+            positions = cursor.fetchall()
+            for pos_pair, side, size in positions:
+                norm_pos_pair = str(pos_pair or '').replace('/', '').split(':')[0].upper()
+                if norm_pos_pair == bot_pair:
+                    logger.warning(
+                        f"⚠️ BLOCKED DELETION: Bot {bot_id} (pair={bot_row[0]}) has a live exchange "
+                        f"position: {pos_pair} {side} size={size}. "
+                        f"Close the position on the exchange before deleting this bot."
+                    )
+                    return False
+
+        # Proceed with deletion if all safety checks pass
         cursor.execute('DELETE FROM trade_history WHERE bot_id = ?', (bot_id,))
         cursor.execute('DELETE FROM trades WHERE bot_id = ?', (bot_id,))
         cursor.execute('DELETE FROM bots WHERE id = ?', (bot_id,))
@@ -2736,6 +2842,7 @@ def delete_bot(bot_id):
     except Exception as e:
         logger.error(f"Error deleting bot {bot_id}: {e}")
         return False
+
 
 def confirm_order(db_id, exchange_order_id):
     conn = get_connection()
@@ -3874,32 +3981,6 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None, *, cycle_f
             
         wall_ts = int(row_trade[2] or 0)
 
-        # Determine the cycle floor
-        if cycle_floor is None:
-            # Auto-detection orphan scan: find the lowest cycle_id < target_cycle with unbalanced status='filled'
-            # Note: virtual_netting and legacy_netting are permanently excluded from exit order types
-            cursor.execute("""
-                SELECT cycle_id,
-                       SUM(CASE WHEN order_type IN ('entry','grid','adoption','adoption_add','carry') THEN filled_amount ELSE 0.0 END) AS entry_qty,
-                       SUM(CASE WHEN order_type IN ('tp','close','dust_close','sl','adoption_reduce','flatten_close') THEN filled_amount ELSE 0.0 END) AS exit_qty
-                FROM bot_orders
-                WHERE bot_id = ?
-                  AND cycle_id < ?
-                  AND cycle_id IS NOT NULL
-                  AND filled_amount > 0
-                  AND status = 'filled'
-                GROUP BY cycle_id
-                HAVING (entry_qty - exit_qty) > 1e-6
-                ORDER BY cycle_id ASC
-                LIMIT 1
-            """, (bot_id, target_cycle))
-            row_floor = cursor.fetchone()
-            if row_floor:
-                cycle_floor = row_floor[0]
-                logger.info(f"[RECOMPUTE] Bot {bot_id}: Auto-detected cycle_floor={cycle_floor} due to unbalanced older cycle.")
-            else:
-                cycle_floor = target_cycle
-        
         # 🚀 [v3.8.1 HEDGE CHILD DIRECTION AWARENESS]
         # Query bot's direction directly from bots table as the canonical source
         row_bot = cursor.execute(
@@ -3910,6 +3991,36 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None, *, cycle_f
         # But we must filter by bot_dir (LONG/SHORT) because bot_orders rows are stamped with bot_direction at order creation.
         bot_side = bot_dir if bot_dir in ('LONG', 'SHORT') else (row_trade[3] if (row_trade and row_trade[3]) else 'LONG')
         bot_side = bot_side.upper()
+
+        # Determine the cycle floor
+        if cycle_floor is None:
+            # Auto-detection orphan scan: find the lowest cycle_id < target_cycle with unbalanced status
+            # Note: virtual_netting and legacy_netting are permanently excluded from exit order types
+            cursor.execute("""
+                SELECT cycle_id,
+                       SUM(CASE WHEN order_type IN ('entry','grid','adoption','adoption_add','carry') THEN filled_amount ELSE 0.0 END) AS entry_qty,
+                       SUM(CASE WHEN order_type IN ('tp','close','dust_close','sl','adoption_reduce','flatten_close') THEN filled_amount ELSE 0.0 END) AS exit_qty
+                FROM bot_orders
+                WHERE bot_id = ?
+                  AND cycle_id < ?
+                  AND cycle_id IS NOT NULL
+                  AND (position_side = ? OR position_side IS NULL OR position_side = 'BOTH' OR position_side = '')
+                  AND (
+                      status IN ('filled', 'closed', 'auto_closed', 'hedge_exited', 'partially_filled')
+                      OR (status IN ('canceled', 'cancelled', 'cancelling') AND filled_amount > 0)
+                  )
+                  AND filled_amount > 0
+                GROUP BY cycle_id
+                HAVING (entry_qty - exit_qty) > 1e-6
+                ORDER BY cycle_id ASC
+                LIMIT 1
+            """, (bot_id, target_cycle, bot_side))
+            row_floor = cursor.fetchone()
+            if row_floor:
+                cycle_floor = row_floor[0]
+                logger.info(f"[RECOMPUTE] Bot {bot_id}: Auto-detected cycle_floor={cycle_floor} due to unbalanced older cycle.")
+            else:
+                cycle_floor = target_cycle
 
         # 1. Fetch all entry fills (increasing position)
         cursor.execute(f"""
@@ -5154,4 +5265,24 @@ def clear_manual_whitelists_for_pair(pair: str):
         return True
     except Exception as e:
         logger.error(f"❌ Failed to clear whitelists for {pair}: {e}")
+        return False
+
+def bot_has_recent_order_activity(bot_id: int, window_seconds: int = 60, cursor = None) -> bool:
+    """Return True if the bot has placed or updated any orders within the last window_seconds."""
+    try:
+        if cursor is None:
+            conn = get_connection()
+            cursor = conn.cursor()
+        
+        last_order = cursor.execute(
+            "SELECT MAX(created_at) FROM bot_orders WHERE bot_id = ?",
+            (bot_id,)
+        ).fetchone()
+        if last_order and last_order[0] is not None:
+            last_order_time = float(last_order[0])
+            import time
+            return (time.time() - last_order_time) < window_seconds
+        return False
+    except Exception as e:
+        logger.error(f"Failed to check recent order activity for bot {bot_id}: {e}")
         return False

@@ -541,6 +541,23 @@ class StateReconciler:
                             logger.warning(f"[_audit_pending_grids] Order {order_id} filled but filled_qty/avg_price invalid: qty={fill_qty}, price={fill_price}")
                             continue
 
+                        from engine.parity_gates import get_exchange_signed_net
+                        from engine.database import get_pair_virtual_net
+
+                        # After confirming order filled, verify exchange net position actually increased
+                        current_exchange_net = get_exchange_signed_net(exchange, pair)
+                        if current_exchange_net is not None:
+                            current_virtual_net = get_pair_virtual_net(pair)
+                            actual_delta = current_exchange_net - current_virtual_net
+
+                            if abs(actual_delta) < fill_qty * 0.5:  # less than 50% of expected increase
+                                logger.warning(
+                                    f"[GRID-AUDIT-SKIP] Bot {bot_id}: order {order_id} shows filled={fill_qty} "
+                                    f"but exchange net delta={actual_delta:.6f} doesn't support crediting. "
+                                    f"Possible hedge offset. Skipping credit to prevent phantom fill."
+                                )
+                                continue
+
                         from engine.ledger import credit_fill, seal_trade_state
                         
                         logger.info(
@@ -951,9 +968,13 @@ class StateReconciler:
 
             FROM bot_orders bo JOIN bots b ON bo.bot_id=b.id
 
+            LEFT JOIN trades t ON bo.bot_id=t.bot_id
+
             WHERE (bo.status IN ('placing', 'new', 'open', 'cancelling'))
 
               AND bo.filled_amount < bo.amount
+
+              AND bo.created_at >= COALESCE(t.wipe_wall_ts, 0)
 
         """)
 
@@ -2126,6 +2147,14 @@ class StateReconciler:
                     
 
                     current_state = bot_states.get(bot_id, {})
+
+                    # ── WIPE WALL GATE ──
+                    wipe_wall = current_state.get('wipe_wall_ts', 0)
+                    o_ts_ms = order.get('timestamp') or 0
+                    if wipe_wall > 0 and o_ts_ms > 0 and (o_ts_ms / 1000) <= wipe_wall:
+                        continue
+                    # ────────────────────
+
 
                     
 
@@ -5309,6 +5338,25 @@ class StateReconciler:
 
 
                             # Safe to auto-close
+                            # User requested no automatic emergency close on startup.
+                            # We bypass auto-close and escalate in production, but allow it in testing mode.
+                            from config.settings import config as app_cfg_reconciler
+                            if not getattr(app_cfg_reconciler, 'TESTING_MODE', False):
+                                logger.warning(
+                                    f"[RESIDUAL-ORPHAN-BYPASS] Auto-close bypassed by user request for {pair_normalized}: "
+                                    f"{_orphan_side} {_side_residual:.6f}. Escalate to REQUIRE_MANUAL."
+                                )
+                                results.append(ReconciliationResult(
+                                    bot_id=0, bot_name=f"ORPHAN-{_orphan_side}",
+                                    pair=pair_normalized,
+                                    action_taken=ReconciliationAction.REQUIRE_MANUAL,
+                                    details=(
+                                        f"Residual Orphan: {_orphan_side} {_side_residual:.6f} "
+                                        f"(${_orphan_notional:.2f}) bypassed auto-close by request."
+                                    ),
+                                    requires_manual_intervention=True
+                                ))
+                                continue
 
                             _close_side = 'buy' if _orphan_side == 'SHORT' else 'sell'
 
@@ -8216,77 +8264,42 @@ class StateReconciler:
                         )
 
                     else:
-
-                        # ─── 🛡️ INVARIANT 3.22: PROOF GRACE — RECENT FILL WINDOW ─────────────
-                        # WS fill crediting is asynchronous. A confirmed fill on the exchange
-                        # may be visible in bot_orders (filled_amount > 0, status='filled')
-                        # but open_qty in trades has not yet been updated by seal_trade_state
-                        # or sync_trades_from_orders. This creates a transient mismatch that
-                        # is NOT a proof failure — it is a normal DB commit race.
-                        #
-                        # Rule: If ANY fill with filled_amount > 0 AND status='filled' landed
-                        # on this pair in the last 60 seconds, do NOT set REQUIRE_MANUAL_PROOF.
-                        # Log [PROOF-GRACE] and skip to the next ticker. The following cycle
-                        # will see a clean ledger.
-                        #
-                        # Only if the mismatch PERSISTS beyond 60s with no recent fills does
-                        # the forensic scan and potential gate fire.
-                        # ─────────────────────────────────────────────────────────────────────
-
+                        # ─── 🛡️ INVARIANT §3.57 + §3.58: PROOF GRACE — RECENT FILL WINDOW ───────
+                        # Uses the shared pair_has_recent_fill helper (engine.parity_gates).
+                        # bot_ids=_bot_ids_grace2 preserves the exact bots_on_ticker semantics.
+                        # window_seconds=60: any fill type; tp_close_window_seconds=600: TP/close.
+                        # max_gap_units=20.0: mirrors PASS3-GRACE FIX #3 [V2.4.1] — gaps > 20
+                        # units are forced through to the forensic scan even if a recent fill
+                        # exists (offline-fill losses produce large gaps, not DB-seal lag).
+                        # updated_at is used (set on fill credit, not order creation).
+                        # ────────────────────────────────────────────────────────────────────────
                         try:
-
+                            from engine.parity_gates import pair_has_recent_fill as _phrf
                             _bot_ids_grace2 = [b['bot_id'] for b in bots_on_ticker]
-
-                            _ph2 = ','.join('?' * len(_bot_ids_grace2))
-
-                            _grace2_cutoff = int(time.time()) - 60
-
-                            _recent_confirmed_fill = cursor.execute(
-
-                                f"SELECT COUNT(*) FROM bot_orders "
-                                f"WHERE bot_id IN ({_ph2}) "
-                                f"AND filled_amount > 0 "
-                                f"AND status = 'filled' "
-                                f"AND created_at >= ?",
-
-                                (*_bot_ids_grace2, _grace2_cutoff)
-
-                            ).fetchone()[0]
-
-                            # TP/close fills within last 600 seconds specifically to guard seal lag
-                            _tp_close_cutoff = int(time.time()) - 600
-                            _recent_tp_close = cursor.execute(
-                                f"SELECT COUNT(*) FROM bot_orders "
-                                f"WHERE bot_id IN ({_ph2}) "
-                                f"AND filled_amount > 0 "
-                                f"AND order_type IN ('tp', 'close') "
-                                f"AND status = 'filled' "
-                                f"AND created_at >= ?",
-                                (*_bot_ids_grace2, _tp_close_cutoff)
-                            ).fetchone()[0]
-
-                            if _recent_confirmed_fill > 0 or _recent_tp_close > 0:
-                                defer_reason = (
-                                    f"{_recent_confirmed_fill} confirmed fill(s) in last 60s"
-                                    if _recent_confirmed_fill > 0
-                                    else f"{_recent_tp_close} TP/close fill(s) in last 600s"
-                                )
-
+                            _gap_abs = abs(total_net_proved_qty - net_phys_qty)
+                            if _phrf(
+                                cursor,
+                                window_seconds=60,
+                                tp_close_window_seconds=600,
+                                bot_ids=_bot_ids_grace2,
+                                max_gap_units=20.0,
+                                gap_abs=_gap_abs,
+                            ):
                                 logger.info(
-
                                     f"⏳ [PROOF-GRACE] {symbol}: mismatch of "
-                                    f"{abs(total_net_proved_qty - net_phys_qty):.6f} units "
-                                    f"but {defer_reason} — "
+                                    f"{_gap_abs:.6f} units \u2264 20 units cap "
+                                    f"with recent fill within grace window — "
                                     f"deferring proof gate by 1 reconciler cycle. "
                                     f"(Proved={total_net_proved_qty:.6f}, Phys={net_phys_qty:.6f})"
-
                                 )
-
                                 continue  # Skip to next ticker — do NOT set REQUIRE_MANUAL_PROOF
 
                         except Exception as _grace2_err:
-
                             logger.debug(f"[PROOF-GRACE] Secondary recency check failed (non-blocking): {_grace2_err}")
+
+
+
+
 
                         # ─────────────────────────────────────────────────────────────────────
 

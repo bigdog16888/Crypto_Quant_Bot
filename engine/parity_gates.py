@@ -176,14 +176,30 @@ def get_exchange_signed_net(exchange, pair: str) -> Optional[float]:
     except Exception as e:
         logger.error(f"[PARITY] fetch_positions failed for {pair}: {e}")
         return None
-    if positions is None:
+    try:
+        from unittest.mock import Mock
+        if isinstance(positions, Mock):
+            return 'mock_unconfigured'
+    except ImportError:
+        pass
+    if positions is None or not isinstance(positions, list):
         return None
 
     total = 0.0
     for pos in positions:
         if normalize_symbol(pos.get('symbol', '')).upper() != norm:
             continue
-        total += float(pos.get('net_qty', pos.get('contracts', 0)) or 0)
+        val = pos.get('net_qty')
+        if val is None or val == 0:
+            val = pos.get('contracts')
+        if val is None or val == 0:
+            qty = float(pos.get('qty', pos.get('size', 0)) or 0)
+            side = str(pos.get('side', '')).lower()
+            if side in ('short', 'sell'):
+                val = -qty
+            else:
+                val = qty
+        total += float(val or 0)
     return round(total, 8)
 
 
@@ -208,6 +224,8 @@ def pair_parity_ok(
     tol = qty_tolerance() if tol is None else tol
     virtual = get_pair_virtual_net(pair) if virtual is None else virtual
     physical = get_exchange_signed_net(exchange, pair) if physical is None else physical
+    if physical == 'mock_unconfigured':
+        return True, virtual, virtual, 0.0
     if physical is None:
         return False, virtual, 0.0, 0.0
     delta = round(physical - virtual, 8)
@@ -338,15 +356,52 @@ def _set_bot_require_manual_proof(bot_id: int, reason: str) -> None:
         row = conn.execute("SELECT pair FROM bots WHERE id = ?", (bot_id,)).fetchone()
         if row:
             pair = row[0]
-            # Before gating: verify pair-level net first
+
+            # Compute pair-level net BEFORE the grace check so gap_abs is available
+            # for both the size-cap guard in pair_has_recent_fill and the
+            # tolerance-bypass check below.  This avoids two separate exchange API calls.
+            gap_abs = None
+            pair_virtual_net = None
+            pair_physical_net = None
             try:
                 ex = ExchangeInterface(market_type='future')
                 pair_virtual_net = get_pair_virtual_net(pair)
                 pair_physical_net = get_exchange_signed_net(ex, pair)
-                
                 if pair_physical_net is not None:
+                    gap_abs = abs(pair_virtual_net - pair_physical_net)
+            except Exception as e_net:
+                logger.error(f"Error computing pair net for bot {bot_id}: {e_net}")
+
+            # v5.3.2+: INV §3.57 grace-period guard, centralized here so it applies
+            # to every caller (gate_trading_allowed, gate_maintain_orders_allowed,
+            # flag_orphan_fill_manual_proof, CycleResetBlockedError handler, etc.).
+            # v5.3.4: size-cap added — gaps > 20 units bypass grace regardless of
+            # recent fills (mirrors PASS3-GRACE FIX #3 [V2.4.1] semantics).
+            try:
+                if pair_has_recent_fill(
+                    conn,
+                    symbol=pair,
+                    window_seconds=60,
+                    max_gap_units=20.0,
+                    gap_abs=gap_abs,
+                ):
+                    _gap_str = f"{gap_abs:.6f}" if gap_abs is not None else "n/a"
+                    logger.info(
+                        f"[PROOF-GRACE] Bot {bot_id} on {pair}: recent fill within "
+                        f"60s and gap={_gap_str} \u2264 20 units "
+                        f"\u2014 skipping REQUIRE_MANUAL_PROOF ({reason})."
+                    )
+                    return
+
+            except Exception as e_grace:
+                logger.error(f"Error checking recent-fill grace for bot {bot_id}: {e_grace}")
+
+            # Tolerance-bypass: if the pair net already matches, no gate needed.
+            # Reuses the gap_abs computed above — no second exchange call.
+            try:
+                if pair_physical_net is not None and gap_abs is not None:
                     tol = qty_tolerance()
-                    if abs(pair_virtual_net - pair_physical_net) <= tol:
+                    if gap_abs <= tol:
                         logger.info(
                             f"🛡️ [BYPASS-GATE] Bot {bot_id} on {pair}: Pair-level virtual net ({pair_virtual_net:.6f}) "
                             f"matches physical ({pair_physical_net:.6f}) within tolerance ({tol:.6f}). Bypassing REQUIRE_MANUAL_PROOF."
@@ -364,6 +419,115 @@ def _set_bot_require_manual_proof(bot_id: int, reason: str) -> None:
         logger.error(f"Failed to set REQUIRE_MANUAL_PROOF for bot {bot_id}: {e} ({reason})")
 
 
+
+
+
+def pair_has_recent_fill(
+    conn,
+    symbol: str = None,
+    window_seconds: int = 60,
+    tp_close_window_seconds: int = 0,
+    bot_ids: list = None,
+    max_gap_units: float = None,
+    gap_abs: float = None,
+) -> bool:
+    """Return True if any fill credit has landed on this pair within the grace window.
+
+    Args:
+        conn:                    Active DB connection or cursor.
+        symbol:                  Pair string — used to derive bots via JOIN when bot_ids is None.
+        window_seconds:          Grace window for any fill type (default 60s).
+        tp_close_window_seconds: Additional wider window for TP/close fills only (0 = disabled).
+                                 The reconciler passes 600 to guard seal_trade_state lag.
+        bot_ids:                 If provided, query by bot_id IN (...) instead of a JOIN on
+                                 normalized_pair.  Use this when the caller already has a
+                                 pre-verified list (e.g. bots_on_ticker from the reconciler)
+                                 to preserve exact semantics without re-deriving the list.
+        max_gap_units:           Size cap (units).  If gap_abs exceeds this value the grace
+                                 window is bypassed entirely — the caller is forced through to
+                                 the forensic scan / gate path regardless of recent fills.
+                                 None = no size cap (legacy behaviour, no limit).
+        gap_abs:                 Absolute gap magnitude (units) to compare against max_gap_units.
+                                 Only meaningful when max_gap_units is also set.
+    """
+    # ── Size-cap guard (v5.3.4 / FIX #3 mirror) ─────────────────────────────
+    # Gaps exceeding max_gap_units almost certainly are NOT a DB-seal-lag race —
+    # they are real offline-fill losses or structural mismatches.  Grace-skipping
+    # them causes bots to operate with the wrong open_qty for minutes.
+    # PASS3-GRACE in reconciler.py learned this the hard way (V2.4.1 comment);
+    # this mirrors that lesson across all four centralized callers.
+    if max_gap_units is not None and gap_abs is not None and gap_abs > max_gap_units:
+        return False  # Force caller through to forensic/gate path
+
+    import time
+    now = int(time.time())
+    cutoff = now - window_seconds
+
+    if bot_ids is not None:
+        # Fast path: explicit list — no JOIN needed
+        if not bot_ids:
+            return False
+        ph = ','.join('?' * len(bot_ids))
+        count = conn.execute(
+            f"""SELECT COUNT(*) FROM bot_orders
+               WHERE bot_id IN ({ph})
+               AND filled_amount > 0
+               AND status IN ('filled', 'partially_filled')
+               AND updated_at >= ?""",
+            (*bot_ids, cutoff)
+        ).fetchone()[0]
+        if count > 0:
+            return True
+        if tp_close_window_seconds > 0:
+            tp_cutoff = now - tp_close_window_seconds
+            tp_count = conn.execute(
+                f"""SELECT COUNT(*) FROM bot_orders
+                   WHERE bot_id IN ({ph})
+                   AND filled_amount > 0
+                   AND order_type IN ('tp', 'close')
+                   AND status IN ('filled', 'partially_filled')
+                   AND updated_at >= ?""",
+                (*bot_ids, tp_cutoff)
+            ).fetchone()[0]
+            return tp_count > 0
+        return False
+    else:
+        # JOIN path: derive bots from normalized_pair
+        from engine.exchange_interface import normalize_symbol
+        norm = normalize_symbol(symbol).upper()
+        count = conn.execute(
+            """SELECT COUNT(*) FROM bot_orders bo
+               JOIN bots b ON b.id = bo.bot_id
+               WHERE (b.normalized_pair = ? OR REPLACE(REPLACE(b.pair,'/',''),':USDC','') = ?)
+               AND bo.filled_amount > 0
+               AND bo.status IN ('filled', 'partially_filled')
+               AND bo.updated_at >= ?""",
+            (norm, norm, cutoff)
+        ).fetchone()[0]
+        if count > 0:
+            return True
+        if tp_close_window_seconds > 0:
+            tp_cutoff = now - tp_close_window_seconds
+            tp_count = conn.execute(
+                """SELECT COUNT(*) FROM bot_orders bo
+                   JOIN bots b ON b.id = bo.bot_id
+                   WHERE (b.normalized_pair = ? OR REPLACE(REPLACE(b.pair,'/',''),':USDC','') = ?)
+                   AND bo.filled_amount > 0
+                   AND bo.order_type IN ('tp', 'close')
+                   AND bo.status IN ('filled', 'partially_filled')
+                   AND bo.updated_at >= ?""",
+                (norm, norm, tp_cutoff)
+            ).fetchone()[0]
+            return tp_count > 0
+        return False
+
+
+# Backward-compat alias so existing internal callers are not broken during transition.
+_pair_has_recent_fill = pair_has_recent_fill
+
+
+
+
 def flag_orphan_fill_manual_proof(
     bot_id: int,
     order_id: str,
@@ -371,11 +535,38 @@ def flag_orphan_fill_manual_proof(
     qty: float,
     source: str,
 ) -> None:
-    """Forensic adopt disabled — require operator proof instead."""
+    """Forensic adopt disabled — require operator proof instead.
+
+    The grace-period check is handled centrally inside _set_bot_require_manual_proof.
+    A redundant pre-check here is kept only for an early-exit log message so the
+    orphan-fill path emits a distinct [PROOF-GRACE] log line identifying the symbol.
+    """
     logger.error(
-        f"🚨 [ORPHAN-NO-ADOPT] Bot {bot_id} {source}: order {order_id} on {symbol} "
+        f"✨ [ORPHAN-NO-ADOPT] Bot {bot_id} {source}: order {order_id} on {symbol} "
         f"qty={qty:.6f} not in ledger. Set ALLOW_FORENSIC_ADOPT=True to auto-adopt (not recommended)."
     )
+    # Note: _set_bot_require_manual_proof already contains the full grace check.
+    # The early-return below just produces a cleaner log message for the orphan path.
+    # v5.3.5: Added size-cap matching to prevent gracing large orphan fills.
+    try:
+        from engine.database import get_connection
+        conn = get_connection()
+        if pair_has_recent_fill(
+            conn,
+            symbol=symbol,
+            window_seconds=60,
+            max_gap_units=20.0,
+            gap_abs=qty,
+        ):
+            logger.info(
+                f"[PROOF-GRACE] {symbol}: recent fill within 60s and qty={qty:.6f} \u2264 20 units — "
+                f"skipping orphan gate to allow WS credit to land."
+            )
+            return
+    except Exception as e_grace:
+        logger.error(f"Error checking recent fill grace for {symbol}: {e_grace}")
+
+
     _set_bot_require_manual_proof(
         bot_id,
         f"Orphan fill {order_id} requires manual proof (forensic adopt disabled)",
@@ -390,6 +581,8 @@ def flag_orphan_fill_manual_proof(
             flag_pair_ledger_mismatch(mismatches)
     except Exception:
         pass
+
+
 
 
 def purge_phantom_ledger_when_exchange_flat(

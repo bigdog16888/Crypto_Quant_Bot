@@ -68,7 +68,9 @@ class TestADR003Invariants(unittest.TestCase):
         mock_exchange = MagicMock(spec=ExchangeInterface)
         mock_exchange.get_symbol_precision.return_value = {'step_size': 0.1}
         mock_exchange.round_to_step.side_effect = lambda qty, step: round(qty, 1)
-        mock_exchange.fetch_positions.return_value = []
+        mock_exchange.fetch_positions.return_value = [
+            {'symbol': 'SOL/USDC:USDC', 'side': 'long', 'qty': 2.0, 'entryPrice': 65.0}
+        ]
         mock_exchange.fetch_order.side_effect = Exception("Order not found")
 
         # Mock order placement returning standard CCXT dict
@@ -215,9 +217,20 @@ class TestADR003Invariants(unittest.TestCase):
         mock_exchange.round_to_step.side_effect = lambda qty, step: round(qty, 1)
         mock_exchange.fetch_order.side_effect = Exception("Order not found")
 
-        # Scenario 1: Currently hold 40.0, adding 15.0 (Total = 55.0 > 50.0 limit)
+        # Scenario 1: Currently hold 40.0 in DB and exchange, adding 15.0 (Total = 55.0 > 50.0 limit)
+        self.conn.execute("""
+            INSERT INTO bot_orders (bot_id, order_type, client_order_id, price, amount, filled_amount, status, cycle_id, step)
+            VALUES (1001, 'grid', 'PARENT_GRID', 65.0, 55.0, 55.0, 'filled', 1, 8)
+        """)
+        self.conn.execute("""
+            INSERT INTO bot_orders (bot_id, order_type, client_order_id, price, amount, filled_amount, status, cycle_id, step)
+            VALUES (2001, 'entry', 'CHILD_ENTRY', 60.0, 40.0, 40.0, 'filled', 1, 1)
+        """)
+        self.conn.execute("UPDATE trades SET open_qty = 40.0 WHERE bot_id = 2001")
+        self.conn.commit()
+
         mock_exchange.fetch_positions.return_value = [
-            {'symbol': 'SOL/USDC:USDC', 'side': 'short', 'qty': 40.0, 'entryPrice': 60.0}
+            {'symbol': 'SOL/USDC:USDC', 'side': 'long', 'qty': 15.0, 'entryPrice': 60.0}
         ]
 
         with patch.object(executor, '_place_gtx_order_with_retry') as mock_place:
@@ -235,9 +248,21 @@ class TestADR003Invariants(unittest.TestCase):
             self.assertFalse(res)
             mock_place.assert_not_called()
 
-        # Scenario 2: Currently hold 30.0, adding 15.0 (Total = 45.0 <= 50.0 limit)
+        # Scenario 2: Currently hold 30.0 in DB and exchange, adding 15.0 (Total = 45.0 <= 50.0 limit)
+        self.conn.execute("DELETE FROM bot_orders WHERE bot_id IN (1001, 2001)")
+        self.conn.execute("""
+            INSERT INTO bot_orders (bot_id, order_type, client_order_id, price, amount, filled_amount, status, cycle_id, step)
+            VALUES (1001, 'grid', 'PARENT_GRID', 65.0, 45.0, 45.0, 'filled', 1, 8)
+        """)
+        self.conn.execute("""
+            INSERT INTO bot_orders (bot_id, order_type, client_order_id, price, amount, filled_amount, status, cycle_id, step)
+            VALUES (2001, 'entry', 'CHILD_ENTRY', 60.0, 30.0, 30.0, 'filled', 1, 1)
+        """)
+        self.conn.execute("UPDATE trades SET open_qty = 30.0 WHERE bot_id = 2001")
+        self.conn.commit()
+
         mock_exchange.fetch_positions.return_value = [
-            {'symbol': 'SOL/USDC:USDC', 'side': 'short', 'qty': 30.0, 'entryPrice': 60.0}
+            {'symbol': 'SOL/USDC:USDC', 'side': 'long', 'qty': 15.0, 'entryPrice': 60.0}
         ]
         mock_order = {'id': 'EX_ENTRY_OK', 'status': 'open'}
 

@@ -21,6 +21,9 @@ class MockStreamlit:
             return None
         return noop
     
+    def button(self, *args, **kwargs):
+        return False
+    
     @property
     def session_state(self):
         return self._session_state

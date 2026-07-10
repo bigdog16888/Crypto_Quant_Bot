@@ -202,9 +202,9 @@ class TestV3911Fixes(unittest.TestCase):
 
         # Insert a placing order row
         self.conn.execute("""
-            INSERT INTO bot_orders (bot_id, order_id, client_order_id, price, amount, filled_amount, status, step, cycle_id, order_type)
-            VALUES (?, ?, ?, 60000.0, 1.0, 0.0, 'placing', 1, 1, 'grid')
-        """, (bot_id, order_id, cid))
+            INSERT INTO bot_orders (bot_id, order_id, client_order_id, price, amount, filled_amount, status, step, cycle_id, order_type, created_at)
+            VALUES (?, ?, ?, 60000.0, 1.0, 0.0, 'placing', 1, 1, 'grid', ?)
+        """, (bot_id, order_id, cid, int(time.time())))
         self.conn.commit()
 
         # Mock exchange to return order filled

@@ -4,7 +4,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 class Config:
-    VERSION = "5.1.1"  # v5.1.1: UI single-page layout, fixed-height alert banner, GTR health keys
+    VERSION = "5.3.7"  # v5.3.7: Refactored grid grace age check and cached indicators
+
     ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
     def __init__(self):
@@ -47,6 +48,9 @@ class Config:
         
         # 🛡️ SAFETY TOGGLE: Strict Cleanup (True = Kill Manual Orders, False = Protect Them)
         self.STRICT_CLEANUP = os.getenv("STRICT_CLEANUP", "False").lower() == "true"
+        
+        # TESTING MODE (used to bypass/alter production behavior in unit tests)
+        self.TESTING_MODE = os.getenv("TESTING_MODE", "False").lower() in ("true", "1")
 
         # 🛡️ SAFETY TOGGLE: Block autonomous execution in production (requires human approval)
         self.REQUIRE_HUMAN_APPROVAL = os.getenv("REQUIRE_HUMAN_APPROVAL", "False").lower() == "true"

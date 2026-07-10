@@ -85,6 +85,14 @@ def test_audit_pending_grids_filled(memory_db):
         'price': 1.0978,
         'lastTradeTimestamp': int(time.time() * 1000)
     }
+    mock_exchange.fetch_positions.return_value = [
+        {
+            'symbol': 'XRP/USDC:USDC',
+            'contracts': 14.7,
+            'net_qty': 14.7,
+            'side': 'long'
+        }
+    ]
 
     reconciler = StateReconciler(exchanges={'future': mock_exchange})
 

@@ -223,9 +223,13 @@ def test_inv34_gate_cleared_after_tp_when_flat(memory_db):
     )
     memory_db.commit()
 
+    # Create a mock exchange to return flat positions (so it passes the parity check)
+    mock_exchange = MagicMock()
+    mock_exchange.fetch_positions.return_value = []
+
     # Call seal_trade_state with flat position (total_invested=0, avg=0, open_qty=0)
     # The gate status 'REQUIRE_MANUAL_PROOF' should be automatically cleared to 'Scanning'.
-    res = seal_trade_state(bot_id)
+    res = seal_trade_state(bot_id, exchange=mock_exchange)
     assert res.get('status') == 'Scanning'
 
     row_bot = memory_db.execute("SELECT status FROM bots WHERE id = ?", (bot_id,)).fetchone()

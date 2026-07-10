@@ -223,12 +223,13 @@ def _compute_netting_status(
                 pass
 
             ref_price = ref_prices.get(p, 1.0)
-            diff_qty = abs(v_net - ph_net)
+            diff_qty = round(abs(v_net - ph_net), 8)
             diff_usd = diff_qty * ref_price
             if diff_usd > worst_gap:
                 worst_gap = diff_usd
 
-            drift = (diff_qty > tol) and not startup_suppression
+            # Drift is detected if the gap exceeds the quantity tolerance OR if the USD value of the gap exceeds $5.00
+            drift = (diff_qty > tol or diff_usd > 5.0) and not startup_suppression
             if drift:
                 mismatch_count += 1
 
@@ -298,6 +299,16 @@ def _compute_order_health(
         if phase == "STUCK_DUST_NO_EXIT":
             dust.append(row["name"])
             continue
+
+        # Exempt hedge child bots whose parents are still active from missing order alerts
+        if row.get("bot_type") == "hedge_child" and row.get("parent_bot_id"):
+            parent_id = int(row["parent_bot_id"])
+            parent_row = next((r for r in bot_df_rows if int(r["id"]) == parent_id), None)
+            if parent_row:
+                parent_inv = float(parent_row.get("total_invested") or 0)
+                if parent_inv > 0.01:
+                    # Parent is active, so child expects 0 open orders by design.
+                    continue
 
         if actual_ph == 0 and inv > 0.01 and phase not in ("CARRY_PENDING",):
             if startup_suppression:

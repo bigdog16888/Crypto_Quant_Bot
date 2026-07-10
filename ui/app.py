@@ -404,21 +404,25 @@ with st.sidebar:
     
     if not engine_running:
         if st.button("▶️ Start Monitoring"):
-            # Start engine logic...
-            runner_path = os.path.join(ROOT_DIR, "engine", "runner.py")
-            
-            # Redirect stdout/stderr to DEVNULL. runner.py natively uses its own RotatingFileHandler.
-            # Passing a file handle here locks the file on Windows and causes RotatingFileHandler to crash.
-            subprocess.Popen(
-                [sys.executable, runner_path],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=subprocess.CREATE_NEW_CONSOLE if sys.platform == "win32" else 0,
-                close_fds=True,
-            )
-            st.success("Monitoring service started. Refreshing page...")
-            time.sleep(2) # Give it a moment
-            st.rerun()
+            # Hard safety check to prevent pytest from spawning runner processes
+            if "PYTEST_CURRENT_TEST" in os.environ:
+                st.warning("⚠️ Action Blocked: Cannot start monitoring runner under pytest.")
+            else:
+                # Start engine logic...
+                runner_path = os.path.join(ROOT_DIR, "engine", "runner.py")
+                
+                # Redirect stdout/stderr to DEVNULL. runner.py natively uses its own RotatingFileHandler.
+                # Passing a file handle here locks the file on Windows and causes RotatingFileHandler to crash.
+                subprocess.Popen(
+                    [sys.executable, runner_path],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=subprocess.CREATE_NEW_CONSOLE if sys.platform == "win32" else 0,
+                    close_fds=True,
+                )
+                st.success("Monitoring service started. Refreshing page...")
+                time.sleep(2) # Give it a moment
+                st.rerun()
     else:
         st.success(f"Monitoring Running (PID: {pid})")
         if st.button("🛑 Stop Monitoring"):

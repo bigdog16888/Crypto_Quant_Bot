@@ -29,6 +29,9 @@ class TestAppStartup(unittest.TestCase):
         # Ensure session_state behaves like a dict
         self.mock_st.session_state = {}
 
+        # Configure st.button to return False by default to prevent starting the runner
+        self.mock_st.button.return_value = False
+
         # Apply mocks to sys.modules
         sys.modules['streamlit'] = self.mock_st
         sys.modules['ui.views.monitor'] = MagicMock()
@@ -60,6 +63,24 @@ class TestAppStartup(unittest.TestCase):
             import traceback
             traceback.print_exc()
             self.fail(f"ui.app import failed with error: {e}")
+
+    from unittest.mock import patch
+    @patch('subprocess.Popen')
+    def test_app_does_not_spawn_runner_under_test(self, mock_popen):
+        """Verify that importing/running ui/app.py under test conditions never spawns a runner subprocess."""
+        # Only return True for the start monitoring button, False for others
+        # to avoid triggering the force kill button and terminate_process logic.
+        def side_effect_button(label, *args, **kwargs):
+            if "Start Monitoring" in label:
+                return True
+            return False
+        self.mock_st.button.side_effect = side_effect_button
+        
+        if 'ui.app' in sys.modules:
+            del sys.modules['ui.app']
+            
+        import ui.app
+        mock_popen.assert_not_called()
 
     def tearDown(self):
         # Clean up mocks

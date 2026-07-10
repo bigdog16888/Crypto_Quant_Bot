@@ -357,3 +357,88 @@ class TestStaleOrphanAlertFiltering:
         filtered = [a for a in alerts if float(a[7] or 0) >= engine_started]
         assert len(filtered) == 1
         assert filtered[0][0] == 2
+
+
+class TestHedgeChildHealthExemption:
+    def test_hedge_child_with_active_parent_exempt(self, mem_db):
+        """Verify that a hedge child bot with an active parent and 0 orders is exempt from health warnings."""
+        # Setup: ENGINE_STARTED_AT to pass grace period
+        _set_engine_started_at(mem_db, time.time() - 300)
+
+        # Insert parent bot (ID 200001, active, total_invested = 100.0)
+        mem_db.execute(
+            "INSERT INTO bots (id, name, pair, normalized_pair, direction, is_active, status, bot_type) "
+            "VALUES (200001, 'parent_bot', 'BTC/USDC:USDC', 'BTC/USDC:USDC', 'LONG', 1, 'IN TRADE', 'standard')"
+        )
+        mem_db.execute(
+            "INSERT INTO trades (bot_id, cycle_id, open_qty, wipe_wall_ts, position_side, current_step, total_invested) "
+            "VALUES (200001, 1, 0.5, 0, 'LONG', 1, 100.0)"
+        )
+
+        # Insert child bot (ID 200002, active, total_invested = 50.0, hedge child, parent_bot_id = 200001)
+        mem_db.execute(
+            "INSERT INTO bots (id, name, pair, normalized_pair, direction, is_active, status, bot_type, parent_bot_id) "
+            "VALUES (200002, 'child_bot', 'BTC/USDC:USDC', 'BTC/USDC:USDC', 'SHORT', 1, 'IN TRADE', 'hedge_child', 200001)"
+        )
+        mem_db.execute(
+            "INSERT INTO trades (bot_id, cycle_id, open_qty, wipe_wall_ts, position_side, current_step, total_invested) "
+            "VALUES (200002, 1, 0.3, 0, 'SHORT', 1, 50.0)"
+        )
+        mem_db.commit()
+
+        # Place 0 open orders for child (ID 200002) on exchange
+        result = compute_system_health(
+            db_path=database.DB_PATH,
+            exchange_instance=_make_exchange(),  # Returns no open orders
+            norm_fn=lambda s: s,
+            qty_tolerance_fn=lambda: 0.0001,
+        )
+
+        # Assert no warnings for child_bot in order_health message
+        order_health_msg = result.get("order_health", {}).get("message", "")
+        assert "child_bot" not in order_health_msg, f"Child bot should be exempt from order_health message: '{order_health_msg}'"
+
+    def test_hedge_child_with_inactive_parent_triggers_warning(self, mem_db):
+        """Verify that a hedge child bot with an inactive parent and 0 orders triggers a warning."""
+        # Setup: ENGINE_STARTED_AT to pass grace period
+        _set_engine_started_at(mem_db, time.time() - 300)
+
+        # Insert parent bot (ID 300001, inactive/Scanning, total_invested = 0.0)
+        mem_db.execute(
+            "INSERT INTO bots (id, name, pair, normalized_pair, direction, is_active, status, bot_type) "
+            "VALUES (300001, 'parent_bot_2', 'BTC/USDC:USDC', 'BTC/USDC:USDC', 'LONG', 1, 'Scanning', 'standard')"
+        )
+        mem_db.execute(
+            "INSERT INTO trades (bot_id, cycle_id, open_qty, wipe_wall_ts, position_side, current_step, total_invested) "
+            "VALUES (300001, 1, 0.0, 0, 'LONG', 0, 0.0)"
+        )
+
+        # Insert child bot (ID 300002, active, total_invested = 50.0, hedge child, parent_bot_id = 300001)
+        mem_db.execute(
+            "INSERT INTO bots (id, name, pair, normalized_pair, direction, is_active, status, bot_type, parent_bot_id) "
+            "VALUES (300002, 'child_bot_2', 'BTC/USDC:USDC', 'BTC/USDC:USDC', 'SHORT', 1, 'IN TRADE', 'hedge_child', 300001)"
+        )
+        mem_db.execute(
+            "INSERT INTO trades (bot_id, cycle_id, open_qty, wipe_wall_ts, position_side, current_step, total_invested) "
+            "VALUES (300002, 1, 0.3, 0, 'SHORT', 1, 50.0)"
+        )
+        # Seed an old order in bot_orders so it exceeds 60s check
+        mem_db.execute(
+            "INSERT INTO bot_orders (bot_id, order_id, client_order_id, order_type, price, amount, filled_amount, status, created_at, updated_at) "
+            "VALUES (300002, 'order_old', 'CID_OLD', 'tp', 50000.0, 0.3, 0.0, 'open', ?, ?)",
+            (time.time() - 300, time.time() - 300)
+        )
+        mem_db.commit()
+
+        # Compute health
+        result = compute_system_health(
+            db_path=database.DB_PATH,
+            exchange_instance=_make_exchange(),  # Returns no open orders
+            norm_fn=lambda s: s,
+            qty_tolerance_fn=lambda: 0.0001,
+        )
+
+        # Assert warning for child_bot_2 is triggered
+        order_health_msg = result.get("order_health", {}).get("message", "")
+        assert "child_bot_2" in order_health_msg, f"Expected child_bot_2 to trigger warning in order_health message: '{order_health_msg}'"
+

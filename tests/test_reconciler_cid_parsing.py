@@ -254,18 +254,19 @@ class TestReconcilerCidParsing(unittest.TestCase):
         """)
 
         # Seed synthetic orders: PENDING_*, PLACING_*, GHOST_* with status 'placing'
+        now_ts = int(time.time())
         self.conn.execute("""
-            INSERT INTO bot_orders (bot_id, order_type, client_order_id, status, price, amount, filled_amount)
-            VALUES (10016, 'entry', 'PENDING_10016_ENTRY_1', 'placing', 50000.0, 0.1, 0.0)
-        """)
+            INSERT INTO bot_orders (bot_id, order_type, client_order_id, status, price, amount, filled_amount, created_at)
+            VALUES (10016, 'entry', 'PENDING_10016_ENTRY_1', 'placing', 50000.0, 0.1, 0.0, ?)
+        """, (now_ts,))
         self.conn.execute("""
-            INSERT INTO bot_orders (bot_id, order_type, client_order_id, status, price, amount, filled_amount)
-            VALUES (10016, 'grid', 'PLACING_10016_GRID_1', 'placing', 50000.0, 0.1, 0.0)
-        """)
+            INSERT INTO bot_orders (bot_id, order_type, client_order_id, status, price, amount, filled_amount, created_at)
+            VALUES (10016, 'grid', 'PLACING_10016_GRID_1', 'placing', 50000.0, 0.1, 0.0, ?)
+        """, (now_ts,))
         self.conn.execute("""
-            INSERT INTO bot_orders (bot_id, order_type, client_order_id, status, price, amount, filled_amount)
-            VALUES (10016, 'tp', 'GHOST_10016_TP_1', 'placing', 50000.0, 0.1, 0.0)
-        """)
+            INSERT INTO bot_orders (bot_id, order_type, client_order_id, status, price, amount, filled_amount, created_at)
+            VALUES (10016, 'tp', 'GHOST_10016_TP_1', 'placing', 50000.0, 0.1, 0.0, ?)
+        """, (now_ts,))
         self.conn.commit()
 
         # Mock CCXT exchange object

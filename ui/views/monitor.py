@@ -141,8 +141,7 @@ def _fetch_fresh_monitor_data():
             
             # 3. Fetch Market Orders (Live from Exchange)
             try:
-                ex = get_exchange_instance(global_config.MARKET_TYPE)
-                m_orders = ex.fetch_open_orders(None)
+                m_orders = fetch_open_orders_cached(global_config.MARKET_TYPE, None)
             except Exception as e:
                 exchange_error = f"Exchange Order Sync Error: {e}"
             
@@ -292,7 +291,7 @@ def _header_metrics_fragment():
         st.error(f"Dashboard Load Error: {e}")
 
 
-@st.fragment(run_every=15)
+@st.fragment(run_every=5)
 def _bot_positions_fragment():
     auto_refresh = st.session_state.get("auto_refresh_toggle", True)
     wizard_active = any(bool(st.session_state.get(k)) for k in st.session_state if k.startswith(("forensic_trades_", "adopt_force_sel_", "trade_sel_", "_confirm_")))
@@ -379,6 +378,8 @@ def _bot_positions_fragment():
         
         # Highlight missing orders per-row
         def highlight_health(row):
+            if pd.isna(row.get('id')):
+                return str(row.get('status', ''))
             bid, inv = int(row['id']), float(row['total_invested'] or 0)
             ord_count = physical_order_counts.get(bid, 0)
             status = str(row['status'])
@@ -453,8 +454,7 @@ def _bot_positions_fragment():
         # splits one net exchange position across multiple bot_id rows.
         live_physical_net_by_pair = {}
         try:
-            ex_phys = get_exchange_instance(global_config.MARKET_TYPE)
-            for _pos in (ex_phys.fetch_positions() or []):
+            for _pos in (fetch_positions_cached(global_config.MARKET_TYPE) or []):
                 _amt = float(_pos.get('contracts', 0) or _pos.get('size', 0) or 0)
                 if abs(_amt) < 1e-12:
                     continue
@@ -526,10 +526,19 @@ def _bot_positions_fragment():
         # ──────────────────────────────────────────────────────────────────────
         _banner_parts = []
         if mismatched_pair_count > 0:
-            _banner_parts.append(
-                f"🔴 {mismatched_pair_count} pair(s) mismatched  ·  "
-                f"Worst gap: ${worst_pair_usd:,.2f}"
-            )
+            for row_mp in mismatched_pairs:
+                mp_pair, mp_virt_usd, mp_phys_usd, mp_diff_usd, mp_vqty, mp_pqty, mp_dqty, mp_price = row_mp
+                clean_pair_name = mp_pair.replace(" NET", "")
+                
+                # Retrieve active bot names on this pair from df_pos_f
+                pair_bots = df_pos_f[df_pos_f['pair'] == clean_pair_name]
+                bot_names = [row_b['name'] for _, row_b in pair_bots.iterrows()]
+                bot_info = f" ({', '.join(bot_names)})" if bot_names else ""
+                
+                _banner_parts.append(
+                    f"🔴 Mismatch on {clean_pair_name}{bot_info}: "
+                    f"sys={mp_vqty:+.4f} ex={mp_pqty:+.4f} diff={mp_dqty:+.4f} (Gap: ${mp_diff_usd:,.2f})"
+                )
         # Critical bot states from health_data (GTR #1 + #4) — surfaced inside
         # the 15 s fragment so operators see them without waiting for header refresh.
         _hd = st.session_state.get("system_health_data") or {}
@@ -678,19 +687,8 @@ def _bot_positions_fragment():
                                 pass
                             if gow_ok:
                                 # Grace period: suppress warning if engine just acted on this bot
-                                last_order_time = 0.0
-                                try:
-                                    last_order = conn_local.execute(
-                                        "SELECT MAX(created_at) FROM bot_orders WHERE bot_id = ?",
-                                        (bid,)
-                                    ).fetchone()
-                                    if last_order and last_order[0] is not None:
-                                        last_order_time = float(last_order[0])
-                                except Exception:
-                                    pass
-                                last_order_age = time.time() - last_order_time
-                                if last_order_age < 60:
-                                    # Engine just placed orders — grid may be in-flight
+                                from engine.database import bot_has_recent_order_activity
+                                if bot_has_recent_order_activity(bid, 60, conn_local):
                                     pass  # suppress warning
                                 else:
                                     # Genuinely missing grid — emit warning
@@ -721,17 +719,29 @@ def _bot_positions_fragment():
             _alert_html = (
                 f'<div style="height:{_BANNER_H};background:rgba(255,75,75,0.12);'
                 f'border:1px solid rgba(255,75,75,0.6);border-radius:0.5rem;'
-                f'padding:0 1rem;display:flex;align-items:center;'
+                f'padding:0 1rem;display:flex;align-items:center;justify-content:space-between;'
                 f'color:#FF4B4B;font-size:0.88rem;font-weight:500;'
                 f'margin-bottom:0.75rem;overflow:hidden;white-space:nowrap;'
                 f'text-overflow:ellipsis">'
-                f"🚨&nbsp;&nbsp;" + "&nbsp;&nbsp;|&nbsp;&nbsp;".join(_banner_parts)
+                f'<div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'
+                f"🚨&nbsp;&nbsp;" + "&nbsp;&nbsp;|&nbsp;&nbsp;".join(_banner_parts) + "</div>"
+                f'<span style="font-size:0.75rem;opacity:0.8;white-space:nowrap;margin-left:1rem">'
+                f"Updated: {time.strftime('%H:%M:%S')}</span>"
                 + "</div>"
             )
         else:
-            # Invisible spacer — identical height to alert div
+            # Active green status confirmation — identical height to prevent shifting
             _alert_html = (
-                f'<div style="height:{_BANNER_H};margin-bottom:0.75rem"></div>'
+                f'<div style="height:{_BANNER_H};background:rgba(75,255,75,0.06);'
+                f'border:1px solid rgba(75,255,75,0.3);border-radius:0.5rem;'
+                f'padding:0 1rem;display:flex;align-items:center;justify-content:space-between;'
+                f'color:#2ECC71;font-size:0.88rem;font-weight:500;'
+                f'margin-bottom:0.75rem;overflow:hidden;white-space:nowrap;'
+                f'text-overflow:ellipsis">'
+                f'<div>🟢&nbsp;&nbsp;All systems aligned and reconciled</div>'
+                f'<span style="font-size:0.75rem;opacity:0.8;white-space:nowrap;margin-left:1rem">'
+                f"Checked: {time.strftime('%H:%M:%S')}</span>"
+                f'</div>'
             )
         st.markdown(_alert_html, unsafe_allow_html=True)
 
@@ -965,8 +975,7 @@ def _bot_positions_fragment():
                     cache_key = (p, tf, itype, period)
                     if cache_key in indicator_cache_f: return indicator_cache_f[cache_key]
                     try:
-                        ex_obj = get_exchange_instance(global_config.MARKET_TYPE)
-                        ohlcv = ex_obj.fetch_ohlcv(p, timeframe=tf, limit=max(100, period*2))
+                        ohlcv = fetch_ohlcv_cached(global_config.MARKET_TYPE, p, tf)
                         if not ohlcv: return None
                         df = pd.DataFrame(ohlcv, columns=['t','o','h','l','c','v'])
                         from engine import indicators
@@ -1033,8 +1042,7 @@ def _bot_positions_fragment():
                     tf_stoch = cfg.get('stoch_tf', '15m')
                     # Note: stochastic returns (%K, %D). We'll use %K.
                     try:
-                        ex_obj = get_exchange_instance(global_config.MARKET_TYPE)
-                        ohlcv = ex_obj.fetch_ohlcv(row.get('pair'), timeframe=tf_stoch, limit=60)
+                        ohlcv = fetch_ohlcv_cached(global_config.MARKET_TYPE, row.get('pair'), tf_stoch)
                         if ohlcv:
                             df = pd.DataFrame(ohlcv, columns=['t','o','h','l','c','v'])
                             from engine import indicators
@@ -1048,8 +1056,7 @@ def _bot_positions_fragment():
                 if cfg.get('mode_boll'): 
                     tf_boll = cfg.get('boll_tf', '15m')
                     try:
-                        ex_obj = get_exchange_instance(global_config.MARKET_TYPE)
-                        ohlcv = ex_obj.fetch_ohlcv(row.get('pair'), timeframe=tf_boll, limit=60)
+                        ohlcv = fetch_ohlcv_cached(global_config.MARKET_TYPE, row.get('pair'), tf_boll)
                         if ohlcv:
                             df = pd.DataFrame(ohlcv, columns=['t','o','h','l','c','v'])
                             from engine import indicators
@@ -1241,54 +1248,58 @@ def _bot_positions_fragment():
                 print(f"Error extracting info for bot {row.get('id')}: {e}")
             return res
 
-        info_df = df_pos_f.apply(extract_info, axis=1, result_type='expand')
-        df_pos_f['TP | Grid'] = info_df['Trigger']
-        df_pos_f['Active Orders'] = info_df['Orders']
-        df_pos_f['Active TP'] = info_df['TP_Price_Str']
-        df_pos_f['Next Grid'] = info_df['Grid_Price_Str']
+        if not df_pos_f.empty:
+            info_df = df_pos_f.apply(extract_info, axis=1, result_type='expand')
+            df_pos_f['TP | Grid'] = info_df['Trigger']
+            df_pos_f['Active Orders'] = info_df['Orders']
+            df_pos_f['Active TP'] = info_df['TP_Price_Str']
+            df_pos_f['Next Grid'] = info_df['Grid_Price_Str']
 
-        df_pos_f['Exp $'] = info_df['Expected_Profit_Str']
-        df_pos_f['EE'] = info_df['EE_Status']
-        df_pos_f['Ages (pos/cyc)'] = info_df['Ages']
-        df_pos_f['Total Invested'] = df_pos_f['total_invested'].apply(
-            lambda x: f"${x:,.2f}" if x > 0.01 else "-"
-        )
-        df_pos_f['Open Qty'] = df_pos_f['open_qty'].apply(
-            lambda x: f"{float(x):.4f}" if pd.notna(x) and float(x) > 1e-8 else "-"
-        )
-        df_pos_f['Avg Entry'] = df_pos_f['avg_entry_price'].apply(
-            lambda x: f"${float(x):,.4f}" if pd.notna(x) and float(x) > 0 else "-"
-        )
+            df_pos_f['Exp $'] = info_df['Expected_Profit_Str']
+            df_pos_f['EE'] = info_df['EE_Status']
+            df_pos_f['Ages (pos/cyc)'] = info_df['Ages']
+            df_pos_f['Total Invested'] = df_pos_f['total_invested'].apply(
+                lambda x: f"${x:,.2f}" if x > 0.01 else "-"
+            )
+            df_pos_f['Open Qty'] = df_pos_f['open_qty'].apply(
+                lambda x: f"{float(x):.4f}" if pd.notna(x) and float(x) > 1e-8 else "-"
+            )
+            df_pos_f['Avg Entry'] = df_pos_f['avg_entry_price'].apply(
+                lambda x: f"${float(x):,.4f}" if pd.notna(x) and float(x) > 0 else "-"
+            )
 
-        # Unrealized PnL: (current_price - avg_entry) * open_qty, signed by direction
-        def calc_unrealised(row):
-            try:
-                inv = float(row.get('total_invested') or 0)
-                if inv <= 0.01:
+            # Unrealized PnL: (current_price - avg_entry) * open_qty, signed by direction
+            def calc_unrealised(row):
+                try:
+                    inv = float(row.get('total_invested') or 0)
+                    if inv <= 0.01:
+                        return "-"
+                    aq = float(row.get('open_qty') or 0)
+                    ap = float(row.get('avg_entry_price') or 0)
+                    pk = _norm_universal(row.get('pair', ''))
+                    cp = float(pair_prices.get(pk, 0))
+                    if aq < 1e-8 or ap < 1e-8 or cp < 1e-8:
+                        return "-"
+                    direction_u = str(row.get('direction', 'LONG')).upper()
+                    if direction_u == 'SHORT':
+                        pnl = (ap - cp) * aq
+                    else:
+                        pnl = (cp - ap) * aq
+                    arrow = "▲" if pnl >= 0 else "▼"
+                    return f"{arrow}${pnl:,.2f}"
+                except:
                     return "-"
-                aq = float(row.get('open_qty') or 0)
-                ap = float(row.get('avg_entry_price') or 0)
-                pk = _norm_universal(row.get('pair', ''))
-                cp = float(pair_prices.get(pk, 0))
-                if aq < 1e-8 or ap < 1e-8 or cp < 1e-8:
-                    return "-"
-                direction_u = str(row.get('direction', 'LONG')).upper()
-                if direction_u == 'SHORT':
-                    pnl = (ap - cp) * aq
-                else:
-                    pnl = (cp - ap) * aq
-                arrow = "▲" if pnl >= 0 else "▼"
-                return f"{arrow}${pnl:,.2f}"
-            except:
-                return "-"
 
-        df_pos_f['PnL'] = df_pos_f.apply(calc_unrealised, axis=1)
+            df_pos_f['PnL'] = df_pos_f.apply(calc_unrealised, axis=1)
 
-        # Entry trigger (only meaningful for scanning bots)
-        df_pos_f['Entry Trigger'] = info_df['Trigger'].where(
-            ~df_pos_f['status'].str.contains('IN TRADE|DUST|HEDGE ACTIVE', na=False),
-            other=""
-        )
+            # Entry trigger (only meaningful for scanning bots)
+            df_pos_f['Entry Trigger'] = info_df['Trigger'].where(
+                ~df_pos_f['status'].str.contains('IN TRADE|DUST|HEDGE ACTIVE', na=False),
+                other=""
+            )
+        else:
+            for col in ['TP | Grid', 'Active Orders', 'Active TP', 'Next Grid', 'Exp $', 'EE', 'Ages (pos/cyc)', 'Total Invested', 'Open Qty', 'Avg Entry', 'PnL', 'Entry Trigger']:
+                df_pos_f[col] = pd.Series(dtype=object)
 
         st.dataframe(
             df_pos_f[[

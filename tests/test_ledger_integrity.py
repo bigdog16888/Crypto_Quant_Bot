@@ -1145,4 +1145,90 @@ def test_sync_trades_from_orders_preserves_pending_hedge_close(memory_db):
     assert row_bot[0] == 'Scanning', f"Parent status must reset to Scanning, got {row_bot[0]}"
 
 
+def test_seal_trade_state_require_manual_proof_loophole(memory_db):
+    """Test REQUIRE_MANUAL_PROOF auto-clear loophole in seal_trade_state()."""
+    from unittest.mock import MagicMock
+    from engine.ledger import seal_trade_state
+
+    bot_id = 999
+    setup_bot_fixture(memory_db, bot_id, 'Loophole Bot', 'SOL/USDC:USDC', 'LONG')
+    cursor = memory_db.cursor()
+    cursor.execute("UPDATE bots SET status = 'REQUIRE_MANUAL_PROOF' WHERE id = ?", (bot_id,))
+    cursor.execute("UPDATE trades SET open_qty = 0.0, cycle_id = 1 WHERE bot_id = ?", (bot_id,))
+    memory_db.commit()
+
+    # Create a mock exchange that returns a NON-ZERO physical position (0.06)
+    mock_exchange = MagicMock()
+    mock_exchange.fetch_positions.return_value = [
+        {
+            'symbol': 'SOL/USDC:USDC',
+            'contracts': 0.06,
+            'qty': 0.06,
+            'net_qty': 0.06,
+            'side': 'long'
+        }
+    ]
+
+    # Call seal_trade_state. The virtual open_qty is 0 (since no fills in bot_orders),
+    # but mock exchange has a nonzero physical net (0.06).
+    # We expect the gate to NOT clear and status to remain REQUIRE_MANUAL_PROOF.
+    seal_trade_state(bot_id, exchange=mock_exchange)
+    
+    row_status = cursor.execute("SELECT status FROM bots WHERE id = ?", (bot_id,)).fetchone()
+    assert row_status[0] == 'REQUIRE_MANUAL_PROOF'
+
+    # Inverse case: both virtual flat and physical flat (0.0).
+    # Confirm the gate clears normally (becomes 'Scanning')
+    mock_exchange_flat = MagicMock()
+    mock_exchange_flat.fetch_positions.return_value = []
+    
+    seal_trade_state(bot_id, exchange=mock_exchange_flat)
+    row_status_flat = cursor.execute("SELECT status FROM bots WHERE id = ?", (bot_id,)).fetchone()
+    assert row_status_flat[0] == 'Scanning'
+
+
+def test_seal_trade_state_require_manual_proof_loophole_exchange_unavailable(memory_db):
+    """Test REQUIRE_MANUAL_PROOF auto-clear loophole when exchange is unavailable."""
+    from engine.ledger import seal_trade_state
+
+    bot_id = 9991
+    setup_bot_fixture(memory_db, bot_id, 'Loophole Bot Unavailable', 'SOL/USDC:USDC', 'LONG')
+    cursor = memory_db.cursor()
+    cursor.execute("UPDATE bots SET status = 'REQUIRE_MANUAL_PROOF' WHERE id = ?", (bot_id,))
+    cursor.execute("UPDATE trades SET open_qty = 0.0, cycle_id = 1 WHERE bot_id = ?", (bot_id,))
+    memory_db.commit()
+
+    # Call seal_trade_state with exchange=None.
+    # It must fail closed and preserve the REQUIRE_MANUAL_PROOF status.
+    seal_trade_state(bot_id, exchange=None)
+    
+    row_status = cursor.execute("SELECT status FROM bots WHERE id = ?", (bot_id,)).fetchone()
+    assert row_status[0] == 'REQUIRE_MANUAL_PROOF'
+
+
+def test_seal_trade_state_require_manual_proof_loophole_exception(memory_db):
+    """Test REQUIRE_MANUAL_PROOF auto-clear loophole when check raises an exception."""
+    from unittest.mock import MagicMock
+    from engine.ledger import seal_trade_state
+
+    bot_id = 9992
+    setup_bot_fixture(memory_db, bot_id, 'Loophole Bot Exception', 'SOL/USDC:USDC', 'LONG')
+    cursor = memory_db.cursor()
+    cursor.execute("UPDATE bots SET status = 'REQUIRE_MANUAL_PROOF' WHERE id = ?", (bot_id,))
+    cursor.execute("UPDATE trades SET open_qty = 0.0, cycle_id = 1 WHERE bot_id = ?", (bot_id,))
+    memory_db.commit()
+
+    # Mock exchange raising an exception on fetch_positions
+    mock_exchange_err = MagicMock()
+    mock_exchange_err.fetch_positions.side_effect = Exception("Exchange Connection Lost")
+
+    # Call seal_trade_state. It must fail closed and preserve REQUIRE_MANUAL_PROOF status.
+    seal_trade_state(bot_id, exchange=mock_exchange_err)
+    
+    row_status = cursor.execute("SELECT status FROM bots WHERE id = ?", (bot_id,)).fetchone()
+    assert row_status[0] == 'REQUIRE_MANUAL_PROOF'
+
+
+
+
 

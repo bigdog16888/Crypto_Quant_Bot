@@ -286,6 +286,26 @@ def _credit_fill_internal(
                         'forensic_adoption_reduce', 'flatten_close')
 
         if order_type in _ENTRY_TYPES and row_step is not None and row_cycle is not None and order_amount > 0:
+            # Before the existing step saturation check, insert a step-level claim:
+            try:
+                _step_claim = conn.execute(
+                    "INSERT OR IGNORE INTO fill_claims (bot_id, order_id, caller, claimed_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (bot_id, f"STEP_{row_step}_{row_cycle}", f"step_lock_{_claim_caller}", int(time.time()))
+                )
+                conn.commit()
+                if _step_claim.rowcount == 0:
+                    logger.warning(
+                        f"[STEP-LOCK] Bot {bot_id} step={row_step} cycle={row_cycle}: "
+                        f"already being credited by another caller. Skipping."
+                    )
+                    return False
+            except Exception as _sl_err:
+                logger.warning(
+                    f"[STEP-LOCK] Failed checking step lock for bot {bot_id} step={row_step}: "
+                    f"{_sl_err}. Proceeding without lock."
+                )
+
             try:
                 already_credited = conn.execute(
                     "SELECT COALESCE(SUM(filled_amount), 0.0) FROM bot_orders "
@@ -476,6 +496,7 @@ def seal_trade_state(
     force_recompute: bool = False,
     *,
     cycle_floor: int = None,
+    exchange=None,
 ) -> Dict[str, Any]:
     """Public entry-point for sealing bot trade state.
 
@@ -493,6 +514,7 @@ def seal_trade_state(
         bot_id,
         force_recompute=force_recompute,
         cycle_floor=cycle_floor,
+        exchange=exchange,
     )
 
 def _seal_trade_state_internal(
@@ -500,6 +522,7 @@ def _seal_trade_state_internal(
     force_recompute: bool = False,
     *,
     cycle_floor: int = None,
+    exchange=None,
 ) -> Dict[str, Any]:
     """
     THE authoritative trades-table writer (v2.0).
@@ -732,11 +755,44 @@ def _seal_trade_state_internal(
                 pass
 
             if main_open_qty <= step_size_tolerance:
-                new_status = 'Scanning'
-                logger.info(f"[SEAL] Bot {bot_id}: REQUIRE_MANUAL_PROOF cleared — position is now flat after TP.")
-                cascade_statuses = ('pending_close', 'FLATTENING', 'pending_flatten', 'pending_hedge_close')
-                cascade_ts = int(time.time()) if new_status in cascade_statuses else 0
-                conn.execute("UPDATE bots SET status = ?, cascade_started_at = ? WHERE id = ?", (new_status, cascade_ts, bot_id))
+                # Loophole fix: verify physical exchange parity before clearing gate
+                has_parity = False
+                active_exchange = exchange
+                if not active_exchange:
+                    try:
+                        from engine.runner import BotRunner
+                        runner = BotRunner.get_instance()
+                        if runner and runner.exchange:
+                            active_exchange = runner.exchange
+                    except Exception:
+                        pass
+
+                if active_exchange:
+                    try:
+                        from engine.parity_gates import pair_parity_ok
+                        ok, virt_net, phys_net, delta = pair_parity_ok(pair, active_exchange)
+                        if ok:
+                            has_parity = True
+                            logger.info(f"[SEAL] Bot {bot_id}: Parity verified with exchange (delta={delta:.6f}).")
+                        else:
+                            logger.warning(
+                                f"[SEAL] Bot {bot_id}: REQUIRE_MANUAL_PROOF NOT cleared. "
+                                f"Pair {pair} is NOT in parity: virtual={virt_net:.6f}, "
+                                f"physical={phys_net:.6f}, delta={delta:.6f}."
+                            )
+                    except Exception as e_parity:
+                        logger.error(f"[SEAL] Bot {bot_id} parity check failed: {e_parity}")
+                else:
+                    logger.warning(f"[SEAL] Bot {bot_id}: REQUIRE_MANUAL_PROOF NOT cleared. Exchange is unavailable and cannot verify parity.")
+
+                if has_parity:
+                    new_status = 'Scanning'
+                    logger.info(f"[SEAL] Bot {bot_id}: REQUIRE_MANUAL_PROOF cleared — position is now flat after TP.")
+                    cascade_statuses = ('pending_close', 'FLATTENING', 'pending_flatten', 'pending_hedge_close')
+                    cascade_ts = int(time.time()) if new_status in cascade_statuses else 0
+                    conn.execute("UPDATE bots SET status = ?, cascade_started_at = ? WHERE id = ?", (new_status, cascade_ts, bot_id))
+                else:
+                    logger.info(f"[SEAL] Bot {bot_id}: REQUIRE_MANUAL_PROOF preserved — physical exchange position mismatch or unavailable")
             else:
                 logger.info(f"[SEAL] Bot {bot_id}: REQUIRE_MANUAL_PROOF preserved — position still open (open_qty={main_open_qty:.6f})")
         else:

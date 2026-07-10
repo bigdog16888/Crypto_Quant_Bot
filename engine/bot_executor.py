@@ -2699,7 +2699,8 @@ class BotExecutor:
                             accum_row = _hc_enforce_conn.execute(
                                 "SELECT COALESCE(SUM(filled_amount), 0.0) FROM bot_orders "
                                 "WHERE bot_id = ? AND cycle_id = ? AND step >= 1 AND step < ? "
-                                "AND order_type IN ('entry', 'grid')",
+                                "AND order_type IN ('entry', 'grid') "
+                                "AND status IN ('filled', 'partially_filled')",
                                 (parent_id, parent_cycle_id, hedge_trigger)
                             ).fetchone()
                             pre_trigger_accumulated_qty = float(accum_row[0]) if accum_row else 0.0
@@ -2779,6 +2780,84 @@ class BotExecutor:
                                 delta = parent_step_qty - child_step_qty
 
                                 if delta > tolerance:
+                                    # ── LIVE EXCHANGE GUARD (INV-30) ──
+                                    # Check live net to avoid double catch-ups if the DB has been wiped or aligned.
+                                    try:
+                                        from engine.parity_gates import get_exchange_signed_net as _gesn
+                                        live_signed_net = _gesn(exchange, pair)
+                                        if live_signed_net is not None:
+                                            child_direction_early = _hc_enforce_conn.execute("SELECT direction FROM bots WHERE id=?", (bot_id,)).fetchone()[0]
+                                            _parent_target_calc = pre_trigger_accumulated_qty + parent_step_qty
+                                            if child_direction_early.upper() == 'SHORT':
+                                                live_hedge_qty = max(0.0, _parent_target_calc - live_signed_net)
+                                            else:
+                                                live_hedge_qty = max(0.0, live_signed_net + _parent_target_calc)
+
+                                            if live_hedge_qty > child_step_qty + 1e-8:
+                                                already_covered = live_hedge_qty - child_step_qty
+                                                adjusted_delta = max(0.0, delta - already_covered)
+                                                logger.info(
+                                                    f"[HEDGE-LIVE-GUARD-INV30] Child {bot_id} on {pair}: "
+                                                    f"DB child_step_qty={child_step_qty:.6f} but exchange shows "
+                                                    f"live_hedge_qty={live_hedge_qty:.6f} (already_covered={already_covered:.6f}). "
+                                                    f"Reducing catch-up delta {delta:.6f} → {adjusted_delta:.6f}."
+                                                )
+                                                # Correct open_qty in DB and write reconciliation order
+                                                try:
+                                                    _corrected_qty = round(live_hedge_qty, 8)
+                                                    _hc_enforce_conn.execute(
+                                                        "UPDATE trades SET open_qty = ? WHERE bot_id = ?",
+                                                        (_corrected_qty, bot_id)
+                                                    )
+                                                    # Insert reconciliation marker
+                                                    import time as _time_mod
+                                                    # Delete any prior LIVE_GUARD_INV30 rows for that exact (bot_id, step, cycle_id) to prevent stacking
+                                                    _hc_enforce_conn.execute(
+                                                        "DELETE FROM bot_orders "
+                                                        "WHERE bot_id = ? AND step = ? AND cycle_id = ? AND client_order_id LIKE '%LIVE_GUARD_INV30%'",
+                                                        (bot_id, child_step, child_cycle_id)
+                                                    )
+                                                    _recon_cid = f"CQB_{bot_id}_LIVE_GUARD_INV30_{child_cycle_id}_{child_step}"
+                                                    _hc_enforce_conn.execute(
+                                                        "INSERT OR IGNORE INTO bot_orders "
+                                                        "(bot_id, step, order_type, order_id, price, amount, status, "
+                                                        " created_at, client_order_id, updated_at, notes, cycle_id, "
+                                                        " filled_amount, position_side) "
+                                                        "VALUES (?, ?, 'entry', ?, 0, ?, 'filled', ?, ?, ?, "
+                                                        " 'Live-guard INV30 DB sync: hedge already present on exchange.', "
+                                                        " ?, ?, ?)",
+                                                        (
+                                                            bot_id, child_step,
+                                                            _recon_cid,
+                                                            _corrected_qty,
+                                                            int(_time_mod.time()),
+                                                            _recon_cid,
+                                                            int(_time_mod.time()),
+                                                            child_cycle_id,
+                                                            _corrected_qty,
+                                                            child_direction_early
+                                                        )
+                                                    )
+                                                    _hc_enforce_conn.commit()
+                                                    logger.info(
+                                                        f"[HEDGE-LIVE-GUARD-INV30] DB corrected: child {bot_id} "
+                                                        f"open_qty updated to {_corrected_qty:.6f}, "
+                                                        f"reconciliation marker {_recon_cid} inserted."
+                                                    )
+                                                except Exception as _db_fix_err:
+                                                    logger.error(
+                                                        f"[HEDGE-LIVE-GUARD-INV30] Failed to write DB correction: {_db_fix_err}"
+                                                    )
+                                                delta = adjusted_delta
+                                    except Exception as _live_guard_err:
+                                        logger.warning(
+                                            f"[HEDGE-LIVE-GUARD-INV30] Could not fetch live net for {pair}: {_live_guard_err}."
+                                        )
+
+                                    if delta <= tolerance:
+                                        logger.info(f"[HEDGE-LIVE-GUARD-INV30] Adjusted delta {delta:.6f} <= tolerance {tolerance:.6f}. Skipping catch-up.")
+                                        continue
+
                                     logger.warning(
                                         f"[INV-30] Under-hedge drift of {delta:.6f} detected at step {child_step} "
                                         f"(parent step {S}) for child {bot_id}. "
@@ -2791,7 +2870,7 @@ class BotExecutor:
                                             price_to_use = float(exchange.get_last_price(pair) or 0)
                                         except Exception:
                                             price_to_use = 0.0
-                                    
+
                                     cid = f"CQB_{bot_id}_ENTRY_{child_cycle_id}_{child_step}_CATCHUP_{int(time.time())}"[:36]
                                     child_direction = _hc_enforce_conn.execute("SELECT direction FROM bots WHERE id=?", (bot_id,)).fetchone()[0]
                                     child_side = 'sell' if child_direction == 'SHORT' else 'buy'
@@ -2806,7 +2885,7 @@ class BotExecutor:
                                         }
                                         is_testnet = getattr(config, 'TESTNET', False) or getattr(config, 'DEMO_TRADING', False)
                                         params = self._resolve_position_side_param(params, is_testnet)
-                                        
+
                                         try:
                                             order = exchange.create_order(
                                                 pair, 'limit', child_side, entry_qty, price_to_use, params=params
@@ -4904,9 +4983,113 @@ class BotExecutor:
         ).fetchone()
         child_step_qty = float(child_qty_row[0]) if child_qty_row else 0.0
 
-        # 3. Compute delta
+        # 3. Single live position fetch — used for BOTH the live guard and the cap check below.
+        #    Doing one fetch here avoids a race condition between two separate calls within the
+        #    same function, and eliminates a redundant API round-trip.
+        from engine.parity_gates import get_exchange_signed_net
+        _live_signed_net = None
+        try:
+            _live_signed_net = get_exchange_signed_net(exchange, pair)
+        except Exception as _fetch_err:
+            logger.warning(
+                f"[HEDGE-SIGNAL] get_exchange_signed_net failed for live guard/cap check on {pair}: {_fetch_err}. "
+                f"Proceeding with DB-only delta."
+            )
+
+        # 4. Compute DB-based delta
         qty_delta = parent_target_qty - child_step_qty
 
+        # ── LIVE EXCHANGE GUARD ─────────────────────────────────────────────────
+        # After any alignment/wipe event the child's DB open_qty and bot_orders
+        # rows are zeroed out, making child_step_qty=0 even though the exchange
+        # may already hold the correct hedge position.  Trusting DB=0 blindly
+        # fires a full catch-up on the next parent step — the XRP/BTC incident.
+        #
+        # Fix: use the signed net already fetched above to determine how much
+        # of the required hedge is ALREADY physically present, and subtract that
+        # from qty_delta before placing any order.
+        #
+        # child direction is opposite to parent direction:
+        #   parent LONG → child SHORT → hedge shows as negative signed net
+        #   parent SHORT → child LONG  → hedge shows as positive signed net
+        _child_direction_early = 'SHORT' if direction.upper() == 'LONG' else 'LONG'
+        if _live_signed_net is not None and not isinstance(_live_signed_net, str):
+            if _child_direction_early == 'SHORT':
+                live_hedge_qty = max(0.0, parent_target_qty - _live_signed_net)
+            else:
+                live_hedge_qty = max(0.0, _live_signed_net + parent_target_qty)
+
+            if live_hedge_qty > child_step_qty + 1e-8:
+                # Exchange holds more hedge than DB tracks — DB was stale/wiped.
+                # Compute how much of the delta is already covered physically.
+                already_covered = live_hedge_qty - child_step_qty
+                adjusted_delta = max(0.0, qty_delta - already_covered)
+                logger.info(
+                    f"[HEDGE-LIVE-GUARD] Child {child_bot_id} on {pair}: "
+                    f"DB child_step_qty={child_step_qty:.6f} but exchange shows "
+                    f"live_hedge_qty={live_hedge_qty:.6f} (already_covered={already_covered:.6f}). "
+                    f"Reducing catch-up delta {qty_delta:.6f} → {adjusted_delta:.6f}."
+                )
+                # Q1: Also correct child_step_qty in the DB so subsequent cycles
+                # do not re-trigger the guard and so flag_pair_ledger_mismatch
+                # sees the correct virtual state.  We update the trades row
+                # open_qty to reflect reality; a synthetic filled bot_orders row
+                # is also inserted so recompute_invested_from_orders is consistent.
+                try:
+                    _corrected_qty = round(live_hedge_qty, 8)
+                    conn.execute(
+                        "UPDATE trades SET open_qty = ? WHERE bot_id = ?",
+                        (_corrected_qty, child_bot_id)
+                    )
+                    # Insert a reconciliation marker so the ledger recompute agrees
+                    import time as _time_mod
+                    # Delete any prior LIVE_GUARD_RECON rows for that exact (bot_id, step, cycle_id) to prevent stacking
+                    conn.execute(
+                        "DELETE FROM bot_orders "
+                        "WHERE bot_id = ? AND step = ? AND cycle_id = ? AND client_order_id LIKE '%LIVE_GUARD_RECON%'",
+                        (child_bot_id, child_step, parent_cycle_id)
+                    )
+                    _recon_cid = f"CQB_{child_bot_id}_LIVE_GUARD_RECON_{parent_cycle_id}_{child_step}"
+                    conn.execute(
+                        "INSERT OR IGNORE INTO bot_orders "
+                        "(bot_id, step, order_type, order_id, price, amount, status, "
+                        " created_at, client_order_id, updated_at, notes, cycle_id, "
+                        " filled_amount, position_side) "
+                        "VALUES (?, ?, 'entry', ?, 0, ?, 'filled', ?, ?, ?, "
+                        " 'Live-guard DB sync: hedge already present on exchange after wipe/alignment.', "
+                        " ?, ?, ?)",
+                        (
+                            child_bot_id, child_step,
+                            _recon_cid,         # order_id (synthetic)
+                            _corrected_qty,     # amount
+                            int(_time_mod.time()),  # created_at
+                            _recon_cid,         # client_order_id
+                            int(_time_mod.time()),  # updated_at
+                            parent_cycle_id,    # cycle_id
+                            _corrected_qty,     # filled_amount
+                            _child_direction_early,  # position_side
+                        )
+                    )
+                    conn.commit()
+                    logger.info(
+                        f"[HEDGE-LIVE-GUARD] DB corrected: child {child_bot_id} "
+                        f"open_qty updated to {_corrected_qty:.6f}, "
+                        f"reconciliation marker {_recon_cid} inserted."
+                    )
+                except Exception as _db_fix_err:
+                    logger.error(
+                        f"[HEDGE-LIVE-GUARD] Failed to write DB correction for child "
+                        f"{child_bot_id}: {_db_fix_err}. Delta was still adjusted."
+                    )
+                qty_delta = adjusted_delta
+                child_step_qty = live_hedge_qty  # update local variable for is_repl below
+        else:
+            if _live_signed_net is None:
+                logger.warning(
+                    f"⚠️ [HEDGE-LIVE-GUARD] Could not verify live net for {pair} (fetch returned None). "
+                    f"Bypassing guard recheck and proceeding with DB-only delta."
+                )
+        # ── END LIVE EXCHANGE GUARD ─────────────────────────────────────────────
         # Get exchange precision step size
         prec = exchange.get_symbol_precision(pair)
         qty_step = float(prec.get('step_size', 0.001) or 0.001)
@@ -4944,8 +5127,8 @@ class BotExecutor:
             except Exception:
                 pass  # Not found = safe to place
 
-        # Determine child direction (opposite to parent)
-        child_direction = 'SHORT' if direction.upper() == 'LONG' else 'LONG'
+        # Determine child direction (opposite to parent) — reuse early computation
+        child_direction = _child_direction_early
         child_side = 'sell' if child_direction == 'SHORT' else 'buy'
 
         # Round qty to exchange precision
@@ -4988,69 +5171,18 @@ class BotExecutor:
         else:
             max_pos_limit = float(max_pos_limit)
 
-        # Get actual physical position from exchange (authoritative)
+        # Capacity check uses the positions already fetched above.
         _current_phys = None
-        try:
-            positions = exchange.fetch_positions()
-            if positions:
-                from engine.exchange_interface import normalize_symbol
-                target_symbol_norm = normalize_symbol(pair)
-                expected_side = 'long' if child_direction.upper() == 'LONG' else 'short'
-                for p in positions:
-                    if normalize_symbol(p.get('symbol', '')) == target_symbol_norm:
-                        pos_amt = None
+        if _live_signed_net is not None and not isinstance(_live_signed_net, str):
+            expected_side = 'long' if child_direction.upper() == 'LONG' else 'short'
+            p_side = 'long' if _live_signed_net > 0 else 'short' if _live_signed_net < 0 else 'flat'
+            if p_side == expected_side:
+                _current_phys = {'size': abs(_live_signed_net)}
 
-                        # 1. Try raw Binance positionAmt first (always signed)
-                        raw_info = p.get('info', {})
-                        raw_pa = raw_info.get('positionAmt', raw_info.get('positionAmount'))
-                        if raw_pa is not None:
-                            pos_amt = float(raw_pa)
-
-                        # 2. Try top-level positionAmt (always signed)
-                        if pos_amt is None or pos_amt == 0:
-                            raw_pa_top = p.get('positionAmt', p.get('positionAmount'))
-                            if raw_pa_top is not None:
-                                pos_amt = float(raw_pa_top)
-
-                        # 3. Try CCXT contracts (signed in some versions)
-                        if pos_amt is None or pos_amt == 0:
-                            raw_contracts = p.get('contracts')
-                            if raw_contracts is not None:
-                                pos_amt = float(raw_contracts)
-
-                        # 4. Try CCXT qty/size (for compatibility/mocks)
-                        if pos_amt is None or pos_amt == 0:
-                            raw_qty = p.get('qty', p.get('size'))
-                            if raw_qty is not None:
-                                pos_amt = float(raw_qty)
-
-                        # If the detected pos_amt is positive but side is explicitly SHORT, correct the sign
-                        if pos_amt is not None and pos_amt > 0:
-                            side = str(p.get('side', '')).upper()
-                            if side == 'SHORT':
-                                pos_amt = -pos_amt
-
-                        # 5. Fall back to side field only if positionAmt/contracts/qty unavailable
-                        if pos_amt is None or pos_amt == 0:
-                            side = str(p.get('side', '')).upper()
-                            size = float(p.get('contracts', 0) or 
-                                         p.get('qty', 0) or
-                                         p.get('size', 0) or
-                                         abs(float(p.get('positionAmt', 0) or p.get('info', {}).get('positionAmt', 0))))
-                            pos_amt = size if side == 'LONG' else -size
-                        
-                        p_side = 'long' if pos_amt > 0 else 'short' if pos_amt < 0 else 'flat'
-                        if p_side == expected_side:
-                            p_qty = float(p.get('qty') if p.get('qty') is not None else p.get('size') if p.get('size') is not None else abs(pos_amt))
-                            _current_phys = {'size': p_qty}
-                            break
-        except Exception as e_phys:
-            logger.error(f"[HEDGE-SIGNAL] Failed to fetch positions from exchange for capacity check: {e_phys}")
-
-        # Fallback to DB active_positions cache if exchange fetch fails
+        # Fallback to DB active_positions cache if the single fetch failed
         if _current_phys is None:
             logger.warning(f"[HEDGE-SIGNAL] Falling back to DB cache for capacity check on {pair}")
-            _current_phys = self._get_phys_pos(pair, direction=child_direction)
+            _current_phys = {'size': child_step_qty}
 
         _current_phys_qty = _current_phys['size'] if _current_phys else 0.0
         _expected_after = _current_phys_qty + entry_qty

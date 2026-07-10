@@ -1,5 +1,6 @@
 # Crypto Quant Bot — AI Agent Codebase Guide
-**Version: 5.2.0 | Last Updated: 2026-07-07**
+**Version: 5.3.7 | Last Updated: 2026-07-10**
+
 
 > **READ THIS FIRST** before touching any code. This is the single authoritative guide.
 > It supersedes `UNIFIED_BOT_DOCUMENTATION.md` and all older session notes.
@@ -757,9 +758,42 @@ AND created_at >= (strftime('%s','now') - 60)
 If count > 0: log `[PROOF-GRACE]` and `continue` to the next ticker. Do NOT set gate.
 If count = 0 AND mismatch persists: proceed to forensic scan and potential gate.
 
+This grace period guard applies to ALL callers of `_set_bot_require_manual_proof` (centralized in v5.3.2) and `audit_pair_ledger_vs_exchange`, including `flag_orphan_fill_manual_proof`, `gate_trading_allowed`, and `gate_maintain_orders_allowed`. No pair may be gated while a fill credit is in flight on that pair.
+
 **Observed false positive (2026-05-29):** `short eth` TP fill of 0.119 ETH landed at engine restart. 19 seconds later `open_qty` was sealed. The reconciler's proof scan ran during that 19s window, found `System=-0.324 vs Physical=-0.301` (diff 0.023), and gated all 3 ETH hedge child bots with `REQUIRE_MANUAL_PROOF`. The ledger was correct — only the timing was wrong.
 
-### 3.58. Hedge Child base_size Config Bypass (v3.6.4)
+**v5.3.3 update**: The inline grace-check in `reconciler.py` was replaced with a call to the shared `pair_has_recent_fill()` function from `engine.parity_gates`. The shared function uses `updated_at` (fill-credit timestamp, not order creation) and accepts an explicit `bot_ids` list to preserve the reconciler’s `bots_on_ticker` semantics exactly. A 600s TP/close window is preserved via `tp_close_window_seconds=600`.
+
+**v5.3.4 update (Size-cap and Grace Coexistence)**:
+To prevent transient mismatches from masking extremely large, structural gaps (e.g. after long offline periods where offline TP fills are missing from the ledger), `pair_has_recent_fill()` enforces a maximum gap size limit of `20.0` units via parameters `max_gap_units=20.0` and `gap_abs`. Gaps exceeding 20.0 units bypass grace entirely and are routed immediately to the forensic scan and gate paths, regardless of recent fills.
+
+Two grace mechanisms legitimately coexist:
+1. **`PASS3-GRACE` (reconciler.py, early check)**: Checks a broader set of order types and checks both `filled_at` and `updated_at` timestamps over a 90s window. It triggers *before* the historical-net agreement check is evaluated.
+2. **Centralized Grace (parity_gates.py, called by reconciler and other gate points)**: Checks a 60s window (or 600s for TP/close orders) via the shared `pair_has_recent_fill()`. It uses `updated_at` (the precise fill-credit commit timestamp) and is size-capped at 20.0 units.
+
+### 3.58. REQUIRE_MANUAL_PROOF Writer Inventory (v5.3.4)
+
+Every location that writes `bots.status = 'REQUIRE_MANUAL_PROOF'` is classified below. This table is CI-enforced: `tests/test_require_proof_writers.py` fails if any new raw SQL write appears outside the whitelisted (B) locations.
+
+| # | File | Line | Classification | Reason bypass is safe |
+|---|------|------|----------------|-----------------------|
+| 1 | `engine/parity_gates.py` | ~396 | **(A) Grace-checked** — THE centralized write | All (A) callers funnel here; grace check runs inside this function (v5.3.4: size-capped at 20.0 units) |
+| 2 | `engine/bot_executor.py` | ~626 | **(B) Hard-failure** | Phase 1 two-phase reset: exchange close literally failed |
+| 3 | `engine/database.py` | ~1508 | **(A) Grace-checked** | Converted from raw SQL to `_set_bot_require_manual_proof()` call in v5.3.3 |
+| 4 | `engine/database.py` | ~3808 | **(B) Hard-failure** | `flag_pair_ledger_mismatch`: post-forensic confirmed delta |
+| 5 | `engine/oneway_netting.py` | ~462 | **(B) Hard-failure** | Exchange API unavailable for N consecutive cycles |
+| 6 | `engine/reconciler.py` | ~48 | **(B) Hard-failure** | `flag_bot_manual_proof` local helper — only called from hard-failure paths |
+| 7 | `engine/reconciler.py` | ~5709 | **(B) Hard-failure** | `DIRECTIONAL-MISMATCH`: physical position contradicts bot direction |
+| 8 | `engine/reconciler.py` | ~7971 | **(B) Hard-failure** | `ADOPT-LIMIT-EXCEEDED`: would adopt > `MAX_ADOPTION_QTY_PER_CYCLE` |
+| 9 | `engine/reconciler.py` | ~8588 | **(B) Hard-failure** | `PROOF-FAILED`: forensic scan succeeded but gap persists past grace window |
+| 10 | `engine/reconciler.py` | ~8614 | **(B) Hard-failure** | `PROOF-FAILED`: forensic scan raised exception, gap unresolved |
+| 11 | `engine/runner.py` | ~1139 | **(B) Hard-failure** | Exchange close FAILED during pending flatten |
+| 12 | `engine/runner.py` | ~1180 | **(B) Hard-failure** | `safe_wipe_bot` refused after close |
+| 13 | `engine/runner.py` | ~1192 | **(B) Hard-failure** | `safe_wipe_bot` raised exception |
+
+**Rule**: Any new (A) write MUST call `_set_bot_require_manual_proof()` (never raw SQL). Any new (B) write MUST be added to the whitelist in `tests/test_require_proof_writers.py` and this table.
+
+
 INVARIANT: Hedge child bots have `base_size = 0` by design. They never place independent entries.
 
 The strict `base_size < exchange_min_notional` config check in `process_bot` (bot_executor.py) MUST be bypassed entirely for `bot_type = 'hedge_child'`. Bypassing this guard ensures that hedge child bots are not halted with `Config Error` at startup.
@@ -811,6 +845,11 @@ INVARIANT (INV-34): Fills recorded by `credit_fill()` must never be blocked or d
 ### 3.70. Shutdown Grid and Exit Auditing (INV-37) (v5.1.0)
 INVARIANT (INV-37): During the graceful shutdown sequence of the engine, the reconciler must execute active REST audits for all open/new grid, entry, and take-profit (exit) orders via `_audit_pending_exits()` and `_audit_pending_grids()`. Fills confirmed by the exchange must be credited and the bot's trade state sealed in the DB before the final `seal_all_active_bots()` is executed. This prevents writing a stale virtual trade state to the database on shutdown.
 - **REST rate-limit safety guard**: `_audit_pending_grids()` must cap CCXT `fetch_order` calls to 20 per run. If more than 20 qualifying orders exist, it prioritizes orders older than 60 seconds, logs a WARNING, and processes only the oldest 20.
+
+### 3.71. Exchange Net Position Verification Invariant (INV-38) (v5.3.0)
+INVARIANT (INV-38): In one-way multi-bot mode, a filled order does not guarantee a net position increase — exchange net position must be verified before crediting any grid or entry fill.
+- **Verification Logic**: In `_audit_pending_grids()`, after confirming that an order status is `filled` on the exchange via REST API, the reconciler must verify that the actual exchange net position supports crediting the fill. It fetches the live signed exchange net position and compares it against the current system-wide virtual net position.
+- **Delta Threshold**: If the absolute difference (`abs(actual_delta) = abs(current_exchange_net - current_virtual_net)`) is less than 50% of the proposed fill quantity (`fill_qty * 0.5`), it indicates that the position change has already been offset or is not present on the exchange (possible hedge child offset or phantom fill). In this case, the reconciler skips calling `credit_fill()`, logs a WARNING, and continues, preventing phantom fill propagation.
 
 ---
 
@@ -932,6 +971,9 @@ INVARIANT (INV-37): During the graceful shutdown sequence of the engine, the rec
 - **C7 GATED_FILL_DROP**: Fills arriving via WebSocket while a bot is gated in `REQUIRE_MANUAL_PROOF` are silently dropped by `credit_fill()` early return. The position closes physically on the exchange, but the virtual ledger stays open. The mismatch is flagged as `GHOST_VIRTUAL` in the next cycle by the reconciler.
   - **Prevented by**: INV-34 (allowing fills to credit and open_qty to update regardless of bot status, letting TP cascades reset the bot).
   - **Historical**: Design flaw resolved in v4.3.6.
+- **C8 TRANSIENT_GATE**: parity gate fires during the 12ms window between exchange position update and WS fill credit landing in ledger, causing false REQUIRE_MANUAL_PROOF on all bots of that pair.
+  - **Prevented by**: Centralized INV §3.57 grace period guard inside `_set_bot_require_manual_proof`.
+
 
 ### CATEGORY D — EXCHANGE MECHANICAL
 - **D1 POSITION_SIDE_MAINNET**: positionSide sent to mainnet One-Way
@@ -966,6 +1008,9 @@ streamlit run ui/app.py
 
 # Tail log
 Get-Content engine.log -Wait -Tail 30
+
+# Verify the deployed code version is actually running (process start time vs file modifications)
+python scripts/verify_deployment.py
 ```
 
 After restart, watch for:
@@ -977,10 +1022,94 @@ After restart, watch for:
 
 ## 8. Version History (Change Log)
 
+### v5.3.7 — 2026-07-10
+Refactored grid grace age check and separated database/UI concerns.
+
+- **`engine/database.py`**: Added the shared helper `bot_has_recent_order_activity()` to retrieve the age of the latest bot order in a thread-safe manner.
+- **`ui/views/monitor.py`**: Replaced the local raw SQL block query with the centralized `bot_has_recent_order_activity()` call, keeping UI concerns clean of raw DB details.
+- **Bumped version** to `5.3.7`.
+
+### v5.3.6 — 2026-07-10
+UI Performance Caching and Descriptive Parity Warnings.
+
+- **`ui/views/monitor.py`**: Routed UI positions fragment and indicator calculation calls (RSI, CCI, Stochastic, Bollinger Bands) through `fetch_ohlcv_cached()`, `fetch_positions_cached()`, and `fetch_open_orders_cached()` to eliminate a 30+ network REST call rate-limit storm. Updated positions fragment refresh to 5s. Added detailed mismatch context and timestamps to the alert banner.
+- **Bumped version** to `5.3.6`.
+
+### v5.3.5 — 2026-07-09
+Resolved size-cap bypass in flag_orphan_fill_manual_proof.
+
+- **`engine/parity_gates.py`**: Added `max_gap_units=20.0` and `gap_abs=qty` to the early-return `pair_has_recent_fill()` precheck in `flag_orphan_fill_manual_proof()`. This ensures that orphan fills larger than 20.0 units bypass grace and are gated (instead of silently exiting early and bypassing the size-capped check in `_set_bot_require_manual_proof()`).
+- **`tests/test_parity_grace.py`**: Added regression test `test_flag_orphan_fill_gates_for_large_gap_even_with_recent_fill` (orphan fill with qty > 20 units + recent timestamp → must gate, not grace).
+- **Bumped version** to `5.3.5`. Automated Tests: 425 passed, 0 failed.
+
+### v5.3.4 — 2026-07-09
+Size-cap safety checks for consolidated grace-period guard.
+
+
+- **`engine/parity_gates.py`**: Added `max_gap_units` and `gap_abs` to `pair_has_recent_fill()` signature to enforce a maximum gap size limit of `20.0` units. Gaps exceeding `20.0` units bypass the grace period entirely (mirrors PASS3-GRACE FIX #3 [V2.4.1] semantics). In `_set_bot_require_manual_proof()`, moved pair net agreement checking above the grace check, so `gap_abs` is computed once and passed to the grace guard and tolerance-bypass check.
+- **`engine/reconciler.py`**: Updated `pair_has_recent_fill()` call to pass the actual gap magnitude (`gap_abs=_gap_abs`) and cap (`max_gap_units=20.0`). Removed the stale pre-refactor comment block.
+- **`tests/test_parity_grace.py`**: Added size-cap regression tests verifying that large gaps bypass the grace window while small gaps are skipped.
+- **Grace Coexistence Documented**: Explicitly documented why PASS3-GRACE (early 90s window, multiple timestamps and order types) and the Centralized Grace (60s window, updated_at only, size-capped) legitimately coexist.
+- **Bumped version** to `5.3.4`. Automated Tests: 424 passed, 0 failed.
+
+### v5.3.3 — 2026-07-09
+Grace-period guard consolidation, CI static-analysis enforcement, and changelog backfill.
+
+
+- **`engine/parity_gates.py`**: Renamed `_pair_has_recent_fill` → public `pair_has_recent_fill` with two new parameters: `bot_ids: list = None` (explicit ID list, skips JOIN) and `tp_close_window_seconds: int = 0` (wider window for TP/close fills). Backward-compat alias `_pair_has_recent_fill = pair_has_recent_fill` preserved.
+- **`engine/reconciler.py`**: Replaced the 50-line inline grace-check block (~line 8284–8333) with a 10-line call to the shared `pair_has_recent_fill()`. Semantics preserved exactly: same `bots_on_ticker` ID list, same 60s/600s windows; `updated_at` used instead of `created_at` (more reliable — set on fill credit, not order creation).
+- **`engine/database.py`**: Fixed `CycleResetBlockedError` handler at `_reset_bot_after_tp_internal` line 1508. Old code: raw `cursor.execute(...)` inside a `BEGIN IMMEDIATE` transaction that was then rolled back by the outer `except` handler — the bot was **never actually gated**. New code: calls `_set_bot_require_manual_proof(bot_id, str(e))` on a separate connection, which survives the rollback and applies the grace check.
+- **`tests/test_require_proof_writers.py`** [NEW]: CI static-analysis test that scans all engine `.py` files for raw `UPDATE bots SET status='REQUIRE_MANUAL_PROOF'` writes, and fails if any appear outside the hardcoded whitelist of 12 known hard-failure locations.
+- **CODEBASE_GUIDE.md §3.58**: Added `REQUIRE_MANUAL_PROOF` Writer Inventory table classifying all 13 write locations as (A) Grace-checked or (B) Hard-failure.
+- **CODEBASE_GUIDE.md §8**: Filled in missing changelog entries for v5.1.2 through v5.3.2.
+- **Bumped version** to `5.3.3`. Automated Tests: 422 passed, 0 failed.
+
+### v5.3.2 — 2026-07-09
+Centralized grace-period guard hardening (INV-37 continuation).
+
+- **`engine/parity_gates.py`**: Moved the 60s fill-credit grace check from `flag_orphan_fill_manual_proof` into `_set_bot_require_manual_proof` itself. This guarantees that every caller — `gate_trading_allowed`, `gate_maintain_orders_allowed`, `flag_orphan_fill_manual_proof`, and any future caller — is covered by the grace guard without each caller needing to remember to call it.
+- **`tests/test_parity_grace.py`**: Added `test_gate_maintain_orders_allowed_skips_gate_on_recent_fill` and `test_gate_trading_allowed_skips_gate_on_recent_fill` to verify the centralized guard fires for both gate function entry points.
+- **Bumped version** to `5.3.2`. Automated Tests: 420 passed, 0 failed.
+
+### v5.3.1 — 2026-07-09
+Transient gate prevention via fill-credit grace window (INV-37/INV-38 fix).
+
+- **Root cause (INV-37)**: A race condition where the exchange physical position snapshot (via WS `ACCOUNT_UPDATE`) updated up to ~12ms before the corresponding order execution event was processed by `WSEventHandlers`. This caused a transient ledger mismatch that triggered the pair-level parity gate, setting all bots on the pair to `REQUIRE_MANUAL_PROOF`.
+- **`engine/parity_gates.py`**: Added `_pair_has_recent_fill(conn, symbol, window_seconds=60)` helper. Added pre-check in `flag_orphan_fill_manual_proof`: if a fill was credited within 60s, skip the gate to allow the WS credit pipeline to complete.
+- **`tests/test_parity_grace.py`** [NEW]: Added `test_flag_orphan_fill_ignores_gating_on_recent_fill` and `test_flag_orphan_fill_gates_when_no_recent_fill`.
+- **CODEBASE_GUIDE.md**: Updated §3.57 to document the grace-period guard. Added `C8 TRANSIENT_GATE` failure mode to Category C of §5.
+- **Bumped version** to `5.3.1`. Automated Tests: 418 passed, 0 failed.
+
+### v5.3.0 — 2026-07-09
+BTC phantom fill repair and parity reconciliation hardening.
+
+- **DB repair**: Marked phantom grid fills (`CQB_10016_GRID_52_7`, `CQB_10016_GRID_52_8_R*`) as `reset_cleared` after verifying exchange held only 0.076 BTC (matching step 6 adoption fill of 0.078 BTC minus rounding). Cleared all `LIVE_GUARD_INV30` synthetic rows for hedge child 100317.
+- **`engine/reconciler.py`** (`_audit_pending_grids`): Added position-verification step after `fetch_order` returns `status=filled`. If the exchange net position delta does not support the fill quantity (less than 50% of expected), log `[GRID-AUDIT-SKIP]` and skip `credit_fill` to prevent phantom fill crediting.
+- **`engine/health.py`**: Documented that `PAIR_PARITY_QTY_TOLERANCE` is a dust-rounding tolerance, not a USD-value tolerance. Gaps exceeding `$5 USD` trigger `REQUIRE_MANUAL_PROOF` investigation per §3.52.
+- **Bumped version** to `5.3.0`.
+
+### v5.2.0 — 2026-07-09
+SUI parity gate false-positive fix (INV-38 precursor).
+
+- **Root cause**: `flag_orphan_fill_manual_proof` called `audit_pair_ledger_vs_exchange` without checking the WS fill credit window. A SUI fill landed on 4 bots simultaneously, triggering the parity gate before the fill was propagated to `trades.open_qty`.
+- **`engine/parity_gates.py`**: Added fill-credit window guard to `flag_orphan_fill_manual_proof` checking for fills within the last 60 seconds before calling `_set_bot_require_manual_proof`. This is the architectural precursor to the centralized guard added in v5.3.1.
+- **`engine/database.py`**: Confirmed `updated_at` is set by `_credit_fill_internal`’s `UPDATE bot_orders SET ... updated_at = ?` — making it reliable as the fill-credit timestamp.
+- **Bumped version** to `5.2.0`.
+
+### v5.1.2 — 2026-07-06
+LIVE_GUARD deterministic client order ID fix (INV-42).
+
+- **Root cause (INV-42)**: `_signal_hedge_child_entry` and `maintain_orders` used `time.time()`-based client order IDs for `LIVE_GUARD_RECON` and `LIVE_GUARD_INV30` synthetic rows. On engine restart, new IDs were generated and old rows were orphaned in `bot_orders` without `reset_cleared` status, causing duplicate virtual net inflation.
+- **`engine/bot_executor.py`**: Replaced timestamp-based IDs with deterministic client order IDs (`CQB_{bot_id}_LIVE_GUARD_RECON_{cycle_id}_{step}` and `CQB_{bot_id}_LIVE_GUARD_INV30_{cycle_id}_{step}`). Added `DELETE` of prior rows before insert to prevent accumulation.
+- **`tests/test_inv42_hedge_live_guard.py`** [NEW]: Regression test verifying deterministic IDs and single-row-per-slot guarantee.
+- **Bumped version** to `5.1.2`. Automated Tests: 404 passed, 0 failed.
+
 ### v5.1.1 — 2026-07-06
 UI single-page layout overhaul, fixed-height alert banner, GTR critical-state health keys, and engine/UI stability fixes.
 
+
 - **UI Layout (`ui/views/monitor.py`)**: Promoted bot table to the first visible element in the Overview tab by removing the always-visible treemap from the pre-tab section. Header condensed from 8 tiles (2 rows × 4) to 5 tiles (1 row): Equity / Balance / PnL / Invested / **⚡ Status** pill. Status pill shows `system_status` + worst-gap inline; hover reveals In-Trade count.
+
 - **Heatmap moved to Charts tab**: Portfolio Risk Heatmap (`plotly` treemap) relocated from the main render path to a `st.expander(..., expanded=False)` inside the Charts tab — not rendered until explicitly opened.
 - **Compact control bar**: Auto-Refresh toggle and Refresh Now button share a single two-column row; removed `st.write("")` spacer hacks.
 - **Fixed-height alert banner (no layout shift)**: Replaced the 3-metric row (`st.metric` columns for Mismatched Pairs / Worst Gap / System Status) and the `st.caption` order-health line with a single `58 px` HTML container that is **always rendered** regardless of health state. Healthy state → invisible spacer of identical height. Error state → red-bordered alert div. Bot table anchor point is stable across every fragment refresh tick.

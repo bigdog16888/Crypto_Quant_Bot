@@ -2,6 +2,57 @@
 
 All notable **architecture** changes are documented here. Version numbers match `CODEBASE_GUIDE.md`, `config/settings.py`, and `docs/ARCHITECTURE_v3.x.md`.
 
+## v5.3.7 — 2026-07-10 — bot_has_recent_order_activity helper & monitor.py refactor
+- **engine/database.py**:
+  - Added thread-safe `bot_has_recent_order_activity()` database helper.
+- **ui/views/monitor.py**:
+  - Refactored grid grace age check to call the database helper, keeping database details separated from UI code.
+
+## v5.3.6 — 2026-07-10 — UI Caching and Parity Warning Upgrades
+- **ui/views/monitor.py**:
+  - Routed UI positions fragment and indicator queries through cached helpers to prevent REST rate-limit storms.
+  - Upgraded positions fragment refresh interval to 5s.
+  - Added detailed bot names, quantities, and gaps to the mismatch warning banner, with real-time timestamps.
+
+## v5.3.5 — 2026-07-10 — Deploy-Recency Check integration
+- **scripts/verify_deployment.py**:
+  - Added deploy-recency check tool to prevent starting stale runner processes.
+
+## v5.3.4 — 2026-07-10 — Parity Status Labeling
+- **scripts/run_startup_heal.py**:
+  - Enforced true zero-delta checks and formatted parity status output.
+
+## v5.3.3 — 2026-07-10 — Whitelist Static Analysis & Centralized Proof Gates
+- **engine/parity_gates.py**:
+  - Centralized REQUIRE_MANUAL_PROOF writes and consolidated grace checks.
+- **tests/test_require_proof_writers.py**:
+  - Implemented static analysis whitelist verification.
+
+## v5.3.2 — 2026-07-10 — Oldest-Fill wall_ts Checks
+- **scripts/align_db.py**, **scripts/full_restore_and_align.py**:
+  - Fixed `wipe_wall_ts` blind reset in recovery and database alignment scripts by applying `wall_ts = min(now_ts, oldest_ts)`.
+
+## v5.3.1 — 2026-07-10 — Size-cap Bypass in flag_orphan_fill_manual_proof
+- **engine/parity_gates.py**:
+  - Added size-cap limits to prevent false triggers on sub-epsilon dust.
+
+## v5.2.2 — 2026-07-08 — Hedge Child Live Exchange Guard & DB Sync (INV-42)
+
+- **engine/bot_executor.py**:
+  - Implemented the **INV-42** Live Exchange Guard inside both `_signal_hedge_child_entry` and the INV-30 continuous reconciliation loop in `maintain_orders`.
+  - The guard queries the live exchange signed net before submitting any hedge catch-up entry; if the expected physical position already exists on the exchange, it skips order placement and corrects `trades.open_qty` plus inserts a `bot_orders` reconciliation record in SQLite.
+  - Collapsed the separate capacity check and guard position fetches into a single CCXT positions fetch to eliminate internal race conditions.
+- **Incident Mitigation**:
+  - Resolved two independent occurrences of the hedge over-placement bug (XRP and BTC) triggered by alignment/wipe events that reset child trades to `open_qty = 0` while leaving parent positions active.
+
+## v5.2.1 — 2026-07-08 — Realized PnL FIFO Calculation from Ledger Ground Truth
+
+- **engine/database.py**:
+  - Implemented `compute_realized_pnl_fifo()` to compute cycle realized PnL directly from the `bot_orders` table (the immutable ledger ground truth), eliminating the dependency on the mutable `trades` table cache.
+  - Updated `_reset_bot_after_tp_internal` to use `compute_realized_pnl_fifo` for all close and reset pathways.
+- **Tracked Follow-up (Pending)**:
+  - **Duplicate Logging Issue in `handle_flatten`**: Identified that `handle_flatten()` logs twice during flattens (one dummy/empty log row via direct `log_trade` + one populated log row via `reset_bot_after_tp`). This is preserved as-is for isolation and will be cleaned up in a future change.
+
 ## v5.2.0 — 2026-07-07 — Netting-Aware Close Recovery (INV-38) & Write-Queue Deadlock Resolution
 
 - **engine/recovery.py (new module)**:
