@@ -1452,14 +1452,23 @@ def compute_realized_pnl_fifo(cursor, bot_id: int, cycle_id: int, bot_direction:
 
     # 2. Fetch exits (decreasing position)
     cursor.execute("""
-        SELECT COALESCE(SUM(filled_amount), 0.0),
-               COALESCE(SUM(filled_amount * price), 0.0)
+        SELECT filled_amount, price
         FROM bot_orders
         WHERE bot_id = ? AND cycle_id = ? AND filled_amount > 0
           AND order_type IN ('adoption_reduce', 'tp', 'close', 'dust_close', 'sl', 'flatten_close')
           AND status NOT IN ('cancelled', 'canceled', 'failed', 'rejected')
     """, (bot_id, cycle_id))
-    exit_qty, exit_value = cursor.fetchone()
+    exits = cursor.fetchall()
+    
+    exit_qty = 0.0
+    exit_value = 0.0
+    for amt, pr in exits:
+        exit_qty += amt
+        if pr > 0.0:
+            exit_value += amt * pr
+        else:
+            use_pr = exit_price if exit_price > 0.0 else entry_avg
+            exit_value += amt * use_pr
 
     # If exits are less than entries, value the remaining part at exit_price
     effective_exit_qty = exit_qty
@@ -1561,6 +1570,10 @@ def _reset_bot_after_tp_internal(cursor, bot_id, exit_price, direction=None, act
         )
 
     cursor.execute("UPDATE bot_orders SET status = 'auto_closed', updated_at = ? WHERE bot_id = ? AND status IN ('open', 'new', 'placing', 'cancelling')", (now_ts, bot_id))
+    try:
+        cursor.execute("DELETE FROM fill_claims WHERE bot_id = ?", (bot_id,))
+    except sqlite3.OperationalError:
+        pass
 
     # ── HEDGE PRESERVATION GATE ──────────────────────────────────────────────
     # Hedge orders represent REAL physical SHORT positions on the exchange.
@@ -2983,16 +2996,15 @@ def update_active_positions_snapshot(positions: list):
         # If the System's virtual net (Sum of all bots) matches the exchange net, we populate
         # active_positions with INDIVIDUAL bot shares.
         #
-        # ROOT CAUSE FIX (v3.3.1): The previous v_net was derived from
-        # trades.total_invested / trades.avg_entry_price — a stale cache value. The monitor's
-        # Global Netting Diagnostics uses get_pair_virtual_net() which reads bot_orders fills
-        # directly (proof-based). When trades was even slightly behind (e.g. a partial TP fill
-        # committed to bot_orders but sync_trades_from_orders hadn't run yet), SNAP-ALLOCATE
-        # saw a different v_net than the monitor, hitting the mismatch branch and writing the
-        # entire NET physical qty under one owner_id instead of splitting by bot. The monitor
-        # then compared proof-net (0.47 SOL) vs active_positions (0.58 SOL) and fired
-        # SYSTEM MISMATCH. Fix: use get_pair_virtual_net() and recompute_invested_from_orders()
-        # — the same proof-based sources the monitor and reconciler already trust.
+        # WARNING (POST-ADR-006): Under the Independent Accounting Model (ADR-006),
+        # get_pair_virtual_net() no longer aggregates bot_orders directly; instead, it is a fast
+        # direction-adjusted sum of the cached trades.open_qty column across active bots.
+        #
+        # TRADEOFF: While computationally efficient, this introduces a critical cache dependency on
+        # trades.open_qty. To prevent SNAP-ALLOCATE from running against stale database cache states
+        # (which triggers false mismatches and gates bots), the caller MUST ensure the database is fully
+        # healed and aligned (e.g., sync_trades_from_orders and ledger seal have completed) BEFORE
+        # running this position snapshot refresh.
         processed_pairs = set()
         for (symbol, side), data in agg_positions.items():
             processed_pairs.add(symbol)
@@ -3798,28 +3810,170 @@ def audit_pair_ledger_vs_exchange(exchange, qty_tolerance: float = None) -> list
     return mismatches
 
 
-def flag_pair_ledger_mismatch(mismatches: list) -> None:
-    """Set all active bots on mismatched pairs to REQUIRE_MANUAL_PROOF."""
+def check_bot_reconciliation(bot_id: int, conn, exchange_open_orders: list) -> bool:
+    """
+    Returns True if the bot's database orders and open quantity reconcile perfectly
+    with the exchange open orders. Returns False if there is a discrepancy.
+    """
+    cursor = conn.cursor()
+    row = cursor.execute(
+        "SELECT status, direction FROM bots WHERE id=?", (bot_id,)
+    ).fetchone()
+    if not row:
+        return True
+    status, direction = row
+    
+    trade_row = cursor.execute(
+        "SELECT open_qty FROM trades WHERE bot_id=?", (bot_id,)
+    ).fetchone()
+    db_qty = float(trade_row[0]) if trade_row else 0.0
+    
+    # Get expected open orders from DB
+    db_open = cursor.execute(
+        "SELECT order_id, amount FROM bot_orders WHERE bot_id=? AND status IN ('open', 'new')",
+        (bot_id,)
+    ).fetchall()
+    db_open_dict = {str(r[0]): float(r[1]) for r in db_open if r[0]}
+    
+    # Get actual open orders on exchange for this bot (prefixed with CQB_{bot_id}_)
+    ex_prefix = f"CQB_{bot_id}_"
+    ex_open_dict = {}
+    for o in exchange_open_orders:
+        cid = o.get('clientOrderId', '') or ''
+        if cid.startswith(ex_prefix):
+            ex_open_dict[str(o['id'])] = float(o['amount'])
+            
+    # Check open orders match exactly
+    if set(db_open_dict.keys()) != set(ex_open_dict.keys()):
+        return False
+        
+    for ord_id, qty in db_open_dict.items():
+        if abs(qty - ex_open_dict[ord_id]) > 1e-6:
+            return False
+            
+    # Check if the status matches the presence of a position
+    if status == 'Scanning' and db_qty != 0.0:
+        return False
+    if status == 'IN TRADE' and db_qty == 0.0:
+        return False
+        
+    return True
+
+
+def flag_pair_ledger_mismatch(mismatches: list, exchange=None) -> list:
+    """
+    Sets the status of specific bot(s) on mismatched pairs to 'REQUIRE_MANUAL_PROOF'.
+    Returns a list of critical mismatches that exceed the dollar/unit threshold.
+    Mismatches below the threshold are isolated (only the affected bots are gated) and do not block startup.
+    """
     from engine.exchange_interface import normalize_symbol
+    from config.settings import config
 
     if not mismatches:
-        return
+        return []
     conn = get_connection()
+    critical_mismatches = []
+    
     for pair, virtual, physical, delta in mismatches:
         norm = normalize_symbol(pair).upper()
-        logger.error(
-            f"🚨 [PAIR-LEDGER-MISMATCH] {pair}: virtual={virtual:.6f} "
-            f"exchange={physical:.6f} delta={delta:.6f}. Manual proof required."
-        )
-        conn.execute(
-            """
-            UPDATE bots SET status='REQUIRE_MANUAL_PROOF'
-            WHERE is_active=1 AND (pair=? OR normalized_pair=?)
-              AND status NOT IN ('STOPPED')
-            """,
-            (pair, norm),
-        )
+        
+        # 1. Fetch current price to calculate notional value of drift
+        price = None
+        if exchange:
+            try:
+                ticker = exchange.fetch_ticker(pair)
+                price = float(ticker.get('last') or 0.0)
+            except Exception:
+                pass
+        
+        if price is None or price <= 0:
+            # Fallback: get last price from bot_orders
+            row_price = conn.execute(
+                "SELECT price FROM bot_orders WHERE bot_id IN "
+                "(SELECT id FROM bots WHERE pair=? OR normalized_pair=?)"
+                " AND price > 0 ORDER BY created_at DESC LIMIT 1",
+                (pair, norm),
+            ).fetchone()
+            price = float(row_price[0]) if row_price else 1.0 # fallback to 1.0 if no trades exist
+            
+        notional_drift = abs(delta) * price
+        
+        # 2. Check if the drift is below the isolation threshold (default: $100.0)
+        isolation_threshold = getattr(config, 'STARTUP_ISOLATION_DOLLAR_THRESHOLD', 100.0)
+        is_isolated = notional_drift <= isolation_threshold
+        
+        # Fetch open orders from exchange to check bot-level reconciliation
+        exchange_open_orders = []
+        if exchange:
+            try:
+                exchange_open_orders = exchange.fetch_open_orders(pair) or []
+            except Exception as e:
+                logger.warning(f"Could not fetch open orders for {pair} during isolation: {e}")
+                
+        # Get active bots on this pair
+        bot_rows = conn.execute(
+            "SELECT id, direction, status, bot_type FROM bots WHERE is_active=1 AND (pair=? OR normalized_pair=?) AND status NOT IN ('STOPPED')",
+            (pair, norm)
+        ).fetchall()
+        
+        # Run reconciliation check for each bot
+        unreconciled_bots = []
+        for bid, bdir, bstatus, btype in bot_rows:
+            if not check_bot_reconciliation(bid, conn, exchange_open_orders):
+                unreconciled_bots.append((bid, bdir, bstatus, btype))
+                
+        # Determine mismatch direction/side
+        mismatched_side = 'LONG' if delta > 0 else 'SHORT'
+        
+        # Determine bots to gate:
+        to_gate_ids = []
+        if unreconciled_bots:
+            # Gate only the unreconciled bots
+            to_gate_ids = [b[0] for b in unreconciled_bots]
+        else:
+            # If all are order-reconciled, target the mismatch direction side.
+            # We prioritize standard bots over hedge children to protect unrelated hedge relationships.
+            matching_std = [b[0] for b in bot_rows if b[1] == mismatched_side and b[3] == 'standard']
+            if matching_std:
+                to_gate_ids = matching_std
+            else:
+                matching_any = [b[0] for b in bot_rows if b[1] == mismatched_side]
+                to_gate_ids = matching_any
+                
+        if is_isolated and to_gate_ids:
+            logger.warning(
+                f"[STARTUP-ISOLATION] Mismatch on {pair} is within threshold "
+                f"(${notional_drift:.2f} <= ${isolation_threshold:.2f}). "
+                f"Isolating problem by gating only bots: {to_gate_ids}. Bypassing global block."
+            )
+            # Gate the selected bots and write drift detail in the notes so it is visible and investigated
+            for bid in to_gate_ids:
+                conn.execute(
+                    "UPDATE bots SET status='REQUIRE_MANUAL_PROOF', "
+                    "notes = '[MANUAL-REVIEW] Startup drift isolated. Drift: ' || ? || ' (Value: $' || ? || '). Gated due to mismatch.' "
+                    "WHERE id = ?",
+                    (f"{delta:+.6f}", f"{notional_drift:.2f}", bid)
+                )
+        else:
+            # Critical mismatch! Gate ALL bots on this pair.
+            logger.error(
+                f"🚨 [PAIR-LEDGER-MISMATCH] {pair}: virtual={virtual:.6f} "
+                f"exchange={physical:.6f} delta={delta:.6f} (value=${notional_drift:.2f} > ${isolation_threshold:.2f}). "
+                f"Manual proof required on entire pair."
+            )
+            conn.execute(
+                """
+                UPDATE bots SET status='REQUIRE_MANUAL_PROOF',
+                                notes = '[MANUAL-REVIEW] Critical startup drift unresolved. Gated all bots.'
+                WHERE is_active=1 AND (pair=? OR normalized_pair=?)
+                  AND status NOT IN ('STOPPED')
+                """,
+                (pair, norm),
+            )
+            critical_mismatches.append((pair, virtual, physical, delta))
+            
     conn.commit()
+    return critical_mismatches
 
 
 def verify_filled_orders_against_exchange(exchange, bot_id: int = None) -> int:
@@ -4010,17 +4164,21 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None, *, cycle_f
                       OR (status IN ('canceled', 'cancelled', 'cancelling') AND filled_amount > 0)
                   )
                   AND filled_amount > 0
+                  AND (? = 0 OR created_at >= ?)
                 GROUP BY cycle_id
                 HAVING (entry_qty - exit_qty) > 1e-6
                 ORDER BY cycle_id ASC
                 LIMIT 1
-            """, (bot_id, target_cycle, bot_side))
+            """, (bot_id, target_cycle, bot_side, wall_ts, wall_ts))
             row_floor = cursor.fetchone()
             if row_floor:
                 cycle_floor = row_floor[0]
                 logger.info(f"[RECOMPUTE] Bot {bot_id}: Auto-detected cycle_floor={cycle_floor} due to unbalanced older cycle.")
             else:
                 cycle_floor = target_cycle
+
+        if cycle_floor < target_cycle:
+            wall_ts = 0
 
         # 1. Fetch all entry fills (increasing position)
         cursor.execute(f"""
@@ -4089,7 +4247,7 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None, *, cycle_f
             total_cost = sum(ab['qty'] * ab['price'] for ab in active_buys)
             avg_price = total_cost / total_qty
             total_invested = total_qty * avg_price
-            max_step = max(ab['step'] for ab in active_buys) if active_buys else 0
+            max_step = max((ab['step'] or 0) for ab in active_buys) if active_buys else 0
             
             # Use formula to check if step needs refinement (e.g. carry trades)
             if total_invested > 0:
@@ -4338,6 +4496,10 @@ def sync_trades_from_orders(bot_id: int) -> bool:
                 resting_status = 'hedge_standby' if bot_type == 'hedge_child' else 'Scanning'
                 
                 cursor.execute("UPDATE bots SET status = ? WHERE id = ?", (resting_status, bot_id))
+                try:
+                    cursor.execute("DELETE FROM fill_claims WHERE bot_id = ?", (bot_id,))
+                except sqlite3.OperationalError:
+                    pass
                 conn.commit()
                 return True
             return False

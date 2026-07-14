@@ -2785,7 +2785,7 @@ class BotExecutor:
                                     try:
                                         from engine.parity_gates import get_exchange_signed_net as _gesn
                                         live_signed_net = _gesn(exchange, pair)
-                                        if live_signed_net is not None:
+                                        if live_signed_net is not None and not isinstance(live_signed_net, str):
                                             child_direction_early = _hc_enforce_conn.execute("SELECT direction FROM bots WHERE id=?", (bot_id,)).fetchone()[0]
                                             _parent_target_calc = pre_trigger_accumulated_qty + parent_step_qty
                                             if child_direction_early.upper() == 'SHORT':
@@ -2818,17 +2818,34 @@ class BotExecutor:
                                                         (bot_id, child_step, child_cycle_id)
                                                     )
                                                     _recon_cid = f"CQB_{bot_id}_LIVE_GUARD_INV30_{child_cycle_id}_{child_step}"
+                                                    _recon_price = 0.0
+                                                    try:
+                                                        _ticker = exchange.fetch_ticker(pair)
+                                                        _recon_price = float(_ticker.get('last') or 0.0)
+                                                    except Exception:
+                                                        pass
+                                                    if _recon_price <= 0.0:
+                                                        try:
+                                                            _parent_row = _hc_enforce_conn.execute(
+                                                                "SELECT avg_entry_price FROM trades WHERE bot_id = ?",
+                                                                (bot_id,)
+                                                            ).fetchone()
+                                                            if _parent_row:
+                                                                _recon_price = float(_parent_row[0] or 0.0)
+                                                        except Exception:
+                                                            pass
                                                     _hc_enforce_conn.execute(
                                                         "INSERT OR IGNORE INTO bot_orders "
                                                         "(bot_id, step, order_type, order_id, price, amount, status, "
                                                         " created_at, client_order_id, updated_at, notes, cycle_id, "
                                                         " filled_amount, position_side) "
-                                                        "VALUES (?, ?, 'entry', ?, 0, ?, 'filled', ?, ?, ?, "
+                                                        "VALUES (?, ?, 'entry', ?, ?, ?, 'filled', ?, ?, ?, "
                                                         " 'Live-guard INV30 DB sync: hedge already present on exchange.', "
                                                         " ?, ?, ?)",
                                                         (
                                                             bot_id, child_step,
                                                             _recon_cid,
+                                                            _recon_price,
                                                             _corrected_qty,
                                                             int(_time_mod.time()),
                                                             _recon_cid,
@@ -5050,17 +5067,34 @@ class BotExecutor:
                         (child_bot_id, child_step, parent_cycle_id)
                     )
                     _recon_cid = f"CQB_{child_bot_id}_LIVE_GUARD_RECON_{parent_cycle_id}_{child_step}"
+                    _recon_price = 0.0
+                    try:
+                        _ticker = exchange.fetch_ticker(pair)
+                        _recon_price = float(_ticker.get('last') or 0.0)
+                    except Exception:
+                        pass
+                    if _recon_price <= 0.0:
+                        try:
+                            _parent_row = conn.execute(
+                                "SELECT avg_entry_price FROM trades WHERE bot_id = ?",
+                                (child_bot_id,)
+                            ).fetchone()
+                            if _parent_row:
+                                _recon_price = float(_parent_row[0] or 0.0)
+                        except Exception:
+                            pass
                     conn.execute(
                         "INSERT OR IGNORE INTO bot_orders "
                         "(bot_id, step, order_type, order_id, price, amount, status, "
                         " created_at, client_order_id, updated_at, notes, cycle_id, "
                         " filled_amount, position_side) "
-                        "VALUES (?, ?, 'entry', ?, 0, ?, 'filled', ?, ?, ?, "
+                        "VALUES (?, ?, 'entry', ?, ?, ?, 'filled', ?, ?, ?, "
                         " 'Live-guard DB sync: hedge already present on exchange after wipe/alignment.', "
                         " ?, ?, ?)",
                         (
                             child_bot_id, child_step,
                             _recon_cid,         # order_id (synthetic)
+                            _recon_price,       # price
                             _corrected_qty,     # amount
                             int(_time_mod.time()),  # created_at
                             _recon_cid,         # client_order_id

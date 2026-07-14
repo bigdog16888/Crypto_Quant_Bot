@@ -115,7 +115,7 @@ def resolve_gated_bot(
 
     # Step 3: Fetch live signed net for this pair
     live_net = get_exchange_signed_net(exchange, pair)
-    if live_net is None:
+    if live_net is None or live_net == 'mock_unconfigured':
         raise RuntimeError(
             f"Bot {bot_id}: fetch_positions failed for {pair}. Cannot resolve without "
             f"live exchange data — aborting to prevent silent ledger corruption."

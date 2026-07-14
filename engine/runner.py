@@ -105,6 +105,8 @@ class BotRunner:
     def __init__(self):
         BotRunner._instance = self
         self.running = False
+        import time
+        self.started_at = time.time()
         # BotExecutor instance (lazy initialization for strategy caching)
         self._bot_executor: BotExecutor | None = None
 
@@ -227,7 +229,13 @@ class BotRunner:
             else:
                 logger.info("Startup Sync Complete")
         except Exception as e:
-            logger.error(f"Failed to sync bots on startup (non-fatal): {e}")
+            logger.critical(f"🛑 FATAL: Startup Sync Failed: {e}", exc_info=True)
+            if config.TESTING_MODE:
+                logger.warning("⚠️ [STARTUP-BARRIER-FAIL] Bypassing fatal abort in TESTING_MODE.")
+            else:
+                self.running = False
+                import sys
+                sys.exit(1)
 
         # Safe Monitor Mode: Disable execution if flag is False
         self.trading_enabled = getattr(config, 'TRADING_ENABLED', False)
@@ -393,462 +401,204 @@ class BotRunner:
         except Exception as e:
             logger.error(f"❌ Critical Error during State Reconciliation: {e}")
 
-
-
     def startup_sync(self):
         """
-        Active Reconciliation on Startup.
-        Forces the DB to match the Exchange (Source of Truth).
-        - Cancels orphan orders (Ghost Orders).
-        - Adopts active positions if missing from DB.
+        Strict, blocking startup synchronization barrier.
+        Forces the local database ledger and cache to match the exchange truth,
+        heals any mismatches, purges phantom residues, and guarantees that 100%
+        of active pairs are in perfect parity before lifting the barrier.
         """
-        logger.info("🔄 [STARTUP-SYNC] Analyzing Exchange Reality...")
+        logger.info("🔄 [STARTUP-SYNC] Entering strict, blocking startup barrier...")
         if self._abort_if_stop_requested("startup-sync"):
             return
 
         try:
-            # 0a. 📡 PRIME POSITION SNAPSHOT — fetch fresh exchange reality BEFORE any reconciliation.
-            # ─────────────────────────────────────────────────────────────────────────────────────────
-            # ROOT CAUSE FIX (v2.1.2):
-            #   reconstruct_offline_fills and adopt_from_physical_positions both read 'active_positions'
-            #   from SQLite to detect gaps. At startup, that table holds the last snapshot from the
-            #   *previous* session — which already matched the virtual ledger state at shutdown.
-            #   Any fills that occurred while the engine was offline are invisible to the gap detector,
-            #   so it reports "zero gap" and skips the history scan entirely.
-            #
-            #   Fix: populate active_positions from the live exchange FIRST, so all subsequent
-            #   reconciliation passes operate on ground-truth physical reality.
-            # ─────────────────────────────────────────────────────────────────────────────────────────
-            try:
-                from engine.database import update_active_positions_snapshot
-                logger.info("📡 [STARTUP-PRIME] Fetching live exchange positions to prime active_positions snapshot...")
-                _primed_any = False
-                for _mt, _ex in self.exchanges.items():
-                    try:
-                        _snap = _ex.fetch_positions()
-                        if _snap is not None:
-                            update_active_positions_snapshot(_snap)
-                            logger.info(f"✅ [STARTUP-PRIME] Primed active_positions from {_mt} ({len(_snap)} positions).")
-                            _primed_any = True
-                            break  # One exchange is sufficient for position snapshot
-                    except Exception as _pe:
-                        logger.warning(f"⚠️ [STARTUP-PRIME] Could not fetch positions from {_mt}: {_pe}")
-                if not _primed_any:
-                    logger.warning("⚠️ [STARTUP-PRIME] Could not prime active_positions — reconciler will use stale snapshot.")
-            except Exception as _prime_err:
-                logger.warning(f"⚠️ [STARTUP-PRIME] Position prime failed (non-fatal): {_prime_err}")
+            # Get exchange instance (usually 'future')
+            parity_ex = None
+            for _mt, _ex in self.exchanges.items():
+                if _ex:
+                    parity_ex = _ex
+                    break
 
-            if self._abort_if_stop_requested("startup-sync"):
-                return
+            if not parity_ex:
+                raise RuntimeError("No active exchange interface configured for startup barrier.")
 
-            # 0b. 🛡️ Offline Fill Detection — now runs against fresh exchange reality.
-            # This credits any fills that happened while the engine was offline,
-            # so maintain_orders sees correct step/invested before placing new orders.
+            from engine.database import (
+                heal_inflated_filled_amounts,
+                consolidate_duplicate_bot_orders,
+                verify_filled_orders_against_exchange,
+                sync_trades_from_orders,
+                update_active_positions_snapshot,
+                audit_pair_ledger_vs_exchange,
+                flag_pair_ledger_mismatch
+            )
+            from engine.ledger import seal_all_active_bots
+            from engine.oneway_netting import reconcile_oneway_pair_open_qty, sync_pair_to_exchange, detect_bot_ghost, wipe_bot_ghost
+            from engine.parity_gates import detect_and_repair_global_wipe, startup_repair_mismatched_pairs
+
+            conn = get_connection()
+            active_ids = [r[0] for r in conn.execute("SELECT id FROM bots WHERE is_active=1").fetchall()]
+            pairs = [r[0] for r in conn.execute("SELECT DISTINCT pair FROM bots WHERE is_active=1").fetchall()]
+
+            # -------------------------------------------------------------
+            # STEP 1: Core Database Cleaning & Pre-Flight Order Checks
+            # -------------------------------------------------------------
+            logger.info("🧹 [STARTUP-BARRIER] [1/8] Cleaning database fills and duplicates...")
+            heal_inflated_filled_amounts()
+            consolidate_duplicate_bot_orders()
+
+            # -------------------------------------------------------------
+            # STEP 2: Exchange Fill Verification & Offline Fill Reconstruction
+            # -------------------------------------------------------------
+            logger.info("📡 [STARTUP-BARRIER] [2/8] Syncing recent/historical fills from exchange...")
+            verify_filled_orders_against_exchange(parity_ex)
+
+            # Compute offline duration from last clean-shutdown timestamp
+            _shutdown_ts_file = 'last_shutdown.ts'
+            _offline_hours = 168.0  # safe default (7 days)
+            if os.path.exists(_shutdown_ts_file):
+                try:
+                    with open(_shutdown_ts_file) as _sf:
+                        _last_shutdown = int(_sf.read().strip())
+                    _offline_hours = max(2.0, (time.time() - _last_shutdown) / 3600.0 + 1.0)
+                    logger.info(f"[STARTUP-BARRIER] Outage window: ~{_offline_hours:.1f}h. Scanning offline fills...")
+                except Exception as _ts_err:
+                    logger.warning(f"[STARTUP-BARRIER] Could not read last_shutdown.ts: {_ts_err}. Defaulting to 168h.")
+            _scan_hours = min(_offline_hours, 168.0)
+
             if self._reconciler:
-                try:
-                    # Compute offline duration from the last clean-shutdown timestamp.
-                    # This avoids over-scanning on a simple restart (e.g. 2h instead of 48h)
-                    # while still catching fills from a long outage (capped at 7 days).
-                    _shutdown_ts_file = 'last_shutdown.ts'
-                    _offline_hours = 168.0  # safe default if no record exists if file missing
-                    if os.path.exists(_shutdown_ts_file):
-                        try:
-                            with open(_shutdown_ts_file) as _sf:
-                                _last_shutdown = int(_sf.read().strip())
-                            _offline_hours = max(2, (time.time() - _last_shutdown) / 3600 + 1)
-                            logger.info(
-                                f"[STARTUP-SCAN] Engine was offline ~{_offline_hours:.1f}h "
-                                f"(last shutdown: {_last_shutdown}). Scanning fill history."
-                            )
-                        except Exception as _ts_err:
-                            logger.warning(f"[STARTUP-SCAN] Could not read last_shutdown.ts: {_ts_err}. Using 168h default.")
-                            _offline_hours = 168.0
-                    _scan_hours = min(_offline_hours, 168.0)  # cap at 7 days
-                    logger.info(f"🔍 [STARTUP-SYNC] Running offline fill detection ({_scan_hours:.1f}h window)...")
-                    stats = self._reconciler.reconstruct_offline_fills(since_hours=int(_scan_hours))
-                    logger.info(f"✅ [STARTUP-SYNC] Offline fills credited: {stats}")
-                except Exception as _rf_err:
-                    logger.warning(f"⚠️ [STARTUP-SYNC] Offline fill detection failed (non-fatal): {_rf_err}")
+                stats = self._reconciler.reconstruct_offline_fills(since_hours=int(_scan_hours))
+                logger.info(f"✅ [STARTUP-BARRIER] Offline fills reconstruction complete: {stats}")
 
-            # 🔑 ORDER-ID LEDGER VERIFICATION
-            # After crediting any offline fills, recompute each bot's invested amount
-            # from confirmed CQB_{id}_ order fills. This self-heals any counter drift
-            # caused by WS drops, engine crashes, or mid-update restarts — no manual
-            # DB patching required.
-            try:
-                from engine.database import sync_trades_from_orders
-                _conn = get_connection()
-                _active_ids = [r[0] for r in _conn.execute(
-                    "SELECT id FROM bots WHERE is_active=1"
-                ).fetchall()]
-                from engine.database import (
-                    consolidate_duplicate_bot_orders,
-                    heal_inflated_filled_amounts,
-                    verify_filled_orders_against_exchange,
-                )
-                _inflated = heal_inflated_filled_amounts()
-                if _inflated:
-                    logger.warning(
-                        f"🩹 [STARTUP-FILL-CAP] Capped {_inflated} inflated filled_amount row(s)."
-                    )
-                _merged = consolidate_duplicate_bot_orders()
-                if _merged:
-                    logger.warning(
-                        f"🩹 [STARTUP-CID-DEDUP] Merged {_merged} duplicate client_order_id group(s)."
-                    )
-                _healed_fills = 0
-                for _mt, _ex in self.exchanges.items():
-                    if _ex:
-                        _healed_fills = verify_filled_orders_against_exchange(_ex)
-                        break
-                if _healed_fills:
-                    logger.warning(
-                        f"🩹 [STARTUP-FILL-HEAL] Re-credited {_healed_fills} order(s) from exchange truth."
-                    )
-                # 🚀 [STARTUP-SYNC-BARRIER]
-                # Run sync_trades_from_orders exactly once for all active bots to sync trades table.
-                _fixes = sum(sync_trades_from_orders(bid) for bid in _active_ids)
-                if _fixes:
-                    logger.info(f"✅ [STARTUP-BARRIER] Initial sync_trades_from_orders corrected {_fixes} bot(s) with ledger drift from order fills.")
-                else:
-                    logger.info("✅ [STARTUP-BARRIER] All bot ledgers are in sync with confirmed order fills.")
+            # -------------------------------------------------------------
+            # STEP 3: Ledger Sealing & Cache Propagation
+            # -------------------------------------------------------------
+            logger.info("🔒 [STARTUP-BARRIER] [3/8] Sealing all active bots from ledger fills...")
+            seal_all_active_bots()
+            for bid in active_ids:
+                sync_trades_from_orders(bid)
+            logger.info("✅ [STARTUP-BARRIER] Sealing and trades cache propagation complete.")
 
-                # Synchronization barrier: wait until active trades count stabilizes
-                _last_count = None
-                _consecutive_matches = 0
-                _max_barrier_retries = 10
-                _barrier_stable = False
+            # -------------------------------------------------------------
+            # STEP 4: Global Wipe Checks & Ghost/Netting Alignment
+            # -------------------------------------------------------------
+            logger.info("⚖️ [STARTUP-BARRIER] [4/8] Running global wipe and ghost repairs...")
+            detect_and_repair_global_wipe(parity_ex)
+            for _pair in pairs:
+                sync_pair_to_exchange(_pair, parity_ex, conn)
+            for bid in active_ids:
+                if detect_bot_ghost(parity_ex, bid, conn):
+                    wipe_bot_ghost(parity_ex, bid, conn)
 
-                logger.info("⏳ [STARTUP-BARRIER] Entering active trades count stability check (max 10s)...")
-                for _attempt in range(1, _max_barrier_retries + 1):
-                    _check_conn = get_connection()
-                    _count = _check_conn.execute("SELECT COUNT(*) FROM trades WHERE total_invested > 0").fetchone()[0]
-                    logger.info(f"   [STARTUP-BARRIER] Check {_attempt}: active trades count = {_count}")
+            # -------------------------------------------------------------
+            # STEP 5: One-way open_qty Netting Reconciliation
+            # -------------------------------------------------------------
+            logger.info("⚖️ [STARTUP-BARRIER] [5/8] Aligning cross-bot netting open quantities...")
+            for _pair in pairs:
+                _msg = reconcile_oneway_pair_open_qty(parity_ex, _pair)
+                if _msg:
+                    logger.warning(f"  [{_pair}]: {_msg}")
 
-                    if _last_count is not None and _count == _last_count:
-                        _consecutive_matches += 1
-                        if _consecutive_matches >= 1:
-                            logger.info(f"✅ [STARTUP-BARRIER] Active trades count stabilized at {_count} across checks.")
-                            _barrier_stable = True
-                            break
+            # -------------------------------------------------------------
+            # STEP 6: Prime Physical Position Snapshot (SNAP-ALLOCATE)
+            # -------------------------------------------------------------
+            logger.info("📡 [STARTUP-BARRIER] [6/8] Priming active_positions snapshot (SNAP-ALLOCATE)...")
+            _snap = parity_ex.fetch_positions()
+            if _snap is not None:
+                update_active_positions_snapshot(_snap)
+                logger.info(f"✅ [STARTUP-BARRIER] SNAP-ALLOCATE primed successfully ({len(_snap)} positions).")
+            else:
+                logger.warning("⚠️ [STARTUP-BARRIER] Could not retrieve position snapshot; using database cached snapshot.")
+
+            # -------------------------------------------------------------
+            # STEP 7: Pair Parity Repair (Deflate, Orphan Flatten, Phantom Purges)
+            # -------------------------------------------------------------
+            logger.info("🔧 [STARTUP-BARRIER] [7/8] Running pair parity repairs...")
+            _repair_summary = startup_repair_mismatched_pairs(parity_ex)
+            logger.info(f"✅ [STARTUP-BARRIER] Repair sequence finished: {_repair_summary}")
+
+            # -------------------------------------------------------------
+            # STEP 8: Final Parity Verification & Strict Block
+            # -------------------------------------------------------------
+            logger.info("🔍 [STARTUP-BARRIER] [8/8] Verifying final pair parity...")
+            _mismatches = audit_pair_ledger_vs_exchange(parity_ex)
+            if _mismatches:
+                _critical = flag_pair_ledger_mismatch(_mismatches, exchange=parity_ex)
+                for _p, _v, _ph, _d in _mismatches:
+                    logger.error(f"❌ [STARTUP-BARRIER-FAIL] {_p}: ledger={_v:.6f} exchange={_ph:.6f} delta={_d:.6f}")
+                
+                if _critical:
+                    if config.TESTING_MODE:
+                        logger.warning("⚠️ [STARTUP-BARRIER-FAIL] Critical mismatch detected on startup, but TESTING_MODE is active. Bypassing strict exit.")
                     else:
-                        _consecutive_matches = 0
-
-                    _last_count = _count
-                    time.sleep(1)
-
-                if not _barrier_stable:
-                    logger.warning("⚠️ [STARTUP-BARRIER] Active trades count did not stabilize after 10s. Proceeding anyway.")
-
-                _parity_ex = None
-                for _mt, _ex in self.exchanges.items():
-                    if _ex:
-                        _parity_ex = _ex
-                        break
-                if _parity_ex:
-                    # 1. Global wipe check FIRST — before anything else sees the mismatches
-                    try:
-                        from engine.parity_gates import detect_and_repair_global_wipe
-                        _wipe_result = detect_and_repair_global_wipe(_parity_ex)
-                        if _wipe_result['triggered']:
-                            logger.critical(f"[STARTUP] Global wipe repair complete: {_wipe_result}")
-                    except Exception as _w_err:
-                        logger.error(f"❌ [STARTUP-GLOBAL-WIPE-REPAIR] Failed: {_w_err}")
-
-                    # Phase B: Sync pair to exchange at startup, after detect_and_repair_global_wipe()
-                    try:
-                        from engine.oneway_netting import sync_pair_to_exchange
-                        _conn = get_connection()
-                        _pairs = [r[0] for r in _conn.execute("SELECT DISTINCT pair FROM bots WHERE is_active=1").fetchall()]
-                        for _pair in _pairs:
-                            sync_pair_to_exchange(_pair, _parity_ex, _conn)
-                    except Exception as _sync_err:
-                        logger.error(f"❌ [STARTUP-EXCHANGE-SYNC] Failed check: {_sync_err}")
-
-
-                    # INV-26: Per-bot ghost check (all active bots)
-                    try:
-                        from engine.oneway_netting import detect_bot_ghost, wipe_bot_ghost
-                        _conn = get_connection()
-                        _active_bots = _conn.execute(
-                            "SELECT id FROM bots WHERE is_active=1"
-                        ).fetchall()
-                        for (_bot_id,) in _active_bots:
-                            if detect_bot_ghost(_parity_ex, _bot_id, _conn):
-                                wipe_bot_ghost(_parity_ex, _bot_id, _conn)
-                    except Exception as _ghost_err:
-                        logger.error(f"❌ [STARTUP-BOT-GHOST] Failed check: {_ghost_err}")
-
-                    from engine.database import audit_pair_ledger_vs_exchange, flag_pair_ledger_mismatch
-                    _mismatches = audit_pair_ledger_vs_exchange(_parity_ex)
-                    if _mismatches:
-                        flag_pair_ledger_mismatch(_mismatches)
-                        for _p, _v, _ph, _d in _mismatches:
-                            logger.error(
-                                f"🚨 [STARTUP-PARITY] {_p}: ledger={_v:.6f} exchange={_ph:.6f} "
-                                f"delta={_d:.6f}"
-                            )
-                        # Proof-based repair: re-scan Binance fill history for CQB-tagged
-                        # orders on each mismatched pair (no forensic adopt).
-                        if self._reconciler:
-                            for _p, _v, _ph, _d in _mismatches:
-                                try:
-                                    logger.info(
-                                        f"🔍 [STARTUP-PAIR-REPAIR] {_p}: scanning CQB trade history "
-                                        f"(ledger={_v:.4f} exchange={_ph:.4f})..."
-                                    )
-                                    self._reconciler.reconstruct_offline_fills(
-                                        since_hours=int(_scan_hours),
-                                        pair_filter=_p,
-                                        forensic_mode=False,
-                                    )
-                                except Exception as _pr_err:
-                                    logger.warning(
-                                        f"⚠️ [STARTUP-PAIR-REPAIR] {_p} failed: {_pr_err}"
-                                    )
-                            _mismatches_after = audit_pair_ledger_vs_exchange(_parity_ex)
-                            if len(_mismatches_after) < len(_mismatches):
-                                logger.info(
-                                    f"✅ [STARTUP-PAIR-REPAIR] Parity improved: "
-                                    f"{len(_mismatches)} → {len(_mismatches_after)} mismatch(es)."
-                                )
-                            from engine.oneway_netting import reconcile_oneway_pair_open_qty
-                            from engine.database import audit_pair_ledger_vs_exchange
-                            _pairs_for_ow = [
-                                r[0] for r in get_connection().execute(
-                                    "SELECT DISTINCT pair FROM bots WHERE is_active=1"
-                                ).fetchall()
-                            ]
-                            for _ow_p in _pairs_for_ow:
-                                _ow_msg = reconcile_oneway_pair_open_qty(_parity_ex, _ow_p)
-                                if _ow_msg:
-                                    logger.warning(
-                                        f"⚖️ [STARTUP-ONEWAY-REPAIR] {_ow_p}: {_ow_msg}"
-                                    )
-                            from engine.parity_gates import startup_repair_mismatched_pairs
-                            _repair_summary = startup_repair_mismatched_pairs(_parity_ex)
-                            if _repair_summary.get('purged'):
-                                logger.info(
-                                    f"✅ [STARTUP-PHANTOM-PURGE] {_repair_summary['purged']}"
-                                )
-                            if _repair_summary.get('deflated'):
-                                logger.warning(
-                                    f"🔧 [STARTUP-DEFLATE] {_repair_summary['deflated']}"
-                                )
-                            if _repair_summary.get('orphan_repaired'):
-                                logger.warning(
-                                    f"🔧 [STARTUP-ORPHAN-REPAIR] {_repair_summary['orphan_repaired']}"
-                                )
-                            _mismatches_after = audit_pair_ledger_vs_exchange(_parity_ex)
-                            if not _mismatches_after:
-                                logger.info(
-                                    "✅ [STARTUP-PARITY] All pairs within tolerance after repair."
-                                )
-                            else:
-                                for _p, _v, _ph, _d in _mismatches_after:
-                                    logger.error(
-                                        f"🚨 [STARTUP-PARITY-REMAINING] {_p}: "
-                                        f"ledger={_v:.6f} exchange={_ph:.6f} delta={_d:.6f}"
-                                    )
-                            if _mismatches_after:
-                                flag_pair_ledger_mismatch(_mismatches_after)
-            except Exception as _lv_err:
-                logger.warning(f"⚠️ [STARTUP-LEDGER-VERIFY] Ledger verification failed (non-fatal): {_lv_err}")
-
-            # 🚀 ROOT CAUSE FIX: After crediting offline fills and verifying the ledger,
-            # run _align_memory_to_ledger() to ensure the trades table exactly matches
-            # the bot_orders ledger before any trading decisions are made.
-            # This is the definitive self-heal for the System vs Exchange discrepancies.
-            try:
-                if self._reconciler:
-                    self._reconciler._align_memory_to_ledger()
-                    logger.info("✅ [STARTUP] Memory-to-ledger alignment complete.")
-            except Exception as _smal_err:
-                logger.warning(f"⚠️ [STARTUP] Memory-to-ledger alignment failed (non-fatal): {_smal_err}")
-
-            # v2.0: Seal all active bot states from the authoritative ledger (bot_orders).
-            # This is the canonical startup gate — trades table is written exactly once,
-            # from confirmed fills, before any orders are placed or cancelled.
-            try:
-                from engine.ledger import seal_all_active_bots
-                corrected = seal_all_active_bots()
-                if corrected:
-                    logger.info(f"✅ [STARTUP-SEAL] {corrected} bot(s) had trades row corrected by seal_all_active_bots().")
+                        # Block start and raise error to abort startup
+                        raise RuntimeError(
+                            f"Startup parity verification FAILED for {len(_critical)} critical pair(s). "
+                            "Engine cannot start in a mismatched state. Run scripts/run_startup_heal.py or resolve manually."
+                        )
                 else:
-                    logger.info("✅ [STARTUP-SEAL] All bot trades rows are consistent with ledger fills.")
-            except Exception as _seal_err:
-                logger.warning(f"⚠️ [STARTUP-SEAL] seal_all_active_bots failed (non-fatal): {_seal_err}")
+                    logger.info("✅ [STARTUP-BARRIER] All mismatches successfully isolated. Startup barrier cleared.")
+            else:
+                logger.info("✅ [STARTUP-BARRIER] All pairs verified in perfect parity. Startup barrier cleared.")
 
-
-
-            # 🔬 BIDIRECTIONAL PROOF RECONCILIATION — run at every startup.
-            # Verifies all ledger orders against exchange (PASS 1) and scans exchange
-            # fills for DNA-matched orders not yet in bot_orders (PASS 2).
-            # This is the definitive fix for SUI/XRP/BTC ghost-position discrepancies.
-            try:
-                if self._reconciler:
-                    logger.info("🔬 [STARTUP] Running bidirectional physical position reconciliation...")
-                    _adopt_results = self._reconciler.adopt_from_physical_positions(limit_per_symbol=500)
-                    if _adopt_results:
-                        for _bid, _res in _adopt_results.items():
-                            logger.info(
-                                f"  📊 Bot {_bid} ({_res.get('symbol')} {_res.get('side')}): "
-                                f"phys={_res.get('phys_qty'):.4f} "
-                                f"proved={_res.get('proved_qty', 0):.4f} "
-                                f"healed={_res.get('p1_healed', 0)} "
-                                f"adopted={_res.get('p2_adopted', 0)} "
-                                f"match={_res.get('qty_matched')}"
-                            )
-                    else:
-                        logger.info("  [STARTUP] No physical positions to reconcile.")
-            except Exception as _adopt_err:
-                logger.warning(f"⚠️ [STARTUP] Physical adoption scan failed (non-fatal): {_adopt_err}")
-
-
-
-            active_bots = self.get_active_bots()
-            allowed_bot_ids = {str(b[0]) for b in active_bots if b[9] == 1} # Only Active bots
-            logger.info(f"   > Active Bots Allowed: {allowed_bot_ids}")
-
-            # 2. Scan ALL Open Orders
+            # Cleanup stray/manual orders
+            logger.info("🧹 [STARTUP-CLEANUP] Scanning for ghost orders to cancel...")
             total_cancelled = 0
-            for m_type, ex in self.exchanges.items():
-                try:
-                    orders = ex.fetch_open_orders()
-                    if not orders: continue
-
+            allowed_bot_ids = {str(bid) for bid in active_ids}
+            try:
+                orders = parity_ex.fetch_open_orders()
+                if orders:
                     for o in orders:
                         cid = o.get('clientOrderId', '')
-                        # Identify Bot ID from ClientID (Format: CQB_{bot_id}_...)
                         bot_id = None
                         if cid.startswith('CQB_'):
                             parts = cid.split('_')
                             if len(parts) > 1:
                                 bot_id = parts[1]
-
-                        # Decision Logic
                         should_cancel = False
                         reason = ""
-
                         if bot_id:
                             if bot_id not in allowed_bot_ids:
-                                # 🚀 SIGNATURE-BASED ACCURACY FIX:
-                                # Do NOT purge orders with CQB prefix - they are "System DNA".
-                                # Tag them as STRAY for the UI to handle, don't just delete them.
                                 should_cancel = False
-                                reason = f"Bot {bot_id} exists on exchange but is STOPPED/Unknown in DB. Tagging for recovery."
-                                logger.info(f"📍 [STARTUP-SYNC] Identified STRAY Bot Order {o['id']} (Bot {bot_id}). PRESERVING for recovery.")
+                                logger.info(f"Preserving stray CQB order {o['id']} (bot {bot_id}) for recovery.")
                         else:
-                            # Unknown/Manual Order - strict mode would cancel, but safety mode ignores
                             if getattr(config, 'STRICT_CLEANUP', True):
                                 should_cancel = True
-                                reason = "Unknown/Manual Order (Strict Mode)"
-
+                                reason = "Manual/Unknown Order (Strict Mode)"
                         if should_cancel:
-                            logger.warning(f"🚫 [STARTUP-CLEANUP] Cancelling Ghost Order {o['id']} ({o['symbol']}): {reason}")
-                            ex.cancel_order(o['id'], o['symbol'])
+                            logger.warning(f"🚫 Cancelling Ghost Order {o['id']} ({o['symbol']}): {reason}")
+                            parity_ex.cancel_order(o['id'], o['symbol'])
                             total_cancelled += 1
-
-                except Exception as e:
-                    logger.error(f"   > Failed to scan orders for {m_type}: {e}")
+            except Exception as _ord_err:
+                logger.warning(f"⚠️ Ghost order scan failed: {_ord_err}")
 
             if total_cancelled > 0:
-                logger.info(f"✅ [STARTUP-CLEANUP] Cancelled {total_cancelled} ghost orders.")
-            else:
-                logger.info("✅ [STARTUP-CLEANUP] No host orders (or only stray CQB orders) found.")
+                logger.info(f"✅ Ghost order cleanup completed: {total_cancelled} orders cancelled.")
 
-            # 🚀 [v2.4.1] FINAL GATE: FULL RECONCILIATION.
-            # Runs the complete resolve_net_mismatch logic to identify and clear
-            # wrong-side residues (ghosts) immediately on startup.
-            #
-            # 🛡️ [v3.1.0 WS-WARMUP FIX]: WebSocket connects asynchronously. If reconcile_all()
-            # fires before the WS cache is populated, PRE-COMMIT-RESOLVE reads an empty order cache
-            # and marks ALL live exchange orders as 'failed'. maintain_orders then sees 0 orders
-            # for bots that have active positions and panics. The 8s wait is negligible at startup
-            # but eliminates this entire class of post-restart false alarms.
-            try:
-                if self._reconciler:
-                    WS_WARMUP_SECONDS = 20
-                    logger.info(f"⏳ [STARTUP-RECON] Waiting {WS_WARMUP_SECONDS}s for WS cache to warm up before reconcile_all...")
-                    time.sleep(WS_WARMUP_SECONDS)
+            # -------------------------------------------------------------
+            # WS Cache Warmup & Reconciler Align
+            # -------------------------------------------------------------
+            if self._reconciler:
+                WS_WARMUP_SECONDS = 20
+                logger.info(f"⏳ [STARTUP-RECON] Waiting {WS_WARMUP_SECONDS}s for WS cache to warm up before final reconcile...")
+                time.sleep(WS_WARMUP_SECONDS)
 
-                    # One final position snapshot refresh after warmup — ensures active_positions
-                    # is current before reconcile_all makes any state decisions.
-                    try:
-                        for _mt, _ex in self.exchanges.items():
-                            try:
-                                _fresh_snap = _ex.fetch_positions()
-                                if _fresh_snap is not None:
-                                    from engine.database import update_active_positions_snapshot
-                                    update_active_positions_snapshot(_fresh_snap)
-                                    logger.info(f"✅ [STARTUP-RECON] Post-warmup position snapshot refreshed ({len(_fresh_snap)} positions).")
-                                    break
-                            except Exception as _pe2:
-                                logger.warning(f"⚠️ [STARTUP-RECON] Post-warmup snapshot failed for {_mt}: {_pe2}")
-                    except Exception as _snap2_err:
-                        logger.warning(f"⚠️ [STARTUP-RECON] Post-warmup snapshot error (non-fatal): {_snap2_err}")
+                # Final position refresh post-warmup
+                try:
+                    _fresh_snap = parity_ex.fetch_positions()
+                    if _fresh_snap is not None:
+                        update_active_positions_snapshot(_fresh_snap)
+                except Exception as _snap_w_err:
+                    logger.warning(f"⚠️ Post-warmup snapshot refresh failed: {_snap_w_err}")
 
-                    logger.info("🛡️ [STARTUP-RECON] Executing full reconciliation pass...")
-                    self._reconciler.reconcile_all()
-                    logger.info("✅ [STARTUP-RECON] Full reconciliation complete.")
-            except Exception as _recon_err:
-                logger.error(f"❌ [STARTUP-RECON] Full reconciliation failed: {_recon_err}")
-
-            # ═══════════════════════════════════════════════════════════════════════
-            # 🔍 COLD TRUTH DIAGNOSTIC — LOG ONLY, NO DESTRUCTIVE ACTIONS.
-            # ═══════════════════════════════════════════════════════════════════════
-            # IMPORTANT: A previous version of this block auto-reset bots when
-            # exchange showed 0 physical. This was WRONG — it used a single-point-in-
-            # time fetch_positions() snapshot with NO CQB DNA proof. A bot with a
-            # live WS_ENTRY_FILL could appear as exchange=0 if the snapshot settled
-            # slightly after the fill, causing a legitimate position to be wiped.
-            #
-            # This block now ONLY logs discrepancies for human review.
-            # The correct fix for a stale virtual ledger is:
-            #   Bot Manager → Reset Bot (manual, intentional, proof-reviewed).
-            # ═══════════════════════════════════════════════════════════════════════
-            try:
-                from engine.database import get_connection as _ct_get_conn
-                _cold_conn = _ct_get_conn()
-                _cold_phys = {}
-                for _mt, _ex in self.exchanges.items():
-                    try:
-                        for _p in (_ex.fetch_positions() or []):
-                            _sym = str(_p.get('symbol', '')).replace('/', '').replace(':', '').upper()
-                            _cold_phys[_sym] = abs(float(_p.get('contracts', 0) or 0))
-                        break
-                    except Exception as _cp_err:
-                        logger.warning(f"⚠️ [COLD-DIAG] Could not fetch positions: {_cp_err}")
-
-                _cold_bots = _cold_conn.execute("""
-                    SELECT b.id, b.name, b.pair, t.total_invested, t.wipe_wall_ts, t.cycle_phase
-                    FROM bots b JOIN trades t ON b.id = t.bot_id
-                    WHERE b.is_active = 1 AND t.total_invested > 0
-                """).fetchall()
-
-                _now = int(time.time())
-                for _cbot_id, _cbot_name, _cpair, _c_invested, _c_wall, _c_phase in _cold_bots:
-                    if str(_c_phase or '').upper() == 'CARRY_PENDING':
-                        continue
-                    _norm = str(_cpair).split(':')[0].replace('/', '').upper()
-                    _phys_qty = _cold_phys.get(_norm, 0.0)
-                    if _phys_qty < 0.0001:
-                        _wall_age = _now - int(_c_wall or 0)
-                        logger.warning(
-                            f"🔍 [COLD-DIAG] Bot {_cbot_name} ({_cpair}): "
-                            f"virtual=${_c_invested:.2f} but exchange shows 0 physical "
-                            f"(wipe_wall age={_wall_age}s). "
-                            f"ACTION REQUIRED: Manual reset via Bot Manager if this persists."
-                        )
-            except Exception as _ct_err:
-                logger.warning(f"⚠️ [COLD-DIAG] Cold truth diagnostic failed (non-fatal): {_ct_err}")
-
-            # 3. Scan Positions (Adoption is verified in run_cycle via snapshot logic)
-            # We explicitly run one cycle of 'update_active_positions_snapshot' to map reality to DB
-            # self.run_cycle() # REMOVED: Premature cycle execution before reconciliation settles
+                logger.info("🛡️ [STARTUP-RECON] Executing final reconciliation check...")
+                self._reconciler.reconcile_all()
+                self._reconciler._align_memory_to_ledger()
+                logger.info("✅ [STARTUP-RECON] Final reconciliation check complete.")
 
         except Exception as e:
             logger.error(f"❌ [STARTUP-SYNC] Failed: {e}")
+            raise
 
     def _calculate_unrealized_pnl(self, exchange_snapshot=None) -> float:
         """Calculates total unrealized PnL across all active market types."""
@@ -1068,7 +818,7 @@ class BotRunner:
 
         # Fetch live signed net before any exchange order or DB change
         live_net = get_exchange_signed_net(ex, pair)
-        if live_net is None:
+        if live_net is None or live_net == 'mock_unconfigured':
             logger.error(
                 f"[PENDING-FLATTEN] Bot {bot_id}: fetch_positions failed for {pair}. "
                 f"Cannot determine closeable_qty — leaving bot gated."
@@ -1077,6 +827,7 @@ class BotRunner:
 
         closeable_qty = compute_closeable_qty(direction, open_qty, live_net)
         unphysical_remainder = round(open_qty - closeable_qty, 8)
+        fill_price = 0.0
 
         logger.warning(
             f"[PENDING-FLATTEN] Bot {bot_id}: live_net={live_net:.6f} "
@@ -1159,6 +910,7 @@ class BotRunner:
                 bot_id=bot_id,
                 pair=pair,
                 direction=direction,
+                exit_price=fill_price,
                 reason=(
                     f"pending_flatten: closeable={closeable_qty:.6f} "
                     f"unphysical={unphysical_remainder:.6f}"
@@ -1217,7 +969,7 @@ class BotRunner:
         conn = get_connection()
         # Find the most recent flatten_close order for this bot
         row = conn.execute("""
-            SELECT id, order_id, client_order_id, filled_amount, status
+            SELECT id, order_id, client_order_id, filled_amount, status, price
             FROM bot_orders
             WHERE bot_id=? AND order_type='flatten_close'
             ORDER BY id DESC LIMIT 1
@@ -1231,8 +983,9 @@ class BotRunner:
             self.pending_close_cycles[bot_id] = cycle_n + 1
             return
 
-        db_row_id, exchange_oid, cid, filled_amount, order_status = row
+        db_row_id, exchange_oid, cid, filled_amount, order_status, fill_price = row
         filled_amount = float(filled_amount or 0)
+        fill_price = float(fill_price or 0)
 
         # ── Check fill via WS-credited amount ────────────────────────────────
         is_filled = filled_amount > 0 or str(order_status).lower() in ('filled', 'closed')
@@ -1248,25 +1001,37 @@ class BotRunner:
                                 o.get('clientOrderId', '') == cid):
                             if float(o.get('amount', 0)) > 0:
                                 is_filled = True
+                                fill_price = float(o.get('average') or o.get('price') or 0.0)
                                 # Update the DB row so future cycles don't re-poll
                                 conn.execute(
-                                    "UPDATE bot_orders SET filled_amount=?, status='filled', updated_at=? WHERE id=?",
-                                    (float(o.get('amount', 0)), int(time.time()), db_row_id)
+                                    "UPDATE bot_orders SET price=?, filled_amount=?, status='filled', updated_at=? WHERE id=?",
+                                    (fill_price, float(o.get('amount', 0)), int(time.time()), db_row_id)
                                 )
                                 conn.commit()
                                 break
             except Exception as _poll_err:
                 logger.warning(f"  ⚠️ [HEDGE-FLATTEN-POLL] REST poll failed (non-fatal): {_poll_err}")
 
+        # If it filled but we don't have the price, try to fetch it
+        if is_filled and fill_price <= 0.0 and exchange_oid:
+            try:
+                ex = list(self.exchanges.values())[0] if self.exchanges else None
+                if ex:
+                    o = ex.fetch_order(exchange_oid, pair)
+                    fill_price = float(o.get('average') or o.get('price') or 0.0)
+            except Exception as _pe:
+                logger.warning(f"  ⚠️ [HEDGE-FLATTEN-POLL] Price fetch failed (non-fatal): {_pe}")
+
         if is_filled:
             logger.info(
                 f"✅ [HEDGE-FLATTEN-POLL] Bot {bot_name} flatten_close confirmed filled "
-                f"(cid={cid}). Calling safe_wipe_bot..."
+                f"(cid={cid}) @ {fill_price:.4f}. Calling safe_wipe_bot..."
             )
             try:
                 from engine.database import safe_wipe_bot
                 wiped = safe_wipe_bot(
                     bot_id=bot_id, pair=pair, direction=direction,
+                    exit_price=fill_price,
                     reason="HEDGE-FLATTEN: market close confirmed filled",
                     human_approved=True
                 )
@@ -1297,6 +1062,27 @@ class BotRunner:
                 )
 
     def run_cycle(self):
+
+        # 🚨 Freshness Check: Exit if code on disk is newer than runner memory (structural fix for stale processes)
+        if not config.TESTING_MODE:
+            try:
+                from scripts.verify_deployment import get_newest_modified_time
+                newest_time, newest_file = get_newest_modified_time(["engine", "scripts", "ui", "config"])
+                if newest_time > self.started_at + 2.0:
+                    logger.critical(
+                        f"🛑 [DEPLOY-OUTDATED] Code on disk ({newest_file}) was modified "
+                        f"after the runner process started. Force-terminating stale process."
+                    )
+                    self.running = False
+                    try:
+                        from engine.write_queue import WriteQueue
+                        WriteQueue().flush()
+                    except Exception as _flush_err:
+                        logger.error(f"Failed to flush WriteQueue before exit: {_flush_err}")
+                    import sys
+                    sys.exit(1)
+            except Exception as _fresh_err:
+                logger.warning(f"Process freshness check failed: {_fresh_err}")
 
         start_time = time.time()
         logger.debug("Entering run_cycle")

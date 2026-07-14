@@ -687,6 +687,55 @@ class TestDatabase(unittest.TestCase):
             WriteQueue()._bypass = orig_bypass
             database.close_connection()
 
+    def test_recompute_with_null_step_below_wipe_wall(self):
+        """Test that recompute_invested_from_orders handles NULL step values defensively
+
+        and respects wipe_wall_ts, excluding historical orders before the wipe wall.
+        """
+        database.init_db()
+        conn = database.get_connection()
+        cursor = conn.cursor()
+        bot_id = 8888
+        
+        # 1. Insert bot and trade row
+        cursor.execute("INSERT OR REPLACE INTO bots (id, name, status, direction, pair) VALUES (?, 'test_null_step_bot', 'Scanning', 'LONG', 'SOL/USDC:USDC')", (bot_id,))
+        cursor.execute("""
+            INSERT OR REPLACE INTO trades (
+                bot_id, cycle_id, open_qty, total_invested, avg_entry_price, 
+                current_step, entry_confirmed, entry_order_id, tp_order_id, 
+                wipe_wall_ts, cycle_phase, position_side
+            ) VALUES (?, 10, 0.0, 0.0, 0.0, 0, 0, NULL, NULL, 5000, 'IDLE', 'LONG')
+        """, (bot_id,))
+        
+        # 2. Insert an old unbalanced order with step = NULL and created_at < wipe_wall_ts (below wipe wall)
+        cursor.execute("""
+            INSERT INTO bot_orders (bot_id, cycle_id, step, order_type, price, amount, filled_amount, status, created_at, updated_at)
+            VALUES (?, 9, NULL, 'adoption_add', 1.5, 10.0, 10.0, 'filled', 1000, 1000)
+        """, (bot_id,))
+        
+        # 3. Insert a new order with step = NULL and created_at >= wipe_wall_ts (above wipe wall)
+        cursor.execute("""
+            INSERT INTO bot_orders (bot_id, cycle_id, step, order_type, price, amount, filled_amount, status, created_at, updated_at)
+            VALUES (?, 10, NULL, 'adoption_add', 2.0, 5.0, 5.0, 'filled', 6000, 6000)
+        """, (bot_id,))
+        
+        conn.commit()
+        
+        # 4. Run recompute_invested_from_orders. 
+        # Under the fix:
+        # - The old order at cycle 9 (created_at=1000 < wipe_wall_ts=5000) must be excluded from auto-detection.
+        # - The new order at cycle 10 (created_at=6000 >= wipe_wall_ts=5000) must be included.
+        # - Its step=NULL must not cause a crash and should default to 0.
+        res = database.recompute_invested_from_orders(bot_id)
+        
+        # We expect: (total_invested, avg_entry_price, open_qty, current_step)
+        # - open_qty = 5.0 (only the new order, old order is excluded by wipe wall)
+        # - avg_entry_price = 2.0
+        # - current_step = 0 (since step is NULL, defensively treated as 0)
+        self.assertEqual(res[2], 5.0, "Should only include the new order above the wipe wall")
+        self.assertEqual(res[1], 2.0, "Weighted average price should be 2.0")
+        self.assertEqual(res[3], 1, "Null step should be defensively treated as 0 and refined to 1 without crashing")
+
 
 if __name__ == '__main__':
     unittest.main()

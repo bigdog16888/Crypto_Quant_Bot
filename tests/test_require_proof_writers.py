@@ -28,9 +28,10 @@ LINE_TOLERANCE = 15
 WHITELIST = [
     # (relative posix path from repo root, approx line number, description)
     # NOTE: database.py:1508 is NOT here - it was converted to _set_bot_require_manual_proof
-    ("engine/parity_gates.py",   414,  "THE centralized write point - all grace-checked callers funnel here"),
+    ("engine/parity_gates.py",   435,  "THE centralized write point - all grace-checked callers funnel here"),
     ("engine/bot_executor.py",   626,  "Phase 1 two-phase reset: exchange close FAILED - real error not a race"),
-    ("engine/database.py",      3808,  "flag_pair_ledger_mismatch: confirmed audit delta post-forensic"),
+    ("engine/database.py",      3952,  "flag_pair_ledger_mismatch: isolated startup drift check"),
+    ("engine/database.py",      3966,  "flag_pair_ledger_mismatch: critical startup drift check"),
     ("engine/oneway_netting.py", 462,  "PA_SYNC: exchange API unreachable for N consecutive cycles"),
     ("engine/reconciler.py",      48,  "flag_bot_manual_proof local helper: only called from hard-failure paths"),
     ("engine/reconciler.py",    5709,  "DIRECTIONAL-MISMATCH: physical position contradicts bot direction"),
@@ -39,11 +40,11 @@ WHITELIST = [
     # Both are guarded by the pair_has_recent_fill outer check (grace window fires before
     # reaching this branch). These are inside the forensic-scan success/fail paths
     # respectively and fire only when the mismatch persists beyond the grace window.
-    ("engine/reconciler.py",    8588,  "PROOF-FAILED: forensic scan succeeded but gap persists"),
-    ("engine/reconciler.py",    8614,  "PROOF-FAILED: forensic scan raised exception, gap unresolved"),
-    ("engine/runner.py",        1139,  "Exchange close FAILED during pending flatten"),
-    ("engine/runner.py",        1180,  "safe_wipe_bot refused after close"),
-    ("engine/runner.py",        1192,  "safe_wipe_bot raised exception during flatten"),
+    ("engine/reconciler.py",    8566,  "PROOF-FAILED: forensic scan succeeded but gap persists"),
+    ("engine/reconciler.py",    8592,  "PROOF-FAILED: forensic scan raised exception, gap unresolved"),
+    ("engine/runner.py",         885,  "Exchange close FAILED during pending flatten"),
+    ("engine/runner.py",         926,  "safe_wipe_bot refused after close"),
+    ("engine/runner.py",         938,  "safe_wipe_bot raised exception during flatten"),
 ]
 
 RAW_SQL_PATTERN = re.compile(

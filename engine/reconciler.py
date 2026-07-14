@@ -6348,25 +6348,12 @@ class StateReconciler:
                         tol = qty_tolerance()
                         if abs(virtual - physical) < tol:
                             # Determine correct clear status
-                            _trade_row = _conn.execute(
-                                "SELECT open_qty FROM trades WHERE bot_id = ?", (_gated_id,)
-                            ).fetchone()
-                            _has_qty = (_trade_row[0] > 0.0001) if (_trade_row and _trade_row[0] is not None) else False
-                            
-                            if _has_qty:
-                                target_status = 'IN TRADE'
-                            else:
-                                target_status = 'Scanning' if _gated_type == 'standard' else 'hedge_standby'
-                                
-                            logger.info(
-                                f"[AUTO-CLEAR] Bot {_gated_id} ({_gated_name}): pair net now "
-                                f"matches exchange (virtual={virtual}, physical={physical}). "
-                                f"Clearing REQUIRE_MANUAL_PROOF -> {target_status}."
+                            from engine.parity_gates import clear_bot_require_manual_proof
+                            clear_bot_require_manual_proof(
+                                _gated_id,
+                                f"pair net now matches exchange (virtual={virtual}, physical={physical})",
+                                conn=_conn
                             )
-                            _conn.execute(
-                                "UPDATE bots SET status=? WHERE id=?", (target_status, _gated_id)
-                            )
-                            _conn.commit()
         except Exception as _clear_err:
             logger.error(f"❌ [AUTO-CLEAR-MANUAL-PROOF] Failed: {_clear_err}")
 

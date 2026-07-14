@@ -101,3 +101,10 @@ class WriteQueue:
             raise task.exception
         return task.result
 
+    def flush(self):
+        """Block until all enqueued tasks are processed."""
+        if getattr(self, '_bypass', False):
+            return
+        self._queue.join()
+
+

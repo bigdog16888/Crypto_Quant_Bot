@@ -171,11 +171,29 @@ def get_exchange_signed_net(exchange, pair: str) -> Optional[float]:
     if not exchange:
         return None
     norm = normalize_symbol(pair).upper()
-    try:
-        positions = exchange.fetch_positions()
-    except Exception as e:
-        logger.error(f"[PARITY] fetch_positions failed for {pair}: {e}")
-        return None
+    
+    positions = None
+    max_attempts = 3
+    import time
+    from config.settings import config
+    
+    for attempt in range(1, max_attempts + 1):
+        try:
+            positions = exchange.fetch_positions()
+            break
+        except Exception as e:
+            if attempt == max_attempts:
+                logger.error(
+                    f"[PARITY] fetch_positions failed for {pair} on final attempt {attempt}/{max_attempts}: {e}"
+                )
+            else:
+                sleep_time = 0.01 if config.TESTING_MODE else 1.5
+                logger.warning(
+                    f"[PARITY] fetch_positions failed for {pair} on attempt {attempt}/{max_attempts}: {e}. "
+                    f"Retrying in {sleep_time}s..."
+                )
+                time.sleep(sleep_time)
+
     try:
         from unittest.mock import Mock
         if isinstance(positions, Mock):
@@ -227,6 +245,9 @@ def pair_parity_ok(
     if physical == 'mock_unconfigured':
         return True, virtual, virtual, 0.0
     if physical is None:
+        logger.warning(
+            f"[PARITY] Could not verify exchange position for {pair} after retries — degraded state, treating as gate-worthy."
+        )
         return False, virtual, 0.0, 0.0
     delta = round(physical - virtual, 8)
     return abs(delta) <= tol, virtual, physical, delta
@@ -417,6 +438,51 @@ def _set_bot_require_manual_proof(bot_id: int, reason: str) -> None:
         conn.commit()
     except Exception as e:
         logger.error(f"Failed to set REQUIRE_MANUAL_PROOF for bot {bot_id}: {e} ({reason})")
+
+
+def clear_bot_require_manual_proof(bot_id: int, reason: str, conn=None) -> bool:
+    """
+    Centralized function to safely clear REQUIRE_MANUAL_PROOF status for a bot.
+    Restores the bot status to 'IN TRADE', 'Scanning', or 'hedge_standby' based on database state.
+    Returns True if successfully cleared.
+    """
+    from engine.database import get_connection
+    try:
+        if conn is None:
+            conn = get_connection()
+        row = conn.execute("SELECT name, pair, bot_type, status FROM bots WHERE id = ?", (bot_id,)).fetchone()
+        if not row:
+            logger.error(f"Cannot clear REQUIRE_MANUAL_PROOF for bot {bot_id}: bot not found.")
+            return False
+        
+        name, pair, bot_type, status = row
+        if status != 'REQUIRE_MANUAL_PROOF':
+            return True
+            
+        trade_row = conn.execute(
+            "SELECT open_qty FROM trades WHERE bot_id = ?", (bot_id,)
+        ).fetchone()
+        has_qty = (trade_row[0] > 0.0001) if (trade_row and trade_row[0] is not None) else False
+        
+        if has_qty:
+            target_status = 'IN TRADE'
+        else:
+            target_status = 'Scanning' if bot_type == 'standard' else 'hedge_standby'
+            
+        logger.info(
+            f"[AUTO-CLEAR] Bot {bot_id} ({name}): clearing REQUIRE_MANUAL_PROOF -> {target_status}. "
+            f"Reason: {reason}"
+        )
+        
+        conn.execute(
+            "UPDATE bots SET status = ? WHERE id = ? AND status = 'REQUIRE_MANUAL_PROOF'",
+            (target_status, bot_id)
+        )
+        conn.commit()
+        return True
+    except Exception as e:
+        logger.error(f"Failed to clear REQUIRE_MANUAL_PROOF for bot {bot_id}: {e}")
+        return False
 
 
 
@@ -1122,7 +1188,7 @@ def startup_repair_mismatched_pairs(exchange) -> Dict[str, Any]:
 
     remaining = audit_pair_ledger_vs_exchange(exchange, qty_tolerance())
     if remaining:
-        flag_pair_ledger_mismatch(remaining)
+        flag_pair_ledger_mismatch(remaining, exchange=exchange)
         summary['remaining'] = [(p, v, ph, d) for p, v, ph, d in remaining]
     return summary
 
@@ -1245,11 +1311,35 @@ def proof_flatten_pair(
         }
 
     # 4. Reset bots only when exchange is flat
+    exit_price = 0.0
+    if result.get('close_order'):
+        try:
+            ord_id = result['close_order'].get('id')
+            fetched_ord = exchange.fetch_order(ord_id, pair)
+            exit_price = float(fetched_ord.get('average') or fetched_ord.get('price') or 0.0)
+            if exit_price <= 0.0:
+                trades = exchange.fetch_my_trades(pair, limit=5)
+                matching_trades = [t for t in trades if str(t.get('order')) == str(ord_id)]
+                if matching_trades:
+                    total_val = sum(float(t.get('amount', 0)) * float(t.get('price', 0)) for t in matching_trades)
+                    total_qty = sum(float(t.get('amount', 0)) for t in matching_trades)
+                    if total_qty > 0:
+                        exit_price = total_val / total_qty
+        except Exception as _e_ord:
+            logger.warning(f"[PROOF-FLATTEN] Could not fetch average fill price for close order: {_e_ord}")
+            
+        if exit_price <= 0.0:
+            try:
+                ticker = exchange.fetch_ticker(pair)
+                exit_price = float(ticker.get('last') or 0.0)
+            except Exception:
+                pass
+
     for bid in target_bot_ids:
         try:
             reset_bot_after_tp(
                 bid,
-                exit_price=0.0,
+                exit_price=exit_price,
                 action_label='MANUAL_CLOSE',
                 notes=f'proof_flatten_pair: exchange flat verified',
                 human_approved=True,

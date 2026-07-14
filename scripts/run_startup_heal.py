@@ -70,13 +70,15 @@ def main():
     print(f"      sealed; {corrected} bot(s) corrected")
 
     conn = get_connection()
-    for bid_row in conn.execute("SELECT id FROM bots WHERE is_active=1"):
-        sync_trades_from_orders(bid_row[0])
+    bids = [row[0] for row in conn.execute("SELECT id FROM bots WHERE is_active=1").fetchall()]
+    for bid in bids:
+        sync_trades_from_orders(bid)
 
     print("\n[6/7] One-way open_qty repair (cross-bot netting)...")
     from engine.oneway_netting import reconcile_oneway_pair_open_qty
     conn = get_connection()
-    for (pair,) in conn.execute("SELECT DISTINCT pair FROM bots WHERE is_active=1"):
+    pairs = [row[0] for row in conn.execute("SELECT DISTINCT pair FROM bots WHERE is_active=1").fetchall()]
+    for pair in pairs:
         msg = reconcile_oneway_pair_open_qty(ex, pair)
         if msg:
             print(f"      {pair}: {msg}")

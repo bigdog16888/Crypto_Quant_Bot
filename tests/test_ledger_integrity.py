@@ -1190,6 +1190,7 @@ def test_seal_trade_state_require_manual_proof_loophole(memory_db):
 def test_seal_trade_state_require_manual_proof_loophole_exchange_unavailable(memory_db):
     """Test REQUIRE_MANUAL_PROOF auto-clear loophole when exchange is unavailable."""
     from engine.ledger import seal_trade_state
+    from unittest.mock import patch
 
     bot_id = 9991
     setup_bot_fixture(memory_db, bot_id, 'Loophole Bot Unavailable', 'SOL/USDC:USDC', 'LONG')
@@ -1200,7 +1201,8 @@ def test_seal_trade_state_require_manual_proof_loophole_exchange_unavailable(mem
 
     # Call seal_trade_state with exchange=None.
     # It must fail closed and preserve the REQUIRE_MANUAL_PROOF status.
-    seal_trade_state(bot_id, exchange=None)
+    with patch('engine.runner.BotRunner.get_instance', return_value=None):
+        seal_trade_state(bot_id, exchange=None)
     
     row_status = cursor.execute("SELECT status FROM bots WHERE id = ?", (bot_id,)).fetchone()
     assert row_status[0] == 'REQUIRE_MANUAL_PROOF'

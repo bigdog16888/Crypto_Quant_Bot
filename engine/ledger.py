@@ -799,6 +799,59 @@ def _seal_trade_state_internal(
             cascade_statuses = ('pending_close', 'FLATTENING', 'pending_flatten', 'pending_hedge_close')
             cascade_ts = int(time.time()) if new_status in cascade_statuses else 0
             conn.execute("UPDATE bots SET status = ?, cascade_started_at = ? WHERE id = ?", (new_status, cascade_ts, bot_id))
+
+        if new_status in ('Scanning', 'hedge_standby'):
+            # Retrieve last fill timestamp for wipe wall and cycle start
+            last_fill_row = conn.execute(
+                "SELECT MAX(created_at) FROM bot_orders "
+                "WHERE bot_id = ? AND status IN ('filled','partially_filled') "
+                "AND filled_amount > 0",
+                (bot_id,)
+            ).fetchone()
+            now_ts = int(last_fill_row[0]) if (last_fill_row and last_fill_row[0] is not None) else int(time.time())
+            
+            # Determine if the last filled order was a TP order
+            last_exit_row = conn.execute(
+                "SELECT order_type FROM bot_orders "
+                "WHERE bot_id = ? AND status IN ('filled','partially_filled') "
+                "AND filled_amount > 0 AND order_type IS NOT NULL "
+                "ORDER BY created_at DESC, id DESC LIMIT 1",
+                (bot_id,)
+            ).fetchone()
+            last_exit_type = str(last_exit_row[0]).lower() if last_exit_row else None
+
+            # Increment cycle_id and clear cache columns in trades table
+            # Only increment if the bot is actually transitioning from an active state,
+            # and the last exit order was NOT a TP (since reset_bot_after_tp handles TP resets)
+            is_transitioning = curr_status in ('IN TRADE', 'REQUIRE_MANUAL_PROOF') or (prev_row and float(prev_row[0] or 0) > 0.01)
+            should_increment = is_transitioning and last_exit_type != 'tp'
+
+            if should_increment:
+                conn.execute("""
+                    UPDATE trades 
+                    SET total_invested = 0, avg_entry_price = 0, current_step = 0, 
+                        entry_confirmed = 0, cycle_phase = 'IDLE',
+                        cycle_id = COALESCE(cycle_id, 1) + 1,
+                        entry_order_id = NULL, tp_order_id = NULL, open_qty = 0,
+                        wipe_wall_ts = ?, cycle_start_time = ?
+                    WHERE bot_id = ?
+                """, (now_ts, now_ts, bot_id))
+                logger.info(f"🌉 [SEAL-CYCLE-RESET] Bot {bot_id}: Transitioned to flat. Cycle incremented.")
+            else:
+                # Ensure wipe_wall_ts and cycle_start_time are set even if not incrementing
+                conn.execute("""
+                    UPDATE trades 
+                    SET total_invested = 0, avg_entry_price = 0, current_step = 0, 
+                        entry_confirmed = 0, cycle_phase = 'IDLE',
+                        entry_order_id = NULL, tp_order_id = NULL, open_qty = 0
+                    WHERE bot_id = ?
+                """, (bot_id,))
+                
+            try:
+                conn.execute("DELETE FROM fill_claims WHERE bot_id = ?", (bot_id,))
+            except sqlite3.OperationalError:
+                pass
+
         conn.commit()
 
 

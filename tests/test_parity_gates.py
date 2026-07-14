@@ -364,3 +364,185 @@ def test_set_bot_require_manual_proof_bypass_when_pair_balanced(memory_db):
     # Check that bot 10008 was NOT gated (status should still be 'IN TRADE', not 'REQUIRE_MANUAL_PROOF')
     status = memory_db.execute("SELECT status FROM bots WHERE id = 10008").fetchone()[0]
     assert status == 'IN TRADE'
+
+
+def test_startup_isolation_proportionate_gating(memory_db):
+    """
+    Asserts that small mismatches below the dollar threshold only gate the matching side bots
+    and are not flagged as critical mismatches, while large mismatches gate all bots on the pair.
+    """
+    from engine.database import flag_pair_ledger_mismatch
+    from unittest.mock import MagicMock
+    
+    # 1. Setup two bots on SOL/USDC:USDC (one LONG, one SHORT)
+    memory_db.execute("DELETE FROM bots")
+    memory_db.execute(
+        "INSERT INTO bots (id, name, pair, direction, is_active, normalized_pair, status) "
+        "VALUES (1001, 'sol_long', 'SOL/USDC:USDC', 'LONG', 1, 'SOLUSDC', 'IN TRADE')"
+    )
+    memory_db.execute(
+        "INSERT INTO bots (id, name, pair, direction, is_active, normalized_pair, status) "
+        "VALUES (1002, 'sol_short', 'SOL/USDC:USDC', 'SHORT', 1, 'SOLUSDC', 'Scanning')"
+    )
+    # Insert a dummy order to ensure fallback price discovery finds something > 0
+    memory_db.execute(
+        "INSERT INTO bot_orders (bot_id, order_type, order_id, price, amount, filled_amount, status, cycle_id, step) "
+        "VALUES (1001, 'entry', 'sol_e1', 10.0, 1.0, 1.0, 'filled', 1, 1)"
+    )
+    # Insert trades table rows so check_bot_reconciliation returns True for both
+    memory_db.execute("INSERT INTO trades (bot_id, open_qty) VALUES (1001, 1.0)")
+    memory_db.execute("INSERT INTO trades (bot_id, open_qty) VALUES (1002, 0.0)")
+    memory_db.commit()
+
+    # Create mock exchange that returns SOL price = $10.0
+    mock_ex = MagicMock()
+    mock_ex.fetch_ticker.return_value = {'last': 10.0}
+
+    # Scenario A: Small mismatch of -0.01 units. Value = 0.01 * $10 = $0.10 (<= $100.0)
+    # This should be isolated: only the SHORT bot (matching negative delta) should be gated.
+    mismatches = [('SOL/USDC:USDC', 1.0, 0.99, -0.01)]
+    critical = flag_pair_ledger_mismatch(mismatches, exchange=mock_ex)
+    
+    assert len(critical) == 0  # No critical mismatches
+    
+    status_long = memory_db.execute("SELECT status FROM bots WHERE id = 1001").fetchone()[0]
+    status_short = memory_db.execute("SELECT status FROM bots WHERE id = 1002").fetchone()[0]
+    
+    assert status_long == 'IN TRADE'  # Long bot left alone
+    assert status_short == 'REQUIRE_MANUAL_PROOF'  # Short bot gated
+
+    # Reset statuses
+    memory_db.execute("UPDATE bots SET status = 'IN TRADE'")
+    memory_db.commit()
+
+    # Scenario B: Large mismatch of -20.0 units. Value = 20.0 * $10 = $200 (> $100.0)
+    # This should NOT be isolated: it should return a critical mismatch and gate both bots.
+    mismatches = [('SOL/USDC:USDC', 1.0, -19.0, -20.0)]
+    critical = flag_pair_ledger_mismatch(mismatches, exchange=mock_ex)
+    
+    assert len(critical) == 1
+    assert critical[0][0] == 'SOL/USDC:USDC'
+    
+    status_long = memory_db.execute("SELECT status FROM bots WHERE id = 1001").fetchone()[0]
+    status_short = memory_db.execute("SELECT status FROM bots WHERE id = 1002").fetchone()[0]
+    
+    assert status_long == 'REQUIRE_MANUAL_PROOF'  # Gated
+    assert status_short == 'REQUIRE_MANUAL_PROOF'  # Gated
+
+
+
+def test_startup_isolation_exact_reconciliation_and_hedge_protection(memory_db):
+    """
+    1. Verifies that under-credited fills on standard short bot correctly gate only the short bot
+       (the unreconciled one) while keeping the long bot active.
+    2. Verifies that standard bots are gated in preference to hedge children on direction fallbacks,
+       preventing unrelated hedge relationships from being broken.
+    3. Verifies that isolated drifts write exact mismatch values in the bot notes.
+    """
+    from engine.database import flag_pair_ledger_mismatch, check_bot_reconciliation
+    from unittest.mock import MagicMock
+    
+    # -------------------------------------------------------------------------
+    # SCENARIO 1: Under-credited Grid Fill on Short Bot
+    # -------------------------------------------------------------------------
+    memory_db.execute("DELETE FROM bots")
+    memory_db.execute("DELETE FROM bot_orders")
+    memory_db.execute("DELETE FROM trades")
+    
+    # Long Bot
+    memory_db.execute(
+        "INSERT INTO bots (id, name, pair, direction, is_active, normalized_pair, status, bot_type) "
+        "VALUES (1001, 'sol_long', 'SOL/USDC:USDC', 'LONG', 1, 'SOLUSDC', 'IN TRADE', 'standard')"
+    )
+    memory_db.execute(
+        "INSERT INTO trades (bot_id, open_qty) VALUES (1001, 0.01)"
+    )
+    memory_db.execute(
+        "INSERT INTO bot_orders (bot_id, order_id, amount, status) "
+        "VALUES (1001, 'CQB_1001_TP', 0.01, 'open')"
+    )
+    
+    # Short Bot (has under-credited grid fill on exchange, DB open grid order exists but is missing on exchange)
+    memory_db.execute(
+        "INSERT INTO bots (id, name, pair, direction, is_active, normalized_pair, status, bot_type) "
+        "VALUES (1002, 'sol_short', 'SOL/USDC:USDC', 'SHORT', 1, 'SOLUSDC', 'IN TRADE', 'standard')"
+    )
+    memory_db.execute(
+        "INSERT INTO trades (bot_id, open_qty) VALUES (1002, 0.01)"
+    )
+    memory_db.execute(
+        "INSERT INTO bot_orders (bot_id, order_id, amount, status) "
+        "VALUES (1002, 'CQB_1002_GRID', 0.01, 'open')"
+    )
+    memory_db.commit()
+
+    # Exchange open orders only contain Bot 1001's open order
+    ex_open_orders = [
+        {'id': 'CQB_1001_TP', 'amount': 0.01, 'clientOrderId': 'CQB_1001_TP'}
+    ]
+    
+    # Verify open-order reconciliation check results
+    assert check_bot_reconciliation(1001, memory_db, ex_open_orders) is True
+    assert check_bot_reconciliation(1002, memory_db, ex_open_orders) is False
+
+    mock_ex = MagicMock()
+    mock_ex.fetch_ticker.return_value = {'last': 10.0}
+    mock_ex.fetch_open_orders.return_value = ex_open_orders
+
+    # Drift is -0.01 (physical short position is more than DB). Value = 0.01 * $10 = $0.10
+    mismatches = [('SOL/USDC:USDC', 0.0, -0.01, -0.01)]
+    critical = flag_pair_ledger_mismatch(mismatches, exchange=mock_ex)
+    
+    assert len(critical) == 0  # Should be isolated
+    
+    status_long = memory_db.execute("SELECT status FROM bots WHERE id = 1001").fetchone()[0]
+    status_short = memory_db.execute("SELECT status, notes FROM bots WHERE id = 1002").fetchone()
+    
+    assert status_long == 'IN TRADE'  # Reconciled bot left active
+    assert status_short[0] == 'REQUIRE_MANUAL_PROOF'  # Unreconciled bot gated
+    assert "-0.010000" in status_short[1]
+    assert "$0.10" in status_short[1]
+
+    # -------------------------------------------------------------------------
+    # SCENARIO 2: Hedge Child Gating Protection
+    # -------------------------------------------------------------------------
+    # Reset statuses
+    memory_db.execute("UPDATE bots SET status = 'IN TRADE', notes = NULL")
+    
+    # Add a hedge child of 1001 (SOL long_hedge) which has direction SHORT and status hedge_standby (qty=0)
+    memory_db.execute(
+        "INSERT INTO bots (id, name, pair, direction, is_active, normalized_pair, status, bot_type) "
+        "VALUES (1003, 'sol_long_hedge', 'SOL/USDC:USDC', 'SHORT', 1, 'SOLUSDC', 'hedge_standby', 'hedge_child')"
+    )
+    memory_db.execute(
+        "INSERT INTO trades (bot_id, open_qty) VALUES (1003, 0.0)"
+    )
+    
+    # Put Bot 1002's grid order back on the exchange so both bots are order-reconciled
+    ex_open_orders_both = [
+        {'id': 'CQB_1001_TP', 'amount': 0.01, 'clientOrderId': 'CQB_1001_TP'},
+        {'id': 'CQB_1002_GRID', 'amount': 0.01, 'clientOrderId': 'CQB_1002_GRID'}
+    ]
+    
+    assert check_bot_reconciliation(1001, memory_db, ex_open_orders_both) is True
+    assert check_bot_reconciliation(1002, memory_db, ex_open_orders_both) is True
+    assert check_bot_reconciliation(1003, memory_db, ex_open_orders_both) is True
+
+    mock_ex_both = MagicMock()
+    mock_ex_both.fetch_ticker.return_value = {'last': 10.0}
+    mock_ex_both.fetch_open_orders.return_value = ex_open_orders_both
+
+    # Drift is -0.01 (SHORT direction). Since all bots are order-reconciled, we fallback to direction match.
+    # Candidates matching direction SHORT are 1002 (standard short) and 1003 (hedge child SHORT).
+    # Gating must prioritize standard bot 1002, leaving hedge child 1003 untouched.
+    critical = flag_pair_ledger_mismatch(mismatches, exchange=mock_ex_both)
+    
+    assert len(critical) == 0
+    
+    status_long = memory_db.execute("SELECT status FROM bots WHERE id = 1001").fetchone()[0]
+    status_short = memory_db.execute("SELECT status FROM bots WHERE id = 1002").fetchone()[0]
+    status_hedge = memory_db.execute("SELECT status FROM bots WHERE id = 1003").fetchone()[0]
+    
+    assert status_long == 'IN TRADE'
+    assert status_short == 'REQUIRE_MANUAL_PROOF'  # Standard short bot gated
+    assert status_hedge == 'hedge_standby'  # Hedge child left untouched!

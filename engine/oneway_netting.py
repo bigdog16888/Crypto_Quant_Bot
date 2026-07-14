@@ -147,7 +147,7 @@ def reconcile_oneway_pair_open_qty(
         return None
 
     physical = get_exchange_signed_net(exchange, pair)
-    if physical is None:
+    if physical is None or physical == 'mock_unconfigured':
         return None
 
     virtual = get_pair_open_qty_net(pair)
@@ -264,7 +264,7 @@ def get_authoritative_close_qty(exchange, pair: str, direction: str, db_qty: flo
     from engine.parity_gates import get_exchange_signed_net
 
     physical_net = get_exchange_signed_net(exchange, pair)
-    if physical_net is None:
+    if physical_net is None or physical_net == 'mock_unconfigured':
         # Fallback to db_qty if exchange call failed, to be safe.
         logger.warning(
             f"[ONEWAY-NETTING] get_exchange_signed_net failed for {pair}. "
@@ -443,7 +443,7 @@ def sync_pair_to_exchange(pair, exchange, conn):
     import time
     
     exchange_net = get_exchange_signed_net(exchange, pair)
-    if exchange_net is None:
+    if exchange_net is None or exchange_net == 'mock_unconfigured':
         logger.warning(f"[EXCHANGE-SYNC] Failed to fetch real exchange net position for pair {pair}.")
         # ADR-005 stale-cycle tracking: increment counter and apply circuit breaker.
         try:
@@ -614,7 +614,7 @@ def _attempt_drift_correction(pair, diff, bot_details, conn, sync_data, exchange
         return
 
     exchange_net_after = get_exchange_signed_net(exchange, pair)
-    if exchange_net_after is None:
+    if exchange_net_after is None or exchange_net_after == 'mock_unconfigured':
         logger.warning(
             f"[EXCHANGE-SYNC-CORRECT] Could not re-fetch exchange net after reseal for {pair} — "
             f"skipping post-reseal check."
