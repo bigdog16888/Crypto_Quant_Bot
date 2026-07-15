@@ -10,7 +10,7 @@ del engine.emergency 2>nul
 
 echo Starting bot runner with fix...
 cd /d "%~dp0"
-start "Bot Runner" python engine\runner.py
+start "Bot Runner" python engine\run_engine.py
 echo Bot runner restarted. Check engine_runner_debug.log for output.
 timeout /t 5 /nobreak
 

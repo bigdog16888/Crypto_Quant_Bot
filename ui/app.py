@@ -409,9 +409,9 @@ with st.sidebar:
                 st.warning("⚠️ Action Blocked: Cannot start monitoring runner under pytest.")
             else:
                 # Start engine logic...
-                runner_path = os.path.join(ROOT_DIR, "engine", "runner.py")
+                runner_path = os.path.join(ROOT_DIR, "engine", "run_engine.py")
                 
-                # Redirect stdout/stderr to DEVNULL. runner.py natively uses its own RotatingFileHandler.
+                # Redirect stdout/stderr to DEVNULL. run_engine.py natively uses its own RotatingFileHandler.
                 # Passing a file handle here locks the file on Windows and causes RotatingFileHandler to crash.
                 subprocess.Popen(
                     [sys.executable, runner_path],

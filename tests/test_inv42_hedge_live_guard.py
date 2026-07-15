@@ -363,3 +363,80 @@ class TestINV42HedgeLiveGuard(unittest.TestCase):
         self.assertAlmostEqual(recon_order[1], 0.100)
         self.assertEqual(recon_order[2], 'filled')
 
+    def test_live_guard_with_parent_partially_tpd(self):
+        """
+        Regression test: Verify that if parent is at step 7, but its size has been
+        reduced via partial TP, the under-hedge catch-up logic caps delta to the
+        remaining parent hedgeable headroom (0.0). No catch-up order should be placed,
+        and no Live Guard database sync should be triggered (keeping child at 0.0).
+        """
+        # Parent (bot 10016): LONG, Step 7, cycle 52.
+        # Parent actual open_qty is 0.080 (due to partial TP of 0.071 from peak of 0.151)
+        _insert_bot(self.conn, 10016, 'long btc price', 'BTC/USDC:USDC', 'BTCUSDC', 'LONG', hedge_child_bot_id=100317, hedge_trigger_step=7)
+        _insert_trades(self.conn, 10016, open_qty=0.080, cycle_id=52, current_step=7)
+
+        # Parent entries: step 7 entry = 0.071, steps 1..6 entries = 0.080
+        self.conn.execute("""
+            INSERT INTO bot_orders (bot_id, order_type, client_order_id, price, amount, filled_amount, status, cycle_id, step)
+            VALUES (10016, 'grid', 'CQB_10016_GRID_52_7', 62500, 0.071, 0.071, 'filled', 52, 7)
+        """)
+        self.conn.execute("""
+            INSERT INTO bot_orders (bot_id, order_type, client_order_id, price, amount, filled_amount, status, cycle_id, step)
+            VALUES (10016, 'grid', 'CQB_10016_GRID_52_6', 62500, 0.080, 0.080, 'filled', 52, 6)
+        """)
+        # Parent TP fill for step 6 (reduced position by 0.071)
+        self.conn.execute("""
+            INSERT INTO bot_orders (bot_id, order_type, client_order_id, price, amount, filled_amount, status, cycle_id, step)
+            VALUES (10016, 'tp', 'CQB_10016_TP_52_6_FILL', 62500, 0.071, 0.071, 'filled', 52, 6)
+        """)
+        self.conn.commit()
+
+        # Child (bot 100317): SHORT, DB open_qty = 0.0
+        _insert_bot(self.conn, 100317, 'long btc price_hedge', 'BTC/USDC:USDC', 'BTCUSDC', 'SHORT', bot_type='hedge_child', parent_bot_id=10016, status='IN TRADE')
+        _insert_trades(self.conn, 100317, open_qty=0.0, cycle_id=52, current_step=1)
+
+        executor = BotExecutor(runner=None)
+        mock_exchange = MagicMock(spec=ExchangeInterface)
+        mock_exchange.get_symbol_precision.return_value = {'step_size': 0.001}
+        mock_exchange.round_to_step.side_effect = lambda qty, step: round(qty, 3)
+        mock_exchange.fetch_open_orders.return_value = []
+        mock_exchange.get_last_price.return_value = 62500.0
+
+        # Simulate exchange having the parent's actual net position (LONG +0.080, meaning child is flat)
+        mock_exchange.fetch_positions.return_value = [
+            {
+                'symbol': 'BTC/USDC:USDC',
+                'net_qty': 0.080,
+                'contracts': 0.080,
+                'side': 'long'
+            }
+        ]
+
+        bot_status = {'open_qty': 0.0, 'total_invested': 0.0, 'cycle_id': 52, 'current_step': 1}
+        bot_config = {'bot_type': 'hedge_child'}
+
+        with patch.object(mock_exchange, 'create_order') as mock_create:
+            executor.maintain_orders(
+                bot_id=100317,
+                name='long btc price_hedge',
+                pair='BTC/USDC:USDC',
+                direction='SHORT',
+                bot_status=bot_status,
+                current_price=62500.0,
+                exchange=mock_exchange,
+                market_snapshot={'open_orders': []},
+                bot_config=bot_config
+            )
+            # Assert no catch-up order was placed
+            mock_create.assert_not_called()
+
+        # Assert child DB open_qty remains 0.0 (no spurious Live Guard sync)
+        child_trade = self.conn.execute("SELECT open_qty FROM trades WHERE bot_id=100317").fetchone()
+        self.assertEqual(child_trade[0], 0.0)
+
+        # Assert no Live Guard reconciliation markers were inserted in bot_orders
+        recon_count = self.conn.execute(
+            "SELECT COUNT(*) FROM bot_orders WHERE bot_id=100317 AND notes LIKE '%Live-guard%'"
+        ).fetchone()[0]
+        self.assertEqual(recon_count, 0)
+

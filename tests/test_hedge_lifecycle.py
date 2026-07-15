@@ -2187,7 +2187,7 @@ class TestINV29HedgeGates(unittest.TestCase):
         self.conn.commit()
         
         from engine.runner import BotRunner
-        with patch('engine.database.check_and_fix_integrity'), patch('engine.runner.BotRunner._post_init'):
+        with patch('engine.database.check_and_fix_integrity'), patch('engine.runner.startup.StartupMixin._post_init'):
             runner = BotRunner()
         runner.exchanges = {}
         

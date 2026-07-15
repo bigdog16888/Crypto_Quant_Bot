@@ -68,7 +68,7 @@ def main():
     pid = get_runner_pid()
     if not pid:
         print("\n⚠️ [WARNING] No active engine runner process found listening on port 19888!")
-        print("Please start the engine runner using: python engine/runner.py")
+        print("Please start the engine runner using: python engine/run_engine.py")
         sys.exit(2)
         
     start_time = get_process_start_time(pid)
@@ -85,7 +85,7 @@ def main():
         print("\n🛑 [DEPLOY ERROR] OUTDATED CODE RUNNING!")
         print(f"The running process (started {start_dt}) is older than the newest modified file ({newest_dt}).")
         print("Please kill the old process and restart the runner:")
-        print(f"  PowerShell: Stop-Process -Id {pid} -Force; python engine/runner.py")
+        print(f"  PowerShell: Stop-Process -Id {pid} -Force; python engine/run_engine.py")
         sys.exit(3)
         
     print("\n✅ [DEPLOY SUCCESS] Runner process is up-to-date and running the latest code.")

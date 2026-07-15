@@ -787,9 +787,9 @@ Every location that writes `bots.status = 'REQUIRE_MANUAL_PROOF'` is classified 
 | 8 | `engine/reconciler.py` | ~7971 | **(B) Hard-failure** | `ADOPT-LIMIT-EXCEEDED`: would adopt > `MAX_ADOPTION_QTY_PER_CYCLE` |
 | 9 | `engine/reconciler.py` | ~8588 | **(B) Hard-failure** | `PROOF-FAILED`: forensic scan succeeded but gap persists past grace window |
 | 10 | `engine/reconciler.py` | ~8614 | **(B) Hard-failure** | `PROOF-FAILED`: forensic scan raised exception, gap unresolved |
-| 11 | `engine/runner.py` | ~1139 | **(B) Hard-failure** | Exchange close FAILED during pending flatten |
-| 12 | `engine/runner.py` | ~1180 | **(B) Hard-failure** | `safe_wipe_bot` refused after close |
-| 13 | `engine/runner.py` | ~1192 | **(B) Hard-failure** | `safe_wipe_bot` raised exception |
+| 11 | `engine/runner/cycle_loop.py` | 136 | **(B) Hard-failure** | Exchange close FAILED during pending flatten |
+| 12 | `engine/runner/cycle_loop.py` | 178 | **(B) Hard-failure** | `safe_wipe_bot` refused after close |
+| 13 | `engine/runner/cycle_loop.py` | 190 | **(B) Hard-failure** | `safe_wipe_bot` raised exception |
 
 **Rule**: Any new (A) write MUST call `_set_bot_require_manual_proof()` (never raw SQL). Any new (B) write MUST be added to the whitelist in `tests/test_require_proof_writers.py` and this table.
 

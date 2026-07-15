@@ -42,9 +42,9 @@ WHITELIST = [
     # respectively and fire only when the mismatch persists beyond the grace window.
     ("engine/reconciler.py",    8566,  "PROOF-FAILED: forensic scan succeeded but gap persists"),
     ("engine/reconciler.py",    8592,  "PROOF-FAILED: forensic scan raised exception, gap unresolved"),
-    ("engine/runner.py",         885,  "Exchange close FAILED during pending flatten"),
-    ("engine/runner.py",         926,  "safe_wipe_bot refused after close"),
-    ("engine/runner.py",         938,  "safe_wipe_bot raised exception during flatten"),
+    ("engine/runner/cycle_loop.py", 136,  "Exchange close FAILED during pending flatten"),
+    ("engine/runner/cycle_loop.py", 178,  "safe_wipe_bot refused after close"),
+    ("engine/runner/cycle_loop.py", 190,  "safe_wipe_bot raised exception during flatten"),
 ]
 
 RAW_SQL_PATTERN = re.compile(
