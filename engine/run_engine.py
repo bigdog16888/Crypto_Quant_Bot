@@ -10,7 +10,8 @@ import os
 # Add root to sys.path to ensure module resolution
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from engine.runner import BotRunner, SocketLock  # noqa: E402, F401
+from engine.runner import BotRunner  # noqa: E402
+from engine.runner.shutdown import SocketLock  # noqa: E402
 
 if __name__ == "__main__":
     import time

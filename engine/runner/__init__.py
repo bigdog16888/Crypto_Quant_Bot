@@ -4,7 +4,8 @@ Module 1 of 4: ShutdownMixin extracted. All other methods remain here
 in BotRunner's class body until extracted into their own mixin modules.
 
 Import pattern:
-    from engine.runner import BotRunner, SocketLock
+    from engine.runner import BotRunner
+    from engine.runner.shutdown import SocketLock
 """
 
 import time
