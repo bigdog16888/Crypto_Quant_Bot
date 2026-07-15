@@ -2714,6 +2714,7 @@ class BotExecutor:
                             (bot_id,)
                         ).fetchone()
                         child_open_qty = float(child_qty_row[0] or 0.0) if child_qty_row else 0.0
+                        running_child_open_qty = child_open_qty
                         child_cycle_id = int(child_qty_row[1] or 1) if child_qty_row else 1
 
                         # 3. Compute aggregate drift and tolerance
@@ -2778,6 +2779,10 @@ class BotExecutor:
 
                                 child_step_qty = child_filled_qty + child_inflight_qty
                                 delta = parent_step_qty - child_step_qty
+
+                                # --- HEDGE HEADROOM CAP ---
+                                headroom = max(0.0, parent_hedgeable_qty - running_child_open_qty)
+                                delta = min(delta, headroom)
 
                                 if delta > tolerance:
                                     # ── LIVE EXCHANGE GUARD (INV-30) ──
@@ -2866,6 +2871,7 @@ class BotExecutor:
                                                         f"[HEDGE-LIVE-GUARD-INV30] Failed to write DB correction: {_db_fix_err}"
                                                     )
                                                 delta = adjusted_delta
+                                                running_child_open_qty = _corrected_qty
                                     except Exception as _live_guard_err:
                                         logger.warning(
                                             f"[HEDGE-LIVE-GUARD-INV30] Could not fetch live net for {pair}: {_live_guard_err}."

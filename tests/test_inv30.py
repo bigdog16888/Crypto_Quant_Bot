@@ -450,5 +450,90 @@ class TestINV30HedgeReconciliation(unittest.TestCase):
             self.assertAlmostEqual(placed_qty, 503.8)
             self.assertIn('CQB_100318_ENTRY_130_1_CATCHUP', kwargs['params']['newClientOrderId'])
 
+    def test_inv30_headroom_cap_limits_catchup_to_remaining_headroom(self):
+        """INV-30: HEDGE HEADROOM CAP — child already holds most of parent_hedgeable,
+        so the catch-up order is capped at the remaining headroom and never exceeds
+        parent_hedgeable_qty.
+        parent_hedgeable_qty=1000, child holds 900 -> headroom=100.
+        Raw per-step delta=500 -> clamped to min(500,100)=100."""
+        # Parent: open_qty=1000, pre-trigger fills=0 -> parent_hedgeable_qty=1000
+        _insert_bot(self.conn, 10018, 'sui long', 'SUI/USDC:USDC', 'SUIUSDC', 'LONG', hedge_child_bot_id=100318, hedge_trigger_step=7)
+        _insert_trades(self.conn, 10018, open_qty=1000.0, cycle_id=128, current_step=7)
+        # Parent step 7 fill of 500 (so raw per-step delta for child would be 500)
+        self.conn.execute(
+            "INSERT INTO bot_orders (bot_id, order_type, client_order_id, price, amount, filled_amount, status, cycle_id, step) "
+            "VALUES (10018, 'grid', 'CQB_10018_GRID_128_7', 0.68, 500.0, 500.0, 'filled', 128, 7)"
+        )
+        # Child: holds 900 of the 1000 hedgeable (running_child_open_qty=900) but has NO
+        # per-step bot_orders fill at step 1 (child_step_qty=0) -> raw delta = 500 - 0 = 500.
+        _insert_bot(self.conn, 100318, 'sui long_hedge', 'SUI/USDC:USDC', 'SUIUSDC', 'SHORT', bot_type='hedge_child', parent_bot_id=10018, status='IN TRADE')
+        _insert_trades(self.conn, 100318, open_qty=900.0, cycle_id=128, current_step=1)
+        self.conn.commit()
+
+        executor = BotExecutor(runner=None)
+        mock_exchange = MagicMock(spec=ExchangeInterface)
+        mock_exchange.get_symbol_precision.return_value = {'step_size': 0.1}
+        mock_exchange.round_to_step.side_effect = lambda qty, step: round(qty, 1)
+        mock_exchange.fetch_open_orders.return_value = []
+
+        mock_order = {
+            'id': 'EX_CHILD_CAP',
+            'status': 'open',
+            'clientOrderId': 'CQB_100318_ENTRY_128_1_CATCHUP_123456789'
+        }
+        mock_exchange.create_order.return_value = mock_order
+
+        bot_status = {'open_qty': 900.0, 'total_invested': 100.0, 'cycle_id': 128, 'current_step': 1}
+        bot_config = {'bot_type': 'hedge_child'}
+
+        with patch.object(mock_exchange, 'create_order', return_value=mock_order) as mock_create:
+            executor.maintain_orders(
+                bot_id=100318, name='sui long_hedge', pair='SUI/USDC:USDC',
+                direction='SHORT', bot_status=bot_status, current_price=0.68,
+                exchange=mock_exchange, market_snapshot={'open_orders': []}, bot_config=bot_config
+            )
+            mock_create.assert_called_once()
+            args, kwargs = mock_create.call_args
+            placed_qty = args[3]
+            # Raw delta = 500, but headroom = parent_hedgeable - child_open_qty = 1000 - 900 = 100.
+            # Must be clamped to 100, and must never exceed parent_hedgeable_qty (1000).
+            self.assertAlmostEqual(placed_qty, 100.0)
+            self.assertLessEqual(placed_qty, 1000.0)
+
+    def test_inv30_headroom_cap_zero_headroom_no_order(self):
+        """INV-30: HEDGE HEADROOM CAP — child already holds >= parent_hedgeable
+        (headroom=0). delta clamps to 0: no catch-up order placed, no exception,
+        child status left unchanged (IN TRADE)."""
+        _insert_bot(self.conn, 10018, 'sui long', 'SUI/USDC:USDC', 'SUIUSDC', 'LONG', hedge_child_bot_id=100318, hedge_trigger_step=7)
+        _insert_trades(self.conn, 10018, open_qty=1000.0, cycle_id=128, current_step=7)
+        self.conn.execute(
+            "INSERT INTO bot_orders (bot_id, order_type, client_order_id, price, amount, filled_amount, status, cycle_id, step) "
+            "VALUES (10018, 'grid', 'CQB_10018_GRID_128_7', 0.68, 500.0, 500.0, 'filled', 128, 7)"
+        )
+        # Child holds 1000 == parent_hedgeable -> headroom = max(0, 1000-1000) = 0
+        _insert_bot(self.conn, 100318, 'sui long_hedge', 'SUI/USDC:USDC', 'SUIUSDC', 'SHORT', bot_type='hedge_child', parent_bot_id=10018, status='IN TRADE')
+        _insert_trades(self.conn, 100318, open_qty=1000.0, cycle_id=128, current_step=1)
+        self.conn.commit()
+
+        executor = BotExecutor(runner=None)
+        mock_exchange = MagicMock(spec=ExchangeInterface)
+        mock_exchange.get_symbol_precision.return_value = {'step_size': 0.1}
+        mock_exchange.round_to_step.side_effect = lambda qty, step: round(qty, 1)
+        mock_exchange.fetch_open_orders.return_value = []
+
+        bot_status = {'open_qty': 1000.0, 'total_invested': 100.0, 'cycle_id': 128, 'current_step': 1}
+        bot_config = {'bot_type': 'hedge_child'}
+
+        with patch.object(mock_exchange, 'create_order') as mock_create:
+            executor.maintain_orders(
+                bot_id=100318, name='sui long_hedge', pair='SUI/USDC:USDC',
+                direction='SHORT', bot_status=bot_status, current_price=0.68,
+                exchange=mock_exchange, market_snapshot={'open_orders': []}, bot_config=bot_config
+            )
+            # headroom=0 -> delta clamped to 0 -> no order, no error
+            mock_create.assert_not_called()
+            child_bot = self.conn.execute("SELECT status FROM bots WHERE id=100318").fetchone()
+            self.assertEqual(child_bot[0], 'IN TRADE')
+
 if __name__ == '__main__':
     unittest.main()
