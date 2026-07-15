@@ -23,7 +23,15 @@ backlog. Each entry: module, method(s), current direct-test status, notes.
 - `StartupMixin._initialize_safety_baseline` — **UNCOVERED** (direct). Indirect: same.
 
 ## Module 4 — `engine/runner/cycle_loop.py`
-- (to be filled in after extraction)
+- `CycleLoopMixin.run_cycle` — **UNCOVERED** (direct). Indirect: exercised via
+  `test_bot_lifecycle`, `test_hedge_lifecycle`, `test_pending_flatten_handler`,
+  and the full `pytest` run (orchestration path).
+- `CycleLoopMixin._handle_pending_flatten` — **UNCOVERED** (direct). Indirect:
+  `test_pending_flatten_handler` exercises the startup-sync repair path; the
+  in-cycle handler itself is only indirectly covered.
+- `CycleLoopMixin._handle_pending_close` — **UNCOVERED** (direct). Indirect:
+  exercised via `test_bot_lifecycle` close paths.
+- `CycleLoopMixin._process_directive` (if present) — **UNCOVERED** (direct).
 
 ## Module 1 — `engine/runner/shutdown.py`
 - `ShutdownMixin.stop_engine` — **UNCOVERED** (direct). Indirect: exercised via
