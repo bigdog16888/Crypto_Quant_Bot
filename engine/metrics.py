@@ -33,11 +33,13 @@ def export_trade_history(bot_id: int | None = None, format: str = 'csv') -> str:
     try:
         conn = get_connection()
         query = "SELECT * FROM trade_history"
+        params = ()
         if bot_id:
-            query += f" WHERE bot_id = {bot_id}"
+            query += " WHERE bot_id = ?"
+            params = (bot_id,)
         query += " ORDER BY timestamp DESC"
         
-        df = pd.read_sql_query(query, conn)
+        df = pd.read_sql_query(query, conn, params=params)
         conn.close()
         
         if format == 'csv':
