@@ -429,6 +429,22 @@ class ExchangeInterface:
             self.logger.error(f"Closed Orders Fetch Error for {symbol}: {e}")
             return []
 
+    def fetch_ticker(self, symbol: str) -> Optional[dict]:
+        """
+        Wrapper around ccxt raw fetch_ticker.
+        ADDED 2026-07-17: previously callers (bot_executor, database,
+        parity_gates, oneway_netting) called exchange.fetch_ticker() on the
+        ExchangeInterface wrapper, which had NO such method -> AttributeError.
+        6 call sites were silently swallowing it via try/except and falling
+        back to price=0.0 (latent zero-price bug in drift/PnL calcs).
+        Delegate to the raw ccxt object, consistent with every other fetch_* method.
+        """
+        try:
+            return self.exchange.fetch_ticker(symbol)
+        except Exception as e:
+            self.logger.error(f"Ticker Fetch Error for {symbol}: {e}")
+            return None
+
     def fetch_my_trades(self, symbol: str, since: Optional[int] = None, limit: int = 50) -> List[dict]:
         """
         Fetches specific fill details (trades).
