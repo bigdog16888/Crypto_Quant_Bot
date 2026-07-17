@@ -806,10 +806,25 @@ def deflate_pair_ledger_overcount(exchange, pair: str) -> Optional[str]:
         fill_f = float(fill or 0)
         cut = min(fill_f, remaining)
         new_fill = round(fill_f - cut, 8)
-        conn.execute(
-            "UPDATE bot_orders SET filled_amount=?, updated_at=? WHERE id=?",
-            (new_fill, int(time.time()), db_id),
-        )
+        # Rule 10 (§5 A7 RESURRECTED_GHOST): a row whose fill is FULLY neutralized
+        # must be terminal-statused, not left as status='filled' with a trimmed qty.
+        # Otherwise the next seal_trade_state/reconciler cycle re-adopts it as a real
+        # fill and the phantom net resurrects.
+        # Exact-zero (new_fill <= 0), NOT qty_tolerance(): a residual below the pair
+        # tolerance can still be genuine remaining exposure (Rule 10 negative case —
+        # a partially-trimmed row must stay 'filled'), so only a fully-consumed row
+        # is terminal-statused. This matches the codebase's existing
+        # `filled_amount <= 0` / `tp_qty <= 0` exact-zero conventions.
+        if new_fill <= 0:
+            conn.execute(
+                "UPDATE bot_orders SET status='reset_cleared', filled_amount=0, updated_at=? WHERE id=?",
+                (int(time.time()), db_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE bot_orders SET filled_amount=?, updated_at=? WHERE id=?",
+                (new_fill, int(time.time()), db_id),
+            )
         remaining -= cut
         trimmed += cut
         touched_bots.add(bid)
