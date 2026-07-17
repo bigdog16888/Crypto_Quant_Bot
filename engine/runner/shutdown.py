@@ -16,6 +16,7 @@ STRUCTURAL ADAPTATIONS from original engine/runner.py (all flagged, no logic cha
 import json
 import logging
 import os
+import signal
 import socket as _socket_module
 import time
 
@@ -52,11 +53,11 @@ class SocketLock:
             self._socket = None
             return False
 
-    def release(self):
+    def release(self, reason: str = "manual/unknown"):
         if self._socket:
             try:
                 self._socket.close()
-                logger.info(f"🔓 SocketLock released (port {self.port})")
+                logger.info(f"🔓 SocketLock released (port {self.port}) — reason: {reason}")
             except Exception:
                 pass
             self._socket = None
@@ -82,6 +83,12 @@ class ShutdownMixin:
         ADAPTATION: original had 'runner.running = False' (closure var);
         as mixin method this becomes 'self.running = False'.
         """
+        # Record the signal so SocketLock.release() can log the shutdown reason.
+        try:
+            _sig_name = signal.Signals(signum).name
+        except (ValueError, AttributeError):
+            _sig_name = str(signum)
+        self._shutdown_reason = f"signal {signum} ({_sig_name})"
         logger.info(f"Signal {signum} received. Initiating graceful shutdown...")
         # Step 1: Stop WS stream immediately — no new fills can enter the queue.
         try:
@@ -212,4 +219,8 @@ class ShutdownMixin:
         except Exception as _lsts_err:
             logger.warning(f"[SHUTDOWN] Could not write last_shutdown.ts: {_lsts_err}")
 
-        lock.release()
+        # Pass the recorded shutdown reason (signal/exception/manual) so future
+        # restart gaps are unambiguous. Default if nothing recorded.
+        _reason = getattr(self, "_shutdown_reason", None) or (
+            "fast-shutdown" if shutdown_fast else "clean-shutdown-sequence")
+        lock.release(reason=_reason)
