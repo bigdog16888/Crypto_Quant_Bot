@@ -14,8 +14,12 @@ with the exact open items.
 - Ongoing job (Track A, Hermes): continue watching engine.log / active_positions for drift, ghost positions, mismatches. This is continuous, not one-time.
 
 ## Open items
-- [TRACK A / Hermes] auth2015: -2015 on fapiPrivateGetIncome. NARROWED to income/read-permission scope disabled on the API key (NOT IP, NOT invalid key — fetch_positions/fetch_ticker/fetch_my_trades all succeed from same IP+key). Bot NEVER calls it in production. Non-blocking. Operator decides whether to enable the permission in Binance UI. Tagged: opened 2026-07-17 by Hermes.
+- [TRACK A / Hermes] auth2015: -2015 on fapiPrivateGetIncome. NARROWED to income/read-permission scope disabled on the API key (NOT IP, NOT invalid key — fetch_positions/fetch_ticker/fetch_my_trades all succeed from same IP+key). Bot NEVER calls it in production. PARKED — no action; operator's call whether to enable the permission in Binance UI. Tagged: opened 2026-07-17 by Hermes.
 - [Memory store] was in fail-loop 2026-07-17; junk entry cleaned 2026-07-17 (attempt 2). Store now 2,080/2,200, 8 valid entries. No open memory item.
+
+## OS-level redundancy (PENDING operator confirmation — NOT created)
+- Hermes cron = InProcessCronScheduler (60s in-process ticker), NOT Windows Task Scheduler. One-time jobs silently never fire if laptop off. Session-start date-check (scripts/session_start_check.py, tests/test_session_start_check.py) is the AUTHORITATIVE net and is committed + passing.
+- OPTIONAL belt-and-suspenders: register a real Windows Task Scheduler task via `schtasks /create` pointing at a .bat that runs session_start_check.py and appends to PROJECT_STATUS.md. This would fire independent of the Hermes process. PENDING operator risk-tolerance confirmation (creates a persistent OS scheduled task; low risk but persistent). Not done yet.
 
 ## In-progress structural work (TRACK B — SEPARATE TOOL: Cline/Windsurf)
 - engine/runner.py mid-migration to mixin-based package engine/runner/.
