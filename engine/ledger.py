@@ -597,7 +597,35 @@ def _seal_trade_state_internal(
             conn.commit()
     except Exception as _pf_err:
         logger.warning(f"[LEDGER-PREFLIGHT] Bot {bot_id}: pre-flight guard failed (non-fatal): {_pf_err}")
-    # ────────────────────────────────────────────────────────────────────────────
+    # ────────────────────────────────────────────────────────────────────────
+
+    # MECHANISM B FIX: For idle bots transitioning to Scanning, force recompute to only
+    # scan the CURRENT cycle (not older cycles polluted by Mechanism A drift).
+    # Detect this early by checking current cycle_id and whether it has fills.
+    try:
+        conn = get_connection()
+        row_cycle = conn.execute("SELECT cycle_id FROM trades WHERE bot_id = ?", (bot_id,)).fetchone()
+        current_cycle_id = int(row_cycle[0]) if row_cycle and row_cycle[0] is not None else 1
+        
+        # Check if bot has fills in current cycle
+        curr_cycle_fills = conn.execute(
+            "SELECT COUNT(*) FROM bot_orders "
+            "WHERE bot_id = ? AND cycle_id = ? "
+            "AND order_type IN ('entry','grid','adoption','adoption_add','carry') "
+            "AND status IN ('filled','partially_filled','closed','auto_closed','hedge_exited') "
+            "AND filled_amount > 0",
+            (bot_id, current_cycle_id)
+        ).fetchone()
+        has_current_cycle_fills = curr_cycle_fills and curr_cycle_fills[0] > 0
+        
+        # If bot has NO current-cycle fills and will end up flat (idle), 
+        # restrict recompute to current cycle only
+        if not has_current_cycle_fills and cycle_floor is None:
+            # Bot appears idle - force recompute to only scan current cycle
+            cycle_floor = current_cycle_id
+            logger.debug(f"[SEAL] Bot {bot_id}: Idle bot detected (no cycle {current_cycle_id} fills). Restricting recompute to current cycle only.")
+    except Exception as _cf_err:
+        logger.warning(f"[SEAL] Bot {bot_id}: cycle_floor detection warning (non-fatal): {_cf_err}")
 
     try:
         cost, avg, qty, step = recompute_invested_from_orders(bot_id, cycle_floor=cycle_floor)
@@ -810,21 +838,41 @@ def _seal_trade_state_internal(
             ).fetchone()
             now_ts = int(last_fill_row[0]) if (last_fill_row and last_fill_row[0] is not None) else int(time.time())
             
-            # Determine if the last filled order was a TP order
+            # Get the CURRENT cycle_id from trades (the cycle we just sealed)
+            row_cycle = conn.execute("SELECT cycle_id FROM trades WHERE bot_id = ?", (bot_id,)).fetchone()
+            current_cycle_id = int(row_cycle[0]) if row_cycle and row_cycle[0] is not None else 1
+
+            # MECHANISM B FIX: Only increment cycle_id if there are ACTUAL fills in the CURRENT cycle.
+            # Check if there are any filled entry/grid orders in the current cycle_id.
+            # If zero current-cycle fills, the bot is idle - do NOT increment cycle_id.
+            # This prevents drift when Mechanism A put fills in wrong old cycles.
+            curr_cycle_fills = conn.execute(
+                "SELECT COUNT(*) FROM bot_orders "
+                "WHERE bot_id = ? AND cycle_id = ? "
+                "AND order_type IN ('entry','grid','adoption','adoption_add','carry') "
+                "AND status IN ('filled','partially_filled','closed','auto_closed','hedge_exited') "
+                "AND filled_amount > 0",
+                (bot_id, current_cycle_id)
+            ).fetchone()
+            has_current_cycle_fills = curr_cycle_fills and curr_cycle_fills[0] > 0
+
+            # Determine if the last filled order in the CURRENT cycle was a TP
             last_exit_row = conn.execute(
                 "SELECT order_type FROM bot_orders "
-                "WHERE bot_id = ? AND status IN ('filled','partially_filled') "
+                "WHERE bot_id = ? AND cycle_id = ? "
+                "AND status IN ('filled','partially_filled') "
                 "AND filled_amount > 0 AND order_type IS NOT NULL "
                 "ORDER BY created_at DESC, id DESC LIMIT 1",
-                (bot_id,)
+                (bot_id, current_cycle_id)
             ).fetchone()
             last_exit_type = str(last_exit_row[0]).lower() if last_exit_row else None
 
-            # Increment cycle_id and clear cache columns in trades table
-            # Only increment if the bot is actually transitioning from an active state,
-            # and the last exit order was NOT a TP (since reset_bot_after_tp handles TP resets)
-            is_transitioning = curr_status in ('IN TRADE', 'REQUIRE_MANUAL_PROOF') or (prev_row and float(prev_row[0] or 0) > 0.01)
-            should_increment = is_transitioning and last_exit_type != 'tp'
+            # Increment cycle_id ONLY if:
+            # 1. Bot is actually transitioning from active state (IN TRADE or REQUIRE_MANUAL_PROOF)
+            # 2. There ARE fills in the current cycle (bot was actually trading this cycle)
+            # 3. The last exit in current cycle was NOT a TP (TP handled by reset_bot_after_tp)
+            is_transitioning = curr_status in ('IN TRADE', 'REQUIRE_MANUAL_PROOF')
+            should_increment = is_transitioning and has_current_cycle_fills and last_exit_type != 'tp'
 
             if should_increment:
                 conn.execute("""
@@ -836,9 +884,10 @@ def _seal_trade_state_internal(
                         wipe_wall_ts = ?, cycle_start_time = ?
                     WHERE bot_id = ?
                 """, (now_ts, now_ts, bot_id))
-                logger.info(f"🌉 [SEAL-CYCLE-RESET] Bot {bot_id}: Transitioned to flat. Cycle incremented.")
+                logger.info(f"🌉 [SEAL-CYCLE-RESET] Bot {bot_id}: Transitioned to flat. Cycle incremented (had {curr_cycle_fills[0]} current-cycle fills).")
             else:
                 # Ensure wipe_wall_ts and cycle_start_time are set even if not incrementing
+                # But DO NOT increment cycle_id if no current-cycle fills (idle bot)
                 conn.execute("""
                     UPDATE trades 
                     SET total_invested = 0, avg_entry_price = 0, current_step = 0, 
@@ -846,7 +895,13 @@ def _seal_trade_state_internal(
                         entry_order_id = NULL, tp_order_id = NULL, open_qty = 0
                     WHERE bot_id = ?
                 """, (bot_id,))
-                
+                if not has_current_cycle_fills:
+                    logger.info(f"🌉 [SEAL-CYCLE-SKIP] Bot {bot_id}: No current-cycle fills (cycle={current_cycle_id}). Cycle NOT incremented.")
+                elif last_exit_type == 'tp':
+                    logger.info(f"🌉 [SEAL-CYCLE-SKIP] Bot {bot_id}: Last exit was TP in current cycle. Cycle NOT incremented (reset_bot_after_tp handles).")
+                else:
+                    logger.info(f"🌉 [SEAL-CYCLE-SKIP] Bot {bot_id}: Not transitioning from active state (status={curr_status}). Cycle NOT incremented.")
+            
             try:
                 conn.execute("DELETE FROM fill_claims WHERE bot_id = ?", (bot_id,))
             except sqlite3.OperationalError:
