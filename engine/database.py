@@ -4366,16 +4366,20 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None, *, cycle_f
         logger.error(f"Error in recompute_invested_from_orders (bot {bot_id}): {e}")
         return (0.0, 0.0, 0.0, 0)
 
-
 def get_pair_virtual_net(symbol: str) -> float:
     """
     Returns the signed virtual net quantity for a normalized symbol across ALL active bots.
-    Under ADR-006, this is simply the sum of open_qty (direction-adjusted) across active bots,
-    including both standard and hedge_child bots to represent true system-wide virtual net.
+    The `open_qty` column in `trades` is already stored with the correct sign
+    (positive for LONG, negative for SHORT). The original implementation
+    incorrectly applied an additional direction‑based sign flip, which double‑inverted
+    SHORT quantities and produced an inflated virtual net for mixed‑direction
+    pairs.
+    The corrected logic simply sums the raw `open_qty` values.
     """
+    
     from engine.exchange_interface import normalize_symbol
     norm_symbol = normalize_symbol(symbol).upper()
-
+    
     conn = get_connection()
     try:
         rows = conn.execute("""
@@ -4385,13 +4389,8 @@ def get_pair_virtual_net(symbol: str) -> float:
             WHERE b.is_active = 1 AND (b.normalized_pair = ? OR b.pair = ? OR b.normalized_pair = ? OR b.pair = ?)
         """, (norm_symbol, symbol, symbol, norm_symbol)).fetchall()
         
-        net_qty = 0.0
-        for direction, open_qty in rows:
-            qty = float(open_qty)
-            if direction.upper() == 'LONG':
-                net_qty += qty
-            else:
-                net_qty -= qty
+        # Sum the signed open_qty directly; no extra direction handling needed.
+        net_qty = sum(float(open_qty) for _, open_qty in rows)
         return round(net_qty, 8)
     except Exception as e:
         logger.error(f"[get_pair_virtual_net] Error for {symbol}: {e}")

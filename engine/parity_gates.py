@@ -815,11 +815,55 @@ def deflate_pair_ledger_overcount(exchange, pair: str) -> Optional[str]:
         # a partially-trimmed row must stay 'filled'), so only a fully-consumed row
         # is terminal-statused. This matches the codebase's existing
         # `filled_amount <= 0` / `tp_qty <= 0` exact-zero conventions.
+        # NOTE: Previously we marked rows as ``reset_cleared`` unconditionally when
+        # the trimmed ``new_fill`` reached zero. That caused a race where a real fill
+        # reported by Binance (e.g. order 961145669) was cleared before confirming the
+        # exchange state, leaving the DB with ``reset_cleared`` while the exchange still
+        # shows ``filled``.
+        #
+        # Guard: before marking ``reset_cleared`` we verify the order on the live
+        # exchange. If the exchange reports ``filled`` we keep the row as‑is (the
+        # ``credit_fill`` path already recorded the correct values). Only when the
+        # exchange confirms the order does **not** exist or is not filled do we safely
+        # clear the DB row.
         if new_fill <= 0:
-            conn.execute(
-                "UPDATE bot_orders SET status='reset_cleared', filled_amount=0, updated_at=? WHERE id=?",
-                (int(time.time()), db_id),
-            )
+            try:
+                from engine.exchange_interface import ExchangeInterface
+                # Retrieve order identifiers from the DB row before it is overwritten.
+                cur_order = conn.execute(
+                    "SELECT order_id, client_order_id, pair FROM bot_orders WHERE id=?",
+                    (db_id,)
+                ).fetchone()
+                if cur_order:
+                    order_id_val, client_cid, pair = cur_order
+                else:
+                    order_id_val = client_cid = pair = None
+                sym = pair or locals().get('pair')
+                ex = ExchangeInterface()
+                exchange_order = None
+                if order_id_val:
+                    exchange_order = ex.fetch_order(str(order_id_val), sym)
+                elif client_cid:
+                    exchange_order = ex.fetch_order(str(client_cid), sym)
+                if exchange_order and exchange_order.get('status') == 'filled':
+                    logger.info(
+                        f"[PARITY-GATE] Skip reset_cleared for db_id={db_id} \u2013 "
+                        f"order {order_id_val or client_cid} still filled on exchange."
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE bot_orders SET status='reset_cleared', filled_amount=0, updated_at=? WHERE id=?",
+                        (int(time.time()), db_id),
+                    )
+            except Exception as _e_ex:
+                logger.warning(
+                    f"[PARITY-GATE] Exchange guard error while resetting db_id={db_id}: {_e_ex}. "
+                    "Proceeding with reset_cleared."
+                )
+                conn.execute(
+                    "UPDATE bot_orders SET status='reset_cleared', filled_amount=0, updated_at=? WHERE id=?",
+                    (int(time.time()), db_id),
+                )
         else:
             conn.execute(
                 "UPDATE bot_orders SET filled_amount=?, updated_at=? WHERE id=?",
