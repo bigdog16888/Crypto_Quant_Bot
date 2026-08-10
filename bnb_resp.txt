@@ -1,0 +1,19 @@
+  % Total    % Received % Xferd  Average Speed  Time    Time    Time   Current
+                                 Dload  Upload  Total   Spent   Left   Speed
+  0      0   0      0   0      0      0      0                              0100    150 100    150   0      0    702      0                              0100    150 100    150   0      0    697      0                              0100    150 100    150   0      0    693      0                              0
+HTTP/1.1 502 Bad Gateway
+Date: Thu, 06 Aug 2026 00:59:19 GMT
+Content-Type: text/html
+Content-Length: 150
+Connection: keep-alive
+Server: nginx
+Access-Control-Allow-Origin: *
+Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS
+
+<html>
+<head><title>502 Bad Gateway</title></head>
+<body>
+<center><h1>502 Bad Gateway</h1></center>
+<hr><center>nginx</center>
+</body>
+</html>

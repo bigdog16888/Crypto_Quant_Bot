@@ -633,6 +633,7 @@ def _seal_trade_state_internal(
         logger.error(f"[SEAL] recompute_invested_from_orders failed for bot {bot_id}: {e}")
         return {}
     main_open_qty = max(0.0, qty)
+    has_real_position = abs(qty) > 1e-8
 
 
     try:
@@ -887,14 +888,24 @@ def _seal_trade_state_internal(
                 logger.info(f"🌉 [SEAL-CYCLE-RESET] Bot {bot_id}: Transitioned to flat. Cycle incremented (had {curr_cycle_fills[0]} current-cycle fills).")
             else:
                 # Ensure wipe_wall_ts and cycle_start_time are set even if not incrementing
-                # But DO NOT increment cycle_id if no current-cycle fills (idle bot)
-                conn.execute("""
-                    UPDATE trades 
-                    SET total_invested = 0, avg_entry_price = 0, current_step = 0, 
-                        entry_confirmed = 0, cycle_phase = 'IDLE',
-                        entry_order_id = NULL, tp_order_id = NULL, open_qty = 0
-                    WHERE bot_id = ?
-                """, (bot_id,))
+                # Preserve real position if it exists (has_real_position)
+                if has_real_position:
+                    conn.execute("""
+                        UPDATE trades 
+                        SET total_invested = ?, avg_entry_price = ?, current_step = ?, 
+                            entry_confirmed = CASE WHEN ? > 0.01 THEN 1 ELSE 0 END, cycle_phase = 'IDLE',
+                            entry_order_id = NULL, tp_order_id = NULL, open_qty = ?,
+                            wipe_wall_ts = ?, cycle_start_time = ?
+                        WHERE bot_id = ?
+                    """, (cost, avg, step, cost, qty, now_ts, now_ts, bot_id))
+                else:
+                    conn.execute("""
+                        UPDATE trades 
+                        SET total_invested = 0, avg_entry_price = 0, current_step = 0, 
+                            entry_confirmed = 0, cycle_phase = 'IDLE',
+                            entry_order_id = NULL, tp_order_id = NULL, open_qty = 0
+                        WHERE bot_id = ?
+                    """, (bot_id,))
                 if not has_current_cycle_fills:
                     logger.info(f"🌉 [SEAL-CYCLE-SKIP] Bot {bot_id}: No current-cycle fills (cycle={current_cycle_id}). Cycle NOT incremented.")
                 elif last_exit_type == 'tp':

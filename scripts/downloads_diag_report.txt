@@ -1,0 +1,77 @@
+﻿=== Downloads folder diagnostic - CLEAN REPORT (pass 4) ===
+Timestamp: 2026-08-10 09:33:09
+
+--- Per-directory file counts (direct children files only) ---
+     2 files  ap_DragonCenterv2.6.2005.0601_2.6.2005.0601_0xfc56f0a8
+    14 files  daily
+     2 files  Fw_
+     6 files  nanlian
+     2 files  paddleocr_training_data
+    23 files  Telegram Desktop
+    11 files  UD3_02_PCL6_2201a
+     9 files  新增資料夾
+   467 files  [TOP-LEVEL FILES]
+TOTAL direct-child files: 536
+
+RECURSIVE TOTAL FILES: 3999
+MEDIA FILES (recursive): 3319
+
+--- Media files per directory (top 15 dirs) ---
+  3208 media  paddleocr_training_data
+     7 media  Telegram Desktop
+     6 media  nanlian
+     0 media  UD3_02_PCL6_2201a
+     0 media  新增資料夾
+     0 media  daily
+     0 media  Fw_
+     0 media  ap_DragonCenterv2.6.2005.0601_2.6.2005.0601_0xfc56f0a8
+
+--- Largest directories by recursive file count (top 10) ---
+  3210 files  paddleocr_training_data
+   258 files  UD3_02_PCL6_2201a
+    23 files  Telegram Desktop
+    14 files  daily
+    10 files  ap_DragonCenterv2.6.2005.0601_2.6.2005.0601_0xfc56f0a8
+     9 files  新增資料夾
+     6 files  nanlian
+     2 files  Fw_
+
+--- Thumbnail cache ---
+Cache file count: 33
+Cache total size (MB): 205.83
+    81.00 MB  iconcache_48.db
+    62.00 MB  thumbcache_1280.db
+    13.00 MB  iconcache_32.db
+    13.00 MB  thumbcache_256.db
+    12.00 MB  iconcache_16.db
+    11.00 MB  iconcache_256.db
+     4.00 MB  thumbcache_96.db
+     3.00 MB  thumbcache_48.db
+     1.78 MB  iconcache_idx.db
+     1.58 MB  ExplorerStartupLog.etl
+     1.00 MB  thumbcache_32.db
+     1.00 MB  thumbcache_16.db
+     1.00 MB  thumbcache_exif.db
+     0.44 MB  thumbcache_idx.db
+     0.03 MB  ExplorerStartupLog_RunOnce.etl
+     0.00 MB  RecommendationsFilterList.json
+     0.00 MB  thumbcache_2560.db
+     0.00 MB  thumbcache_custom_stream.db
+     0.00 MB  thumbcache_wide_alternate.db
+     0.00 MB  thumbcache_wide.db
+     0.00 MB  thumbcache_sr.db
+     0.00 MB  thumbcache_768.db
+     0.00 MB  iconcache_768.db
+     0.00 MB  iconcache_96.db
+     0.00 MB  iconcache_2560.db
+     0.00 MB  iconcache_1280.db
+     0.00 MB  iconcache_1920.db
+     0.00 MB  iconcache_custom_stream.db
+     0.00 MB  iconcache_wide_alternate.db
+     0.00 MB  thumbcache_1920.db
+     0.00 MB  iconcache_wide.db
+     0.00 MB  iconcache_exif.db
+     0.00 MB  iconcache_sr.db
+
+--- Processes (potential lock/write on Downloads) ---
+Explorer PID: 15124  Responding: True  Threads: 114  WorkingSetMB: 328.2

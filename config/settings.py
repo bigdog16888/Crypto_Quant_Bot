@@ -51,7 +51,7 @@ class Config:
         
         # TESTING MODE (used to bypass/alter production behavior in unit tests)
         self.TESTING_MODE = os.getenv("TESTING_MODE", "False").lower() in ("true", "1")
-
+        
         # 🛡️ SAFETY TOGGLE: Block autonomous execution in production (requires human approval)
         self.REQUIRE_HUMAN_APPROVAL = os.getenv("REQUIRE_HUMAN_APPROVAL", "False").lower() == "true"
         
@@ -80,6 +80,8 @@ class Config:
         self.MAX_ADOPTION_QTY_PER_CYCLE = float(os.getenv("MAX_ADOPTION_QTY_PER_CYCLE", "0.5"))
         # Max quantity allowed to be automatically trimmed/aligned by OWAY_REPAIR (default 50.0)
         self.MAX_OWAY_REPAIR_QTY = float(os.getenv("MAX_OWAY_REPAIR_QTY", "50.0"))
+        # Max USD notional for any auto-repair action (orphan flatten, etc.) — default $5.00
+        self.AUTO_REPAIR_MAX_USD = float(os.getenv("AUTO_REPAIR_MAX_USD", "5.0"))
 
         # ── ADR-005 Phase 3: Proportional Allocation ─────────────────────────────
         # When True: sync_pair_to_exchange() writes trades.open_qty proportionally
@@ -96,7 +98,7 @@ class Config:
         self.PATHS = {
             "PID_FILE": os.path.join(self.ROOT_DIR, "engine.pid"),
             "STOP_FILE": os.path.join(self.ROOT_DIR, "engine.stop"),
-            "EMERGENCY_FILE": os.path.join(self.ROOT_DIR, "engine.emergency"),
+            "EMERGENCY_FILE": os.getenv("EMERGENCY_FILE", os.path.join(self.ROOT_DIR, "engine.emergency")),
             "LOG_FILE": os.path.join(self.ROOT_DIR, "engine.log"),
             "DB_FILE": os.path.join(self.ROOT_DIR, "crypto_bot.db"),
         }

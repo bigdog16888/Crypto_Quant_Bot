@@ -4110,6 +4110,7 @@ def verify_filled_orders_against_exchange(exchange, bot_id: int = None) -> int:
 
 
 def recompute_invested_from_orders(bot_id: int, cycle_id: int = None, *, cycle_floor: int = None) -> tuple:
+    print(f"DEBUG FUNCTION CALLED: bot_id={bot_id}")
     """
     Derive (total_invested, avg_entry_price, current_step) from confirmed filled
     bot_orders for the bot's current cycle using chronological FIFO matching.
@@ -4129,11 +4130,13 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None, *, cycle_f
             return (0.0, 0.0, 0.0, 0)
 
         target_cycle = row_trade[0]
+        print(f"DEBUG target_cycle={{{{target_cycle}}}}")
         if target_cycle is None:
             logger.warning(f"[RECOMPUTE] Bot {bot_id}: cycle_id is NULL. Returning zero to prevent phantom accumulation.")
             return (0.0, 0.0, 0.0, 0)
             
         wall_ts = int(row_trade[2] or 0)
+        print(f"DEBUG wall_ts={{{{wall_ts}}}} target_cycle={{{{target_cycle}}}} cycle_floor={{{{cycle_floor}}}}")
 
         # 🚀 [v3.8.1 HEDGE CHILD DIRECTION AWARENESS]
         # Query bot's direction directly from bots table as the canonical source
@@ -4145,6 +4148,8 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None, *, cycle_f
         # But we must filter by bot_dir (LONG/SHORT) because bot_orders rows are stamped with bot_direction at order creation.
         bot_side = bot_dir if bot_dir in ('LONG', 'SHORT') else (row_trade[3] if (row_trade and row_trade[3]) else 'LONG')
         bot_side = bot_side.upper()
+        # Map bot direction (LONG/SHORT) to order side (BUY/SELL) for position_side filter
+        order_side_filter = 'SELL' if bot_side == 'SHORT' else 'BUY'
 
         # Determine the cycle floor
         if cycle_floor is None:
@@ -4158,7 +4163,7 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None, *, cycle_f
                 WHERE bot_id = ?
                   AND cycle_id < ?
                   AND cycle_id IS NOT NULL
-                  AND (position_side = ? OR position_side IS NULL OR position_side = 'BOTH' OR position_side = '')
+                  AND (position_side = ?) OR position_side IS NULL OR position_side = 'BOTH' OR position_side = '')
                   AND (
                       status IN ('filled', 'closed', 'auto_closed', 'hedge_exited', 'partially_filled')
                       OR (status IN ('canceled', 'cancelled', 'cancelling') AND filled_amount > 0)
@@ -4169,7 +4174,7 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None, *, cycle_f
                 HAVING (entry_qty - exit_qty) > 1e-6
                 ORDER BY cycle_id ASC
                 LIMIT 1
-            """, (bot_id, target_cycle, bot_side, wall_ts, wall_ts))
+            """, (bot_id, target_cycle, order_side_filter, wall_ts, wall_ts))
             row_floor = cursor.fetchone()
             if row_floor:
                 cycle_floor = row_floor[0]
@@ -4195,7 +4200,7 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None, *, cycle_f
               AND bo.order_type IN ('entry', 'grid', 'adoption', 'adoption_add', 'carry')
               AND (? = 0 OR bo.created_at >= ?)
             ORDER BY bo.created_at ASC;
-        """, (bot_id, cycle_floor, target_cycle, bot_side, wall_ts, wall_ts))
+        """, (bot_id, cycle_floor, target_cycle, order_side_filter, wall_ts, wall_ts))
         
         buys = [
             {'step': r[0], 'price': float(r[1]), 'qty': float(r[2])}
@@ -4217,30 +4222,51 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None, *, cycle_f
               AND bo.order_type IN ('adoption_reduce', 'tp', 'close', 'dust_close', 'sl', 'flatten_close')
               AND (? = 0 OR bo.created_at >= ?)
             ORDER BY bo.created_at ASC;
-        """, (bot_id, cycle_floor, target_cycle, bot_side, wall_ts, wall_ts))
+        """, (bot_id, cycle_floor, target_cycle, order_side_filter, wall_ts, wall_ts))
         
         sells = [float(r[0]) for r in cursor.fetchall()]
         total_sold = sum(sells)
 
-        # 3. FIFO Match Exit volume against Entries chronologically
+        # 3. FIFO Match Exit volume against Entries chronologically,
+        #    applying sign based on the bot's side (LONG = positive, SHORT = negative)
         accum_sold = total_sold
+        print(f"DEBUG bot_side={bot_side!r} buys={buys} sells={sells} total_sold={total_sold}")
         active_buys = []
         for b in buys:
-            if accum_sold > 0.0:
-                if b['qty'] <= accum_sold:
-                    accum_sold = round(accum_sold - b['qty'], 8)
+            signed_qty = b['qty'] if bot_side == 'LONG' else -b['qty']
+            if bot_side == 'LONG':
+                if signed_qty <= accum_sold:
+                    accum_sold = round(accum_sold - signed_qty, 8)
                 else:
-                    part_qty = round(b['qty'] - accum_sold, 8)
+                    part_qty = round(signed_qty - accum_sold, 8)
                     active_buys.append({
                         'step': b['step'],
                         'price': b['price'],
                         'qty': part_qty
                     })
                     accum_sold = 0.0
-            else:
-                active_buys.append(b)
+            else:  # SHORT side
+                abs_entry = abs(signed_qty)
+                if accum_sold > 0.0:
+                    if abs_entry <= accum_sold:
+                        accum_sold = round(accum_sold - abs_entry, 8)
+                    else:
+                        remaining = round(abs_entry - accum_sold, 8)
+                        active_buys.append({
+                            'step': b['step'],
+                            'price': b['price'],
+                            'qty': -remaining
+                        })
+                        accum_sold = 0.0
+                else:
+                    active_buys.append({
+                        'step': b['step'],
+                        'price': b['price'],
+                        'qty': signed_qty
+                    })
 
         total_qty = round(sum(ab['qty'] for ab in active_buys), 8)
+        print(f"DEBUG active_buys={active_buys} total_qty={total_qty}")
         
         # 4. Compute Weighted Average of active fills
         if total_qty > 1e-8:
@@ -4254,8 +4280,8 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None, *, cycle_f
                 max_step = _calculate_formula_step(bot_id, total_invested, max_step, cursor, target_cycle)
             
             # 🚀 V3.3.1: WIPE AUDIT INTEGRATION
-            from .reconciler_wipe_audit import _check_recompute_for_suspects
-            suspects = _check_recompute_for_suspects(cursor, bot_id, "")
+            from .reconciler_wipe_audit import check_recompute_for_suspects
+            suspects = check_recompute_for_suspects(cursor, bot_id, "")
             if suspects:
                 logger.debug(
                     f"[WIPE-AUDIT] Bot {bot_id}: {len(suspects)} legacy reset_cleared row(s) "
@@ -4353,8 +4379,8 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None, *, cycle_f
             f"no CARRY fills, no active_positions, no cached avg. Cannot price position."
         )
         # 🚀 V3.3.1: WIPE AUDIT INTEGRATION
-        from .reconciler_wipe_audit import _check_recompute_for_suspects
-        suspects = _check_recompute_for_suspects(cursor, bot_id, "")
+        from .reconciler_wipe_audit import check_recompute_for_suspects
+        suspects = check_recompute_for_suspects(cursor, bot_id, "")
         if suspects:
             logger.debug(
                 f"[WIPE-AUDIT] Bot {bot_id}: {len(suspects)} legacy reset_cleared row(s) "
@@ -4383,17 +4409,14 @@ def get_pair_virtual_net(symbol: str) -> float:
     conn = get_connection()
     try:
         rows = conn.execute("""
-            SELECT COALESCE(t.open_qty, 0.0), COALESCE(t.position_side, 'LONG')
+            SELECT b.direction, COALESCE(t.open_qty, 0.0)
             FROM bots b
             JOIN trades t ON t.bot_id = b.id
             WHERE b.is_active = 1 AND (b.normalized_pair = ? OR b.pair = ? OR b.normalized_pair = ? OR b.pair = ?)
         """, (norm_symbol, symbol, symbol, norm_symbol)).fetchall()
         
-        # Apply sign based on position_side: SHORT = negative, LONG = positive
-        net_qty = sum(
-            float(open_qty) * (-1.0 if pos_side.upper() == 'SHORT' else 1.0)
-            for open_qty, pos_side in rows
-        )
+        # Sum the signed open_qty directly; no extra direction handling needed.
+        net_qty = sum(float(open_qty) for _, open_qty in rows)
         return round(net_qty, 8)
     except Exception as e:
         logger.error(f"[get_pair_virtual_net] Error for {symbol}: {e}")

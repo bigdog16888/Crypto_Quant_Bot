@@ -16,7 +16,8 @@ logger = logging.getLogger(__name__)
 
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DB_PATH = os.path.join(BASE_DIR, "crypto_bot.db")
+# Allow test harness to override DB location via HERMES_TEST_DB env var
+DB_PATH = os.getenv('HERMES_TEST_DB', os.path.join(BASE_DIR, "crypto_bot.db"))
 
 # Thread-local storage for SQLite connections
 # SQLite connections should not be shared across threads
@@ -4110,6 +4111,7 @@ def verify_filled_orders_against_exchange(exchange, bot_id: int = None) -> int:
 
 
 def recompute_invested_from_orders(bot_id: int, cycle_id: int = None, *, cycle_floor: int = None) -> tuple:
+    print(f"DEBUG FUNCTION CALLED: bot_id={bot_id}")
     """
     Derive (total_invested, avg_entry_price, current_step) from confirmed filled
     bot_orders for the bot's current cycle using chronological FIFO matching.
@@ -4129,11 +4131,13 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None, *, cycle_f
             return (0.0, 0.0, 0.0, 0)
 
         target_cycle = row_trade[0]
+        print(f"DEBUG target_cycle={{{{target_cycle}}}}")
         if target_cycle is None:
             logger.warning(f"[RECOMPUTE] Bot {bot_id}: cycle_id is NULL. Returning zero to prevent phantom accumulation.")
             return (0.0, 0.0, 0.0, 0)
             
         wall_ts = int(row_trade[2] or 0)
+        print(f"DEBUG wall_ts={{{{wall_ts}}}} target_cycle={{{{target_cycle}}}} cycle_floor={{{{cycle_floor}}}}")
 
         # 🚀 [v3.8.1 HEDGE CHILD DIRECTION AWARENESS]
         # Query bot's direction directly from bots table as the canonical source
@@ -4145,6 +4149,10 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None, *, cycle_f
         # But we must filter by bot_dir (LONG/SHORT) because bot_orders rows are stamped with bot_direction at order creation.
         bot_side = bot_dir if bot_dir in ('LONG', 'SHORT') else (row_trade[3] if (row_trade and row_trade[3]) else 'LONG')
         bot_side = bot_side.upper()
+        # Map bot direction (LONG/SHORT) to order side (BUY/SELL) for position_side filter
+        order_side_filter = 'SELL' if bot_side == 'SHORT' else 'BUY'
+        # For exit fills, short bots close with BUY side, long bots close with SELL side
+        exit_side_filter = 'BUY' if bot_side == 'SHORT' else 'SELL'
 
         # Determine the cycle floor
         if cycle_floor is None:
@@ -4169,7 +4177,7 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None, *, cycle_f
                 HAVING (entry_qty - exit_qty) > 1e-6
                 ORDER BY cycle_id ASC
                 LIMIT 1
-            """, (bot_id, target_cycle, bot_side, wall_ts, wall_ts))
+            """, (bot_id, target_cycle, order_side_filter, wall_ts, wall_ts))
             row_floor = cursor.fetchone()
             if row_floor:
                 cycle_floor = row_floor[0]
@@ -4195,7 +4203,7 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None, *, cycle_f
               AND bo.order_type IN ('entry', 'grid', 'adoption', 'adoption_add', 'carry')
               AND (? = 0 OR bo.created_at >= ?)
             ORDER BY bo.created_at ASC;
-        """, (bot_id, cycle_floor, target_cycle, bot_side, wall_ts, wall_ts))
+        """, (bot_id, cycle_floor, target_cycle, order_side_filter, wall_ts, wall_ts))
         
         buys = [
             {'step': r[0], 'price': float(r[1]), 'qty': float(r[2])}
@@ -4217,30 +4225,51 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None, *, cycle_f
               AND bo.order_type IN ('adoption_reduce', 'tp', 'close', 'dust_close', 'sl', 'flatten_close')
               AND (? = 0 OR bo.created_at >= ?)
             ORDER BY bo.created_at ASC;
-        """, (bot_id, cycle_floor, target_cycle, bot_side, wall_ts, wall_ts))
+        """, (bot_id, cycle_floor, target_cycle, order_side_filter, wall_ts, wall_ts))
         
         sells = [float(r[0]) for r in cursor.fetchall()]
         total_sold = sum(sells)
 
-        # 3. FIFO Match Exit volume against Entries chronologically
+        # 3. FIFO Match Exit volume against Entries chronologically,
+        #    applying sign based on the bot's side (LONG = positive, SHORT = negative)
         accum_sold = total_sold
+        print(f"DEBUG bot_side={bot_side!r} buys={buys} sells={sells} total_sold={total_sold}")
         active_buys = []
         for b in buys:
-            if accum_sold > 0.0:
-                if b['qty'] <= accum_sold:
-                    accum_sold = round(accum_sold - b['qty'], 8)
+            signed_qty = b['qty'] if bot_side == 'LONG' else -b['qty']
+            if bot_side == 'LONG':
+                if signed_qty <= accum_sold:
+                    accum_sold = round(accum_sold - signed_qty, 8)
                 else:
-                    part_qty = round(b['qty'] - accum_sold, 8)
+                    part_qty = round(signed_qty - accum_sold, 8)
                     active_buys.append({
                         'step': b['step'],
                         'price': b['price'],
                         'qty': part_qty
                     })
                     accum_sold = 0.0
-            else:
-                active_buys.append(b)
+            else:  # SHORT side
+                abs_entry = abs(signed_qty)
+                if accum_sold > 0.0:
+                    if abs_entry <= accum_sold:
+                        accum_sold = round(accum_sold - abs_entry, 8)
+                    else:
+                        remaining = round(abs_entry - accum_sold, 8)
+                        active_buys.append({
+                            'step': b['step'],
+                            'price': b['price'],
+                            'qty': -remaining
+                        })
+                        accum_sold = 0.0
+                else:
+                    active_buys.append({
+                        'step': b['step'],
+                        'price': b['price'],
+                        'qty': signed_qty
+                    })
 
         total_qty = round(sum(ab['qty'] for ab in active_buys), 8)
+        print(f"DEBUG active_buys={active_buys} total_qty={total_qty}")
         
         # 4. Compute Weighted Average of active fills
         if total_qty > 1e-8:
@@ -4254,8 +4283,173 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None, *, cycle_f
                 max_step = _calculate_formula_step(bot_id, total_invested, max_step, cursor, target_cycle)
             
             # 🚀 V3.3.1: WIPE AUDIT INTEGRATION
-            from .reconciler_wipe_audit import _check_recompute_for_suspects
-            suspects = _check_recompute_for_suspects(cursor, bot_id, "")
+            from .reconciler_wipe_audit import check_recompute_for_suspects
+            suspects = check_recompute_for_suspects(cursor, bot_id, "")
+            if suspects:
+                logger.debug(
+                    f"[WIPE-AUDIT] Bot {bot_id}: {len(suspects)} legacy reset_cleared row(s) "
+                    f"without proof snapshots (historical; not an active gap)."
+                )
+            
+            return (total_invested, avg_price, total_qty, max_step)
+
+        # PASS 2: Check for CARRY residues
+        carry_row = cursor.execute("""
+            SELECT COALESCE(SUM(filled_amount), 0.0)
+            FROM bot_orders
+            WHERE bot_id  = ?
+              AND cycle_id = ?
+              AND client_order_id LIKE 'CQB_%'
+              AND client_order_id LIKE '%_CARRY_%'
+              AND filled_amount > 0
+              AND status NOT IN ('open', 'new', 'placing', 'cancelling', 'failed', 'auto_closed', 'reset_cleared')
+        """, (bot_id, target_cycle)).fetchone()
+        carry_qty_val = float(carry_row[0] or 0.0)
+
+        if carry_qty_val <= 1e-8:
+            return (0.0, 0.0, 0.0, 0)  # Truly no position this cycle
+
+        # Compute avg price for carry position
+        # Priority: (1) bot_orders CARRY fills directly, (2) active_positions, (3) trades cache
+        bot_row = cursor.execute(
+            "SELECT pair, direction FROM bots WHERE id = ?", (bot_id,)
+        ).fetchone()
+        if not bot_row:
+            return (0.0, 0.0, 0.0, 0)
+
+        pair, direction = bot_row
+        norm_pair = pair.split(':')[0].replace('/', '')
+        snap_side = 'LONG' if str(direction).upper() == 'LONG' else 'SHORT'
+
+        # ── SOURCE 1: Compute directly from CARRY bot_orders fills (most accurate) ──
+        # Works at startup BEFORE active_positions is populated.
+        carry_price_row = cursor.execute("""
+            SELECT
+                SUM(filled_amount * price) / NULLIF(SUM(filled_amount), 0)
+            FROM bot_orders
+            WHERE bot_id = ?
+              AND cycle_id = ?
+              AND client_order_id LIKE 'CQB_%'
+              AND client_order_id LIKE '%_CARRY_%'
+              AND filled_amount > 0
+              AND price > 0
+              AND status NOT IN ('open', 'new', 'placing', 'cancelling', 'failed', 'auto_closed', 'reset_cleared')
+        """, (bot_id, target_cycle)).fetchone()
+
+        if carry_price_row and carry_price_row[0] and float(carry_price_row[0]) > 0:
+            carry_avg_price = float(carry_price_row[0])
+            carry_cost = carry_qty_val * carry_avg_price
+            logger.info(
+                f"[RECOMPUTE-CARRY] Bot {bot_id} cycle {target_cycle}: "
+                f"CARRY qty={carry_qty_val:.8f} @ avg={carry_avg_price:.4f} "
+                f"(from bot_orders CARRY fills). total_invested={carry_cost:.4f}"
+            )
+            carry_step = _calculate_formula_step(bot_id, carry_cost, 1, cursor, target_cycle)
+            return (carry_cost, carry_avg_price, carry_qty_val, carry_step)
+
+        # ── SOURCE 2: active_positions snapshot (available after prime_startup_snapshot) ──
+        snap_row = cursor.execute(
+            "SELECT entry_price FROM active_positions WHERE pair=? AND side=? AND bot_id=?",
+            (norm_pair, snap_side, bot_id)
+        ).fetchone()
+        if snap_row and float(snap_row[0] or 0) > 0:
+            carry_avg_price = float(snap_row[0])
+            carry_cost = carry_qty_val * carry_avg_price
+            logger.info(
+                f"[RECOMPUTE-CARRY] Bot {bot_id} cycle {target_cycle}: "
+                f"CARRY qty={carry_qty_val:.8f} @ entry_price={carry_avg_price:.4f} "
+                f"(from active_positions). total_invested={carry_cost:.4f}"
+            )
+            carry_step = _calculate_formula_step(bot_id, carry_cost, 1, cursor, target_cycle)
+            return (carry_cost, carry_avg_price, carry_qty_val, carry_step)
+
+        # ── SOURCE 3: Last resort — cached avg from trades row ──
+        cached_avg = cursor.execute(
+            "SELECT avg_entry_price FROM trades WHERE bot_id = ?", (bot_id,)
+        ).fetchone()
+        if cached_avg and float(cached_avg[0] or 0) > 0:
+            carry_avg_price = float(cached_avg[0])
+            carry_cost = carry_qty_val * carry_avg_price
+            logger.warning(
+                f"[RECOMPUTE-CARRY] Bot {bot_id}: CARRY fallback to trades.avg_entry_price={carry_avg_price:.4f} "
+                f"(no CARRY fills or active_positions). qty={carry_qty_val:.8f}, cost={carry_cost:.4f}"
+            )
+            carry_step = _calculate_formula_step(bot_id, carry_cost, 1, cursor, target_cycle)
+            return (carry_cost, carry_avg_price, carry_qty_val, carry_step)
+
+        logger.warning(
+            f"[RECOMPUTE-CARRY] Bot {bot_id}: CARRY qty={carry_qty_val:.8f} — "
+            f"no CARRY fills, no active_positions, no cached avg. Cannot price position."
+        )
+        # 🚀 V3.3.1: WIPE AUDIT INTEGRATION
+        from .reconciler_wipe_audit import check_recompute_for_suspects
+        suspects = check_recompute_for_suspects(cursor, bot_id, "")
+        if suspects:
+            logger.debug(
+                f"[WIPE-AUDIT] Bot {bot_id}: {len(suspects)} legacy reset_cleared row(s) "
+                f"without proof snapshots (historical; not an active gap)."
+            )
+
+        return (0.0, 0.0, 0.0, 0)
+    except Exception as e:
+        logger.error(f"Error in recompute_invested_from_orders (bot {bot_id}): {e}")
+        return (0.0, 0.0, 0.0, 0)
+
+        # 3. FIFO Match Exit volume against Entries chronologically,
+        #    applying sign based on the bot's side (LONG = positive, SHORT = negative)
+        accum_sold = total_sold
+        print(f"DEBUG bot_side={bot_side!r} buys={buys} sells={sells} total_sold={total_sold}")
+        active_buys = []
+        for b in buys:
+            signed_qty = b['qty'] if bot_side == 'LONG' else -b['qty']
+            if bot_side == 'LONG':
+                if signed_qty <= accum_sold:
+                    accum_sold = round(accum_sold - signed_qty, 8)
+                else:
+                    part_qty = round(signed_qty - accum_sold, 8)
+                    active_buys.append({
+                        'step': b['step'],
+                        'price': b['price'],
+                        'qty': part_qty
+                    })
+                    accum_sold = 0.0
+            else:  # SHORT side
+                abs_entry = abs(signed_qty)
+                if accum_sold > 0.0:
+                    if abs_entry <= accum_sold:
+                        accum_sold = round(accum_sold - abs_entry, 8)
+                    else:
+                        remaining = round(abs_entry - accum_sold, 8)
+                        active_buys.append({
+                            'step': b['step'],
+                            'price': b['price'],
+                            'qty': -remaining
+                        })
+                        accum_sold = 0.0
+                else:
+                    active_buys.append({
+                        'step': b['step'],
+                        'price': b['price'],
+                        'qty': signed_qty
+                    })
+
+        total_qty = round(sum(ab['qty'] for ab in active_buys), 8)
+        print(f"DEBUG active_buys={active_buys} total_qty={total_qty}")
+        
+        # 4. Compute Weighted Average of active fills
+        if total_qty > 1e-8:
+            total_cost = sum(ab['qty'] * ab['price'] for ab in active_buys)
+            avg_price = total_cost / total_qty
+            total_invested = total_qty * avg_price
+            max_step = max((ab['step'] or 0) for ab in active_buys) if active_buys else 0
+            
+            # Use formula to check if step needs refinement (e.g. carry trades)
+            if total_invested > 0:
+                max_step = _calculate_formula_step(bot_id, total_invested, max_step, cursor, target_cycle)
+            
+            # 🚀 V3.3.1: WIPE AUDIT INTEGRATION
+            from .reconciler_wipe_audit import check_recompute_for_suspects
+            suspects = check_recompute_for_suspects(cursor, bot_id, "")
             if suspects:
                 logger.debug(
                     f"[WIPE-AUDIT] Bot {bot_id}: {len(suspects)} legacy reset_cleared row(s) "
@@ -4353,8 +4547,8 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None, *, cycle_f
             f"no CARRY fills, no active_positions, no cached avg. Cannot price position."
         )
         # 🚀 V3.3.1: WIPE AUDIT INTEGRATION
-        from .reconciler_wipe_audit import _check_recompute_for_suspects
-        suspects = _check_recompute_for_suspects(cursor, bot_id, "")
+        from .reconciler_wipe_audit import check_recompute_for_suspects
+        suspects = check_recompute_for_suspects(cursor, bot_id, "")
         if suspects:
             logger.debug(
                 f"[WIPE-AUDIT] Bot {bot_id}: {len(suspects)} legacy reset_cleared row(s) "
@@ -4383,17 +4577,14 @@ def get_pair_virtual_net(symbol: str) -> float:
     conn = get_connection()
     try:
         rows = conn.execute("""
-            SELECT COALESCE(t.open_qty, 0.0), COALESCE(t.position_side, 'LONG')
+            SELECT b.direction, COALESCE(t.open_qty, 0.0)
             FROM bots b
             JOIN trades t ON t.bot_id = b.id
             WHERE b.is_active = 1 AND (b.normalized_pair = ? OR b.pair = ? OR b.normalized_pair = ? OR b.pair = ?)
         """, (norm_symbol, symbol, symbol, norm_symbol)).fetchall()
         
-        # Apply sign based on position_side: SHORT = negative, LONG = positive
-        net_qty = sum(
-            float(open_qty) * (-1.0 if pos_side.upper() == 'SHORT' else 1.0)
-            for open_qty, pos_side in rows
-        )
+        # Sum the signed open_qty directly; no extra direction handling needed.
+        net_qty = sum(float(open_qty) for _, open_qty in rows)
         return round(net_qty, 8)
     except Exception as e:
         logger.error(f"[get_pair_virtual_net] Error for {symbol}: {e}")

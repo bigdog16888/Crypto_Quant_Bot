@@ -1,0 +1,25 @@
+  % Total    % Received % Xferd  Average Speed  Time    Time    Time   Current
+                                 Dload  Upload  Total   Spent   Left   Speed
+  0      0   0      0   0      0      0      0                              0100      2 100      2   0      0      7      0                              0100      2 100      2   0      0      7      0                              0100      2 100      2   0      0      7      0                              0
+HTTP/1.1 200 OK
+Date: Thu, 06 Aug 2026 00:59:18 GMT
+Content-Type: application/json
+Content-Length: 2
+Connection: keep-alive
+Server: nginx
+x-mbx-used-weight-1m: 5
+x-response-time: 2ms
+Access-Control-Allow-Origin: *
+Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS
+Access-Control-Allow-Credentials: true
+Access-Control-Allow-Headers: *
+Content-Security-Policy: default-src 'self'
+cache-control: no-cache, no-store, must-revalidate
+expires: 0
+pragma: no-cache
+strict-transport-security: max-age=31536000; includeSubdomains
+x-content-type-options: nosniff
+x-frame-options: SAMEORIGIN
+x-xss-protection: 1; mode=block
+
+[]

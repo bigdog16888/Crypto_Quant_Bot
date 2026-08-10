@@ -95,7 +95,7 @@ def _fetch_fresh_monitor_data():
                        b.strategy_type AS strategy_type, b.config AS config, t.current_step AS current_step, 
                        t.total_invested AS total_invested, t.avg_entry_price AS avg_entry_price, 
                        t.target_tp_price AS target_tp_price, b.is_active AS is_active, b.status AS status, 
-                       b.error AS error, t.basket_start_time AS basket_start_time, 
+                       b.last_error AS error, t.basket_start_time AS basket_start_time, 
                        t.cycle_start_time AS cycle_start_time, t.cycle_phase AS cycle_phase, 
                        t.open_qty AS open_qty, b.bot_type AS bot_type, b.parent_bot_id AS parent_bot_id,
                        b.hedge_child_bot_id AS hedge_child_bot_id,
@@ -326,7 +326,7 @@ def _bot_positions_fragment():
                 hx_sum = df_h_f[(df_h_f['bot_id'] == b_id) & (df_h_f['order_type'] == 'hedge_tp')]['filled_amount'].sum()
                 hedge_amounts[b_id] = max(0.0, h_sum - hx_sum)
 
-        hedged_bot_ids = set(df_h_f[df_h_f['filled_amount'] > 1e-8]['bot_id'].unique())
+        hedged_bot_ids = set(df_h_f[df_h_f['filled_amount'] > 1e-8]['bot_id'].unique()) if not df_h_f.empty else set()
         
         # Pre-calculate physical order counts and lists for health checks
         physical_order_counts = {}

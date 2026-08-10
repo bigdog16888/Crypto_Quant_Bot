@@ -54,9 +54,7 @@ def memory_db():
        
     database.DB_PATH = shared_uri
     database.init_db()
-    import gc
-    gc.collect()
-
+    
     conn = database.get_connection()
     # Apply manual migrations not present in init_db
     try:

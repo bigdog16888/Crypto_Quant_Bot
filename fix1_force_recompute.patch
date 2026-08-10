@@ -1,0 +1,11 @@
+--- a/engine/ledger.py
++++ b/engine/ledger.py
+@@
+-        if not has_current_cycle_fills and cycle_floor is None:
+-            # Bot appears idle - force recompute to only scan current cycle
+-            cycle_floor = current_cycle_id
+-            logger.debug(f"[SEAL] Bot {bot_id}: Idle bot detected (no cycle {current_cycle_id} fills). Restricting recompute to current cycle only.")
++        if not has_current_cycle_fills and cycle_floor is None and not force_recompute:
++            # Bot appears idle - force recompute to only scan current cycle
++            cycle_floor = current_cycle_id
++            logger.debug(f"[SEAL] Bot {bot_id}: Idle bot detected (no cycle {current_cycle_id} fills). Restricting recompute to current cycle only (force_recompute={force_recompute}).")

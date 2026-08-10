@@ -1,0 +1,107 @@
+## Recent CHANGELOG entries
+
+### Config
+
+- `AUTO_REPAIR_ORPHAN_EXCHANGE` (default True on testnet)
+
+### Docs
+
+- `docs/ARCHITECTURE_v3.5.md` (authoritative for parity/heal/maintain)
+- `docs/CHANGELOG.md` (this file)
+
+### Tests
+
+- `tests/test_parity_gates.py` — heal gates, deflate, maintain gate
+
+---
+
+## v3.4.2 — 2026-05-19
+
+- Monitor: Total Invested row, Open Qty column
+
+## v3.4.1 — 2026-05-19
+
+- `startup_repair_mismatched_pairs`, testnet phantom purge
+
+## v3.4.0 — 2026-05-19
+
+- `parity_gates.py`, cycle reset gate, proof flatten, forensic adopt disabled
+
+See `docs/ARCHITECTURE_v3.4.md` for v3.4 design (historical).
+
+
+---
+
+## CODEBASE_GUIDE.md (excerpt)
+# Crypto Quant Bot — AI Agent Codebase Guide
+**Version: 5.3.7 | Last Updated: 2026-07-10**
+
+
+> **READ THIS FIRST** before touching any code. This is the single authoritative guide.
+> It supersedes `UNIFIED_BOT_DOCUMENTATION.md` and all older session notes.
+> **Architecture (current):** `docs/ARCHITECTURE_v3.5.md`
+> **Version history:** `docs/CHANGELOG.md`
+> **Architecture v3.4 (historical):** `docs/ARCHITECTURE_v3.4.md`
+> **Operator steps:** `docs/OPERATOR_MISMATCH_RUNBOOK.md`
+
+---
+
+## 🏗️ High-Level Engine Architecture
+The Crypto Quant Bot uses a **Proof-Only Reconciliation Architecture** (v3.5.0 enforces v3.4 design).
+
+### The Three-Layer State Model
+The engine keeps states aligned across three distinct boundaries:
+
+| Layer | Component | Source of Truth | Sync Guarantee |
+| :--- | :--- | :--- | :--- |
+| **1. Exchange Physical Position** | Binance REST API & Websocket Streams | Actual physical contracts held on the exchange account. | **Authority for Reality**: Read live during manual interventions, startup repairs, and gating checks. |
+| **2. Bot Orders Ledger** | SQLite `bot_orders` table | Direction-signed database ledger of all individual grid, TP, and catch-up order fills. | **Authority for History**: Write-heavy. Appends fills asynchronously from websocket event streams. |
+| **3. Trades Cache** | SQLite `trades` table | Aggregated metrics (`open_qty`, `avg_entry_price`, `total_invested`) for fast reads by the UI and the execution loop. | **Eventually Consistent**: Compu
+
+---
+
+## OPERATOR_MISMATCH_RUNBOOK.md (excerpt)
+# Operator Runbook — Pair Mismatch & MANUAL GATE (v3.5.2)
+
+**Read when:** Global Netting shows `SYSTEM MISMATCH`, bots show `🚨 MANUAL GATE`, or Order Health says `MISSING CRITICAL ORDERS`.
+
+**Architecture:** `docs/ARCHITECTURE_v3.5.md` | **Changelog:** `docs/CHANGELOG.md`
+
+### Pass/fail rule (v3.5)
+
+| UI | Meaning |
+|----|---------|
+| **HEALTHY** | `audit_pair_ledger_vs_exchange()` = **0** mismatched pairs (qty within `PAIR_PARITY_QTY_TOLERANCE`, default 0.002) |
+| **MISMATCH** | One or more pairs outside tolerance — trading on those pairs is gated until repair or proof flatten succeeds |
+
+Dollar columns in the UI are illustrative (`qty × price`). **Decisions are made in contract qty space.**
+
+---
+
+## Your current situation (2026-05-19 logs)
+
+| Pair | Ledger | Exchange | Root cause | Auto-fix |
+|------|--------|----------|------------|----------|
+| **XRP** | +292.1 | **0** | Phantom ledger (`entry`/`grid`/`adoption` rows, position already closed on Binance) | **Yes** — `TESTNET_PURGE_P
+
+---
+
+## Recent Git Commits
+6a92f3a Fix double‑sign bug in get_pair_virtual_net
+9078a3f Phase 2: Add 4-bot cycle_id migration script (dry-run) and Mechanism B regression tests
+e15cfc0 ADR-011 Mechanism B: fix cycle_id drift in seal_trade_state (early cycle_floor restriction + current-cycle-only increment guard)
+f5820f3 Merge fix/socketlock-shutdown-reason: log shutdown reason at SocketLock.release()
+4ea25c2 Add SESSION_LOG.md — factual session record (2026-07-17)
+e50ec20 Log shutdown reason at SocketLock.release() (additive, no behavior change)
+0838a4f Add Windows Task Scheduler redundant net (NET 2) for dated-reminder safety
+9dd7b8d Add tests/test_session_start_check.py — permanent regression test for dated-reminder net
+8beae95 Add scripts/session_start_check.py — reliable dated-reminder safety net
+1156c7a Add scripts/check_model_health.py — Level 1 OpenRouter free-tier health check
+
+
+---
+
+## Settings.py version
+VERSION = "5.3.7"  # v5.3.7: Refactored grid grace age check and cached indicators
+
+---

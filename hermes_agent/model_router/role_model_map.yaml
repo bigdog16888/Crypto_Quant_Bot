@@ -1,0 +1,37 @@
+# Role → model mapping (backend priority: nvidia → openrouter → gemini → nous)
+# All model IDs are taken directly from the live NVIDIA NIM catalog, the verified OpenRouter free list, and the confirmed Nous free list.
+# Gemini entries are placeholders (8 rpm / 200 rpd) – not claimed as verified free models.
+# OpenRouter free‑tier entry: inclusionai/ling-3.0-flash:free
+# Nous free‑tier entries: poolside/laguna-s-2.1:free, tencent/hy3:free
+
+text_generation:
+  - backend: nvidia
+    model_id: google/gemma-4-31b-it                 # high‑quality general LLM
+  - backend: openrouter
+    model_id: inclusionai/ling-3.0-flash:free        # verified free on OpenRouter
+  - backend: gemini
+    model_id: google/gemini-3.6-flash               # placeholder limits (8 rpm / 200 rpd)
+  - backend: nous
+    model_id: poolside/laguna-s-2.1:free            # confirmed free Nous model
+
+code_assist:
+  - backend: nvidia
+    model_id: z-ai/glm-5.2                         # real NVIDIA‑listed model, suitable for coding assistance
+  - backend: openrouter
+    model_id: inclusionai/ling-3.0-flash:free        # free fallback
+  - backend: gemini
+    model_id: google/gemini-3.5-flash-lite           # placeholder limits
+  - backend: nous
+    model_id: tencent/hy3:free                       # confirmed free Nous model
+
+reasoning:
+  - backend: openrouter
+    model_id: openai/gpt-oss-120b                   # Hermes‑core model, proven reliable for reasoning
+  - backend: nvidia
+    model_id: nvidia/nemotron-3-nano-omni-30b-a3b-reasoning  # untested NVIDIA reasoning model (one trial)
+  - backend: openrouter
+    model_id: inclusionai/ling-3.0-flash:free        # free fallback if OpenAI unavailable
+  - backend: gemini
+    model_id: google/gemini-3.6-flash               # placeholder limits
+  - backend: nous
+    model_id: poolside/laguna-s-2.1:free            # confirmed free Nous model

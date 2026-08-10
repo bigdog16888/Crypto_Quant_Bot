@@ -4254,8 +4254,8 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None, *, cycle_f
                 max_step = _calculate_formula_step(bot_id, total_invested, max_step, cursor, target_cycle)
             
             # 🚀 V3.3.1: WIPE AUDIT INTEGRATION
-            from .reconciler_wipe_audit import _check_recompute_for_suspects
-            suspects = _check_recompute_for_suspects(cursor, bot_id, "")
+            from .reconciler_wipe_audit import check_recompute_for_suspects
+            suspects = check_recompute_for_suspects(cursor, bot_id, "")
             if suspects:
                 logger.debug(
                     f"[WIPE-AUDIT] Bot {bot_id}: {len(suspects)} legacy reset_cleared row(s) "
@@ -4353,8 +4353,8 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None, *, cycle_f
             f"no CARRY fills, no active_positions, no cached avg. Cannot price position."
         )
         # 🚀 V3.3.1: WIPE AUDIT INTEGRATION
-        from .reconciler_wipe_audit import _check_recompute_for_suspects
-        suspects = _check_recompute_for_suspects(cursor, bot_id, "")
+        from .reconciler_wipe_audit import check_recompute_for_suspects
+        suspects = check_recompute_for_suspects(cursor, bot_id, "")
         if suspects:
             logger.debug(
                 f"[WIPE-AUDIT] Bot {bot_id}: {len(suspects)} legacy reset_cleared row(s) "
@@ -4383,17 +4383,14 @@ def get_pair_virtual_net(symbol: str) -> float:
     conn = get_connection()
     try:
         rows = conn.execute("""
-            SELECT COALESCE(t.open_qty, 0.0), COALESCE(t.position_side, 'LONG')
+            SELECT b.direction, COALESCE(t.open_qty, 0.0)
             FROM bots b
             JOIN trades t ON t.bot_id = b.id
             WHERE b.is_active = 1 AND (b.normalized_pair = ? OR b.pair = ? OR b.normalized_pair = ? OR b.pair = ?)
         """, (norm_symbol, symbol, symbol, norm_symbol)).fetchall()
         
-        # Apply sign based on position_side: SHORT = negative, LONG = positive
-        net_qty = sum(
-            float(open_qty) * (-1.0 if pos_side.upper() == 'SHORT' else 1.0)
-            for open_qty, pos_side in rows
-        )
+        # Sum the signed open_qty directly; no extra direction handling needed.
+        net_qty = sum(float(open_qty) for _, open_qty in rows)
         return round(net_qty, 8)
     except Exception as e:
         logger.error(f"[get_pair_virtual_net] Error for {symbol}: {e}")

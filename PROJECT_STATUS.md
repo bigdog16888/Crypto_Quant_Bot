@@ -1,5 +1,8 @@
 # PROJECT_STATUS.md — Crypto_Quant_Bot
 
+## MODEL ALERT
+- MODEL ALERT: poolside/laguna-m.1:free (DELEGATION) is MISSING from live list — needs replacement
+
 
 Read this FIRST at the start of every task. Update it at the END of every task.
 NEVER mark anything "done" / "closed" without proof-before-claiming evidence
@@ -108,4 +111,5 @@ newly-live. Keep B (hy3:free) as fallback. Keep laguna-m.1:free delegation
 (no failure evidence). Incumbent demoted to secondary.
 
 ## Model health log
+- [2026-08-07 10:00] ALERTS=1; MODEL ALERT: poolside/laguna-m.1:free (DELEGATION) is MISSING from live list — needs replacement
 - [2026-07-17 13:19] PASS — all configured models present, free, no imminent expiry

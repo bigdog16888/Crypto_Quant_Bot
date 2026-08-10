@@ -4383,17 +4383,14 @@ def get_pair_virtual_net(symbol: str) -> float:
     conn = get_connection()
     try:
         rows = conn.execute("""
-            SELECT COALESCE(t.open_qty, 0.0), COALESCE(t.position_side, 'LONG')
+            SELECT b.direction, COALESCE(t.open_qty, 0.0)
             FROM bots b
             JOIN trades t ON t.bot_id = b.id
             WHERE b.is_active = 1 AND (b.normalized_pair = ? OR b.pair = ? OR b.normalized_pair = ? OR b.pair = ?)
         """, (norm_symbol, symbol, symbol, norm_symbol)).fetchall()
         
-        # Apply sign based on position_side: SHORT = negative, LONG = positive
-        net_qty = sum(
-            float(open_qty) * (-1.0 if pos_side.upper() == 'SHORT' else 1.0)
-            for open_qty, pos_side in rows
-        )
+        # Sum the signed open_qty directly; no extra direction handling needed.
+        net_qty = sum(float(open_qty) for _, open_qty in rows)
         return round(net_qty, 8)
     except Exception as e:
         logger.error(f"[get_pair_virtual_net] Error for {symbol}: {e}")

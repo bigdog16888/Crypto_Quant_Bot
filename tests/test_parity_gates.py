@@ -15,6 +15,7 @@ from engine.parity_gates import (
     gate_heal_exit_without_entry,
     deflate_pair_ledger_overcount,
     pair_parity_ok,
+    _orphan_repair_allowed,
 )
 
 

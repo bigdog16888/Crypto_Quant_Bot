@@ -42,6 +42,45 @@ def forensic_adopt_allowed() -> bool:
     return bool(getattr(config, 'ALLOW_FORENSIC_ADOPT', False))
 
 
+def _orphan_repair_allowed(exchange, pair: str) -> Tuple[bool, str]:
+    """
+    Layer 4: Centralized, auditable guard for orphan exchange repair.
+    Returns (allowed, reason). All conditions must pass for repair to proceed.
+    """
+    # 1. Config toggle
+    if not getattr(config, 'AUTO_REPAIR_ORPHAN_EXCHANGE', False):
+        return False, "AUTO_REPAIR_ORPHAN_EXCHANGE=False"
+    
+    # 2. USD notional ceiling (Layer 1)
+    physical = get_exchange_signed_net(exchange, pair)
+    if physical is None:
+        return False, "exchange position unavailable"
+    try:
+        ticker = exchange.fetch_ticker(pair)
+        mark_price = float(ticker.get('last') or ticker.get('markPrice') or 0.0)
+        if mark_price <= 0:
+            return False, "mark price unavailable"
+        notional = abs(physical) * mark_price
+        ceiling = getattr(config, 'AUTO_REPAIR_MAX_USD', 5.0)
+        if notional > ceiling:
+            return False, f"notional ${notional:.2f} > AUTO_REPAIR_MAX_USD ${ceiling}"
+    except Exception as e:
+        return False, f"price fetch failed: {e}"
+    
+    # 3. REQUIRE_MANUAL_PROOF exclusion (Layer 2)
+    from engine.database import get_connection
+    conn = get_connection()
+    norm = normalize_symbol(pair).upper()
+    gated_bots = conn.execute(
+        "SELECT id FROM bots WHERE is_active=1 AND status='REQUIRE_MANUAL_PROOF' AND (normalized_pair=? OR pair=?)",
+        (norm, norm)
+    ).fetchall()
+    if gated_bots:
+        return False, f"bots {[b[0] for b in gated_bots]} require manual proof"
+    
+    return True, ""
+
+
 def get_bot_signed_contribution(bot_id: int) -> float:
     """Signed virtual qty this bot contributes to pair netting."""
     from engine.database import get_connection, recompute_invested_from_orders
@@ -1017,11 +1056,10 @@ def repair_exchange_orphan_when_ledger_flat(
     Exchange is flattened to match the proof ledger (ledger is authoritative).
     Adoption into a wiped cycle is not used — it cannot affect get_pair_virtual_net.
     """
-    if not getattr(config, 'AUTO_REPAIR_ORPHAN_EXCHANGE', False):
-        logger.error(
-            f"🚨 [ORPHAN-EXCHANGE] {pair}: ledger={virtual:.6f} exchange={physical:.6f}. "
-            f"Enable AUTO_REPAIR_ORPHAN_EXCHANGE or flatten manually."
-        )
+    # Layer 4: Centralized guard with redundant checks
+    allowed, reason = _orphan_repair_allowed(exchange, pair)
+    if not allowed:
+        logger.error(f"🚨 [ORPHAN-EXCHANGE-BLOCKED] {pair}: {reason}")
         return None
 
     tol = qty_tolerance()
@@ -1093,7 +1131,7 @@ def reconcile_pair_to_exchange(exchange, pair: str) -> Optional[str]:
     Single pair repair: deflate over-count, flatten orphan exchange, or purge phantom ledger.
     Returns action message or None if already in parity.
     """
-    from engine.database import get_pair_virtual_net
+    from engine.database import get_pair_virtual_net, get_connection
 
     tol = qty_tolerance()
     virtual = get_pair_virtual_net(pair)
@@ -1108,6 +1146,16 @@ def reconcile_pair_to_exchange(exchange, pair: str) -> Optional[str]:
         return msg if ok else None
 
     if abs(virtual) <= tol and abs(physical) > tol:
+        # Layer 2: REQUIRE_MANUAL_PROOF exclusion at reconcile level too
+        conn = get_connection()
+        norm = normalize_symbol(pair).upper()
+        gated_bots = conn.execute(
+            "SELECT id FROM bots WHERE is_active=1 AND status='REQUIRE_MANUAL_PROOF' AND (normalized_pair=? OR pair=?)",
+            (norm, norm)
+        ).fetchall()
+        if gated_bots:
+            logger.warning(f"[REPAIR-SKIPPED] {pair}: bots {[b[0] for b in gated_bots]} are REQUIRE_MANUAL_PROOF — skipping orphan repair.")
+            return None
         return repair_exchange_orphan_when_ledger_flat(exchange, pair, virtual, physical)
 
     if _same_sign_qty(virtual, physical, tol) and abs(virtual) > abs(physical) + 1e-12:
@@ -1222,7 +1270,7 @@ def startup_repair_mismatched_pairs(exchange) -> Dict[str, Any]:
     """
     Run after CQB history scan: purge phantom ledgers (exchange flat), re-audit.
     """
-    from engine.database import audit_pair_ledger_vs_exchange, flag_pair_ledger_mismatch
+    from engine.database import audit_pair_ledger_vs_exchange, flag_pair_ledger_mismatch, get_connection
 
     summary: Dict[str, Any] = {
         'purged': [], 'deflated': [], 'orphan_repaired': [], 'remaining': [],
@@ -1231,8 +1279,19 @@ def startup_repair_mismatched_pairs(exchange) -> Dict[str, Any]:
         return summary
 
     tol = qty_tolerance()
+    conn = get_connection()
     mismatches = audit_pair_ledger_vs_exchange(exchange, qty_tolerance())
     for pair, virtual, physical, delta in mismatches:
+        # Layer 2: REQUIRE_MANUAL_PROOF exclusion — skip ALL auto-repair for gated bots
+        norm = normalize_symbol(pair).upper()
+        gated_bots = conn.execute(
+            "SELECT id FROM bots WHERE is_active=1 AND status='REQUIRE_MANUAL_PROOF' AND (normalized_pair=? OR pair=?)",
+            (norm, norm)
+        ).fetchall()
+        if gated_bots:
+            logger.warning(f"[REPAIR-SKIPPED] {pair}: bots {[b[0] for b in gated_bots]} are REQUIRE_MANUAL_PROOF — skipping ALL auto-repair.")
+            continue
+        
         msg = reconcile_pair_to_exchange(exchange, pair)
         if not msg:
             continue

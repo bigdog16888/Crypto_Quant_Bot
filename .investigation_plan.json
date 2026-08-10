@@ -1,0 +1,91 @@
+{
+  "goal": "Refactor 7 engine modules (Group A) to route all direct DB writes through WriteQueue singleton per INV-31",
+  "steps": [
+    {
+      "step_num": 1,
+      "description": "Read all 7 Group A modules and identify every direct DB write to trades/bot_orders tables",
+      "tool_hint": "read_file + grep",
+      "depends_on": [],
+      "stop_condition": "Found all write sites in all 7 modules",
+      "max_retries": 2
+    },
+    {
+      "step_num": 2,
+      "description": "Read WriteQueue singleton API (write_queue.py) and ledger.py patterns to understand correct WriteQueue usage",
+      "tool_hint": "read_file",
+      "depends_on": [],
+      "stop_condition": "Understand put() vs put_and_wait() semantics and ledger.credit_fill/seal_trade_state patterns",
+      "max_retries": 2
+    },
+    {
+      "step_num": 3,
+      "description": "Map coupling: for each write site, determine if it can use existing ledger functions or needs new WriteQueue-wrapped function",
+      "tool_hint": "analysis",
+      "depends_on": [
+        1,
+        2
+      ],
+      "stop_condition": "Complete mapping table: module -> write site -> target function (existing or new)",
+      "max_retries": 2
+    },
+    {
+      "step_num": 4,
+      "description": "Analyze ws_event_handlers.py's private _db_write_queue \u2014 design unification into WriteQueue singleton",
+      "tool_hint": "read_file + analysis",
+      "depends_on": [
+        1,
+        2
+      ],
+      "stop_condition": "Clear design: how to replace queue.Queue with WriteQueue without changing WS event semantics",
+      "max_retries": 2
+    },
+    {
+      "step_num": 5,
+      "description": "Design new WriteQueue-wrapped functions in database.py or ledger.py for write patterns not covered by existing API",
+      "tool_hint": "analysis",
+      "depends_on": [
+        3
+      ],
+      "stop_condition": "List of new functions needed with signatures and which modules will call them",
+      "max_retries": 2
+    },
+    {
+      "step_num": 6,
+      "description": "Verify RULE #0 (one-way mode) and invariants \u2014 ensure no refactor breaks exchange-first ordering or atomicity",
+      "tool_hint": "read_file (AGENTS.md, invariants)",
+      "depends_on": [
+        3,
+        4,
+        5
+      ],
+      "stop_condition": "Confirmed: all new paths respect INV-15, INV-31, RULE #0",
+      "max_retries": 2
+    },
+    {
+      "step_num": 7,
+      "description": "Create implementation plan per module (7 sub-plans) with exact diffs to apply, in dependency order",
+      "tool_hint": "synthesis",
+      "depends_on": [
+        3,
+        4,
+        5,
+        6
+      ],
+      "stop_condition": "7 module-specific plans ready for conductor fan-out",
+      "max_retries": 2
+    }
+  ],
+  "stop_conditions": [
+    "Cannot explain a discrepancy within 3 checks",
+    "No new information after 2 retries of same approach",
+    "Contradictory evidence that can't be resolved",
+    "Any module has write pattern that cannot be safely routed through WriteQueue"
+  ],
+  "escalate_conditions": [
+    "Need user decision on trade-off (e.g., performance vs correctness for high-frequency writes)",
+    "External dependency unavailable (exchange_interface/recovery design review needed)",
+    "Safety boundary reached (pre-placement guard, test-DB isolation guard)"
+  ],
+  "created_at": "2026-08-07T15:32:29.776193",
+  "status": "planned"
+}

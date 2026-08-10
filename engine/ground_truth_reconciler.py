@@ -5,6 +5,9 @@ from config.settings import config
 
 logger = logging.getLogger("GroundTruthReconciler")
 
+# Import WriteQueue for all database write operations
+from engine.write_queue import WriteQueue
+
 class GroundTruthReconciler:
     """
     INV-31: Continuous physical-vs-virtual reconciliation.
@@ -298,150 +301,176 @@ class GroundTruthReconciler:
         return result
 
     def _refresh_active_positions(self, positions, conn):
-        """
-        Refresh active_positions table to mirror the exchange reality.
-        """
-        from engine.exchange_interface import normalize_symbol
-        from engine.database import (
-            get_pair_virtual_net,
-            recompute_invested_from_orders,
-            get_active_bot_id_by_symbol_direction
-        )
-        try:
-            conn.execute("DELETE FROM active_positions")
-            agg_positions = {}
-            for p in (positions or []):
-                raw_symbol = p.get('symbol', 'UNKNOWN')
-                symbol = normalize_symbol(raw_symbol)
-                amount = float(p.get('contracts', 0) or p.get('size', 0) or p.get('positionAmt', 0) or 0)
-                entry_price = float(p.get('entryPrice', 0) or 0)
-                if abs(amount) == 0:
-                    continue
+            """
+            Refresh active_positions table to mirror the exchange reality.
+            """
+            from engine.exchange_interface import normalize_symbol
+            from engine.database import (
+                get_pair_virtual_net,
+                recompute_invested_from_orders,
+                get_active_bot_id_by_symbol_direction
+            )
+            try:
+                # Delete all active_positions via WriteQueue
+                def _delete_active_positions(c):
+                    c.execute("DELETE FROM active_positions")
+            
+                WriteQueue().put_and_wait(_delete_active_positions)
+            
+                agg_positions = {}
+                for p in (positions or []):
+                    raw_symbol = p.get('symbol', 'UNKNOWN')
+                    symbol = normalize_symbol(raw_symbol)
+                    amount = float(p.get('contracts', 0) or p.get('size', 0) or p.get('positionAmt', 0) or 0)
+                    entry_price = float(p.get('entryPrice', 0) or 0)
+                    if abs(amount) == 0:
+                        continue
 
-                side = 'LONG' if amount > 0 else 'SHORT'
-                key = (symbol, side)
-                if key not in agg_positions:
-                    agg_positions[key] = {'size': 0.0, 'value': 0.0}
-                agg_positions[key]['size'] += abs(amount)
-                agg_positions[key]['value'] += abs(amount) * abs(entry_price)
+                    side = 'LONG' if amount > 0 else 'SHORT'
+                    key = (symbol, side)
+                    if key not in agg_positions:
+                        agg_positions[key] = {'size': 0.0, 'value': 0.0}
+                    agg_positions[key]['size'] += abs(amount)
+                    agg_positions[key]['value'] += abs(amount) * abs(entry_price)
 
-            ts = int(time.time())
-            for (symbol, side), data in agg_positions.items():
-                v_net = get_pair_virtual_net(symbol)
+                ts = int(time.time())
+                for (symbol, side), data in agg_positions.items():
+                    v_net = get_pair_virtual_net(symbol)
 
-                # Fetch active bots
-                cursor = conn.execute("""
-                    SELECT b.id, b.direction, t.avg_entry_price
-                    FROM bots b JOIN trades t ON b.id = t.bot_id
-                    WHERE b.is_active = 1 AND (b.pair = ? OR b.normalized_pair = ?)
-                """, (symbol, symbol))
-                bots = cursor.fetchall()
+                    # Fetch active bots
+                    cursor = conn.execute("""
+                        SELECT b.id, b.direction, t.avg_entry_price
+                        FROM bots b JOIN trades t ON b.id = t.bot_id
+                        WHERE b.is_active = 1 AND (b.pair = ? OR b.normalized_pair = ?)
+                    """, (symbol, symbol))
+                    bots = cursor.fetchall()
 
-                bot_shares = []
-                for b_id, b_dir, b_avg in bots:
-                    _, _, net_qty, _ = recompute_invested_from_orders(b_id)
-                    share_qty = max(0.0, net_qty)
-                    bot_shares.append({'id': b_id, 'dir': b_dir.upper(), 'qty': share_qty, 'avg': float(b_avg or 0)})
+                    bot_shares = []
+                    for b_id, b_dir, b_avg in bots:
+                        _, _, net_qty, _ = recompute_invested_from_orders(b_id)
+                        share_qty = max(0.0, net_qty)
+                        bot_shares.append({'id': b_id, 'dir': b_dir.upper(), 'qty': share_qty, 'avg': float(b_avg or 0)})
 
-                ph_net = data['size'] if side == 'LONG' else -data['size']
-                if abs(v_net - ph_net) < 0.001:
-                    for share in bot_shares:
-                        if share['qty'] > 0:
-                            conn.execute("""
+                    ph_net = data['size'] if side == 'LONG' else -data['size']
+                    if abs(v_net - ph_net) < 0.001:
+                        for share in bot_shares:
+                            if share['qty'] > 0:
+                                def _insert_active_positions(c, bot_id, pair, side, size, entry_price, ts):
+                                    c.execute("""
+                                        INSERT INTO active_positions (bot_id, pair, side, size, entry_price, last_checked)
+                                        VALUES (?, ?, ?, ?, ?, ?)
+                                    """, (bot_id, pair, side, size, entry_price, ts))
+                            
+                                WriteQueue().put_and_wait(
+                                    _insert_active_positions, 
+                                    share['id'], symbol, share['dir'], share['qty'], share['avg'], ts
+                                )
+                    else:
+                        avg_price = data['value'] / data['size'] if data['size'] > 0 else 0
+                        owner_id = get_active_bot_id_by_symbol_direction(symbol, side) or 0
+                        def _insert_active_positions_mismatch(c, owner_id, symbol, side, size, avg_price, ts):
+                            c.execute("""
                                 INSERT INTO active_positions (bot_id, pair, side, size, entry_price, last_checked)
                                 VALUES (?, ?, ?, ?, ?, ?)
-                            """, (share['id'], symbol, share['dir'], share['qty'], share['avg'], ts))
-                else:
-                    avg_price = data['value'] / data['size'] if data['size'] > 0 else 0
-                    owner_id = get_active_bot_id_by_symbol_direction(symbol, side) or 0
-                    conn.execute("""
-                        INSERT INTO active_positions (bot_id, pair, side, size, entry_price, last_checked)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                    """, (owner_id, symbol, side, data['size'], avg_price, ts))
+                            """, (owner_id, symbol, side, size, avg_price, ts))
+                    
+                        WriteQueue().put_and_wait(
+                            _insert_active_positions_mismatch,
+                            owner_id, symbol, side, data['size'], avg_price, ts
+                        )
 
-            if not agg_positions:
-                conn.execute("""
-                    INSERT INTO active_positions (bot_id, pair, side, size, entry_price, last_checked)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """, (0, 'GLOBAL', 'FLAT', 0.0, 0.0, ts))
-
-            conn.commit()
-        except Exception as e:
-            logger.error(f"[GTR] Failed to refresh active_positions: {e}")
+                if not agg_positions:
+                    def _insert_global_flat(c, ts):
+                        c.execute("""
+                            INSERT INTO active_positions (bot_id, pair, side, size, entry_price, last_checked)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                        """, (0, 'GLOBAL', 'FLAT', 0.0, 0.0, ts))
+                
+                    WriteQueue().put_and_wait(_insert_global_flat, ts)
+            except Exception as e:
+                logger.error(f"[GTR] Failed to refresh active_positions: {e}")
 
     def _heal_ghost_virtual(self, bot_id, name, cycle_id, conn):
-        """
-        Physical position is gone but virtual ledger still shows it.
-        Force-zero the ledger and reset to Scanning.
-        """
-        logger.critical(
-            f"[GTR-INV31] GHOST_VIRTUAL: Bot {name} ({bot_id}) "
-            f"has virtual position but physical=0 and no open orders. "
-            f"Force-resetting ledger to Scanning."
-        )
-        conn.execute("""
-            UPDATE trades SET 
-                open_qty=0, total_invested=0, avg_entry_price=0,
-                current_step=0, entry_confirmed=0,
-                cycle_id = cycle_id + 1
-            WHERE bot_id=?
-        """, (bot_id,))
-        conn.execute(
-            "UPDATE bots SET status='Scanning', cascade_started_at=0 WHERE id=?", (bot_id,)
-        )
-        conn.execute("""
-            UPDATE bot_orders SET status='reset_cleared', updated_at=?
-            WHERE bot_id=? AND cycle_id=?
-            AND status NOT IN ('reset_cleared','auto_closed','filled','cancelled')
-        """, (int(time.time()), bot_id, cycle_id))
-        conn.commit()
-        logger.warning(
-            f"[GTR-INV31] Bot {name} ({bot_id}): Ghost virtual cleared. "
-            f"cycle_id incremented to {cycle_id+1}. Status → Scanning."
-        )
+            """
+            Physical position is gone but virtual ledger still shows it.
+            Force-zero the ledger and reset to Scanning.
+            """
+            logger.critical(
+                f"[GTR-INV31] GHOST_VIRTUAL: Bot {name} ({bot_id}) "
+                f"has virtual position but physical=0 and no open orders. "
+                f"Force-resetting ledger to Scanning."
+            )
+        
+            def _heal_ghost_virtual_internal(c, bot_id, cycle_id):
+                c.execute("""
+                    UPDATE trades SET 
+                        open_qty=0, total_invested=0, avg_entry_price=0,
+                        current_step=0, entry_confirmed=0,
+                        cycle_id = cycle_id + 1
+                    WHERE bot_id=?
+                """, (bot_id,))
+                c.execute(
+                    "UPDATE bots SET status='Scanning', cascade_started_at=0 WHERE id=?", (bot_id,)
+                )
+                c.execute("""
+                    UPDATE bot_orders SET status='reset_cleared', updated_at=?
+                    WHERE bot_id=? AND cycle_id=?
+                    AND status NOT IN ('reset_cleared','auto_closed','filled','cancelled')
+                """, (int(time.time()), bot_id, cycle_id))
+        
+            WriteQueue().put_and_wait(_heal_ghost_virtual_internal, bot_id, cycle_id)
+        
+            logger.warning(
+                f"[GTR-INV31] Bot {name} ({bot_id}): Ghost virtual cleared. "
+                f"cycle_id incremented to {cycle_id+1}. Status → Scanning."
+            )
 
     def _heal_stuck_cascade(self, bot_id, name, status, open_qty,
-                             norm_pair, exchange, conn):
-        """
-        Bot has been in a transitional cascade status for > CASCADE_TIMEOUT.
-        Re-trigger the appropriate completion.
-        """
-        logger.critical(
-            f"[GTR-INV31] STUCK_CASCADE: Bot {name} ({bot_id}) "
-            f"has been in '{status}' for >{self.CASCADE_TIMEOUT}s. "
-            f"Re-triggering cascade completion."
-        )
-        if status in ('pending_close', 'FLATTENING') and open_qty <= 0.001:
-            # Position already closed, just needs DB reset
-            from engine.database import reset_bot_after_tp
-            reset_bot_after_tp(bot_id, exit_price=0.0, 
-                               action_label='GTR_STUCK_CASCADE_RECOVERY')
-            logger.warning(
-                f"[GTR-INV31] Bot {name}: pending_close with open_qty=0. "
-                f"Forced reset_bot_after_tp. Status → Scanning."
+                                 norm_pair, exchange, conn):
+            """
+            Bot has been in a transitional cascade status for > CASCADE_TIMEOUT.
+            Re-trigger the appropriate completion.
+            """
+            logger.critical(
+                f"[GTR-INV31] STUCK_CASCADE: Bot {name} ({bot_id}) "
+                f"has been in '{status}' for >{self.CASCADE_TIMEOUT}s. "
+                f"Re-triggering cascade completion."
             )
-        elif status == 'pending_hedge_close' and open_qty <= 0.001:
-            # Parent waiting for child that already closed
-            conn.execute(
-                "UPDATE bots SET status='Scanning', cascade_started_at=0 WHERE id=?", (bot_id,)
-            )
-            conn.execute("""
-                UPDATE trades SET cycle_id=cycle_id+1, current_step=0,
-                open_qty=0, total_invested=0, avg_entry_price=0,
-                entry_confirmed=0 WHERE bot_id=?
-            """, (bot_id,))
-            conn.commit()
-            logger.warning(
-                f"[GTR-INV31] Bot {name}: pending_hedge_close with open_qty=0. "
-                f"Forced Scanning reset. cycle_id incremented."
-            )
-        elif status in ('pending_close', 'FLATTENING') and open_qty > 0.001:
-            # Position still exists — re-trigger flatten
-            logger.warning(
-                f"[GTR-INV31] Bot {name}: stuck {status} with open_qty={open_qty}. "
-                f"Setting pending_flatten for runner to re-execute close."
-            )
-            conn.execute(
-                "UPDATE bots SET status='pending_flatten', cascade_started_at=? WHERE id=?", (int(time.time()), bot_id)
-            )
-            conn.commit()
+            if status in ('pending_close', 'FLATTENING') and open_qty <= 0.001:
+                # Position already closed, just needs DB reset
+                from engine.database import reset_bot_after_tp
+                reset_bot_after_tp(bot_id, exit_price=0.0, 
+                                   action_label='GTR_STUCK_CASCADE_RECOVERY')
+                logger.warning(
+                    f"[GTR-INV31] Bot {name}: pending_close with open_qty=0. "
+                    f"Forced reset_bot_after_tp. Status → Scanning."
+                )
+            elif status == 'pending_hedge_close' and open_qty <= 0.001:
+                # Parent waiting for child that already closed
+                def _reset_hedge_close(c, bot_id):
+                    c.execute(
+                        "UPDATE bots SET status='Scanning', cascade_started_at=0 WHERE id=?", (bot_id,)
+                    )
+                    c.execute("""
+                        UPDATE trades SET cycle_id=cycle_id+1, current_step=0,
+                        open_qty=0, total_invested=0, avg_entry_price=0,
+                        entry_confirmed=0 WHERE bot_id=?
+                    """, (bot_id,))
+            
+                WriteQueue().put_and_wait(_reset_hedge_close, bot_id)
+                logger.warning(
+                    f"[GTR-INV31] Bot {name}: pending_hedge_close with open_qty=0. "
+                    f"Forced Scanning reset. cycle_id incremented."
+                )
+            elif status in ('pending_close', 'FLATTENING') and open_qty > 0.001:
+                # Position still exists — re-trigger flatten
+                logger.warning(
+                    f"[GTR-INV31] Bot {name}: stuck {status} with open_qty={open_qty}. "
+                    f"Setting pending_flatten for runner to re-execute close."
+                )
+                def _set_pending_flatten(c, bot_id, ts):
+                    c.execute(
+                        "UPDATE bots SET status='pending_flatten', cascade_started_at=? WHERE id=?", (ts, bot_id)
+                    )
+            
+                WriteQueue().put_and_wait(_set_pending_flatten, bot_id, int(time.time()))

@@ -445,48 +445,143 @@ class ExchangeInterface:
             self.logger.error(f"Ticker Fetch Error for {symbol}: {e}")
             return None
 
-    def fetch_my_trades(self, symbol: str, since: Optional[int] = None, limit: int = 50) -> List[dict]:
+    def fetch_my_trades(self, symbol: str, since: Optional[int] = None, limit: int = 50, until: Optional[int] = None) -> List[dict]:
         """
-        Fetches specific fill details (trades).
-        Crucial for forensic proof of position ownership.
+        Fetches specific fill details (trades) with proper time-windowed pagination.
+        Demo FAPI /fapi/v1/userTrades requires BOTH startTime AND endTime (max ~7 day window).
+        Walks backward from `until` (or now) in 7-day chunks until `since` (or 30 days ago).
         """
         try:
             if config.TESTNET or config.DEMO_TRADING:
+                norm = normalize_symbol(symbol)
                 endpoint = '/fapi/v1/userTrades'
-                params = {
-                    'symbol': normalize_symbol(symbol),
-                    'limit': limit
-                }
-                if since: params['startTime'] = since
-                
-                res = self._raw_request(endpoint, params=params)
-                trades = []
-                if res:
+                all_trades = []
+
+                # Default: walk back from now (or provided until) to since (or 30 days ago)
+                now_ms = self._get_adjusted_timestamp()
+                end_ms = until if until else now_ms
+                start_ms = since if since else (end_ms - 30 * 24 * 60 * 60 * 1000)  # 30-day floor
+
+                MAX_WINDOW_MS = 7 * 24 * 60 * 60 * 1000  # 7 days in ms
+                PAGE_LIMIT = min(limit, 1000)  # API max is 1000
+
+                while end_ms > start_ms:
+                    window_start = max(start_ms, end_ms - MAX_WINDOW_MS)
+
+                    params = {
+                        'symbol': norm,
+                        'limit': PAGE_LIMIT,
+                        'startTime': window_start,
+                        'endTime': end_ms,
+                    }
+
+                    res = self._raw_request(endpoint, params=params)
+                    if not res:
+                        # Empty page - move to previous window
+                        end_ms = window_start - 1
+                        continue
+
                     for t in res:
-                        trades.append({
+                        all_trades.append({
                             'id': t['id'],
-                            'order': str(t['orderId']),   # CCXT-normalised key used by reconciler
-                            'orderId': t['orderId'],       # raw key, kept for backward compat
+                            'order': str(t['orderId']),
+                            'orderId': t['orderId'],
                             'symbol': t['symbol'],
                             'side': t['side'].lower(),
                             'price': float(t['price']),
                             'amount': float(t['qty']),
                             'cost': float(t['quoteQty']),
                             'commission': float(t.get('commission', 0)),
-                            # clientOrderId is NOT available on /fapi/v1/userTrades responses.
-                            # Reconciler PASS 2 must look up CID from bot_orders by order_id.
                             'clientOrderId': '',
                             'timestamp': t['time']
                         })
-                return trades
-            
-            # Mainnet fallback
+
+                    # If we got fewer than PAGE_LIMIT, this window is exhausted
+                    if len(res) < PAGE_LIMIT:
+                        end_ms = window_start - 1
+                    else:
+                        # Full page - might be more in this window, move end back to oldest trade in this batch
+                        oldest_in_batch = min(t['time'] for t in res)
+                        end_ms = oldest_in_batch - 1
+
+                    if end_ms <= start_ms:
+                        break
+
+                return all_trades
+
+            # Mainnet fallback - CCXT handles pagination
             return self.exchange.fetch_my_trades(symbol, since=since, limit=limit)
         except Exception as e:
             if "2015" in str(e):
                 self.logger.error(f"🛡️ GEOFENCED/RESTRICTED: API permission denied for {symbol} trades. Forensic proof will be skipped.")
                 raise PermissionError(f"API Permission denied for {symbol}")
             self.logger.error(f"Trades Fetch Error for {symbol}: {e}")
+            return []
+
+    def fetch_income(self, symbol: str, since: Optional[int] = None, limit: int = 100, until: Optional[int] = None, income_type: Optional[str] = None) -> List[dict]:
+        """
+        Fetches income history (realized PnL, funding fees, commissions, etc.)
+        Demo FAPI /fapi/v1/income requires BOTH startTime AND endTime (max ~7 day window).
+        Walks backward from `until` (or now) in 7-day chunks until `since` (or 30 days ago).
+        """
+        try:
+            if config.TESTNET or config.DEMO_TRADING:
+                norm = normalize_symbol(symbol)
+                endpoint = '/fapi/v1/income'
+                all_income = []
+
+                now_ms = self._get_adjusted_timestamp()
+                end_ms = until if until else now_ms
+                start_ms = since if since else (end_ms - 30 * 24 * 60 * 60 * 1000)
+
+                MAX_WINDOW_MS = 7 * 24 * 60 * 60 * 1000
+                PAGE_LIMIT = min(limit, 1000)
+
+                while end_ms > start_ms:
+                    window_start = max(start_ms, end_ms - MAX_WINDOW_MS)
+
+                    params = {
+                        'symbol': norm,
+                        'limit': PAGE_LIMIT,
+                        'startTime': window_start,
+                        'endTime': end_ms,
+                    }
+                    if income_type:
+                        params['incomeType'] = income_type
+
+                    res = self._raw_request(endpoint, params=params)
+                    if not res:
+                        end_ms = window_start - 1
+                        continue
+
+                    for t in res:
+                        all_income.append({
+                            'symbol': t['symbol'],
+                            'incomeType': t['incomeType'],
+                            'income': float(t['income']),
+                            'asset': t['asset'],
+                            'time': t['time'],
+                            'info': t.get('info', ''),
+                            'tranId': t.get('tranId', ''),
+                            'tradeId': t.get('tradeId', ''),
+                        })
+
+                    if len(res) < PAGE_LIMIT:
+                        end_ms = window_start - 1
+                    else:
+                        oldest_in_batch = min(t['time'] for t in res)
+                        end_ms = oldest_in_batch - 1
+
+                    if end_ms <= start_ms:
+                        break
+
+                return all_income
+
+            # Mainnet fallback - not implemented in CCXT wrapper
+            self.logger.warning(f"fetch_income not implemented for mainnet, returning empty")
+            return []
+        except Exception as e:
+            self.logger.error(f"Income Fetch Error for {symbol}: {e}")
             return []
 
     def get_symbol_precision(self, symbol: str) -> Dict[str, Any]:
