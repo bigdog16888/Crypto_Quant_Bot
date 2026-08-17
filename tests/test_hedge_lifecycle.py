@@ -14,6 +14,14 @@ import tempfile
 import unittest
 from unittest.mock import patch, MagicMock
 
+# Bypass WriteQueue for tests - MUST be set before any engine imports
+os.environ['PYTEST_RUNNING'] = '1'
+sys.modules['pytest'] = True  # trick WriteQueue into bypass mode
+
+import engine.write_queue as wq_module
+wq_module.WriteQueue._bypass = True
+wq_module.WriteQueue._instance = None
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import engine.database as database
