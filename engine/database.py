@@ -118,6 +118,10 @@ def backup_database():
     if not os.path.exists(DB_PATH):
         return
         
+    # Skip backup during tests
+    if os.environ.get('PYTEST_RUNNING') == '1':
+        return
+        
     try:
         backup_dir = os.path.join(BASE_DIR, "backups")
         os.makedirs(backup_dir, exist_ok=True)
@@ -1051,10 +1055,14 @@ def init_db():
     finally:
         if conn is not None:
             try:
-                pass # conn.close() disabled for singleton safety
+                conn.close()  # Close the init connection to release WAL locks
             except:
                 pass
-    
+
+    # Skip external sync/heal for tests
+    if os.environ.get('PYTEST_RUNNING') == '1':
+        return
+
     try:
         logger.info(f"Database initialized at {DB_PATH}")
     except Exception:
@@ -2171,16 +2179,12 @@ def safe_wipe_bot(
         f"phys_qty={phys_qty:.6f}, ledger_net={ledger_net_qty:.6f}, "
         f"cycle_phase={row[0] if row else 'N/A'}. Executing wipe. Reason: {reason}"
     )
-    if has_external_cursor:
-        _reset_bot_after_tp_internal(
-            cursor, bot_id, exit_price, direction=direction,
-            action_label='SYSTEM_WIPE', notes=reason, human_approved=human_approved
-        )
-    else:
-        reset_bot_after_tp(
-            bot_id, exit_price, direction=direction,
-            action_label='SYSTEM_WIPE', notes=reason, human_approved=human_approved
-        )
+    # Use internal function directly with existing cursor to avoid WriteQueue deadlock
+    _reset_bot_after_tp_internal(
+        cursor, bot_id, exit_price, direction=direction,
+        action_label='SYSTEM_WIPE', notes=reason, human_approved=human_approved
+    )
+    conn.commit()
 
     return True
 
@@ -3037,15 +3041,43 @@ def update_active_positions_snapshot(positions: list):
 
             # If they match within cent-level tolerance, split the record by bot
             if abs(v_net - ph_net) < 0.001:
-                logger.info(f"💎 [SNAP-ALLOCATE] Ticker {symbol} Net matches ({v_net:.4f}). Splitting into {len(bot_shares)} bot shares.")
-                for share in bot_shares:
-                    if share['qty'] > 0:
-                        conn.execute(
-                            "INSERT INTO active_positions (bot_id, pair, side, size, entry_price, last_checked) "
-                            "VALUES (?, ?, ?, ?, ?, ?)",
-                            (share['id'], symbol, share['dir'], share['qty'], share['avg'], ts)
+                # Count bots with non-zero invested qty (candidates for allocation)
+                from engine.parity_gates import qty_tolerance
+                active_shares = [s for s in bot_shares if abs(s['qty']) > qty_tolerance()]
+
+                # FORensic attribution gate: multi-bot auto-split requires ALLOW_FORENSIC_ADOPT=True
+                # Mirrors _attribute_anonymous_fill pattern: single candidate only when forensic disabled
+                if len(active_shares) > 1:
+                    from engine.parity_gates import forensic_adopt_allowed
+                    if not forensic_adopt_allowed():
+                        logger.warning(
+                            f"🛑 [SNAP-ALLOCATE-BLOCKED] {symbol}: {len(active_shares)} bots have invested qty, "
+                            f"net match ({v_net:.4f}) but forensic_adopt_allowed=False. "
+                            f"Refusing multi-bot auto-split. Position will fall through to BRIDGE-MISS path."
                         )
-                        owned_count += 1
+                        # Skip multi-bot split; fall through to mismatch path below (orphan assignment)
+                    else:
+                        logger.info(f"💎 [SNAP-ALLOCATE] Ticker {symbol} Net matches ({v_net:.4f}). Splitting into {len(active_shares)} bot shares.")
+                        for share in active_shares:
+                            conn.execute(
+                                "INSERT INTO active_positions (bot_id, pair, side, size, entry_price, last_checked) "
+                                "VALUES (?, ?, ?, ?, ?, ?)",
+                                (share['id'], symbol, share['dir'], share['qty'], share['avg'], ts)
+                            )
+                            owned_count += 1
+                elif len(active_shares) == 1:
+                    # Single bot with matching invested qty — safe to assign (no forensic gate needed)
+                    share = active_shares[0]
+                    logger.info(f"💎 [SNAP-ALLOCATE] Ticker {symbol} Net matches ({v_net:.4f}). Assigning to single bot {share['id']}.")
+                    conn.execute(
+                        "INSERT INTO active_positions (bot_id, pair, side, size, entry_price, last_checked) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (share['id'], symbol, share['dir'], share['qty'], share['avg'], ts)
+                    )
+                    owned_count += 1
+                else:
+                    # No bots with invested qty — fall through to mismatch path
+                    pass
             else:
                 # Mismatch or Solo Bot: assign the net physical directly
                 avg_price = data['value'] / data['size'] if data['size'] > 0 else 0
