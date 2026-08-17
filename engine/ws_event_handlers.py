@@ -397,8 +397,12 @@ def _attribute_orphan_fill(bot_id: int, order_id: str, client_id: str, qty: floa
 
 def _attribute_anonymous_fill(event: Dict):
     """
-    Scans active bots for matching symbol/side to adopt non-CQB fills.
-    Disabled when ALLOW_FORENSIC_ADOPT=False (proof-only mode).
+    Handle anonymous fills (non-CQB tagged) from WebSocket.
+    
+    Logic:
+    1. Only auto-attribute when exactly ONE active bot matches pair+direction
+    2. For zero or multiple candidates: log full detail and alert — NO auto-attribution
+    3. All cases: log full detail for audit trail
     """
     from engine.parity_gates import forensic_adopt_allowed
     if not forensic_adopt_allowed():
@@ -409,39 +413,38 @@ def _attribute_anonymous_fill(event: Dict):
         return False
 
     symbol = event.get('symbol')
-    side = event.get('side', '').upper() # BUY or SELL
+    side = event.get('side', '').upper()  # BUY or SELL
     qty = float(event.get('filled_qty', 0))
     price = float(event.get('avg_price', 0) or event.get('price', 0))
     order_id = str(event.get('order_id', ''))
     client_id = str(event.get('client_order_id', ''))
-    
-    if qty <= 0: return
+
+    if qty <= 0:
+        return False
 
     logger.info(f"🕵️ [ANONYMOUS-SCAN] Checking bots for {symbol} {side} fill ({qty} @ {price})...")
-    
+
     try:
         from engine.database import get_connection
         from engine.exchange_interface import normalize_symbol
         from engine.ledger import seal_trade_state
+        import time
         conn = get_connection()
 
-        # ── SYMBOL NORMALISATION FIX ────────────────────────────────────────────
-        # The WebSocket delivers the raw Binance symbol (e.g. 'SOLUSDC').
-        # bots.pair stores the CCXT-unified format ('SOL/USDC:USDC').
-        # Match on the normalised form so the lookup never returns zero rows.
-        raw_symbol = symbol  # e.g. 'SOLUSDC'
+        # ── SYMBOL NORMALISATION ──
+        raw_symbol = symbol
         active_bots = conn.execute("""
             SELECT b.id, b.name, b.direction, t.cycle_id, t.current_step, b.pair
             FROM bots b
             JOIN trades t ON t.bot_id = b.id
             WHERE b.is_active = 1
               AND (
-                b.pair = ?                                   -- CCXT unified: 'SOL/USDC:USDC'
-                OR REPLACE(REPLACE(REPLACE(b.pair,'/',''),(SELECT '' WHERE 1),':USDC'),':USDT','') = ?  -- rough strip
+                b.pair = ?
+                OR REPLACE(REPLACE(REPLACE(b.pair,'/',''),'',''),':USDC','') = ?
               )
         """, (raw_symbol, raw_symbol)).fetchall()
 
-        # Fallback: normalise every bot pair and compare
+        # Fallback: normalize every bot pair and compare
         if not active_bots:
             all_bots = conn.execute("""
                 SELECT b.id, b.name, b.direction, t.cycle_id, t.current_step, b.pair
@@ -455,64 +458,87 @@ def _attribute_anonymous_fill(event: Dict):
             ]
 
         if not active_bots:
-            logger.warning(f"[ANONYMOUS-ADOPT] No active bots found for symbol '{raw_symbol}' — fill {order_id} unattributed.")
+            logger.warning(f"[ANONYMOUS-ALERT] No active bots found for symbol '{raw_symbol}' — fill {order_id} unattributed.")
             conn.close()
             return False
 
+        # ── FIND MATCHING BOTS BY DIRECTION ──
+        # side = BUY reduces SHORT, increases LONG
+        # side = SELL reduces LONG, increases SHORT
+        candidates = []
         for bid, name, direction, cycle_id, step, _pair in active_bots:
-            # Only adopt if this bot has NO open orders (deadlock / orphan sign)
-            open_orders_count = conn.execute(
-                "SELECT COUNT(*) FROM bot_orders WHERE bot_id = ? AND status IN ('new', 'open', 'placing', 'cancelling')",
-                (bid,)
-            ).fetchone()[0]
+            is_exit = (direction == 'LONG' and side == 'SELL') or (direction == 'SHORT' and side == 'BUY')
+            is_entry = (direction == 'LONG' and side == 'BUY') or (direction == 'SHORT' and side == 'SELL')
+            
+            # Check if this bot has open position that this fill would affect
+            open_qty_row = conn.execute("SELECT COALESCE(open_qty, 0) FROM trades WHERE bot_id = ?", (bid,)).fetchone()
+            open_qty = float(open_qty_row[0]) if open_qty_row else 0.0
+            
+            # Only match: exit fill reducing existing position, OR entry fill for flat bot
+            if (is_exit and open_qty > 0) or (is_entry and open_qty == 0):
+                candidates.append((bid, name, direction, cycle_id, step, open_qty))
 
-            if open_orders_count == 0:
-                is_entry = (direction == 'LONG' and side == 'BUY') or (direction == 'SHORT' and side == 'SELL')
-                is_exit  = (direction == 'LONG' and side == 'SELL') or (direction == 'SHORT' and side == 'BUY')
+        # ── DECISION LOGIC ──
+        if len(candidates) == 0:
+            logger.warning(
+                f"[ANONYMOUS-ALERT] No matching bots for {symbol} {side} fill {order_id} "
+                f"(qty={qty} @ {price}). Active bots: {len(active_bots)}, "
+                f"matching direction: 0. Fill unattributed — manual review required."
+            )
+            conn.close()
+            return False
 
-                if is_entry or is_exit:
-                    otype = "entry" if is_entry else "tp"
-                    logger.warning(
-                        f"🤝 [ANONYMOUS-ADOPT] Bot {name} ({bid}) adopting anonymous "
-                        f"{side} fill {order_id} (CID={client_id}) as {otype} qty={qty} @ {price}."
-                    )
+        if len(candidates) > 1:
+            # Multiple candidates — log full detail, NO auto-attribution
+            cand_str = "; ".join([f"Bot {b[0]}({b[1]}) dir={b[2]} open_qty={b[5]}" for b in candidates])
+            logger.error(
+                f"[ANONYMOUS-ALERT] AMBIGUOUS: {len(candidates)} bots match {symbol} {side} fill {order_id} "
+                f"(qty={qty} @ {price}). Candidates: {cand_str}. "
+                f"NO auto-attribution — manual review required."
+            )
+            conn.close()
+            return False
 
-                    event_ts_ms = event.get('lastTradeTimestamp') or event.get('timestamp') or 0
-                    fill_ts = int(event_ts_ms / 1000) if event_ts_ms else int(time.time())
+        # Exactly one candidate — safe to auto-attribute
+        bid, name, direction, cycle_id, step, open_qty = candidates[0]
+        otype = "entry" if ((direction == 'LONG' and side == 'BUY') or (direction == 'SHORT' and side == 'SELL')) else "tp"
+        logger.warning(
+            f"🤝 [ANONYMOUS-ADOPT] Bot {name} ({bid}) adopting anonymous "
+            f"{side} fill {order_id} (CID={client_id}) as {otype} qty={qty} @ {price}."
+        )
 
-                    # ── ATOMIC WRITE WITH PROOF METADATA ────────────────────────
-                    # wipe_proof_source = 'forensic_adopt' so future audits never
-                    # classify this row as a SUSPECT_WIPE legacy row.
-                    conn.execute("""
-                        INSERT OR IGNORE INTO bot_orders (
-                            bot_id, order_type, order_id, client_order_id,
-                            price, amount, filled_amount, status,
-                            cycle_id, step, position_side,
-                            created_at, updated_at, filled_at,
-                            wipe_proof_source, notes
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        bid, f"forensic_adoption_{otype}", order_id, client_id,
-                        price, qty, qty, 'filled',
-                        cycle_id, step, 'LONG' if direction == 'LONG' else 'SHORT',
-                        int(time.time()), int(time.time()), fill_ts,
-                        'forensic_adopt',
-                        f"Anonymous Adoption (WS): orphan {side} fill {order_id} adopted at runtime. "
-                        f"CID={client_id} qty={qty} @ {price} fill_ts={fill_ts}."
-                    ))
-                    conn.commit()
-                    conn.close()
-                    _enqueue_db_write(seal_trade_state, bid)
-                    logger.info(
-                        f"✅ [ANONYMOUS-ADOPT] Bot {bid}: adopted {qty:.4f} @ {price:.4f} "
-                        f"(order_id={order_id}) — proof=forensic_adopt."
-                    )
-                    return True
+        event_ts_ms = event.get('lastTradeTimestamp') or event.get('timestamp') or 0
+        fill_ts = int(int(event_ts_ms) / 1000) if event_ts_ms else int(time.time())
 
+        # ── ATOMIC WRITE WITH PROOF METADATA ──
+        conn.execute("""
+            INSERT OR IGNORE INTO bot_orders (
+                bot_id, order_type, order_id, client_order_id,
+                price, amount, filled_amount, status,
+                cycle_id, step, position_side,
+                created_at, updated_at, filled_at,
+                wipe_proof_source, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            bid, f"manual_close_attr_{otype}", order_id, client_id,
+            price, qty, qty, 'filled',
+            cycle_id, step, 'LONG' if direction == 'LONG' else 'SHORT',
+            int(time.time()), int(time.time()), fill_ts,
+            'manual_close_attr',
+            f"MANUAL_CLOSE_ATTR: exchange_order_id={order_id}"
+        ))
+        conn.commit()
         conn.close()
+        _enqueue_db_write(seal_trade_state, bid)
+        logger.info(
+            f"✅ [ANONYMOUS-ADOPT] Bot {bid}: adopted {qty:.4f} @ {price:.4f} "
+            f"(order_id={order_id}) — proof=manual_close_attr."
+        )
+        return True
+
     except Exception as e:
         logger.error(f"[ANONYMOUS-ADOPT] Error adopting fill {order_id} for symbol '{symbol}': {e}", exc_info=True)
-    return False
+        return False
 
 
 def handle_order_update(event: Dict):
