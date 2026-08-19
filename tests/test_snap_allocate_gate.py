@@ -9,15 +9,6 @@ import tempfile
 import shutil
 import unittest
 
-# Bypass WriteQueue for tests - MUST be set before any engine imports
-os.environ['PYTEST_RUNNING'] = '1'
-os.environ['TESTING_MODE'] = 'True'
-sys.modules['pytest'] = True
-
-import engine.write_queue as wq_module
-wq_module.WriteQueue._bypass = True
-wq_module.WriteQueue._instance = None
-
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import engine.database as database
@@ -160,29 +151,32 @@ class TestSnapAllocateGate(unittest.TestCase):
         self.assertEqual(len(rows), 0, f"Expected 0 active positions (blocked), got {len(rows)}: {rows}")
 
     def test_multi_bot_allowed_when_forensic_enabled(self):
-        """Multiple bots with invested qty should split when forensic enabled."""
+        """Multi-bot split should work when forensic adoption is enabled."""
         import config.settings as settings
         settings.config.ALLOW_FORENSIC_ADOPT = True
-        
+
         # Setup: TWO bots with invested qty
         self._setup_longs([(1001, 'bot1', 1.0, 50000.0), (1002, 'bot2', 0.5, 50000.0)])
-        
-        # Snapshot with net matching: 1.5 LONG
+
+        # Snapshot with net matching: 1.5 LONG (1.0 + 0.5 = 1.5)
         mock_positions = [{
             'symbol': 'BTC/USDC:USDC',
             'side': 'long',
-            'contracts': 1.5,
+            'contracts': 1.5,  # This should be the SUM of both bots' qty
             'entryPrice': 50000.0,
         }]
         update_active_positions_snapshot(mock_positions)
-        
+
         # Check active_positions - should have BOTH bots
         cursor = self.conn.cursor()
         rows = cursor.execute("SELECT bot_id, size FROM active_positions WHERE pair='BTCUSDC' ORDER BY bot_id").fetchall()
-        
+
         self.assertEqual(len(rows), 2, f"Expected 2 active positions, got {len(rows)}: {rows}")
         self.assertEqual(rows[0][0], 1001)
         self.assertEqual(rows[1][0], 1002)
+        # Size should be proportional to their quantities (1.0 and 0.5 out of 1.5 total)
+        self.assertAlmostEqual(rows[0][1], 1.0, places=4)  # 1.0/1.5 * 1.5 = 1.0
+        self.assertAlmostEqual(rows[1][1], 0.5, places=4)  # 0.5/1.5 * 1.5 = 0.5
 
     def test_zero_contributors_falls_through(self):
         """Zero bots with invested qty should fall through to mismatch path (assigns to active bot)."""
