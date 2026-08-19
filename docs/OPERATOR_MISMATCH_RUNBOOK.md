@@ -265,3 +265,49 @@ ORDER BY b.pair;
 ```
 If this returns **only genuinely in-trade bots** (those with real exchange positions), and Global
 Netting shows **0 mismatches**, the system is clean.
+
+---
+
+## Known patterns — v3.5.3 additions (2026-08-19)
+
+### Pattern E — Testnet/demo reset synthetic foreign symbols (2026-08-18 incident)
+
+**Log signature (startup barrier):**
+```
+🌐 [STARTUP-BARRIER] 3 exchange position(s) on symbols with NO active bot (foreign/synthetic — e.g. testnet reset seed rows). Ignored by the pair audit; NOT touched by the engine:
+   FOREIGN  BNBUSD (norm=BNBUSD) net_qty=+227.000000
+   FOREIGN  BTCUSD (norm=BTCUSD) net_qty=+778.000000
+   FOREIGN  NEARUSD (norm=NEARUSD) net_qty=-4.000000
+```
+
+**What happened:** The Binance testnet/demo account was reset overnight. Binance seeded the account with USDS-M perpetual synthetic positions (BNBUSD, BTCUSD, NEARUSD, etc.). These are **not** the bot's trading symbols (BNB/USDC:USDC, BTC/USDC:USDC, etc.). `normalize_symbol()` strips separators, so:
+- Bot pair `BNB/USDC:USDC` → `BNBUSDC`
+- Synthetic seed `BNBUSD` → `BNBUSD` (different!)
+
+The pair audit (`audit_pair_ledger_vs_exchange`) only iterates **active bot pairs**, so these foreign symbols were **invisible in the barrier log** before v3.5.3. The engine would start "clean" while the exchange held massive synthetic positions the operator couldn't see.
+
+**Root cause:** Binance testnet reset injects USDS-M positions (no colon, no slash: `BNBUSD`, `BTCUSD`, `NEARUSD`). The bot trades USDⓈ-M format (`BNB/USDC:USDC`). Normalization keys diverge.
+
+**What v3.5.3 adds:** `_classify_foreign_positions()` — a read-only diagnostic that runs at **Step 8** of `startup_sync` (after pair parity repair). It fetches all exchange positions, normalizes each, and classifies them as:
+- **matched** → symbol norm matches an active bot pair (goes to normal pair audit)
+- **foreign** → symbol norm matches NO active bot pair (testnet seed rows, manual positions, delisted symbols)
+
+Foreign positions are **logged with `WARNING` level** and listed explicitly in the startup barrier output. They are **NEVER touched** by the engine — no cancel, no flatten, no DB write.
+
+**Operator action:**
+1. **Read the barrier log** — foreign symbols are now visible in the startup output.
+2. **Decide per symbol:**
+   - **Testnet seed rows** (USDS-M format `SYMBOLUSD`, net_qty ≠ 0): These are Binance-injected. You can ignore them — they don't block the engine, and the pair audit only cares about bot pairs. If you want them gone, manually flatten on Binance (one-way mode: position per symbol).
+   - **Manual positions you placed:** If you intentionally hold a position on a symbol the bot doesn't trade, it will appear here. Flatten or ignore.
+   - **Delisted / stale symbols:** If you previously traded a symbol and it's now delisted, the stale position appears here. Flatten on Binance.
+3. **No DB repair needed** — foreign symbols don't create `bot_orders`, `trades`, or `active_positions` rows. The engine simply doesn't manage them.
+
+**Verification:**
+- Restart engine → startup barrier should list the same foreign symbols (they persist on exchange until you flatten).
+- Global Netting → should show **0 mismatched pairs** (foreign symbols don't count as mismatches).
+- Bots on matched pairs → leave `MANUAL GATE` and trade normally.
+
+**Env notes:**
+- `TESTNET_PURGE_PHANTOM_LEDGER=True` does **not** affect foreign symbols (it only purges ledger rows when exchange net = 0 for a bot pair).
+- `ALLOW_FORENSIC_ADOPT` does **not** affect foreign symbols (it controls WS adoption of fills with no `client_order_id`).
+- To hide foreign warning in logs (not recommended): patch the log level in `engine/runner/startup.py` line ~365.

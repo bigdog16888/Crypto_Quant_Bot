@@ -32,7 +32,7 @@ from engine.database import (
     check_and_fix_integrity,
     get_bot_status,
 )
-from engine.exchange_interface import ExchangeInterface, normalize_market_type
+from engine.exchange_interface import ExchangeInterface, normalize_market_type, normalize_symbol
 from engine.strategies.martingale_strategy import MartingaleStrategy
 from engine.bot_executor import BotExecutor
 from engine.ground_truth_reconciler import GroundTruthReconciler
@@ -182,6 +182,56 @@ class StartupMixin:
         else:
             logger.info("🚀 TRADING MODE ACTIVE: Full order execution enabled.")
 
+    def _classify_foreign_positions(self, parity_ex, pairs):
+        """
+        Read-only diagnostic: split live exchange positions into symbols that
+        match an active bot pair vs foreign symbols (e.g. USDS-M synthetic
+        seed rows like BNBUSD after a testnet/demo reset, or manual positions).
+
+        Returns (foreign, matched) where each entry is
+        (raw_symbol, normalized_symbol, signed_net_qty).
+
+        Foreign positions are NEVER touched here — they are only surfaced so
+        the operator can see why a parity gate fired. The audit
+        (audit_pair_ledger_vs_exchange) only iterates bot pairs, so foreign
+        symbols are otherwise invisible in the barrier log.
+        """
+        foreign, matched = [], []
+        try:
+            positions = parity_ex.fetch_positions()
+        except Exception as e:
+            logger.warning(f"⚠️ [STARTUP-BARRIER] Foreign-symbol scan skipped (fetch_positions failed): {e}")
+            return foreign, matched
+        if not positions:
+            return foreign, matched
+
+        bot_norms = {normalize_symbol(p).upper() for p in pairs}
+        by_norm = {}
+        for pos in positions:
+            raw = pos.get('symbol', '')
+            net = pos.get('net_qty')
+            if net is None or net == 0:
+                net = pos.get('contracts')
+            if net is None or net == 0:
+                qty = float(pos.get('qty', pos.get('size', 0)) or 0)
+                side = str(pos.get('side', '')).lower()
+                net = -qty if side in ('short', 'sell') else qty
+            net = float(net or 0)
+            if abs(net) < 1e-12:
+                continue
+            norm = normalize_symbol(raw).upper()
+            by_norm.setdefault(norm, []).append((raw, net))
+
+        for norm, plist in sorted(by_norm.items()):
+            total = sum(x[1] for x in plist)
+            raws = sorted({x[0] for x in plist})
+            entry = (raws[0] if len(raws) == 1 else '/'.join(raws), norm, total)
+            if norm in bot_norms:
+                matched.append(entry)
+            else:
+                foreign.append(entry)
+        return foreign, matched
+
     def startup_sync(self):
         """
         Strict, blocking startup synchronization barrier.
@@ -303,6 +353,21 @@ class StartupMixin:
             # -------------------------------------------------------------
             logger.info("🔍 [STARTUP-BARRIER] [8/8] Verifying final pair parity...")
             _mismatches = audit_pair_ledger_vs_exchange(parity_ex)
+
+            # Symbol-mismatch visibility: surface exchange positions on symbols no
+            # active bot trades (e.g. USDS-M synthetic seed rows like BNBUSD after
+            # a testnet/demo reset). The pair audit only iterates bot pairs, so
+            # these are otherwise invisible. Read-only — never modifies anything.
+            _foreign, _foreign_matched = self._classify_foreign_positions(parity_ex, pairs)
+            if _foreign:
+                logger.warning(
+                    f"🌐 [STARTUP-BARRIER] {len(_foreign)} exchange position(s) on symbols with NO active bot "
+                    f"(foreign/synthetic — e.g. testnet reset seed rows). Ignored by the pair audit; "
+                    f"NOT touched by the engine:"
+                )
+                for _raw, _norm, _net in _foreign:
+                    logger.warning(f"   FOREIGN  {_raw} (norm={_norm}) net_qty={_net:+.6f}")
+
             if _mismatches:
                 _critical = flag_pair_ledger_mismatch(_mismatches, exchange=parity_ex)
                 for _p, _v, _ph, _d in _mismatches:
@@ -313,8 +378,17 @@ class StartupMixin:
                         logger.warning("⚠️ [STARTUP-BARRIER-FAIL] Critical mismatch detected on startup, but TESTING_MODE is active. Bypassing strict exit.")
                     else:
                         # Block start and raise error to abort startup
+                        _foreign_hint = ""
+                        if _foreign:
+                            _foreign_hint = (
+                                " Foreign (non-bot) symbols present on exchange: "
+                                + ", ".join(f"{_r}({_n:+.4f})" for _r, _nm, _n in _foreign)
+                                + ". If these are testnet/demo reset seed rows, clear or ignore them per "
+                                "docs/OPERATOR_MISMATCH_RUNBOOK.md before restarting."
+                            )
                         raise RuntimeError(
                             f"Startup parity verification FAILED for {len(_critical)} critical pair(s). "
+                            f"{_foreign_hint}"
                             "Engine cannot start in a mismatched state. Run scripts/run_startup_heal.py or resolve manually."
                         )
                 else:
