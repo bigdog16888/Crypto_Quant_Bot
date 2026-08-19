@@ -101,7 +101,7 @@ class TestCreditFillRaceRetry(unittest.TestCase):
         placed in _pending_fills keyed by order_id.
         """
         with patch.object(self.wseh, '_credit_fill_with_retry') as mock_credit, \
-             patch.object(self.wseh, '_enqueue_db_write') as mock_enqueue:
+             patch('engine.write_queue.WriteQueue.put_and_wait') as mock_enqueue:
 
             mock_credit.return_value = False  # Simulate row not yet in DB
 
@@ -172,8 +172,8 @@ class TestCreditFillRaceRetry(unittest.TestCase):
 
         with patch('engine.ledger.credit_fill', side_effect=credit_side_effect), \
              patch('engine.ledger.seal_trade_state', seal_mock), \
-             patch.object(self.wseh, '_enqueue_db_write',
-                          side_effect=lambda fn, *a, **kw: fn(*a, **kw)):
+             patch('engine.write_queue.WriteQueue.put_and_wait',
+                   side_effect=lambda fn, *a, **kw: fn(*a, **kw)):
 
             # First drain — credit_fill still fails, retries incremented to 1
             self.wseh._drain_pending_fills()
@@ -218,8 +218,8 @@ class TestCreditFillRaceRetry(unittest.TestCase):
 
         with patch('engine.ledger.credit_fill', return_value=False), \
              patch('engine.parity_gates.flag_orphan_fill_manual_proof', flag_mock), \
-             patch.object(self.wseh, '_enqueue_db_write',
-                          side_effect=lambda fn, *a, **kw: fn(*a, **kw)):
+             patch('engine.write_queue.WriteQueue.put_and_wait',
+                   side_effect=lambda fn, *a, **kw: fn(*a, **kw)):
 
             # Drain MAX_RETRIES times to exhaust the counter (each drain increments retries)
             for _ in range(PENDING_FILL_MAX_RETRIES):
@@ -261,8 +261,8 @@ class TestCreditFillRaceRetry(unittest.TestCase):
 
         with patch('engine.ledger.credit_fill', credit_mock), \
              patch('engine.ledger.seal_trade_state', MagicMock()), \
-             patch.object(self.wseh, '_enqueue_db_write',
-                          side_effect=lambda fn, *a, **kw: fn(*a, **kw)):
+             patch('engine.write_queue.WriteQueue.put_and_wait',
+                   side_effect=lambda fn, *a, **kw: fn(*a, **kw)):
 
             # Drain twice — second should be a no-op (fill already removed)
             self.wseh._drain_pending_fills()
@@ -301,8 +301,8 @@ class TestCreditFillRaceRetry(unittest.TestCase):
         with patch('engine.ledger.credit_fill', credit_mock), \
              patch('engine.ledger.seal_trade_state', seal_mock), \
              patch('engine.parity_gates.forensic_adopt_allowed', return_value=False), \
-             patch.object(self.wseh, '_enqueue_db_write',
-                          side_effect=lambda fn, *a, **kw: fn(*a, **kw)):
+             patch('engine.write_queue.WriteQueue.put_and_wait',
+                   side_effect=lambda fn, *a, **kw: fn(*a, **kw)):
 
             self.wseh._drain_pending_fills()
 

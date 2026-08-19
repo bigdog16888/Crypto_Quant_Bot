@@ -15,73 +15,14 @@ v2.0 Architecture:
 """
 
 import logging
-import queue
 import threading
 import time
 from typing import Dict, Callable
 
 from engine.ws_cache import get_ws_cache
+from engine.write_queue import WriteQueue
 
 logger = logging.getLogger("WSEventHandlers")
-
-# ---------------------------------------------------------------------------
-# ⚡ ASYNC DB WRITE QUEUE
-# ---------------------------------------------------------------------------
-# All SQLite mutations from the WS path go through this queue/thread so the
-# CCXT listener is never paused by disk I/O.
-# ---------------------------------------------------------------------------
-_db_write_queue: queue.Queue = queue.Queue(maxsize=2000)
-_db_worker_thread: threading.Thread | None = None
-_db_worker_stop = threading.Event()
-
-
-def _db_worker_loop():
-    """Background thread: drain the write queue and execute each task."""
-    while not _db_worker_stop.is_set():
-        try:
-            fn, args, kwargs = _db_write_queue.get(timeout=0.5)
-            try:
-                fn(*args, **kwargs)
-            except Exception as e:
-                logger.error(f"[DB-WORKER] Task failed: {fn.__name__} — {e}")
-            finally:
-                _db_write_queue.task_done()
-        except queue.Empty:
-            continue
-
-
-def _enqueue_db_write(fn: Callable, *args, **kwargs):
-    """Submit a database write task to the background worker queue."""
-    try:
-        _db_write_queue.put_nowait((fn, args, kwargs))
-    except queue.Full:
-        logger.warning(f"[DB-WORKER] Queue full — executing {fn.__name__} synchronously")
-        fn(*args, **kwargs)  # Fallback: execute inline rather than drop data
-
-
-def start_db_worker():
-    """Start the background DB worker thread (idempotent — safe to call multiple times)."""
-    global _db_worker_thread
-    if _db_worker_thread is None or not _db_worker_thread.is_alive():
-        _db_worker_stop.clear()
-        _db_worker_thread = threading.Thread(
-            target=_db_worker_loop, name="WSDBWorker", daemon=True
-        )
-        _db_worker_thread.start()
-        logger.info("[DB-WORKER] Async SQLite write worker started.")
-
-
-def stop_db_worker(timeout: float = 5.0):
-    """Gracefully flush the queue and stop the worker."""
-    _db_worker_stop.set()
-    try:
-        _db_write_queue.join()  # Wait for all tasks to complete
-    except Exception:
-        pass
-    if _db_worker_thread:
-        _db_worker_thread.join(timeout=timeout)
-    logger.info("[DB-WORKER] Async SQLite write worker stopped.")
-
 
 # ---------------------------------------------------------------------------
 # ⚡ TERMINAL ORDER CACHE
@@ -146,7 +87,7 @@ def _handle_fill_with_pending_retry(
     credited = _credit_fill_with_retry(bot_id, order_id, client_id, qty, price, order_type, fill_ts)
     if credited:
         from engine.ledger import seal_trade_state
-        _enqueue_db_write(seal_trade_state, bot_id)
+        WriteQueue().put_and_wait(seal_trade_state, bot_id)
         logger.info(f"[WS-FILL] Bot {bot_id} {order_type}: credit_fill OK → seal enqueued.")
         return
 
@@ -241,7 +182,7 @@ def _drain_pending_fills() -> None:
         credited = _credit_fill_with_retry(bid, order_id, client_id, qty, price, otype, fill_ts)
         if credited:
             from engine.ledger import seal_trade_state
-            _enqueue_db_write(seal_trade_state, bid)
+            WriteQueue().put_and_wait(seal_trade_state, bid)
             logger.info(
                 f"[PENDING-FILL-RETRY] Bot {bid} {otype}: credited on retry #{retries + 1} "
                 f"for order {order_id}."
@@ -285,14 +226,14 @@ def _drain_pending_fills() -> None:
             )
         except Exception as _e_cred:
             logger.error(f"[PENDING-FILL-EXHAUSTED] Best-effort credit_fill failed for order {order_id}: {_e_cred}")
-            
+           
         # 2. THEN set REQUIRE_MANUAL_PROOF
         try:
             from engine.parity_gates import flag_orphan_fill_manual_proof
             flag_orphan_fill_manual_proof(bid, order_id, symbol, qty, 'pending_fill_exhausted')
         except Exception as _e:
             logger.error(f"[PENDING-FILL-ESCALATE] flag_orphan_fill_manual_proof failed: {_e}")
-            
+           
         # 3. Log warning that bot is gated but fill was recorded/attempted
         if recorded:
             logger.warning(
@@ -304,13 +245,10 @@ def _drain_pending_fills() -> None:
                 f"⚠️ [PENDING-FILL-GATED] Bot {bid} {otype} order {order_id}: "
                 f"Bot is now gated (REQUIRE_MANUAL_PROOF), best-effort fill recording did not succeed."
             )
-            
+           
         with _pending_fills_lock:
             _pending_fills.pop(order_id, None)
 
-
-# Auto-start the worker when this module is imported
-start_db_worker()
 
 # ---------------------------------------------------------------------------
 # Deduplication set for notifications
@@ -351,10 +289,10 @@ def _attribute_orphan_fill(bot_id: int, order_id: str, client_id: str, qty: floa
     logger.warning(f"🕵️ [ORPHAN-RECOVERY] Bot {bot_id}: Order {order_id}/{client_id} missing from DB. Adopting forensically.")
     try:
         from engine.database import get_connection
-        from engine.ledger import seal_trade_state
-        conn = get_connection()
+        from engine.ledger import seal_trade_state, credit_fill
         
         # Get bot's current cycle/step to anchor the adoption
+        conn = get_connection()
         bot_info = conn.execute("""
             SELECT t.cycle_id, t.current_step, b.direction 
             FROM trades t 
@@ -364,30 +302,29 @@ def _attribute_orphan_fill(bot_id: int, order_id: str, client_id: str, qty: floa
         cycle_id = bot_info[0] if bot_info else -1
         step = bot_info[1] if bot_info else 0
         direction = bot_info[2] if bot_info else 'LONG'
+        conn.close()
         
         # side from direction
         side = 'LONG' if direction == 'LONG' else 'SHORT'
-             
-        # Insert the missing row
-        conn.execute("""
-            INSERT INTO bot_orders (
-                bot_id, order_type, order_id, client_order_id, 
-                price, amount, filled_amount, status, 
-                cycle_id, step, position_side, 
-                created_at, updated_at, filled_at, notes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            bot_id, f"forensic_adoption_{order_type.lower()}", order_id, client_id,
-            price, qty, qty, 'filled',
-            cycle_id, step, side,
-            int(time.time()), int(time.time()), fill_ts,
-            f"Forensic Recovery: Missing {order_type} record adopted from WS."
-        ))
-        conn.commit()
-        conn.close()
+            
+        # Insert the missing row via credit_fill (which uses WriteQueue internally)
+        credited = credit_fill(
+            bot_id=bot_id,
+            order_id=order_id,
+            cumulative_qty=qty,
+            avg_price=price,
+            order_type=f"forensic_adoption_{order_type.lower()}",
+            is_cumulative=True,
+            fill_ts=fill_ts,
+            caller='orphan_recovery'
+        )
         
-        # Now that the row exists, seal the trade state
-        _enqueue_db_write(seal_trade_state, bot_id)
+        if not credited:
+            logger.error(f"[ORPHAN-RECOVERY] credit_fill failed for bot {bot_id} order {order_id}")
+            return False
+        
+        # Now that the row exists, seal the trade state via WriteQueue
+        WriteQueue().put_and_wait(seal_trade_state, bot_id)
         logger.info(f"✅ [ORPHAN-RECOVERY] Bot {bot_id}: Adopted {qty:.6f} @ {price:.4f}. Ledger truth restored.")
         return True
     except Exception as e:
@@ -427,7 +364,7 @@ def _attribute_anonymous_fill(event: Dict):
     try:
         from engine.database import get_connection
         from engine.exchange_interface import normalize_symbol
-        from engine.ledger import seal_trade_state
+        from engine.ledger import seal_trade_state, credit_fill
         import time
         conn = get_connection()
 
@@ -509,27 +446,31 @@ def _attribute_anonymous_fill(event: Dict):
 
         event_ts_ms = event.get('lastTradeTimestamp') or event.get('timestamp') or 0
         fill_ts = int(int(event_ts_ms) / 1000) if event_ts_ms else int(time.time())
-
-        # ── ATOMIC WRITE WITH PROOF METADATA ──
-        conn.execute("""
-            INSERT OR IGNORE INTO bot_orders (
-                bot_id, order_type, order_id, client_order_id,
-                price, amount, filled_amount, status,
-                cycle_id, step, position_side,
-                created_at, updated_at, filled_at,
-                wipe_proof_source, notes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            bid, f"manual_close_attr_{otype}", order_id, client_id,
-            price, qty, qty, 'filled',
-            cycle_id, step, 'LONG' if direction == 'LONG' else 'SHORT',
-            int(time.time()), int(time.time()), fill_ts,
-            'manual_close_attr',
-            f"MANUAL_CLOSE_ATTR: exchange_order_id={order_id}"
-        ))
-        conn.commit()
+        
+        # Get position side
+        position_side = 'LONG' if direction == 'LONG' else 'SHORT'
+        
+        # Close connection - we'll use credit_fill which manages its own connection via WriteQueue
         conn.close()
-        _enqueue_db_write(seal_trade_state, bid)
+        
+        # Use credit_fill to insert the order (it uses WriteQueue internally)
+        credited = credit_fill(
+            bot_id=bid,
+            order_id=order_id,
+            cumulative_qty=qty,
+            avg_price=price,
+            order_type=f"manual_close_attr_{otype}",
+            is_cumulative=True,
+            fill_ts=fill_ts,
+            caller='anonymous_adopt'
+        )
+        
+        if not credited:
+            logger.error(f"[ANONYMOUS-ADOPT] credit_fill failed for bot {bid} order {order_id}")
+            return False
+        
+        # Now seal the trade state via WriteQueue
+        WriteQueue().put_and_wait(seal_trade_state, bid)
         logger.info(
             f"✅ [ANONYMOUS-ADOPT] Bot {bid}: adopted {qty:.4f} @ {price:.4f} "
             f"(order_id={order_id}) — proof=manual_close_attr."
@@ -756,7 +697,7 @@ def _handle_order_partial_fill(bot_id: int, order_type: str, event: Dict):
             tracker_key = f"{bot_id}_{order_id}"
             _partial_fill_tracker[tracker_key] = cumulative_filled
             # Enqueue idempotent state recompute (non-blocking)
-            _enqueue_db_write(seal_trade_state, bot_id)
+            WriteQueue().put_and_wait(seal_trade_state, bot_id)
             logger.debug(f"[PARTIAL] Bot {bot_id}: credit_fill + seal_trade_state enqueued (cumulative={cumulative_filled:.6f}).")
 
     except Exception as e:
@@ -853,7 +794,7 @@ def _handle_order_filled(bot_id: int, order_type: str, event: Dict):
     # Queue DB status update (non-blocking)
     try:
         from engine.database import update_order_status
-        _enqueue_db_write(update_order_status, order_id, 'filled', bot_id, cumulative_fill_qty)
+        WriteQueue().put_and_wait(update_order_status, order_id, 'filled', bot_id, cumulative_fill_qty)
     except Exception as e:
         logger.debug(f"[WS-FILL] order status update queued failed: {e}")
 
@@ -896,7 +837,7 @@ def _handle_order_canceled(bot_id: int, order_type: str, event: Dict):
 
     try:
         # Capture partial fills before cancellation — queued so listener stays non-blocking
-        _enqueue_db_write(update_order_status, order_id, 'cancelled', bot_id, cumulative_fill)
+        WriteQueue().put_and_wait(update_order_status, order_id, 'cancelled', bot_id, cumulative_fill)
     except Exception as e:
         logger.debug(f"Could not queue cancel for order {order_id} in DB: {e}")
 
