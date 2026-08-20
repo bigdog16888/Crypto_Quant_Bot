@@ -28,14 +28,16 @@ LINE_TOLERANCE = 15
 WHITELIST = [
     # (relative posix path from repo root, approx line number, description)
     # NOTE: database.py:1508 is NOT here - it was converted to _set_bot_require_manual_proof
-    ("engine/parity_gates.py",   435,  "THE centralized write point - all grace-checked callers funnel here"),
-    ("engine/bot_executor.py",   626,  "Phase 1 two-phase reset: exchange close FAILED - real error not a race"),
-    ("engine/database.py",      3952,  "flag_pair_ledger_mismatch: isolated startup drift check"),
-    ("engine/database.py",      3966,  "flag_pair_ledger_mismatch: critical startup drift check"),
-    ("engine/oneway_netting.py", 462,  "PA_SYNC: exchange API unreachable for N consecutive cycles"),
+    ("engine/parity_gates.py",   474,  "THE centralized write point - all grace-checked callers funnel here"),
+    ("engine/bot_executor.py",   756,  "Phase 1 two-phase reset: exchange close FAILED - real error not a race"),
+    ("engine/bot_executor.py",  5146,  "O-10 hedge-engagement watchdog: hedge failed to engage - parent locked (hard failure)"),
+    ("engine/database.py",      1323,  "O-1 freeze_bot_for_position_oversize: position > 2x config max (hard failure)"),
+    ("engine/database.py",      4121,  "flag_pair_ledger_mismatch: isolated startup drift check"),
+    ("engine/database.py",      4135,  "flag_pair_ledger_mismatch: critical startup drift check"),
+    ("engine/oneway_netting.py", 47,   "PA_SYNC: exchange API unreachable for N consecutive cycles (WriteQueue internal)"),
     ("engine/reconciler.py",      48,  "flag_bot_manual_proof local helper: only called from hard-failure paths"),
     ("engine/reconciler.py",    5709,  "DIRECTIONAL-MISMATCH: physical position contradicts bot direction"),
-    ("engine/reconciler.py",    7971,  "ADOPT-LIMIT-EXCEEDED: exceeds MAX_ADOPTION_QTY_PER_CYCLE"),
+    ("engine/reconciler.py",    7958,  "ADOPT-LIMIT-EXCEEDED: exceeds MAX_ADOPTION_QTY_PER_CYCLE"),
     # Two PROOF-FAILED write points in the reconciler's proof-verification block.
     # Both are guarded by the pair_has_recent_fill outer check (grace window fires before
     # reaching this branch). These are inside the forensic-scan success/fail paths
