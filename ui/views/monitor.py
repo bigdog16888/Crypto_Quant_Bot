@@ -1358,63 +1358,70 @@ def _bot_positions_fragment():
 
 @st.fragment(run_every=15)
 def _exchange_sync_diagnostics_fragment():
-    import json
-    import os
+    # O-2: Single source of truth - consume health_data computed in render_monitor_view.
+    # Previously read data/exchange_sync_diagnostics.json (written by oneway_netting
+    # sync_pair_to_exchange), which used different inputs (raw sum(trades.open_qty))
+    # and a different drift threshold (no $5 USD floor) than the header pill's
+    # health source, so the two UI surfaces could disagree.
     import time
-    from config.settings import config
-    
-    cache_file = os.path.join(config.ROOT_DIR, 'data', 'exchange_sync_diagnostics.json')
-    if not os.path.exists(cache_file):
-        st.info("No exchange sync diagnostics data available yet. Waiting for startup or reconciler cycle check.")
+
+    health_data = st.session_state.get("system_health_data") or {}
+    netting = health_data.get("netting_status_per_pair") or {}
+    health_ts = health_data.get("timestamp", 0)
+
+    if not netting:
+        st.info("No exchange sync diagnostics data available yet. Waiting for health computation.")
         return
-        
-    try:
-        with open(cache_file, 'r') as f:
-            data = json.load(f)
-    except Exception as e:
-        st.error(f"Failed to read sync diagnostics: {e}")
-        return
-        
-    if not data:
-        st.info("No exchange sync data in cache.")
-        return
-        
+
     # Count drifting pairs
-    drifting_pairs = [pair for pair, sync_data in data.items() if sync_data.get('drift_detected', False)]
+    drifting_pairs = [pair for pair, nd in netting.items() if nd.get('drift_detected', False)]
     num_drifting = len(drifting_pairs)
-    
+
     label = "🔍 Exchange Sync Diagnostics" if num_drifting == 0 else f"⚠️ Exchange Sync Diagnostics ({num_drifting} pairs drifting)"
-    
+
     with st.expander(label, expanded=num_drifting > 0):
         if num_drifting == 0:
             st.markdown("✅ All pairs in sync")
         else:
             for pair in drifting_pairs:
-                sync_data = data[pair]
-                ts = sync_data.get('timestamp', 0)
-                time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts))
-                drift_detected = sync_data.get('drift_detected', False)
-                exchange_net = sync_data.get('exchange_net', 0.0)
-                db_sum_qty = sync_data.get('db_sum_qty', 0.0)
-                diff = sync_data.get('diff', 0.0)
-                tolerance = sync_data.get('tolerance', 0.0)
-                
+                nd = netting[pair]
+                time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(health_ts))
+                drift_detected = nd.get('drift_detected', False)
+                exchange_net = float(nd.get('physical_net', 0.0) or 0.0)
+                db_sum_qty = float(nd.get('virtual_net', 0.0) or 0.0)
+                diff = exchange_net - db_sum_qty  # signed, matching old JSON 'diff'
+                tolerance = float(nd.get('tolerance', 0.0) or 0.0)
+                diff_usd = float(nd.get('diff_usd', 0.0) or 0.0)
+
                 status_color = "red" if drift_detected else "green"
                 status_text = "DRIFT DETECTED" if drift_detected else "IN SYNC"
-                
+
                 st.markdown(
                     f"### {pair} : :{status_color}[{status_text}]"
                 )
                 st.markdown(
                     f"**Last Checked:** {time_str} | **Tolerance:** {tolerance:.6f}\n\n"
-                    f"**Exchange Net:** `{exchange_net:.8f}` | **DB sum(open_qty):** `{db_sum_qty:.8f}` | **Diff:** `{diff:.8f}`"
+                    f"**Exchange Net:** `{exchange_net:.8f}` | **DB virtual net:** `{db_sum_qty:.8f}` | "
+                    f"**Diff:** `{diff:+.8f}` | **Diff USD:** `${diff_usd:,.2f}`"
                 )
-                
-                bots = sync_data.get('bots', [])
+
+                bots = nd.get('bots', [])
                 if bots:
                     with st.expander(f"Contributing Bots for {pair} ({len(bots)} active)", expanded=drift_detected):
                         import pandas as pd
-                        df = pd.DataFrame(bots)
+                        # health_data bots carry avg_price (not signed_qty); compute the sign
+                        rows = []
+                        for b in bots:
+                            oq = float(b.get('open_qty', 0) or 0)
+                            d = str(b.get('direction', '')).upper()
+                            rows.append({
+                                'bot_id': b.get('bot_id'),
+                                'name': b.get('name'),
+                                'direction': d,
+                                'open_qty': oq,
+                                'signed_qty': oq if d == 'LONG' else -oq,
+                            })
+                        df = pd.DataFrame(rows)
                         df = df.rename(columns={
                             'bot_id': 'Bot ID',
                             'name': 'Bot Name',
