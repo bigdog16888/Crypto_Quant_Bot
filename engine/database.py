@@ -1189,6 +1189,99 @@ def get_bot_params(bot_id):
     cursor.execute('SELECT name, pair, direction, rsi_limit, martingale_multiplier, base_size, strategy_type, config FROM bots WHERE id = ?', (bot_id,))
     return cursor.fetchone()
 
+# ─────────────────────────────────────────────────────────────────────────────
+# O-1: Position-size % circuit breaker (Option 2 — config-based theoretical max)
+#
+# The breaker compares a bot's current total_invested against 2x the
+# config-derived max notional:
+#     config_max = base_size × (1 + m + m² + ... + m^max_steps)
+#
+# Deliberately config-based, NOT historical: a bot accumulating many small
+# grid fills into a large real position must trip the breaker once it exceeds
+# 2x config_max. A historical-average implementation masked that case (the
+# average fill stays small while the accumulated position grows).
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _calculate_config_max_notional(base_size: float, multiplier: float, max_steps: int) -> float:
+    """Theoretical max notional if every step of the ladder filled.
+
+    Geometric series: base_size × Σ(m^i) for i in 0..max_steps.
+    Returns 0.0 for invalid params (base_size <= 0 or max_steps < 0).
+    """
+    try:
+        base_size = float(base_size)
+        multiplier = float(multiplier)
+        max_steps = int(max_steps)
+    except (TypeError, ValueError):
+        return 0.0
+    if base_size <= 0 or max_steps < 0:
+        return 0.0
+    total = 0.0
+    for i in range(max_steps + 1):
+        total += base_size * (multiplier ** i)
+    return total
+
+def _get_bot_config_params(bot_id: int):
+    """Return (base_size, martingale_multiplier, max_steps) for a bot.
+
+    Reads the bots row; max_steps comes from the config JSON blob
+    (default 10 — same default as martingale_strategy.py and bot_manager.py).
+    Returns (0.0, 0.0, 0) if the bot does not exist.
+    """
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT base_size, martingale_multiplier, config FROM bots WHERE id = ?",
+        (bot_id,)
+    ).fetchone()
+    if not row:
+        return 0.0, 0.0, 0
+    base_size = float(row[0] or 0.0)
+    multiplier = float(row[1] or 0.0)
+    max_steps = 10
+    try:
+        if row[2]:
+            cfg = json.loads(row[2])
+            max_steps = int(cfg.get('max_steps', 10))
+    except (ValueError, TypeError, json.JSONDecodeError):
+        pass
+    return base_size, multiplier, max_steps
+
+def check_position_size_circuit_breaker(bot_id: int):
+    """O-1: Check whether a bot's invested notional exceeds 2x config max.
+
+    Returns (should_freeze: bool, current_invested: float, config_max: float).
+    Fires strictly greater than 2x config_max (exactly 2x does NOT fire).
+    No trades row → (False, 0.0, config_max).
+    """
+    base_size, multiplier, max_steps = _get_bot_config_params(bot_id)
+    config_max = _calculate_config_max_notional(base_size, multiplier, max_steps)
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT total_invested FROM trades WHERE bot_id = ?", (bot_id,)
+    ).fetchone()
+    current = float(row[0] or 0.0) if row else 0.0
+    should_freeze = config_max > 0 and current > 2.0 * config_max
+    return should_freeze, current, config_max
+
+def freeze_bot_for_position_oversize(bot_id: int, current_invested: float, config_max: float) -> None:
+    """O-1: Lock an oversized bot to REQUIRE_MANUAL_PROOF with a POS-SIZE-CB note.
+
+    Hard-failure path (position already exceeds 2x config max) — bypasses the
+    grace check by design; whitelisted in tests/test_require_proof_writers.py.
+    """
+    base_size, multiplier, max_steps = _get_bot_config_params(bot_id)
+    note = (
+        f"POS-SIZE-CB: total_invested ${current_invested:.2f} exceeds 2x config max "
+        f"${config_max:.2f} (base=${base_size:.2f}, mult={multiplier:.2f}, max_steps={max_steps})"
+    )
+    conn = get_connection()
+    conn.execute(
+        "UPDATE bots SET status='REQUIRE_MANUAL_PROOF', notes=? WHERE id=?",
+        (note, bot_id)
+    )
+    conn.commit()
+    logger.critical(f"🚨 [POS-SIZE-CB] Bot {bot_id} frozen: {note}")
+
 def update_bot_config_value(bot_id, key, value):
     """Parses JSON config, updates a single key, and saves back."""
     try:
