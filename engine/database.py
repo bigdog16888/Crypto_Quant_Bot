@@ -47,16 +47,23 @@ def get_connection():
                 need_new_connection = True
     
     if need_new_connection:
-        try:
-            _local.connection = sqlite3.connect(DB_PATH, timeout=60.0)
-            _local.connection_db_path = DB_PATH
-            # ENABLE WAL MODE for enterprise concurrency safety
-            _local.connection.execute("PRAGMA journal_mode=WAL")
-            _local.connection.execute("PRAGMA synchronous=NORMAL")
-            _local.connection.execute("PRAGMA busy_timeout=60000")
-        except Exception as e:
-            logger.error(f"❌ Failed to connect to database: {e}")
-            return None
+            try:
+                _local.connection = sqlite3.connect(DB_PATH, timeout=60.0)
+                _local.connection_db_path = DB_PATH
+                # ENABLE WAL MODE for enterprise concurrency safety (production pragmas)
+                _local.connection.execute("PRAGMA journal_mode=WAL")
+                _local.connection.execute("PRAGMA synchronous=NORMAL")
+                _local.connection.execute("PRAGMA busy_timeout=60000")
+                _local.connection.execute("PRAGMA wal_autocheckpoint=1000")
+                _local.connection.execute("PRAGMA cache_size=-32768")
+                # page_size must be set before any tables exist; for existing DB it's a no-op
+                try:
+                    _local.connection.execute("PRAGMA page_size=4096")
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.error(f"❌ Failed to connect to database: {e}")
+                return None
     
     return _local.connection
 
