@@ -933,15 +933,18 @@ def _seal_trade_state_internal(
         return {}
 
 
-def seal_all_active_bots() -> int:
+def seal_all_active_bots(skip_bot_ids: set = None) -> int:
     """
     Run seal_trade_state() for all active bots.
     Used at startup to ensure trades table is consistent before any trading.
     Returns the count of bots that had their state corrected.
+    If skip_bot_ids is provided, bots in that set are NOT sealed
+    (used by the O-9 startup plausibility gate to skip implausible pairs).
     """
     from engine.database import get_connection
 
     corrected = 0
+    skip_bot_ids = skip_bot_ids or set()
     try:
         conn = get_connection()
         bots = conn.execute(
@@ -949,6 +952,9 @@ def seal_all_active_bots() -> int:
         ).fetchall()
 
         for bot_id, bot_name in bots:
+            if bot_id in skip_bot_ids:
+                logger.warning(f"[SEAL-ALL] Skipping bot {bot_name} (id={bot_id}): plausibility-gated.")
+                continue
             before = conn.execute(
                 "SELECT total_invested FROM trades WHERE bot_id = ?", (bot_id,)
             ).fetchone()

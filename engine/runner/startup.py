@@ -232,6 +232,77 @@ class StartupMixin:
                 foreign.append(entry)
         return foreign, matched
 
+    def _startup_pair_plausibility_gate(self, exchange, conn, active_bot_ids):
+        """
+        O-9 (Step 2.5): Matched-pair plausibility gate.
+
+        Before seal_all_active_bots() and wipe_bot_ghost() run, check each active
+        bot's recorded position (trades.open_qty) against the exchange's signed
+        physical net for that bot's PAIR. The 2026-08-19 incident hit a MATCHED
+        pair (10007/BNBUSDC): the exchange showed an implausible size relative to
+        the DB claim, and seal/wipe ran destructively. 9132dc8 only handled the
+        FOREIGN-symbol case; this gate closes the matched-pair case.
+
+        Returns a set of bot_ids for which seal/wipe MUST be blocked this startup
+        (pair-level only — the rest of the engine is untouched). Read-only:
+        never mutates the DB or exchange.
+        """
+        if not getattr(config, 'STARTUP_PLAUSIBILITY_GATE', True):
+            logger.info("⏭️ [STARTUP-BARRIER] STARTUP_PLAUSIBILITY_GATE=False — plausibility gate disabled.")
+            return set()
+
+        from engine.database import get_bot_status
+        from engine.parity_gates import get_exchange_signed_net, qty_tolerance
+
+        tol = qty_tolerance()
+        blocked = set()
+        for bot_id in active_bot_ids:
+            try:
+                t = get_bot_status(bot_id)
+                if not t or not t.get('pair') or not t.get('is_active'):
+                    continue
+                pair = t['pair']
+                direction = str(t.get('direction') or 'LONG').upper()
+                open_qty = float(t.get('open_qty') or 0)
+                db_signed = open_qty if direction == 'LONG' else -open_qty
+            except Exception as _stat_err:
+                logger.warning(f"⚠️ [PLAUSIBILITY] Bot {bot_id}: status read failed ({_stat_err}) — not gated.")
+                continue
+
+            physical = get_exchange_signed_net(exchange, pair)
+            if physical is None or physical == 'mock_unconfigured':
+                continue  # can't verify — defer to Step 8 strict audit
+
+            abs_db, abs_phys = abs(db_signed), abs(physical)
+            real = lambda x: x > tol
+            reason = None
+            if real(abs_db) and not real(abs_phys):
+                reason = f"DB holds {db_signed:+.6f} but exchange is flat ({physical:+.6f})"
+            elif real(abs_phys) and not real(abs_db):
+                reason = f"exchange holds {physical:+.6f} but DB is flat ({db_signed:+.6f})"
+            elif real(abs_db) and real(abs_phys) and (db_signed > tol) != (physical > tol):
+                reason = (f"sign mismatch: DB={db_signed:+.6f} exchange={physical:+.6f} "
+                          f"(one-way mode cannot hold both sides)")
+
+            if reason:
+                logger.error(
+                    f"⛔ [STARTUP-BARRIER] [PLAUSIBILITY-BLOCK] Bot {bot_id} on {pair}: {reason}. "
+                    f"Blocking seal/wipe for THIS pair only. See docs/OPERATOR_MISMATCH_RUNBOOK.md Pattern E. "
+                    f"Not touched by the engine."
+                )
+                blocked.add(bot_id)
+            else:
+                logger.info(
+                    f"✅ [PLAUSIBILITY-OK] Bot {bot_id} {pair}: db={db_signed:+.6f} exchange={physical:+.6f} gap={physical-db_signed:+.6f}"
+                )
+
+        if blocked:
+            logger.warning(
+                f"🌐 [STARTUP-BARRIER] {len(blocked)} matched-pair bot(s) blocked from seal/wipe by plausibility gate: {sorted(blocked)}"
+            )
+        return blocked
+
+
     def startup_sync(self):
         """
         Strict, blocking startup synchronization barrier.
@@ -302,10 +373,15 @@ class StartupMixin:
                 logger.info(f"✅ [STARTUP-BARRIER] Offline fills reconstruction complete: {stats}")
 
             # -------------------------------------------------------------
+            # STEP 2.5 (O-9): Matched-pair plausibility gate (before destructive seal/wipe)
+            # -------------------------------------------------------------
+            _plaus_blocked = self._startup_pair_plausibility_gate(parity_ex, conn, active_ids)
+
+            # -------------------------------------------------------------
             # STEP 3: Ledger Sealing & Cache Propagation
             # -------------------------------------------------------------
             logger.info("🔒 [STARTUP-BARRIER] [3/8] Sealing all active bots from ledger fills...")
-            seal_all_active_bots()
+            seal_all_active_bots(skip_bot_ids=_plaus_blocked)
             for bid in active_ids:
                 sync_trades_from_orders(bid)
             logger.info("✅ [STARTUP-BARRIER] Sealing and trades cache propagation complete.")
@@ -318,6 +394,9 @@ class StartupMixin:
             for _pair in pairs:
                 sync_pair_to_exchange(_pair, parity_ex, conn)
             for bid in active_ids:
+                if bid in _plaus_blocked:
+                    logger.warning(f"⛔ [STARTUP-BARRIER] Skipping ghost wipe for bot {bid} (plausibility-gated).")
+                    continue
                 if detect_bot_ghost(parity_ex, bid, conn):
                     wipe_bot_ghost(parity_ex, bid, conn)
 
