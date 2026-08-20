@@ -4545,12 +4545,21 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None, *, cycle_f
 def get_pair_virtual_net(symbol: str) -> float:
     """
     Returns the signed virtual net quantity for a normalized symbol across ALL active bots.
-    The `open_qty` column in `trades` is already stored with the correct sign
-    (positive for LONG, negative for SHORT). The original implementation
-    incorrectly applied an additional direction‑based sign flip, which double‑inverted
-    SHORT quantities and produced an inflated virtual net for mixed‑direction
-    pairs.
-    The corrected logic simply sums the raw `open_qty` values.
+
+    SIGN CONVENTION: `trades.open_qty` is stored UNSIGNED (always >= 0 — every
+    write path clamps it: ledger.py OPEN_QTY ACCUMULATOR uses MAX(0, ...),
+    seal/sync paths use max(0.0, qty)). The sign lives in `trades.position_side`,
+    so this function applies it here: SHORT rows contribute -open_qty, LONG rows
+    contribute +open_qty. Live DB confirms: zero negative open_qty rows.
+
+    HISTORY — do not "fix" this again: commit 6a92f3a (2026-07-30) removed this
+    sign flip on the mistaken premise that open_qty was already signed; commit
+    94b4652 (2026-08-10) re-added it keyed on t.position_side but left the old
+    (wrong) docstring in place. That stale docstring misled a review on
+    2026-08-20 into nearly re-introducing the double-count bug. Removing the
+    sign flip below makes SHORT positions count as LONG and inflates the net —
+    proven by tests/test_ledger_integrity.py::test_hedge_child_order_virtual_net
+    (LONG +2.0 and SHORT 1.0 on one pair must net to +1.0, not +3.0).
     """
     
     from engine.exchange_interface import normalize_symbol
