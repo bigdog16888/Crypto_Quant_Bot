@@ -269,6 +269,27 @@ class BotRunner(StartupMixin, ShutdownMixin, WebSocketLifecycleMixin, CycleLoopM
 
             # Log for debugging
             logger.debug(f"Circuit Check: Equity ${current_equity:.2f} (Cash: {total_stablecoin:.2f} + Cost: {invested_cost:.2f} + uPnL: {unrealized_pnl:.2f})")
+            # O-3: Record equity snapshot + rolling-window drawdown breaker
+            try:
+                from engine.database import record_equity_snapshot, get_equity_snapshot_series, compute_rolling_drawdown
+                now = time.time()
+                record_equity_snapshot(current_equity, ts=now)
+                window_h = float(getattr(config, "DRAWDOWN_WINDOW_HOURS", 24))
+                threshold_pct = float(getattr(config, "DRAWDOWN_PCT", 20.0))
+                series = get_equity_snapshot_series(ts_from=now - window_h * 3600)
+                if len(series) >= 2:
+                    rolling_drawdown, base = compute_rolling_drawdown(series, current_equity)
+                    if base and base > 0:
+                        if rolling_drawdown >= threshold_pct:
+                            logger.critical(f"O-3 ROLLING-WINDOW DRAWDOWN TRIGGERED! {rolling_drawdown:.2f}% drop over {window_h}h window")
+                            self.circuit_breaker_triggered = True
+                            with open(config.PATHS["EMERGENCY_FILE"], "w") as f:
+                                f.write(f"O-3 Rolling-Window Drawdown Triggered at {rolling_drawdown:.2f}% over {window_h}h")
+                            self.handle_emergency_liquidation()
+                            return
+            except Exception as e:
+                logger.error(f"O-3 rolling-window check failed: {e}")
+
 
             if self.initial_equity > 0:
                 drawdown = (self.initial_equity - current_equity) / self.initial_equity * 100

@@ -39,6 +39,10 @@ class Config:
         self.GLOBAL_STOP_LOSS_PCT = float(os.getenv("GLOBAL_STOP_LOSS_PCT", 50.0))
         self.MAX_RETRIES = int(os.getenv("MAX_RETRIES", 3))
         self.RETRY_DELAY = int(os.getenv("RETRY_DELAY", 2))
+
+        # 🛡️ O-3: Rolling-window portfolio drawdown breaker
+        self.DRAWDOWN_WINDOW_HOURS = float(os.getenv("DRAWDOWN_WINDOW_HOURS", 24))
+        self.DRAWDOWN_PCT = float(os.getenv("DRAWDOWN_PCT", 20.0))
         
         # 🛡️ SAFETY TOGGLE: Allow user to disable auto-cancellation of zombie orders
         self.AUTO_FIX_ZOMBIES = os.getenv("AUTO_FIX_ZOMBIES", "True").lower() == "true"

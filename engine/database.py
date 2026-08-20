@@ -113,6 +113,42 @@ def get_starting_equity():
     row = cursor.fetchone()
     return float(row[0]) if row else 10000.0
 
+def record_equity_snapshot(equity: float, ts: float = None, max_age_hours: float = 48.0) -> None:
+    """O-3: Persist an equity snapshot point. Prunes points older than max_age_hours."""
+    ts = ts if ts is not None else time.time()
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("INSERT OR REPLACE INTO equity_snapshots (ts, equity) VALUES (?, ?)", (ts, float(equity)))
+    cutoff = ts - max_age_hours * 3600
+    cur.execute("DELETE FROM equity_snapshots WHERE ts < ?", (cutoff,))
+    conn.commit()
+    conn.close()
+
+def get_equity_snapshot_series(ts_from: float = None) -> list:
+    """O-3: Return [(ts, equity), ...] ordered by ts, optionally from a cutoff."""
+    conn = get_connection()
+    cur = conn.cursor()
+    if ts_from is not None:
+        cur.execute("SELECT ts, equity FROM equity_snapshots WHERE ts >= ? ORDER BY ts", (ts_from,))
+    else:
+        cur.execute("SELECT ts, equity FROM equity_snapshots ORDER BY ts")
+    rows = cur.fetchall()
+    conn.close()
+    return [(float(ts), float(eq)) for ts, eq in rows]
+
+def compute_rolling_drawdown(series, current_equity: float) -> tuple:
+    """O-3: Given [(ts, equity), ...] (oldest first) and current equity, return"""
+    """(rolling_drawdown_pct, base_equity) where base_equity is the window-start"""
+    """equity (earliest in series). Drawdown = (base - current) / base * 100."""
+    if not series or len(series) < 2:
+        return 0.0, None
+    base_equity = float(series[0][1])
+    if base_equity <= 0:
+        return 0.0, None
+    drawdown = (base_equity - float(current_equity)) / base_equity * 100
+    return max(0.0, drawdown), base_equity
+
+
 def backup_database():
     """Creates a timestamped backup of the database before modification."""
     if not os.path.exists(DB_PATH):
@@ -523,6 +559,14 @@ def init_db():
             )
         """)
         
+        # O-3: Equity snapshots for rolling-window drawdown breaker
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS equity_snapshots (
+                ts INTEGER PRIMARY KEY,
+                equity REAL
+            )
+        """)
+
         # Set default starting equity if not present
         cursor.execute("INSERT OR IGNORE INTO system_equity (key, value) VALUES (?, ?)", ('STARTING_EQUITY', 10000.0))
         cursor.execute("INSERT OR IGNORE INTO system_equity (key, value) VALUES (?, ?)", ('BOT_TRADING_BALANCE', 10000.0))
