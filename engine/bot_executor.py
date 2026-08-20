@@ -4904,6 +4904,27 @@ class BotExecutor:
                         parent_cycle_id=int(bot_status.get('cycle_id', 1)),
                         current_price=current_price,
                     )
+                    # O-10: Hedge-engagement watchdog - verify the hedge child
+                    # actually engaged for this parent at/above trigger step.
+                    try:
+                        from engine.hedge_watchdog import verify_hedge_engagement
+                        _wd = verify_hedge_engagement(parent_bot_id=bot_id,
+                                                     parent_direction=direction,
+                                                     conn=_conn_hcs,
+                                                     config=config)
+                        if _wd.get('engine_halt'):
+                            logger.critical(f"\U0001f6d1\ufe0f O-10 ENGINE HALT: {name} hedge-engagement failure escalated to whole-engine halt (>=2 parents frozen in window).")
+                        elif _wd.get('freeze_parent') and not _wd.get('engaged'):
+                            import time as _wd_time
+                            _conn_hcs.execute(
+                                "UPDATE bots SET status='REQUIRE_MANUAL_PROOF', last_error=?, last_error_time=? WHERE id=?",
+                                ("HEDGE_ENGAGE_FAILURE:" + _wd.get('reason', ''), int(_wd_time.time()), bot_id)
+                            )
+                            _conn_hcs.commit()
+                            logger.critical(f"\U0001f6e1\ufe0f O-10 HEDGE-FREEZE: {name} hedge failed to engage - bot locked to REQUIRE_MANUAL_PROOF.")
+                    except Exception as _wd_err:
+                        logger.error(f"\u274c {name}: O-10 watchdog exception: {_wd_err}")
+
         except Exception as e_hedge_eval:
              logger.error(f"❌ {name}: Failed to evaluate hedge child signal in maintain_orders: {e_hedge_eval}")
 

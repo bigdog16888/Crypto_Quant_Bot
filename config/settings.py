@@ -43,6 +43,11 @@ class Config:
         # 🛡️ O-3: Rolling-window portfolio drawdown breaker
         self.DRAWDOWN_WINDOW_HOURS = float(os.getenv("DRAWDOWN_WINDOW_HOURS", 24))
         self.DRAWDOWN_PCT = float(os.getenv("DRAWDOWN_PCT", 20.0))
+
+        # 🛡️ O-10: Hedge-engagement watchdog
+        self.MIN_HEDGE_QTY = float(os.getenv("MIN_HEDGE_QTY", 0.0001))
+        self.HEDGE_ENGAGE_TIMEOUT_SECONDS = int(os.getenv("HEDGE_ENGAGE_TIMEOUT_SECONDS", 300))
+        self.HEDGE_FAIL_WINDOW_SECONDS = int(os.getenv("HEDGE_FAIL_WINDOW_SECONDS", 86400))
         
         # 🛡️ SAFETY TOGGLE: Allow user to disable auto-cancellation of zombie orders
         self.AUTO_FIX_ZOMBIES = os.getenv("AUTO_FIX_ZOMBIES", "True").lower() == "true"
