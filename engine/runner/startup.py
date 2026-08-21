@@ -567,6 +567,22 @@ class StartupMixin:
         except Exception as e:
             logger.error(f"Startup integrity check failed: {e}")
 
+        # --- READ-ONLY: bots.direction vs trades.position_side divergence check ---
+        # Non-fatal at startup (see check_direction_side_consistency docstring in
+        # engine/integrity.py for the documented surfacing decision). Divergence
+        # means pair-net and bot-contribution sign conventions disagree — parity
+        # math is unreliable until a human inspects. Never mutates state here.
+        try:
+            from engine.integrity import check_direction_side_consistency
+            _divs = check_direction_side_consistency()
+            if _divs:
+                logger.error(
+                    f"⚠️ [STARTUP] {len(_divs)} bots.direction/trades.position_side "
+                    f"divergence(s) detected — see [DIR-SIDE-DIVERGENCE] errors above."
+                )
+        except Exception as e:
+            logger.error(f"Startup direction/position_side check failed (non-fatal): {e}")
+
         # --- v2.0 SCHEMA MIGRATION ---
         # Idempotent: safe to run on every startup.
         # Adds cumulative_filled, position_side, cycle_id columns to bot_orders if missing.

@@ -7,6 +7,96 @@ from .exchange_interface import normalize_symbol
 logger = logging.getLogger("IntegrityEnforcer")
 
 _flag_cycle_count = 0  # Throttle counter for flag_unmatched_positions
+_dir_side_cycle_count = 0  # Throttle counter for the direction/position_side check
+
+
+def check_direction_side_consistency(conn=None) -> List[Dict[str, Any]]:
+    """
+    READ-ONLY consistency check: bots.direction vs trades.position_side.
+
+    WHY THIS EXISTS (task t_fc30b679):
+    get_pair_virtual_net (engine/database.py) signs each trades row by
+    trades.position_side, while get_bot_signed_contribution
+    (engine/parity_gates.py) signs by bots.direction. On live rows the two
+    agree, but nothing enforces that. If they ever diverge for a bot with
+    open_qty != 0, pair-level net and bot-level contribution silently disagree
+    and wipe-proof / parity-gate math gets subtly wrong — no error is raised
+    anywhere else. This check NOTICEs the divergence instead of staying silent.
+
+    RULE — mirrors the two sign conventions EXACTLY:
+      effective_side(position_side) = 'SHORT' if upper == 'SHORT' else 'LONG'
+          (get_pair_virtual_net treats any non-SHORT value, including legacy
+           'BOTH'/NULL, as LONG: SHORT rows contribute -open_qty, all others +)
+      effective_dir(direction)      = 'LONG' if upper == 'LONG' else 'SHORT'
+          (get_bot_signed_contribution: +qty only when direction == 'LONG')
+    A row diverges when effective_side != effective_dir. So a legacy
+    position_side='BOTH' row fires only when direction='SHORT' (a real sign
+    disagreement), not when direction='LONG'.
+
+    Scope: every bot with a trades row where open_qty != 0 (active or not —
+    is_active is included in the log line for triage). open_qty is UNSIGNED;
+    the sign lives in position_side (see get_pair_virtual_net docstring and
+    commit 205592d — do not re-litigate that convention here).
+
+    READ-ONLY: never mutates DB or exchange state. On divergence, logs a loud
+    ERROR with bot_id, pair, and both values, and returns the divergent rows
+    as dicts so callers/tests can inspect them.
+
+    SURFACING DECISION (documented per task):
+    - Periodic integrity pass: YES — called from enforce_integrity() via
+      _maybe_check_direction_side(), throttled to every 30 cycles (~2.5 min),
+      same cadence as flag_unmatched_positions.
+    - Startup barrier: NON-FATAL — called once in BotRunner init right after
+      the early check_and_fix_integrity() (engine/runner/startup.py). Divergence
+      logs ERROR but does NOT abort startup. Rationale: this check is new and
+      unproven in production; divergence degrades parity-report accuracy but
+      does not itself move money, so a hard block risks a false-positive
+      outage. If divergence is ever confirmed live, escalate this to a
+      blocking gate deliberately.
+    """
+    if conn is None:
+        conn = database.get_connection()
+    divergences: List[Dict[str, Any]] = []
+    try:
+        rows = conn.execute("""
+            SELECT b.id, b.pair, b.direction, t.position_side, t.open_qty, b.is_active
+            FROM bots b
+            JOIN trades t ON t.bot_id = b.id
+            WHERE COALESCE(t.open_qty, 0) != 0
+        """).fetchall()
+    except Exception as e:
+        logger.error(f"[DIR-SIDE-CHECK] Query failed (skipping, read-only): {e}")
+        return divergences
+
+    for bot_id, pair, direction, position_side, open_qty, is_active in rows:
+        dir_eff = 'LONG' if str(direction or '').upper() == 'LONG' else 'SHORT'
+        side_eff = 'SHORT' if str(position_side or '').upper() == 'SHORT' else 'LONG'
+        if dir_eff != side_eff:
+            divergences.append({
+                'bot_id': bot_id,
+                'pair': pair,
+                'direction': str(direction),
+                'position_side': str(position_side),
+                'open_qty': float(open_qty),
+                'is_active': is_active,
+            })
+            logger.error(
+                f"🚨 [DIR-SIDE-DIVERGENCE] Bot {bot_id} ({pair}): bots.direction={direction!r} "
+                f"but trades.position_side={position_side!r} with open_qty={open_qty} "
+                f"(is_active={is_active}). Pair-net signs by position_side, bot-contribution "
+                f"signs by direction — they DISAGREE for this bot; parity/wipe-proof math is "
+                f"unreliable until fixed. Manual inspection required (this check never mutates state)."
+            )
+    return divergences
+
+
+def _maybe_check_direction_side():
+    """Throttled wrapper: run the read-only direction/position_side check every 30 cycles."""
+    global _dir_side_cycle_count
+    _dir_side_cycle_count += 1
+    if _dir_side_cycle_count % 30 != 0:
+        return
+    check_direction_side_consistency()
 
 def enforce_integrity(runner_instance, exchange_snapshot: Dict[str, Any]):
     """
@@ -20,6 +110,11 @@ def enforce_integrity(runner_instance, exchange_snapshot: Dict[str, Any]):
     try:
         # 1. Internal DB Fixes
         database.check_and_fix_integrity()
+
+        # 1b. READ-ONLY: bots.direction vs trades.position_side divergence check
+        # (throttled every 30 cycles; never mutates state — see
+        # check_direction_side_consistency docstring for the surfacing decision)
+        _maybe_check_direction_side()
 
         # 2. Flag unmatched positions (report only, never modify trade data)
         flag_unmatched_positions(runner_instance, exchange_snapshot)
