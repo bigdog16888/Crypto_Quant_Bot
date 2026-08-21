@@ -38,6 +38,27 @@ def _pair_norm(pair: str) -> str:
     return normalize_symbol(pair).upper()
 
 
+def _sync_stale_cycle_manual_proof_internal(norm_pair: str):
+    """
+    INV-31 WriteQueue internal — ADR-005 Phase 3 stale-cycle circuit breaker.
+
+    Sets all active bots on the pair to REQUIRE_MANUAL_PROOF after the exchange
+    API has been unreachable for PA_SYNC_MAX_STALE_CYCLES consecutive cycles.
+    Runs on the WriteQueue worker thread (own thread-local connection).
+    Hard-failure path: intentionally bypasses the parity_gates grace check
+    (whitelisted in tests/test_require_proof_writers.py, INV S3.57).
+    """
+    from engine.database import get_connection
+    conn = get_connection()
+    conn.execute(
+        "UPDATE bots SET status='REQUIRE_MANUAL_PROOF' "
+        "WHERE is_active=1 AND normalized_pair=? "
+        "AND status NOT IN ('STOPPED','REQUIRE_MANUAL_PROOF')",
+        (norm_pair,)
+    )
+    conn.commit()
+
+
 def get_pair_open_qty_net(pair: str) -> float:
     """Signed net from trades.open_qty — matches one-way exchange position when accurate."""
     from engine.database import get_connection
@@ -131,6 +152,21 @@ def gate_oneway_opposite_entry(
     return True, ''
 
 
+def _oneway_repair_filled_amount_internal(cut: float, audit_cid: str, bid: int):
+    """
+    INV-31 WriteQueue internal — stamp filled_amount on the ONEWAY_REPAIR
+    adoption_reduce audit row. Runs on the WriteQueue worker thread
+    (own thread-local connection, own commit).
+    """
+    from engine.database import get_connection
+    conn = get_connection()
+    conn.execute(
+        "UPDATE bot_orders SET filled_amount = ? WHERE client_order_id = ? AND bot_id = ?",
+        (cut, audit_cid, bid),
+    )
+    conn.commit()
+
+
 def reconcile_oneway_pair_open_qty(
     exchange,
     pair: str,
@@ -142,6 +178,7 @@ def reconcile_oneway_pair_open_qty(
     from engine.database import get_connection, save_bot_order
     from engine.ledger import seal_trade_state
     from engine.parity_gates import get_exchange_signed_net
+    from engine.write_queue import WriteQueue
 
     if not exchange:
         return None
@@ -219,10 +256,8 @@ def reconcile_oneway_pair_open_qty(
                         notes=f"ONEWAY_REPAIR: align open_qty to exchange (cut {cut:.6f})",
                         cycle_id=cycle_id,
                     )
-                    conn.execute(
-                        "UPDATE bot_orders SET filled_amount = ? WHERE client_order_id = ? AND bot_id = ?",
-                        (cut, audit_cid, bid),
-                    )
+                    # INV-31: route bot_orders write through WriteQueue
+                    WriteQueue().put_and_wait(_oneway_repair_filled_amount_internal, cut, audit_cid, bid)
                     remaining -= cut
                     reduced_bots.append(bid)
                     logger.warning(
@@ -233,7 +268,8 @@ def reconcile_oneway_pair_open_qty(
                     logger.warning(
                         f"⚠️ [ONEWAY-REPAIR] Skip repair for bot {bid}: cut={cut:.6f}, price={current_price:.4f}"
                     )
-        conn.commit()
+        # INV-31: no direct conn.commit() here — save_bot_order and
+        # _oneway_repair_filled_amount_internal each commit on the writer thread.
         for bid in reduced_bots:
             try:
                 seal_trade_state(bid, force_recompute=True)
@@ -340,7 +376,70 @@ def detect_bot_ghost(exchange, bot_id, conn) -> bool:
 
 
 
+# ---------------------------------------------------------------------------
+# INV-31 WriteQueue internals for wipe_bot_ghost.
+#
+# The ghost-wipe DB mutation happens in two atomic commit groups around the
+# seal_trade_state() call:
+#   pre-seal : bots.status + bot_orders cancel + bot_orders reset_cleared
+#   post-seal: bots.status (re-force) + trades.cycle_phase='IDLE'
+# The bots.status writes share a transaction with the bot_orders/trades writes,
+# so each group moves WHOLE onto the WriteQueue worker thread (own thread-local
+# connection, own commit). Splitting a group across the caller's connection and
+# the worker would break atomicity.
+#
+# CALLER CONSTRAINT: callers must NOT hold an open transaction on the conn they
+# pass in (queueing while the caller's transaction holds the write lock would
+# deadlock put_and_wait — see wipe_proof.py external-cursor note). Verified for
+# all three current call sites (bot_executor partial-close fallback, reconciler
+# ghost sweep, startup barrier step 4): each reaches wipe_bot_ghost with only
+# read-only statements executed on conn beforehand.
+# ---------------------------------------------------------------------------
+_GHOST_WIPE_BOT_STATUS_SQL = "UPDATE bots SET status = ? WHERE id = ?"
+_GHOST_WIPE_CANCEL_ORDERS_SQL = (
+    "UPDATE bot_orders SET status='cancelled' "
+    "WHERE bot_id=? AND status IN ('open', 'new', 'placing', 'cancelling')"
+)
+_GHOST_WIPE_RESET_ORDERS_SQL = (
+    "UPDATE bot_orders SET status='reset_cleared' "
+    "WHERE bot_id=? AND (status NOT IN ('open', 'new', 'placing', 'cancelling', 'auto_closed', 'reset_cleared', 'cancelled') OR (status IN ('cancelled', 'canceled') AND filled_amount > 0))"
+)
+_GHOST_WIPE_CYCLE_PHASE_SQL = "UPDATE trades SET cycle_phase = 'IDLE' WHERE bot_id = ?"
+
+
+def _wipe_bot_ghost_pre_seal_internal(bot_id: int, target_status: str):
+    """INV-31 WriteQueue internal — pre-seal commit group of wipe_bot_ghost."""
+    from engine.database import get_connection
+    conn = get_connection()
+    conn.execute(_GHOST_WIPE_BOT_STATUS_SQL, (target_status, bot_id))
+    conn.execute(_GHOST_WIPE_CANCEL_ORDERS_SQL, (bot_id,))
+    conn.execute(_GHOST_WIPE_RESET_ORDERS_SQL, (bot_id,))
+    conn.commit()
+
+
+def _wipe_bot_ghost_post_seal_internal(bot_id: int, target_status: str):
+    """INV-31 WriteQueue internal — post-seal commit group of wipe_bot_ghost."""
+    from engine.database import get_connection
+    conn = get_connection()
+    # Force status to target_status if seal overwrote it to Scanning
+    conn.execute(_GHOST_WIPE_BOT_STATUS_SQL, (target_status, bot_id))
+    # Reset cycle_phase to IDLE — seal_trade_state zeros open_qty but does not
+    # touch cycle_phase, leaving it ACTIVE. An ACTIVE cycle with open_qty=0 and
+    # no orders creates the GHOST_STEP illegal state that GTR is designed to catch.
+    conn.execute(_GHOST_WIPE_CYCLE_PHASE_SQL, (bot_id,))
+    conn.commit()
+
+
 def wipe_bot_ghost(exchange, bot_id, conn):
+    """
+    Wipe a ghost bot: DB claims open_qty > 0 but the exchange is flat on this
+    side (see detect_bot_ghost).
+
+    INV-31: all trades/bot_orders writes route through the WriteQueue singleton
+    via _wipe_bot_ghost_pre_seal_internal / _wipe_bot_ghost_post_seal_internal.
+    The passed-in conn is used for READS only; see the caller constraint in the
+    WriteQueue-internals note above this function.
+    """
     # 1. Fetch details
     row = conn.execute(
         "SELECT b.name, b.pair, b.direction, b.bot_type, t.open_qty, t.cycle_id "
@@ -361,41 +460,19 @@ def wipe_bot_ghost(exchange, bot_id, conn):
         except Exception as e:
             logger.error(f"Failed to cancel open orders for bot {bot_id} on {pair}: {e}")
 
-    # 2. Set status to target status
-    conn.execute(
-        "UPDATE bots SET status = ? WHERE id = ?", (target_status, bot_id)
-    )
+    from engine.write_queue import WriteQueue
 
-    # 3. Cancel open internal orders and archive filled orders to prevent zombie revival
-    conn.execute(
-        "UPDATE bot_orders SET status='cancelled' "
-        "WHERE bot_id=? AND status IN ('open', 'new', 'placing', 'cancelling')",
-        (bot_id,)
-    )
-    conn.execute(
-        "UPDATE bot_orders SET status='reset_cleared' "
-        "WHERE bot_id=? AND (status NOT IN ('open', 'new', 'placing', 'cancelling', 'auto_closed', 'reset_cleared', 'cancelled') OR (status IN ('cancelled', 'canceled') AND filled_amount > 0))",
-        (bot_id,)
-    )
-    conn.commit()
+    # 2+3. Set status to target status; cancel open internal orders and archive
+    # filled orders to prevent zombie revival — one atomic commit group on the
+    # WriteQueue worker thread (INV-31).
+    WriteQueue().put_and_wait(_wipe_bot_ghost_pre_seal_internal, bot_id, target_status)
 
     # 4. Seal the bot using its new 'reset_cleared' state (reads 0.0 open_qty)
     from engine.ledger import seal_trade_state
     seal_trade_state(bot_id, force_recompute=True)
 
-    # Force status to target_status if seal overwrote it to Scanning
-    conn.execute(
-        "UPDATE bots SET status = ? WHERE id = ?",
-        (target_status, bot_id)
-    )
-    # Reset cycle_phase to IDLE — seal_trade_state zeros open_qty but does not
-    # touch cycle_phase, leaving it ACTIVE. An ACTIVE cycle with open_qty=0 and
-    # no orders creates the GHOST_STEP illegal state that GTR is designed to catch.
-    conn.execute(
-        "UPDATE trades SET cycle_phase = 'IDLE' WHERE bot_id = ?",
-        (bot_id,)
-    )
-    conn.commit()
+    # Re-force status + reset cycle_phase — second atomic commit group (INV-31).
+    WriteQueue().put_and_wait(_wipe_bot_ghost_post_seal_internal, bot_id, target_status)
 
     # 5. Write a drift_note audit row
     from engine.database import save_bot_order
@@ -435,9 +512,11 @@ def sync_pair_to_exchange(pair, exchange, conn):
     If diff > qty_tolerance(): log WARNING with full breakdown.
     This phase is OBSERVATION ONLY — it detects drift and logs it with full diagnostic detail but does not change any bot's open_qty.
     Saves the last check result to a local JSON cache so that the UI can render it.
+    REQUIRE_MANUAL_PROOF write routed through WriteQueue per INV-31.
     """
     from engine.parity_gates import get_exchange_signed_net, qty_tolerance
     from engine.exchange_interface import normalize_symbol
+    from engine.write_queue import WriteQueue
     import json
     import os
     import time
@@ -458,13 +537,8 @@ def sync_pair_to_exchange(pair, exchange, conn):
                 )
                 from engine.exchange_interface import normalize_symbol as _ns
                 _norm = _ns(pair).upper()
-                conn.execute(
-                    "UPDATE bots SET status='REQUIRE_MANUAL_PROOF' "
-                    "WHERE is_active=1 AND normalized_pair=? "
-                    "AND status NOT IN ('STOPPED','REQUIRE_MANUAL_PROOF')",
-                    (_norm,)
-                )
-                conn.commit()
+                # Route through WriteQueue
+                WriteQueue().put_and_wait(_sync_stale_cycle_manual_proof_internal, _norm)
         except Exception as _stale_err:
             logger.error(f"[PA-SYNC] Stale-cycle handler failed for {pair}: {_stale_err}")
         return None
