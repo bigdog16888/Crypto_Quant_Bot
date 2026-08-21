@@ -35,6 +35,23 @@ def make_conn():
             open_qty REAL
         )"""
     )
+    # bot_orders table for hedge_watchdog's _child_hedge_qty_from_orders
+    conn.execute(
+        """CREATE TABLE bot_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            bot_id INTEGER,
+            step INTEGER,
+            order_type TEXT,
+            status TEXT DEFAULT 'open',
+            amount REAL,
+            filled_amount REAL DEFAULT 0,
+            created_at INTEGER,
+            filled_at INTEGER DEFAULT 0,
+            cycle_id INTEGER,
+            position_side TEXT DEFAULT 'BOTH',
+            FOREIGN KEY (bot_id) REFERENCES bots (id)
+        )"""
+    )
     return conn
 
 
@@ -56,6 +73,16 @@ def seed_trade(conn, bid, open_qty):
     conn.commit()
 
 
+def seed_bot_order(conn, bot_id, step, order_type, status, amount, filled_amount=0, created_at=1000, filled_at=0, cycle_id=1, position_side='LONG'):
+    """Insert a bot_orders row for testing."""
+    conn.execute(
+        """INSERT INTO bot_orders (bot_id, step, order_type, status, amount, filled_amount, created_at, filled_at, cycle_id, position_side)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (bot_id, step, order_type, status, amount, filled_amount, created_at, filled_at, cycle_id, position_side)
+    )
+    conn.commit()
+
+
 class TestHedgeWatchdog(unittest.TestCase):
 
     def test_engaged_when_child_offsetting(self):
@@ -63,8 +90,9 @@ class TestHedgeWatchdog(unittest.TestCase):
         conn = make_conn()
         seed_bot(conn, 200, direction="LONG", hedge_child=100, status="IN TRADE")
         seed_bot(conn, 100, direction="SHORT", status="HEDGE_STANDBY", hedge_child=None)
-        seed_trade(conn, 100, 0.5)
-        res = verify_hedge_engagement(200, "LONG", conn)
+        # Child has filled entry order for step 1
+        seed_bot_order(conn, 100, 1, 'entry', 'filled', 0.5, 0.5, created_at=1000, filled_at=1000, cycle_id=1)
+        res = verify_hedge_engagement(200, "LONG", conn, config={"child_step": 1, "parent_cycle_id": 1})
         self.assertTrue(res["engaged"])
         self.assertFalse(res["freeze_parent"])
         self.assertFalse(res["engine_halt"])
@@ -84,21 +112,23 @@ class TestHedgeWatchdog(unittest.TestCase):
         conn = make_conn()
         seed_bot(conn, 200, direction="LONG", hedge_child=100, status="IN TRADE")
         seed_bot(conn, 100, direction="LONG", status="HEDGE_STANDBY", hedge_child=None)  # wrong: same dirn
-        seed_trade(conn, 100, 0.5)
-        res = verify_hedge_engagement(200, "LONG", conn)
+        # Child has filled entry order but wrong direction
+        seed_bot_order(conn, 100, 1, 'entry', 'filled', 0.5, 0.5, created_at=1000, filled_at=1000, cycle_id=1)
+        res = verify_hedge_engagement(200, "LONG", conn, config={"child_step": 1, "parent_cycle_id": 1})
         self.assertFalse(res["engaged"])
         self.assertTrue(res["freeze_parent"])
-        self.assertEqual(res["reason"], "child_not_offsetting")
+        self.assertEqual(res["reason"], "wrong_direction")
 
     def test_child_zero_qty_freezes(self):
         """Child has no open position yet => not offsetting => freeze."""
         conn = make_conn()
         seed_bot(conn, 200, direction="LONG", hedge_child=100, status="IN TRADE")
         seed_bot(conn, 100, direction="SHORT", status="HEDGE_STANDBY", hedge_child=None)
-        seed_trade(conn, 100, 0.0)  # no position
-        res = verify_hedge_engagement(200, "LONG", conn)
+        # No bot_orders entry = no position attempt
+        res = verify_hedge_engagement(200, "LONG", conn, config={"child_step": 1, "parent_cycle_id": 1})
         self.assertFalse(res["engaged"])
         self.assertTrue(res["freeze_parent"])
+        self.assertEqual(res["reason"], "no_entry_order")
 
     def test_escalation_over_threshold(self):
         """>=2 parents frozen in window => engine_halt. Fresh parent + 1 existing."""
@@ -147,8 +177,8 @@ class TestHedgeWatchdog(unittest.TestCase):
         conn = make_conn()
         seed_bot(conn, 200, direction="LONG", hedge_child=100, status="IN TRADE")
         seed_bot(conn, 100, direction="SHORT", status="REQUIRE_MANUAL_PROOF", hedge_child=None)
-        seed_trade(conn, 100, 0.5)
-        res = verify_hedge_engagement(200, "LONG", conn)
+        seed_bot_order(conn, 100, 1, 'entry', 'filled', 0.5, 0.5, created_at=1000, filled_at=1000, cycle_id=1)
+        res = verify_hedge_engagement(200, "LONG", conn, config={"child_step": 1, "parent_cycle_id": 1})
         self.assertFalse(res["engaged"])
         self.assertTrue(res["freeze_parent"])
 
@@ -172,9 +202,43 @@ class TestHedgeWatchdog(unittest.TestCase):
     def test_child_offset_ok_opposite_signs(self):
         conn = make_conn()
         seed_bot(conn, 100, direction="SHORT", status="HEDGE_STANDBY", hedge_child=None)
-        seed_trade(conn, 100, 0.5)
-        self.assertTrue(_child_offset_ok(100, "LONG", conn))    # parent LONG -> child SHORT ok
-        self.assertFalse(_child_offset_ok(100, "SHORT", conn))  # parent SHORT -> child SHORT not ok
+        # Add a filled order for the child
+        seed_bot_order(conn, 100, 1, 'entry', 'filled', 0.5, 0.5, created_at=1000, filled_at=1000, cycle_id=1)
+        self.assertTrue(_child_offset_ok(100, "LONG", conn, child_step=1, parent_cycle_id=1)[0])    # parent LONG -> child SHORT ok
+        self.assertFalse(_child_offset_ok(100, "SHORT", conn, child_step=1, parent_cycle_id=1)[0])  # parent SHORT -> child SHORT not ok
+
+    def test_unfilled_entry_within_engage_timeout_no_freeze(self):
+        """Entry placed this cycle but unfilled, within engage_timeout => no freeze."""
+        conn = make_conn()
+        seed_bot(conn, 200, direction="LONG", hedge_child=100, status="IN TRADE")
+        seed_bot(conn, 100, direction="SHORT", status="HEDGE_STANDBY", hedge_child=None)
+        # Child's entry order still open (unfilled), placed ~30s ago
+        seed_bot_order(conn, 100, 1, 'entry', 'open', 0.5, 0.0,
+                       created_at=970, filled_at=0, cycle_id=1)
+        now = 1000.0
+        res = verify_hedge_engagement(200, "LONG", conn, now=now,
+                                      config={"child_step": 1, "parent_cycle_id": 1,
+                                              "HEDGE_ENGAGE_TIMEOUT_SECONDS": 60})
+        # Not yet engaged, but within grace window -> no freeze, no halt
+        self.assertFalse(res["engaged"])
+        self.assertFalse(res["freeze_parent"])
+        self.assertFalse(res["engine_halt"])
+
+    def test_unfilled_entry_past_engage_timeout_freezes(self):
+        """Entry placed this cycle, still unfilled past engage_timeout => freeze."""
+        conn = make_conn()
+        seed_bot(conn, 200, direction="LONG", hedge_child=100, status="IN TRADE")
+        seed_bot(conn, 100, direction="SHORT", status="HEDGE_STANDBY", hedge_child=None)
+        # Child's entry order still open (unfilled), placed 100s ago
+        seed_bot_order(conn, 100, 1, 'entry', 'open', 0.5, 0.0,
+                       created_at=900, filled_at=0, cycle_id=1)
+        now = 1000.0
+        res = verify_hedge_engagement(200, "LONG", conn, now=now,
+                                      config={"child_step": 1, "parent_cycle_id": 1,
+                                              "HEDGE_ENGAGE_TIMEOUT_SECONDS": 60})
+        self.assertFalse(res["engaged"])
+        self.assertTrue(res["freeze_parent"])
+        self.assertFalse(res["engine_halt"])
 
 
 if __name__ == "__main__":
