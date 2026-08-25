@@ -940,6 +940,95 @@ def _reset_to_hedge_standby_status_force_internal(child_bot_id: int):
     conn.commit()
 
 
+def _hedge_cycle_sync_internal(child_bot_id: int, parent_cycle_id: int):
+    """
+    INV-31 WriteQueue internal (part 2) — cycle sync for _signal_hedge_child_entry:
+    carry forward the child's bot_orders from the old cycle to the parent cycle
+    (only while the child holds an active position), then point trades.cycle_id at
+    the parent cycle. Returns (updated_count, old_child_cycle, child_open_qty, carried).
+    Runs inside WriteQueue serialization — must NOT be called directly.
+    """
+    from engine.database import get_connection
+    conn = get_connection()
+    child_info = conn.execute(
+        "SELECT cycle_id, open_qty FROM trades WHERE bot_id = ?",
+        (child_bot_id,)
+    ).fetchone()
+    updated_count = 0
+    old_child_cycle = None
+    child_open_qty = 0.0
+    carried = False
+    if child_info:
+        old_child_cycle = child_info[0]
+        child_open_qty = float(child_info[1] or 0)
+        if old_child_cycle and old_child_cycle != parent_cycle_id and child_open_qty > 0.0001:
+            carried = True
+            updated_count = conn.execute(
+                "UPDATE bot_orders SET cycle_id = ? WHERE bot_id = ? AND cycle_id = ?",
+                (parent_cycle_id, child_bot_id, old_child_cycle)
+            ).rowcount
+    conn.execute(
+        "UPDATE trades SET cycle_id = ? WHERE bot_id = ?",
+        (parent_cycle_id, child_bot_id)
+    )
+    conn.commit()
+    return updated_count, old_child_cycle, child_open_qty, carried
+
+
+def _hedge_live_guard_recon_internal(
+    child_bot_id: int,
+    child_step: int,
+    parent_cycle_id: int,
+    corrected_qty: float,
+    recon_price: float,
+    position_side: str,
+):
+    """
+    INV-31 WriteQueue internal (part 2) — live-guard DB correction of
+    _signal_hedge_child_entry: set trades.open_qty to the corrected qty, delete any
+    prior LIVE_GUARD_RECON marker rows for this (bot, step, cycle), and insert a fresh
+    synthetic filled 'entry' reconciliation row. Returns the reconciliation cid.
+    Runs inside WriteQueue serialization — must NOT be called directly.
+    """
+    import time as _time_mod
+    from engine.database import get_connection
+    conn = get_connection()
+    conn.execute(
+        "UPDATE trades SET open_qty = ? WHERE bot_id = ?",
+        (corrected_qty, child_bot_id)
+    )
+    # Delete any prior LIVE_GUARD_RECON rows for that exact (bot_id, step, cycle_id) to prevent stacking
+    conn.execute(
+        "DELETE FROM bot_orders "
+        "WHERE bot_id = ? AND step = ? AND cycle_id = ? AND client_order_id LIKE '%LIVE_GUARD_RECON%'",
+        (child_bot_id, child_step, parent_cycle_id)
+    )
+    _recon_cid = f"CQB_{child_bot_id}_LIVE_GUARD_RECON_{parent_cycle_id}_{child_step}"
+    conn.execute(
+        "INSERT OR IGNORE INTO bot_orders "
+        "(bot_id, step, order_type, order_id, price, amount, status, "
+        " created_at, client_order_id, updated_at, notes, cycle_id, "
+        " filled_amount, position_side) "
+        "VALUES (?, ?, 'entry', ?, ?, ?, 'filled', ?, ?, ?, "
+        " 'Live-guard DB sync: hedge already present on exchange after wipe/alignment.', "
+        " ?, ?, ?)",
+        (
+            child_bot_id, child_step,
+            _recon_cid,         # order_id (synthetic)
+            recon_price,        # price
+            corrected_qty,      # amount
+            int(_time_mod.time()),  # created_at
+            _recon_cid,         # client_order_id
+            int(_time_mod.time()),  # updated_at
+            parent_cycle_id,    # cycle_id
+            corrected_qty,      # filled_amount
+            position_side,      # position_side
+        )
+    )
+    conn.commit()
+    return _recon_cid
+
+
 class BotExecutor:
     # 🛡️ Binance margin and position limit rejection signals
     _MARGIN_SIGNALS = [
@@ -5149,29 +5238,17 @@ class BotExecutor:
 
         # Synchronize child bot's trades cycle_id with the parent's cycle_id
         # Carry forward unfilled/open orders from old cycle if position is still active
-        child_info = conn.execute(
-            "SELECT cycle_id, open_qty FROM trades WHERE bot_id = ?",
-            (child_bot_id,)
-        ).fetchone()
-        if child_info:
-            old_child_cycle = child_info[0]
-            child_open_qty = float(child_info[1] or 0)
-            if old_child_cycle and old_child_cycle != parent_cycle_id and child_open_qty > 0.0001:
-                updated_count = conn.execute(
-                    "UPDATE bot_orders SET cycle_id = ? WHERE bot_id = ? AND cycle_id = ?",
-                    (parent_cycle_id, child_bot_id, old_child_cycle)
-                ).rowcount
-                logger.warning(
-                    f"⚠️ [HEDGE-CYCLE-CARRY] Child {child_bot_id} trades.cycle_id updated {old_child_cycle} → {parent_cycle_id} "
-                    f"while holding active position open_qty={child_open_qty:.6f}. "
-                    f"Carried forward {updated_count} orders to new cycle to prevent virtual net mismatch."
-                )
-
-        conn.execute(
-            "UPDATE trades SET cycle_id = ? WHERE bot_id = ?",
-            (parent_cycle_id, child_bot_id)
+        # INV-31: route the cycle-sync writes through the WriteQueue worker thread.
+        from engine.write_queue import WriteQueue
+        _sync_updated, _sync_old_cycle, _sync_open_qty, _sync_carried = WriteQueue().put_and_wait(
+            _hedge_cycle_sync_internal, child_bot_id, parent_cycle_id
         )
-        conn.commit()
+        if _sync_carried:
+            logger.warning(
+                f"⚠️ [HEDGE-CYCLE-CARRY] Child {child_bot_id} trades.cycle_id updated {_sync_old_cycle} → {parent_cycle_id} "
+                f"while holding active position open_qty={_sync_open_qty:.6f}. "
+                f"Carried forward {_sync_updated} orders to new cycle to prevent virtual net mismatch."
+            )
 
         # Determine if this is the first hedge entry for this cycle
         prior_entries = conn.execute(
@@ -5256,19 +5333,8 @@ class BotExecutor:
                 # is also inserted so recompute_invested_from_orders is consistent.
                 try:
                     _corrected_qty = round(live_hedge_qty, 8)
-                    conn.execute(
-                        "UPDATE trades SET open_qty = ? WHERE bot_id = ?",
-                        (_corrected_qty, child_bot_id)
-                    )
-                    # Insert a reconciliation marker so the ledger recompute agrees
-                    import time as _time_mod
-                    # Delete any prior LIVE_GUARD_RECON rows for that exact (bot_id, step, cycle_id) to prevent stacking
-                    conn.execute(
-                        "DELETE FROM bot_orders "
-                        "WHERE bot_id = ? AND step = ? AND cycle_id = ? AND client_order_id LIKE '%LIVE_GUARD_RECON%'",
-                        (child_bot_id, child_step, parent_cycle_id)
-                    )
-                    _recon_cid = f"CQB_{child_bot_id}_LIVE_GUARD_RECON_{parent_cycle_id}_{child_step}"
+                    # Resolve the reconciliation price BEFORE the write — the network
+                    # call and the read-only fallback stay on the caller thread.
                     _recon_price = 0.0
                     try:
                         _ticker = exchange.fetch_ticker(pair)
@@ -5285,28 +5351,14 @@ class BotExecutor:
                                 _recon_price = float(_parent_row[0] or 0.0)
                         except Exception:
                             pass
-                    conn.execute(
-                        "INSERT OR IGNORE INTO bot_orders "
-                        "(bot_id, step, order_type, order_id, price, amount, status, "
-                        " created_at, client_order_id, updated_at, notes, cycle_id, "
-                        " filled_amount, position_side) "
-                        "VALUES (?, ?, 'entry', ?, ?, ?, 'filled', ?, ?, ?, "
-                        " 'Live-guard DB sync: hedge already present on exchange after wipe/alignment.', "
-                        " ?, ?, ?)",
-                        (
-                            child_bot_id, child_step,
-                            _recon_cid,         # order_id (synthetic)
-                            _recon_price,       # price
-                            _corrected_qty,     # amount
-                            int(_time_mod.time()),  # created_at
-                            _recon_cid,         # client_order_id
-                            int(_time_mod.time()),  # updated_at
-                            parent_cycle_id,    # cycle_id
-                            _corrected_qty,     # filled_amount
-                            _child_direction_early,  # position_side
-                        )
+                    # INV-31: route the live-guard DB correction (open_qty update,
+                    # marker delete + insert, commit) through the WriteQueue worker.
+                    from engine.write_queue import WriteQueue
+                    _recon_cid = WriteQueue().put_and_wait(
+                        _hedge_live_guard_recon_internal,
+                        child_bot_id, child_step, parent_cycle_id,
+                        _corrected_qty, _recon_price, _child_direction_early,
                     )
-                    conn.commit()
                     logger.info(
                         f"[HEDGE-LIVE-GUARD] DB corrected: child {child_bot_id} "
                         f"open_qty updated to {_corrected_qty:.6f}, "
@@ -5486,29 +5538,17 @@ class BotExecutor:
         # to overwrite the correct open_qty with 0.
         # This is the permanent fix for the SUI/XRP/SOL hedge desync bug.
         try:
-            from engine.database import get_connection as _gc_sync
-            with _gc_sync() as _sc:
-                # Carry forward unfilled/open orders from old cycle if position is still active
-                child_info = _sc.execute(
-                    "SELECT cycle_id, open_qty FROM trades WHERE bot_id = ?",
-                    (child_bot_id,)
-                ).fetchone()
-                if child_info:
-                    old_child_cycle = child_info[0]
-                    child_open_qty = float(child_info[1] or 0)
-                    if old_child_cycle and old_child_cycle != parent_cycle_id and child_open_qty > 0.0001:
-                        updated_count = _sc.execute(
-                            "UPDATE bot_orders SET cycle_id = ? WHERE bot_id = ? AND cycle_id = ?",
-                            (parent_cycle_id, child_bot_id, old_child_cycle)
-                        ).rowcount
-                        logger.warning(
-                            f"⚠️ [HEDGE-CYCLE-CARRY] Child {child_bot_id} trades.cycle_id updated {old_child_cycle} → {parent_cycle_id} "
-                            f"during post-entry sync while holding active position open_qty={child_open_qty:.6f}. "
-                            f"Carried forward {updated_count} orders to new cycle."
-                        )
-                _sc.execute(
-                    "UPDATE trades SET cycle_id = ? WHERE bot_id = ?",
-                    (parent_cycle_id, child_bot_id)
+            # INV-31: route the post-entry cycle-sync writes through the WriteQueue
+            # worker thread (same internal as the pre-entry sync above).
+            from engine.write_queue import WriteQueue
+            _sync_updated, _sync_old_cycle, _sync_open_qty, _sync_carried = WriteQueue().put_and_wait(
+                _hedge_cycle_sync_internal, child_bot_id, parent_cycle_id
+            )
+            if _sync_carried:
+                logger.warning(
+                    f"⚠️ [HEDGE-CYCLE-CARRY] Child {child_bot_id} trades.cycle_id updated {_sync_old_cycle} → {parent_cycle_id} "
+                    f"during post-entry sync while holding active position open_qty={_sync_open_qty:.6f}. "
+                    f"Carried forward {_sync_updated} orders to new cycle."
                 )
             logger.info(
                 f"[HEDGE-CYCLE-SYNC] Child {child_bot_id} trades.cycle_id "
