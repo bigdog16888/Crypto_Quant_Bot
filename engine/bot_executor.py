@@ -638,27 +638,23 @@ def _reset_to_hedge_standby(child_bot_id: int, conn, parent_cycle_id: int, excha
 
     # ═════════════════════════════════════════════════════════════════════════
     # PHASE 2 — DB UPDATE (only reached after exchange is settled or qty was 0)
+    # INV-31: all trades/bots writes route through the WriteQueue singleton.
     # ═════════════════════════════════════════════════════════════════════════
-    conn.execute(
-        "UPDATE trades SET cycle_id = ? WHERE bot_id = ?",
-        (parent_cycle_id, child_bot_id)
+    from engine.write_queue import WriteQueue
+    WriteQueue().put_and_wait(
+        _reset_to_hedge_standby_internal,
+        child_bot_id, parent_cycle_id
     )
-    conn.execute(
-        "UPDATE bots SET status = 'hedge_standby', cascade_started_at = 0 WHERE id = ?",
-        (child_bot_id,)
-    )
-    conn.commit()
 
     # After commit — seal reads the new cycle_id, finds no fills, returns zeros
     from engine.ledger import seal_trade_state
     seal_trade_state(child_bot_id, force_recompute=True)
 
     # Force status to hedge_standby if seal overwrote it
-    conn.execute(
-        "UPDATE bots SET status = 'hedge_standby', cascade_started_at = 0 WHERE id = ?",
-        (child_bot_id,)
+    WriteQueue().put_and_wait(
+        _reset_to_hedge_standby_status_force_internal,
+        child_bot_id
     )
-    conn.commit()
 
     # Audit row (always written, Phase 1 or not)
     drift_cid = f"CQB_{child_bot_id}_DF_RST_{int(time.time())}"
@@ -673,6 +669,275 @@ def _reset_to_hedge_standby(child_bot_id: int, conn, parent_cycle_id: int, excha
         f"🛡️ [HEDGE-ENFORCE] Child bot {child_bot_id} reset to hedge_standby (cycle_id={parent_cycle_id}). "
         f"Parent state: {parent_info_str}"
     )
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# INV-31 WriteQueue internals — maintain_orders cluster (+ B1 fix)
+# Each runs on the WriteQueue worker thread with its own connection.
+# Must NOT be called directly — always via WriteQueue().put_and_wait().
+# ═════════════════════════════════════════════════════════════════════════
+
+def _maintain_pending_flatten_status_internal(bot_id: int, cascade_started_at: int):
+    """INV-31 WriteQueue internal — over-hedged child -> pending_flatten."""
+    from engine.database import get_connection
+    conn = get_connection()
+    conn.execute(
+        "UPDATE bots SET status = 'pending_flatten', cascade_started_at = ? WHERE id = ?",
+        (cascade_started_at, bot_id)
+    )
+    conn.commit()
+
+
+def _maintain_live_guard_recon_internal(
+    bot_id: int,
+    child_step: int,
+    child_cycle_id: int,
+    corrected_qty: float,
+    recon_price: float,
+    recon_cid: str,
+    position_side: str,
+):
+    """
+    INV-31 WriteQueue internal — HEDGE-LIVE-GUARD-INV30 DB correction.
+    Corrects trades.open_qty, deletes prior LIVE_GUARD_INV30 markers and
+    inserts a fresh reconciliation row, in ONE transaction.
+    If recon_price <= 0 the caller's ticker read failed; fall back to the
+    parent's avg_entry_price (read on this connection).
+    """
+    import time as _time_mod
+    from engine.database import get_connection
+    conn = get_connection()
+    if recon_price <= 0.0:
+        try:
+            _parent_row = conn.execute(
+                "SELECT avg_entry_price FROM trades WHERE bot_id = ?",
+                (bot_id,)
+            ).fetchone()
+            if _parent_row:
+                recon_price = float(_parent_row[0] or 0.0)
+        except Exception:
+            pass
+    conn.execute(
+        "UPDATE trades SET open_qty = ? WHERE bot_id = ?",
+        (corrected_qty, bot_id)
+    )
+    conn.execute(
+        "DELETE FROM bot_orders "
+        "WHERE bot_id = ? AND step = ? AND cycle_id = ? AND client_order_id LIKE '%LIVE_GUARD_INV30%'",
+        (bot_id, child_step, child_cycle_id)
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO bot_orders "
+        "(bot_id, step, order_type, order_id, price, amount, status, "
+        " created_at, client_order_id, updated_at, notes, cycle_id, "
+        " filled_amount, position_side) "
+        "VALUES (?, ?, 'entry', ?, ?, ?, 'filled', ?, ?, ?, "
+        " 'Live-guard INV30 DB sync: hedge already present on exchange.', "
+        " ?, ?, ?)",
+        (
+            bot_id, child_step,
+            recon_cid,
+            recon_price,
+            corrected_qty,
+            int(_time_mod.time()),
+            recon_cid,
+            int(_time_mod.time()),
+            child_cycle_id,
+            corrected_qty,
+            position_side
+        )
+    )
+    conn.commit()
+
+
+def _maintain_cancel_purge_order_internal(order_row_id: int):
+    """INV-31 WriteQueue internal — delete a verified-gone cancelling bot_orders row."""
+    from engine.database import get_connection
+    conn = get_connection()
+    conn.execute("DELETE FROM bot_orders WHERE id = ?", (order_row_id,))
+    conn.commit()
+
+
+def _maintain_tp_clear_internal(bot_id: int):
+    """INV-31 WriteQueue internal — clear trades.tp_order_id."""
+    from engine.database import get_connection
+    conn = get_connection()
+    conn.execute(
+        "UPDATE trades SET tp_order_id = NULL WHERE bot_id = ?",
+        (bot_id,)
+    )
+    conn.commit()
+
+
+def _maintain_tp_clear_placeholder_be_internal(bot_id: int):
+    """INV-31 WriteQueue internal — clear tp_order_id only if NULL or a PENDING_BE_* placeholder."""
+    from engine.database import get_connection
+    conn = get_connection()
+    conn.execute(
+        "UPDATE trades SET tp_order_id = NULL WHERE bot_id = ? "
+        "AND (tp_order_id IS NULL OR tp_order_id LIKE 'PENDING_BE_%')",
+        (bot_id,)
+    )
+    conn.commit()
+
+
+def _maintain_be_tp_amount_sync_internal(bot_id: int, client_order_id: str, amount: float):
+    """INV-31 WriteQueue internal — sync pending_placement BE-TP row amount."""
+    from engine.database import get_connection
+    conn = get_connection()
+    conn.execute(
+        "UPDATE bot_orders SET amount = ? WHERE bot_id = ? AND client_order_id = ? AND status = 'pending_placement'",
+        (amount, bot_id, client_order_id)
+    )
+    conn.commit()
+
+
+def _maintain_be_tp_resting_heal_internal(
+    bot_id: int,
+    client_order_id: str,
+    order_id: str,
+    status: str,
+    updated_at: int,
+):
+    """INV-31 WriteQueue internal — heal DB when BE-TP already resting on exchange."""
+    from engine.database import get_connection
+    conn = get_connection()
+    conn.execute(
+        "UPDATE bot_orders SET order_id = ?, status = ?, updated_at = ? "
+        "WHERE bot_id = ? AND client_order_id = ? AND status = 'pending_placement'",
+        (order_id, status, updated_at, bot_id, client_order_id)
+    )
+    conn.execute(
+        "UPDATE trades SET tp_order_id = ? WHERE bot_id = ?",
+        (order_id, bot_id)
+    )
+    conn.commit()
+
+
+def _maintain_be_tp_placed_internal(
+    bot_id: int,
+    client_order_id: str,
+    actual_cid: str,
+    order_id: str,
+    status: str,
+    updated_at: int,
+):
+    """INV-31 WriteQueue internal — record freshly placed BE-TP order."""
+    from engine.database import get_connection
+    conn = get_connection()
+    conn.execute(
+        "UPDATE bot_orders SET order_id = ?, status = ?, client_order_id = ?, updated_at = ? "
+        "WHERE bot_id = ? AND client_order_id = ? AND status = 'pending_placement'",
+        (order_id, status, actual_cid, updated_at, bot_id, client_order_id)
+    )
+    conn.execute(
+        "UPDATE trades SET tp_order_id = ? WHERE bot_id = ?",
+        (order_id, bot_id)
+    )
+    conn.commit()
+
+
+def _maintain_stuck_dust_phase_internal(bot_id: int):
+    """INV-31 WriteQueue internal — mark cycle_phase STUCK_DUST_NO_EXIT."""
+    from engine.database import get_connection
+    conn = get_connection()
+    conn.execute(
+        "UPDATE trades SET cycle_phase='STUCK_DUST_NO_EXIT' WHERE bot_id=?",
+        (bot_id,)
+    )
+    conn.commit()
+
+
+def _maintain_margin_held_clear_internal(bot_id: int):
+    """INV-31 WriteQueue internal — clear MARGIN_HELD/STUCK_DUST_NO_EXIT back to ACTIVE after TP placement."""
+    from engine.database import get_connection
+    conn = get_connection()
+    conn.execute(
+        "UPDATE trades SET cycle_phase='ACTIVE' WHERE bot_id=? AND cycle_phase IN ('MARGIN_HELD', 'STUCK_DUST_NO_EXIT')",
+        (bot_id,)
+    )
+    conn.commit()
+
+
+def _maintain_margin_held_set_internal(bot_id: int):
+    """INV-31 WriteQueue internal — stamp cycle_phase MARGIN_HELD on margin-cap rejection."""
+    from engine.database import get_connection
+    conn = get_connection()
+    conn.execute(
+        "UPDATE trades SET cycle_phase='MARGIN_HELD' WHERE bot_id=? AND cycle_phase NOT IN ('CARRY_PENDING')",
+        (bot_id,)
+    )
+    conn.commit()
+
+
+def _maintain_entry_confirmed_internal(bot_id: int):
+    """INV-31 WriteQueue internal — promote trades.entry_confirmed=1 (step proof T2/T3)."""
+    from engine.database import get_connection
+    conn = get_connection()
+    conn.execute(
+        "UPDATE trades SET entry_confirmed=1 WHERE bot_id=?",
+        (bot_id,)
+    )
+    conn.commit()
+
+
+def _maintain_grid_order_clear_internal(bot_id: int):
+    """INV-31 WriteQueue internal — clear trades.grid_order_id."""
+    from engine.database import get_connection
+    conn = get_connection()
+    conn.execute(
+        "UPDATE trades SET grid_order_id = NULL WHERE bot_id = ?",
+        (bot_id,)
+    )
+    conn.commit()
+
+
+def _maintain_hedge_freeze_internal(bot_id: int, last_error: str, last_error_time: int):
+    """INV-31 WriteQueue internal — O-10 freeze parent to REQUIRE_MANUAL_PROOF."""
+    from engine.database import get_connection
+    conn = get_connection()
+    conn.execute(
+        "UPDATE bots SET status='REQUIRE_MANUAL_PROOF', last_error=?, last_error_time=? WHERE id=?",
+        (last_error, last_error_time, bot_id)
+    )
+    conn.commit()
+
+
+def _reset_to_hedge_standby_internal(child_bot_id: int, parent_cycle_id: int):
+    """
+    INV-31 WriteQueue internal (B1 fix, t_58d817a3) — Phase 2 DB writes of
+    _reset_to_hedge_standby: point the child's trades row at the parent cycle
+    and force status hedge_standby (before and after seal_trade_state, which
+    may overwrite status). Runs inside WriteQueue serialization — must NOT be
+    called directly.
+    """
+    from engine.database import get_connection
+    conn = get_connection()
+    conn.execute(
+        "UPDATE trades SET cycle_id = ? WHERE bot_id = ?",
+        (parent_cycle_id, child_bot_id)
+    )
+    conn.execute(
+        "UPDATE bots SET status = 'hedge_standby', cascade_started_at = 0 WHERE id = ?",
+        (child_bot_id,)
+    )
+    conn.commit()
+
+
+def _reset_to_hedge_standby_status_force_internal(child_bot_id: int):
+    """
+    INV-31 WriteQueue internal (B1 fix) — post-seal status force of
+    _reset_to_hedge_standby: re-assert status hedge_standby after
+    seal_trade_state (which may overwrite status). Runs inside WriteQueue
+    serialization — must NOT be called directly.
+    """
+    from engine.database import get_connection
+    conn = get_connection()
+    conn.execute(
+        "UPDATE bots SET status = 'hedge_standby', cascade_started_at = 0 WHERE id = ?",
+        (child_bot_id,)
+    )
+    conn.commit()
 
 
 class BotExecutor:
@@ -2620,7 +2885,11 @@ class BotExecutor:
     def maintain_orders(self, bot_id, name, pair, direction, bot_status, current_price, exchange: ExchangeInterface, market_snapshot: Dict[str, Any], bot_config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
         Ensures TP and Grid orders are placed active trades.
+
+        INV-31: all trades/bot_orders/bots writes route through the WriteQueue
+        singleton via module-level _maintain_*_internal functions.
         """
+        from engine.write_queue import WriteQueue
         trade_update_data = {}
         if not config.TRADING_ENABLED and not config.DRY_RUN:
             logger.info(f"🛑 [MAINTAIN-BLOCKED] Trading disabled. Bot {name} cannot maintain orders.")
@@ -2735,11 +3004,10 @@ class BotExecutor:
                                     f"by {abs(aggregate_drift):.6f} {pair}. Parent hedgeable={parent_hedgeable_qty:.6f}, "
                                     f"child={child_open_qty:.6f}. Transitioning to pending_flatten."
                                 )
-                                _hc_enforce_conn.execute(
-                                    "UPDATE bots SET status = 'pending_flatten', cascade_started_at = ? WHERE id = ?",
-                                    (int(time.time()), bot_id)
+                                WriteQueue().put_and_wait(
+                                    _maintain_pending_flatten_status_internal,
+                                    bot_id, int(time.time())
                                 )
-                                _hc_enforce_conn.commit()
 
                         else:
                             # Iterate step S from hedge_trigger to parent_step
@@ -2810,57 +3078,19 @@ class BotExecutor:
                                                 # Correct open_qty in DB and write reconciliation order
                                                 try:
                                                     _corrected_qty = round(live_hedge_qty, 8)
-                                                    _hc_enforce_conn.execute(
-                                                        "UPDATE trades SET open_qty = ? WHERE bot_id = ?",
-                                                        (_corrected_qty, bot_id)
-                                                    )
-                                                    # Insert reconciliation marker
-                                                    import time as _time_mod
-                                                    # Delete any prior LIVE_GUARD_INV30 rows for that exact (bot_id, step, cycle_id) to prevent stacking
-                                                    _hc_enforce_conn.execute(
-                                                        "DELETE FROM bot_orders "
-                                                        "WHERE bot_id = ? AND step = ? AND cycle_id = ? AND client_order_id LIKE '%LIVE_GUARD_INV30%'",
-                                                        (bot_id, child_step, child_cycle_id)
-                                                    )
-                                                    _recon_cid = f"CQB_{bot_id}_LIVE_GUARD_INV30_{child_cycle_id}_{child_step}"
                                                     _recon_price = 0.0
                                                     try:
                                                         _ticker = exchange.fetch_ticker(pair)
                                                         _recon_price = float(_ticker.get('last') or 0.0)
                                                     except Exception:
                                                         pass
-                                                    if _recon_price <= 0.0:
-                                                        try:
-                                                            _parent_row = _hc_enforce_conn.execute(
-                                                                "SELECT avg_entry_price FROM trades WHERE bot_id = ?",
-                                                                (bot_id,)
-                                                            ).fetchone()
-                                                            if _parent_row:
-                                                                _recon_price = float(_parent_row[0] or 0.0)
-                                                        except Exception:
-                                                            pass
-                                                    _hc_enforce_conn.execute(
-                                                        "INSERT OR IGNORE INTO bot_orders "
-                                                        "(bot_id, step, order_type, order_id, price, amount, status, "
-                                                        " created_at, client_order_id, updated_at, notes, cycle_id, "
-                                                        " filled_amount, position_side) "
-                                                        "VALUES (?, ?, 'entry', ?, ?, ?, 'filled', ?, ?, ?, "
-                                                        " 'Live-guard INV30 DB sync: hedge already present on exchange.', "
-                                                        " ?, ?, ?)",
-                                                        (
-                                                            bot_id, child_step,
-                                                            _recon_cid,
-                                                            _recon_price,
-                                                            _corrected_qty,
-                                                            int(_time_mod.time()),
-                                                            _recon_cid,
-                                                            int(_time_mod.time()),
-                                                            child_cycle_id,
-                                                            _corrected_qty,
-                                                            child_direction_early
-                                                        )
+                                                    _recon_cid = f"CQB_{bot_id}_LIVE_GUARD_INV30_{child_cycle_id}_{child_step}"
+                                                    WriteQueue().put_and_wait(
+                                                        _maintain_live_guard_recon_internal,
+                                                        bot_id, child_step, child_cycle_id,
+                                                        _corrected_qty, _recon_price,
+                                                        _recon_cid, child_direction_early
                                                     )
-                                                    _hc_enforce_conn.commit()
                                                     logger.info(
                                                         f"[HEDGE-LIVE-GUARD-INV30] DB corrected: child {bot_id} "
                                                         f"open_qty updated to {_corrected_qty:.6f}, "
@@ -2967,8 +3197,7 @@ class BotExecutor:
                             _sts_catch(bot_id)
                         else:
                             logger.info(f"🗑️ [CANCEL-PURGE] Stale order {c_cid} has 0 fills and is confirmed gone. Deleting DB row.")
-                            _c_cancelling.execute("DELETE FROM bot_orders WHERE id = ?", (db_id,))
-                            _c_cancelling.commit()
+                            WriteQueue().put_and_wait(_maintain_cancel_purge_order_internal, db_id)
                     else:
                         logger.warning(f"⏳ [CANCEL-WAIT] Stale order {c_cid} is still open on exchange. Waiting another cycle.")
             except Exception as e_cancelling:
@@ -2983,8 +3212,7 @@ class BotExecutor:
             # 🛡️ Never treat synthetic PENDING_BE* placeholders as real exchange IDs
             if local_tp_id and str(local_tp_id).startswith('PENDING_BE_'):
                 logger.debug(f"[HEDGE-CHILD] {name}: clearing placeholder tp_order_id={local_tp_id}")
-                _hc_conn.execute("UPDATE trades SET tp_order_id = NULL WHERE bot_id = ?", (bot_id,))
-                _hc_conn.commit()
+                WriteQueue().put_and_wait(_maintain_tp_clear_internal, bot_id)
                 local_tp_id = None
 
             if not existing_tp_order:
@@ -3007,8 +3235,7 @@ class BotExecutor:
                             logger.info(f"🚫 [HEDGE-MAINTAIN] Stored TP ID {local_tp_id} is CANCELLED. Evicting from DB state.")
                             from engine.database import update_order_status as _uos
                             _uos(local_tp_id, 'cancelled', bot_id=bot_id)
-                            _hc_conn.execute("UPDATE trades SET tp_order_id = NULL WHERE bot_id = ?", (bot_id,))
-                            _hc_conn.commit()
+                            WriteQueue().put_and_wait(_maintain_tp_clear_internal, bot_id)
                             local_tp_id = None
                         elif status_str == 'filled' or (status_str == 'closed' and float(order_status.get('filled', 0) or 0) > 0 and float(order_status.get('filled', 0) or 0) >= float(order_status.get('amount', 0) or 0) * 0.99):
                             actual_exit = float(order_status.get('average') or order_status.get('price') or current_price)
@@ -3040,8 +3267,7 @@ class BotExecutor:
                                 logger.debug(f'[EXPECTED] cancel unrecognised TP status (hedge-maintain): {_e}')
                             from engine.database import update_order_status as _uos
                             _uos(local_tp_id, 'cancelled', bot_id=bot_id)
-                            _hc_conn.execute("UPDATE trades SET tp_order_id = NULL WHERE bot_id = ?", (bot_id,))
-                            _hc_conn.commit()
+                            WriteQueue().put_and_wait(_maintain_tp_clear_internal, bot_id)
                             local_tp_id = None
                     except Exception as _evict_err:
                         err_str = str(_evict_err).lower()
@@ -3049,15 +3275,13 @@ class BotExecutor:
                             logger.warning(f"🚫 [HEDGE-MAINTAIN] Stored TP ID {local_tp_id} NOT FOUND. Evicting.")
                             from engine.database import update_order_status as _uos
                             _uos(local_tp_id, 'cancelled', bot_id=bot_id)
-                            _hc_conn.execute("UPDATE trades SET tp_order_id = NULL WHERE bot_id = ?", (bot_id,))
-                            _hc_conn.commit()
+                            WriteQueue().put_and_wait(_maintain_tp_clear_internal, bot_id)
                             local_tp_id = None
                         else:
                             logger.error(f"❌ [HEDGE-MAINTAIN] Failed to evict stalemate TP ID {local_tp_id}: {_evict_err}")
                             from engine.database import update_order_status as _uos
                             _uos(local_tp_id, 'cancelled', bot_id=bot_id)
-                            _hc_conn.execute("UPDATE trades SET tp_order_id = NULL WHERE bot_id = ?", (bot_id,))
-                            _hc_conn.commit()
+                            WriteQueue().put_and_wait(_maintain_tp_clear_internal, bot_id)
                             local_tp_id = None
 
             # 🚀 INV-26: Missed BE TP self-healing check
@@ -3112,12 +3336,7 @@ class BotExecutor:
                                 f"Parent is {_parent_status}, but child has open_qty={_child_qty} "
                                 f"without a TP order. Registered {_inv26_cid}."
                             )
-                            _hc_conn.execute(
-                                "UPDATE trades SET tp_order_id = NULL WHERE bot_id = ? "
-                                "AND (tp_order_id IS NULL OR tp_order_id LIKE 'PENDING_BE_%')",
-                                (bot_id,)
-                            )
-                            _hc_conn.commit()
+                            WriteQueue().put_and_wait(_maintain_tp_clear_placeholder_be_internal, bot_id)
                             local_tp_id = None
 
             if local_tp_id is None:
@@ -3217,12 +3436,7 @@ class BotExecutor:
                                         f"Will be placed on next cycle."
                                     )
                                     # Ensure placeholder never leaks into trades.tp_order_id
-                                    _hc_conn.execute(
-                                        "UPDATE trades SET tp_order_id = NULL WHERE bot_id = ? "
-                                        "AND (tp_order_id IS NULL OR tp_order_id LIKE 'PENDING_BE_%')",
-                                        (bot_id,)
-                                    )
-                                    _hc_conn.commit()
+                                    WriteQueue().put_and_wait(_maintain_tp_clear_placeholder_be_internal, bot_id)
                                     # Re-query so the placement block below picks it up this cycle
                                     pending_tp = _hc_conn.execute(
                                         "SELECT price, amount, cycle_id, client_order_id FROM bot_orders "
@@ -3246,23 +3460,19 @@ class BotExecutor:
                     tp_amount = float(_fresh_qty_row[0] or 0) if _fresh_qty_row else float(bot_status.get('open_qty', 0) or 0)
                     
                     # Update database row to sync amount
-                    _hc_conn.execute(
-                        "UPDATE bot_orders SET amount = ? WHERE bot_id = ? AND client_order_id = ? AND status = 'pending_placement'",
-                        (tp_amount, bot_id, be_cid)
+                    WriteQueue().put_and_wait(
+                        _maintain_be_tp_amount_sync_internal,
+                        bot_id, be_cid, tp_amount
                     )
-                    _hc_conn.commit()
 
                     # Check if already resting on CCXT (e.g. by clientOrderId or symbol/price/qty)
                     resting = next((o for o in bot_open_orders if o.get('clientOrderId') == be_cid or (o.get('clientOrderId') and o.get('clientOrderId').startswith(be_cid))), None)
                     if resting:
                         logger.info(f"✅ [HEDGE-MAINTAIN] Child BE TP is already resting on CCXT (id={resting['id']}). Healing DB state.")
-                        _hc_conn.execute(
-                            "UPDATE bot_orders SET order_id = ?, status = ?, updated_at = ? "
-                            "WHERE bot_id = ? AND client_order_id = ? AND status = 'pending_placement'",
-                            (resting['id'], resting.get('status', 'open'), int(time.time()), bot_id, be_cid)
+                        WriteQueue().put_and_wait(
+                            _maintain_be_tp_resting_heal_internal,
+                            bot_id, be_cid, resting['id'], resting.get('status', 'open'), int(time.time())
                         )
-                        _hc_conn.execute("UPDATE trades SET tp_order_id = ? WHERE bot_id = ?", (resting['id'], bot_id))
-                        _hc_conn.commit()
                     else:
                         # Determine if reduceOnly is allowed or if we should use GTC fallback
                         is_reducing = self._is_order_net_reducing(pair, tp_side, tp_amount, bot_id=bot_id, bot_direction=child_direction)
@@ -3292,13 +3502,10 @@ class BotExecutor:
                                 )
                                 if order:
                                     actual_cid = order.get('_fallback_cid') or order.get('clientOrderId') or unique_cid
-                                    _hc_conn.execute(
-                                        "UPDATE bot_orders SET order_id = ?, status = ?, client_order_id = ?, updated_at = ? "
-                                        "WHERE bot_id = ? AND client_order_id = ? AND status = 'pending_placement'",
-                                        (order['id'], order.get('status', 'open'), actual_cid, int(time.time()), bot_id, be_cid)
+                                    WriteQueue().put_and_wait(
+                                        _maintain_be_tp_placed_internal,
+                                        bot_id, be_cid, actual_cid, order['id'], order.get('status', 'open'), int(time.time())
                                     )
-                                    _hc_conn.execute("UPDATE trades SET tp_order_id = ? WHERE bot_id = ?", (order['id'], bot_id))
-                                    _hc_conn.commit()
                                     logger.info(
                                         f"✅ [HEDGE-MAINTAIN] Placed child BE TP order for {name}: {tp_amount} @ {tp_price} (order_id={order['id']})"
                                     )
@@ -3423,8 +3630,7 @@ class BotExecutor:
 
                         if _verified_gone:
                             logger.info(f"🗑️ [CANCEL-PURGE] Stale order {c_cid} verified 0 fills on exchange. Deleting DB row.")
-                            _c_cancelling.execute("DELETE FROM bot_orders WHERE id = ?", (db_id,))
-                            _c_cancelling.commit()
+                            WriteQueue().put_and_wait(_maintain_cancel_purge_order_internal, db_id)
                 else:
                     logger.warning(f"⏳ [CANCEL-WAIT] Stale order {c_cid} is still open on exchange. Waiting another cycle.")
         except Exception as e_cancelling:
@@ -3558,7 +3764,6 @@ class BotExecutor:
                             if detect_bot_ghost(exchange, bot_id, _conn_partial):
                                 logger.info(f"🧹 [GHOST-DETECTED] Bot {name} ({bot_id}) confirmed as a ghost on ReduceOnly rejection. Wiping ghost state.")
                                 wipe_bot_ghost(exchange, bot_id, _conn_partial)
-                                _conn_partial.commit()
                                 return None
                             # Position is real but unreachable: reduceOnly catch-22 + min notional.
                             # Fall through to escalation below.
@@ -3575,11 +3780,7 @@ class BotExecutor:
                             )
                         # Escalate cycle_phase so health checks and the UI banner surface this. [INV-35]
                         try:
-                            _conn_partial.execute(
-                                "UPDATE trades SET cycle_phase='STUCK_DUST_NO_EXIT' WHERE bot_id=?",
-                                (bot_id,)
-                            )
-                            _conn_partial.commit()
+                            WriteQueue().put_and_wait(_maintain_stuck_dust_phase_internal, bot_id)
                         except Exception as _e_stuck:
                             logger.error(
                                 f"[PARTIAL_CLOSE_PENDING] Failed to set STUCK_DUST_NO_EXIT "
@@ -3829,9 +4030,7 @@ class BotExecutor:
                         from engine.database import get_connection as _gc
                         from engine.database import update_order_status as _uos
                         _uos(local_tp_id, 'cancelled', bot_id=bot_id)
-                        _c = _gc()
-                        _c.execute("UPDATE trades SET tp_order_id = NULL WHERE bot_id = ?", (bot_id,))
-                        _c.commit(); _c.close()
+                        WriteQueue().put_and_wait(_maintain_tp_clear_internal, bot_id)
                         local_tp_id = None # Allow placement below
                     elif status_str == 'filled' or (status_str == 'closed' and float(order_status.get('filled', 0) or 0) > 0 and float(order_status.get('filled', 0) or 0) >= float(order_status.get('amount', 0) or 0) * 0.99):
                         if float(bot_status.get('total_invested', 0)) > 0:
@@ -3847,9 +4046,7 @@ class BotExecutor:
                                 _c.close()
                                 if _order_row and _order_row[0] in ['reset_cleared', 'filled']:
                                     logger.info(f"⏭️ {name}: Stored TP ID {local_tp_id} already has status '{_order_row[0]}' in DB. Skipping credit and cascade entirely.")
-                                    _c = _gc()
-                                    _c.execute("UPDATE trades SET tp_order_id = NULL WHERE bot_id = ?", (bot_id,))
-                                    _c.commit(); _c.close()
+                                    WriteQueue().put_and_wait(_maintain_tp_clear_internal, bot_id)
                                     return None
                             except Exception as e_check:
                                 logger.warning(f"⚠️ {name}: Failed to check order status for {local_tp_id}: {e_check}")
@@ -3885,9 +4082,7 @@ class BotExecutor:
                             if remaining_qty > 0.001:
                                 logger.info(f"🔄 [STALEMATE EVICTOR] {name}: Partial TP detected (Remaining: {remaining_qty:.4f}). Clearing tp_order_id and falling through.")
                                 from engine.database import get_connection as _gc
-                                _c = _gc()
-                                _c.execute("UPDATE trades SET tp_order_id = NULL WHERE bot_id = ?", (bot_id,))
-                                _c.commit(); _c.close()
+                                WriteQueue().put_and_wait(_maintain_tp_clear_internal, bot_id)
                                 local_tp_id = None
                                 # Do NOT return None; fall through to place new TP
                             else:
@@ -3915,9 +4110,7 @@ class BotExecutor:
                          from engine.database import get_connection as _gc
                          from engine.database import update_order_status as _uos
                          if _uos(local_tp_id, 'cancelled', bot_id=bot_id):
-                             _c = _gc()
-                             _c.execute("UPDATE trades SET tp_order_id = NULL WHERE bot_id = ?", (bot_id,))
-                             _c.commit(); _c.close()
+                             WriteQueue().put_and_wait(_maintain_tp_clear_internal, bot_id)
                              local_tp_id = None # Allow immediate replacement below!
                          else:
                              logger.warning(f"⚠️ {name}: Stored TP {local_tp_id} cancelled update was rejected (likely filled). Retaining state.")
@@ -3928,9 +4121,7 @@ class BotExecutor:
                          from engine.database import get_connection as _gc
                          from engine.database import update_order_status as _uos
                          if _uos(local_tp_id, 'cancelled', bot_id=bot_id): # 🚀 FUNDAMENTAL FIX: Clear bot_orders state
-                             _c = _gc()
-                             _c.execute("UPDATE trades SET tp_order_id = NULL WHERE bot_id = ?", (bot_id,))
-                             _c.commit(); _c.close()
+                             WriteQueue().put_and_wait(_maintain_tp_clear_internal, bot_id)
                              local_tp_id = None # Allow placement below
                          else:
                              logger.warning(f"⚠️ {name}: Stored TP ID {local_tp_id} NOT FOUND on exchange, but cancelled update was rejected (likely filled).")
@@ -3940,9 +4131,7 @@ class BotExecutor:
                          from engine.database import get_connection as _gc
                          from engine.database import update_order_status as _uos
                          if _uos(local_tp_id, 'cancelled', bot_id=bot_id):
-                             _c = _gc()
-                             _c.execute("UPDATE trades SET tp_order_id = NULL WHERE bot_id = ?", (bot_id,))
-                             _c.commit(); _c.close()
+                             WriteQueue().put_and_wait(_maintain_tp_clear_internal, bot_id)
                              local_tp_id = None
                          else:
                              logger.warning(f"⚠️ {name}: Stored TP ID {local_tp_id} failed to cancel, and DB status update was rejected (likely filled).")
@@ -4106,12 +4295,7 @@ class BotExecutor:
                                             
                                             # Escalate to STUCK_DUST_NO_EXIT status in DB (INV-35 / Fix 2)
                                             try:
-                                                from engine.database import get_connection as _gc_stuck
-                                                with _gc_stuck() as _conn_stuck:
-                                                    _conn_stuck.execute(
-                                                        "UPDATE trades SET cycle_phase='STUCK_DUST_NO_EXIT' WHERE bot_id=?",
-                                                        (bot_id,)
-                                                    )
+                                                WriteQueue().put_and_wait(_maintain_stuck_dust_phase_internal, bot_id)
                                                 logger.critical(f"🚨 [STUCK_DUST_NO_EXIT] {name}: TP is stuck due to reduceOnly catch-22 and min notional. cycle_phase set to STUCK_DUST_NO_EXIT.")
                                             except Exception as e_stuck:
                                                 logger.error(f"Failed to update cycle_phase to STUCK_DUST_NO_EXIT: {e_stuck}")
@@ -4132,12 +4316,7 @@ class BotExecutor:
                                         # Clear any stale MARGIN_HELD phase stamp since TP is now placed
                                         if str(bot_status.get('cycle_phase', '')).upper() in ('MARGIN_HELD', 'STUCK_DUST_NO_EXIT'):
                                             try:
-                                                from engine.database import get_connection as _gc_mhc
-                                                with _gc_mhc() as _conn_mhc:
-                                                    _conn_mhc.execute(
-                                                        "UPDATE trades SET cycle_phase='ACTIVE' WHERE bot_id=? AND cycle_phase IN ('MARGIN_HELD', 'STUCK_DUST_NO_EXIT')",
-                                                        (bot_id,)
-                                                    )
+                                                WriteQueue().put_and_wait(_maintain_margin_held_clear_internal, bot_id)
                                             except Exception:
                                                 pass
                             except Exception as e:
@@ -4148,12 +4327,7 @@ class BotExecutor:
                                     # Stamp MARGIN_HELD phase so monitor shows orange instead of red MISSING CRITICAL.
                                     # This is cleared automatically on the next successful TP placement.
                                     try:
-                                        from engine.database import get_connection as _gc_mh
-                                        with _gc_mh() as _conn_mh:
-                                            _conn_mh.execute(
-                                                "UPDATE trades SET cycle_phase='MARGIN_HELD' WHERE bot_id=? AND cycle_phase NOT IN ('CARRY_PENDING')",
-                                                (bot_id,)
-                                            )
+                                        WriteQueue().put_and_wait(_maintain_margin_held_set_internal, bot_id)
                                     except Exception as _mh_err:
                                         logger.debug(f"[MARGIN-HOLD] DB stamp failed: {_mh_err}")
                                 else:
@@ -4422,10 +4596,7 @@ class BotExecutor:
                              logger.debug(f"🛡️ {name}: Step proof T2 passed (bot_orders filled row found).")
                              # Promote to T1 so next cycle skips this query
                              try:
-                                 _csp.execute(
-                                     "UPDATE trades SET entry_confirmed=1 WHERE bot_id=?", (bot_id,)
-                                 )
-                                 _csp.commit()
+                                 WriteQueue().put_and_wait(_maintain_entry_confirmed_internal, bot_id)
                                  bot_status['entry_confirmed'] = 1
                              except Exception as _e:
                                  logger.error(f"[PROOF-T2] Failed to promote entry_confirmed: {_e}")
@@ -4443,10 +4614,7 @@ class BotExecutor:
                                  f"Auto-healing entry_confirmed=1."
                              )
                              try:
-                                 _csp.execute(
-                                     "UPDATE trades SET entry_confirmed=1 WHERE bot_id=?", (bot_id,)
-                                 )
-                                 _csp.commit()
+                                 WriteQueue().put_and_wait(_maintain_entry_confirmed_internal, bot_id)
                                  bot_status['entry_confirmed'] = 1
                              except Exception as _heal_e:
                                  logger.error(f"[PROOF-T3] {name}: Failed to write entry_confirmed: {_heal_e}")
@@ -4532,9 +4700,7 @@ class BotExecutor:
                                from engine.database import get_connection as _gc
                                from engine.database import update_order_status as _uos
                                if _uos(latest_grid_id, 'cancelled', bot_id=bot_id):
-                                   _c = _gc()
-                                   _c.execute("UPDATE trades SET grid_order_id = NULL WHERE bot_id = ?", (bot_id,))
-                                   _c.commit(); _c.close()
+                                   WriteQueue().put_and_wait(_maintain_grid_order_clear_internal, bot_id)
                                    local_grid_ids = []
                                else:
                                    logger.warning(f"⚠️ {name}: Stored Grid {latest_grid_id} cancelled update was rejected (likely filled). Retaining state.")
@@ -4925,11 +5091,10 @@ class BotExecutor:
                             )
                             if not _already_frozen:
                                 import time as _wd_time
-                                _conn_hcs.execute(
-                                    "UPDATE bots SET status='REQUIRE_MANUAL_PROOF', last_error=?, last_error_time=? WHERE id=?",
-                                    ("HEDGE_ENGAGE_FAILURE:" + _wd.get('reason', ''), int(_wd_time.time()), bot_id)
+                                WriteQueue().put_and_wait(
+                                    _maintain_hedge_freeze_internal,
+                                    bot_id, "HEDGE_ENGAGE_FAILURE:" + _wd.get('reason', ''), int(_wd_time.time())
                                 )
-                                _conn_hcs.commit()
                                 logger.critical(f"\U0001f6e1\ufe0f O-10 HEDGE-FREEZE: {name} hedge failed to engage - bot locked to REQUIRE_MANUAL_PROOF.")
                             else:
                                 logger.debug(f"O-10: {name} already frozen with HEDGE_ENGAGE_FAILURE, skipping re-freeze.")
