@@ -43,18 +43,18 @@ class Config:
         # 🛡️ O-3: Rolling-window portfolio drawdown breaker
         self.DRAWDOWN_WINDOW_HOURS = float(os.getenv("DRAWDOWN_WINDOW_HOURS", 24))
         self.DRAWDOWN_PCT = float(os.getenv("DRAWDOWN_PCT", 20.0))
-
-        # 🛡️ O-10: Hedge-engagement watchdog
+        # 🛡️ O-10: Pair-level netting verification
         self.MIN_HEDGE_QTY = float(os.getenv("MIN_HEDGE_QTY", 0.0001))
         self.HEDGE_ENGAGE_TIMEOUT_SECONDS = int(os.getenv("HEDGE_ENGAGE_TIMEOUT_SECONDS", 300))
         self.HEDGE_FAIL_WINDOW_SECONDS = int(os.getenv("HEDGE_FAIL_WINDOW_SECONDS", 86400))
-        
+        self.PAIR_NETTING_TOLERANCE = float(os.getenv("PAIR_NETTING_TOLERANCE", "0.002"))
+
+        # 🛡️ Circuit breaker: original global-equity breaker gated behind this flag (default OFF).
+        # Disabled because STARTING_EQUITY is a stale DB constant that false-positives when
+        # the live balance drifts from it (testnet resets). O-1 and O-3 run unconditionally.
+        self.ENABLE_GLOBAL_EQUITY_BREAKER = os.getenv("ENABLE_GLOBAL_EQUITY_BREAKER", "false").lower() == "true"
+
         # 🛡️ SAFETY TOGGLE: Allow user to disable auto-cancellation of zombie orders
-        self.AUTO_FIX_ZOMBIES = os.getenv("AUTO_FIX_ZOMBIES", "True").lower() == "true"
-        
-        # 🛡️ SAFETY LIMIT: Maximum account drawdown percentage before blocking new entries (Default 80%)
-        self.MAX_ACCOUNT_DRAWDOWN_PERCENT = float(os.getenv("MAX_ACCOUNT_DRAWDOWN_PERCENT", 80.0))
-        
         # 🛡️ SAFETY TOGGLE: Strict Cleanup (True = Kill Manual Orders, False = Protect Them)
         self.STRICT_CLEANUP = os.getenv("STRICT_CLEANUP", "False").lower() == "true"
         
