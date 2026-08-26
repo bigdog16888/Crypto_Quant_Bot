@@ -35,17 +35,25 @@ from engine.parity_gates import (
 from engine.exchange_interface import ExchangeInterface
 from engine.database import get_connection
 
+# Per-run unique suffix so repeated runs never collide with committed leftovers
+# from earlier runs on the UNIQUE(order_id) / UNIQUE(bot_id, client_order_id)
+# indexes. The function under test commits internally, so a rollback fixture
+# cannot undo its writes; explicit cleanup is required instead.
+_RUN_SUFFIX = str(int(time.time() * 1000))
+
 # ---------------------------------------------------------------------------
-# Helper: run each test inside a transaction that is rolled back automatically.
+# Helper: clean up the fixed test bot ids after each test. A plain rollback is
+# insufficient because deflate_pair_ledger_overcount / gate paths COMMIT inside
+# the call, which would end the fixture transaction anyway.
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(autouse=True)
 def rollback_db():
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("BEGIN")
     yield
-    conn.rollback()
+    conn = get_connection()
+    conn.execute("DELETE FROM bot_orders WHERE bot_id=100317")
+    conn.execute("DELETE FROM bots WHERE id=200000")
+    conn.commit()
 
 
 def test_exchange_error_causes_reset_cleared(monkeypatch, caplog):
@@ -59,8 +67,8 @@ def test_exchange_error_causes_reset_cleared(monkeypatch, caplog):
     cur = conn.cursor()
     cur.execute(
         "INSERT INTO bot_orders (bot_id, step, order_type, order_id, price, amount, filled_amount, status, created_at, client_order_id, updated_at) "
-        "VALUES (100317, 3, 'entry', 123456789, 0, 0, 0.0, 'open', ?, 'TEST_ORDER', 0)",
-        (int(time.time()),),
+        "VALUES (100317, 3, 'entry', ?, 0, 0, 0.0, 'open', ?, ?, 0)",
+        (f"123456789_{_RUN_SUFFIX}", int(time.time()), f"TEST_ORDER_{_RUN_SUFFIX}"),
     )
     row_id = cur.lastrowid
     # Force new_fill <= 0 inside the function by setting amount=0.
@@ -96,8 +104,8 @@ def test_wrong_symbol_falls_back_to_reset(monkeypatch, caplog):
     cur = conn.cursor()
     cur.execute(
         "INSERT INTO bot_orders (bot_id, step, order_type, order_id, price, amount, filled_amount, status, created_at, client_order_id, updated_at) "
-        "VALUES (100317, 3, 'entry', 987654321, 0, 0, 0.0, 'open', ?, 'FAKE_ORDER', 0)",
-        (int(time.time()),),
+        "VALUES (100317, 3, 'entry', ?, 0, 0, 0.0, 'open', ?, ?, 0)",
+        (f"987654321_{_RUN_SUFFIX}", int(time.time()), f"FAKE_ORDER_{_RUN_SUFFIX}"),
     )
     row_id = cur.lastrowid
 
@@ -126,19 +134,25 @@ def test_concurrent_fill_guard_thread_safety(monkeypatch):
     conn = get_connection()
     cur = conn.cursor()
     # Insert two rows that will both trigger the guard.
+    row_ids = []
     for i in range(2):
         cur.execute(
             "INSERT INTO bot_orders (bot_id, step, order_type, order_id, price, amount, filled_amount, status, created_at, client_order_id, updated_at) "
-            "VALUES (100317, 3, 'entry', ?, 0, 0, 0.0, 'open', ?, 'CONC', 0)",
-            (900000000 + i, int(time.time())),
+            "VALUES (100317, 3, 'entry', ?, 0, 0, 0.0, 'open', ?, ?, 0)",
+            (f"90000000{i}_{_RUN_SUFFIX}", int(time.time()), f"CONC_{_RUN_SUFFIX}_{i}"),
         )
-    row_ids = [cur.lastrowid - 1, cur.lastrowid]
+        row_ids.append(cur.lastrowid)
+    # Commit so the worker threads' separate SQLite connections can see the
+    # rows (uncommitted inserts are invisible to other connections).
+    conn.commit()
 
-    # Monkey\u2011patch fetch_order to return a filled order instantly.
-    def fast_filled(self, order_id, sym):
-        return {"status": "filled"}
+    # Monkey-patch fetch_order to return a NOT-filled order instantly. The
+    # exchange guard only skips reset_cleared when the exchange still reports
+    # 'filled'; a cancelled order must let both concurrent guards proceed.
+    def fast_not_filled(self, order_id, sym):
+        return {"status": "canceled"}
 
-    monkeypatch.setattr(ExchangeInterface, "fetch_order", fast_filled)
+    monkeypatch.setattr(ExchangeInterface, "fetch_order", fast_not_filled)
 
     def worker(row_id):
         deflate_pair_ledger_overcount(
@@ -165,9 +179,10 @@ def test_gate_blocks_when_require_manual_proof(monkeypatch, caplog):
     """A bot in ``require_manual_proof`` state must block new entries via the gate."""
     conn = get_connection()
     cur = conn.cursor()
-    # Create a bot entry with the flag.
+    # Create a bot entry with the flag (bots.name is NOT NULL in the schema).
     cur.execute(
-        "INSERT INTO bots (id, pair, direction, bot_type, status) VALUES (200000, 'BTC/USDC:USDC', 'SHORT', 'hedge_child', 'require_manual_proof')"
+        "INSERT INTO bots (id, name, pair, direction, bot_type, status) "
+        "VALUES (200000, 'test_manual_proof_bot', 'BTC/USDC:USDC', 'SHORT', 'hedge_child', 'require_manual_proof')"
     )
     conn.commit()
 

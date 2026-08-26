@@ -193,7 +193,7 @@ class TestTicket5Reconciler(unittest.TestCase):
         _insert_trades(self.conn, 10017, open_qty=0.0)
 
         _insert_bot(self.conn, 99001, 'xrp long_hedge', 'XRP/USDC:USDC', 'XRPUSDC', 'SHORT', bot_type='hedge_child', parent_bot_id=10017, status='IN TRADE')
-        _insert_trades(self.conn, 99001, open_qty=44.7)
+        _insert_trades(self.conn, 99001, open_qty=44.7, position_side='SHORT')
 
     def tearDown(self):
         shutil.rmtree(self.test_dir, ignore_errors=True)

@@ -224,3 +224,87 @@ class TestINV33MigrationSafetyAndGTR(unittest.TestCase):
             # Check bot 100002 (not a ghost)
             is_ghost = detect_bot_ghost(self.mock_exchange, 100002, self.conn)
             self.assertFalse(is_ghost)
+
+    def test_wipe_bot_ghost_reset_filter_status_semantics(self):
+        """B4 (INV-31): pin the reset_cleared status-filter semantics of
+        wipe_bot_ghost's pre-seal commit group.
+
+        The refactor (commit 321971e) moved the inline SQL into
+        _wipe_bot_ghost_pre_seal_internal behind module constants. A
+        statement-by-statement diff vs the pre-refactor function proved the
+        filter byte-identical; this test locks the behaviour so any future
+        semantic drift is caught.
+
+        Filter under test (_GHOST_WIPE_RESET_ORDERS_SQL):
+            SET status='reset_cleared'
+            WHERE bot_id=? AND (
+                status NOT IN ('open','new','placing','cancelling',
+                               'auto_closed','reset_cleared','cancelled')
+                OR (status IN ('cancelled','canceled') AND filled_amount > 0))
+
+        Note the deliberate British/US asymmetry preserved from the original:
+        'cancelled' (British) is in the NOT-IN exclusion list, so it is only
+        reset when it carries a fill; 'canceled' (US) is NOT in the exclusion
+        list, so it is always reset regardless of fill.
+        """
+        from engine.oneway_netting import _wipe_bot_ghost_pre_seal_internal
+
+        _insert_bot(self.conn, 100002, 'short eth', 'ETH/USDC', 'ETHUSDC',
+                    'SHORT', status='IN TRADE', bot_type='standard')
+        _insert_trades(self.conn, 100002, open_qty=0.014, position_side='SHORT')
+
+        # (input status, filled_amount, expected status after pre-seal group)
+        matrix = [
+            # Terminal fills not in the exclusion list -> reset_cleared
+            ('filled',           0.5, 'reset_cleared'),
+            ('closed',           0.5, 'reset_cleared'),
+            ('partially_filled', 0.1, 'reset_cleared'),
+            ('hedge_exited',     0.2, 'reset_cleared'),
+            # Active orders -> cancelled by the cancel filter (filled=0 so the
+            # reset filter's cancelled-with-fill clause does not re-touch them)
+            ('open',             0.0, 'cancelled'),
+            ('new',              0.0, 'cancelled'),
+            ('placing',          0.0, 'cancelled'),
+            ('cancelling',       0.0, 'cancelled'),
+            # Already-terminal statuses excluded from reset -> unchanged
+            ('auto_closed',      0.5, 'auto_closed'),
+            ('reset_cleared',    0.5, 'reset_cleared'),
+            # British 'cancelled': excluded, reset ONLY when it had a fill
+            ('cancelled',        0.3, 'reset_cleared'),
+            ('cancelled',        0.0, 'cancelled'),
+            # US 'canceled': NOT in exclusion list -> always reset
+            ('canceled',         0.2, 'reset_cleared'),
+            ('canceled',         0.0, 'reset_cleared'),
+        ]
+
+        row_ids = {}
+        now_ts = int(time.time())
+        for i, (status, filled, _expected) in enumerate(matrix):
+            cur = self.conn.execute(
+                "INSERT INTO bot_orders (bot_id, step, order_type, order_id, price, "
+                "amount, filled_amount, status, created_at, client_order_id, cycle_id, position_side) "
+                "VALUES (100002, ?, 'entry', ?, 1000.0, ?, ?, ?, ?, ?, 1, 'SHORT')",
+                (i, f"B4_{status}_{i}", filled + 0.1, filled, status, now_ts + i,
+                 f"CQB_B4_{status}_{i}"),
+            )
+            row_ids[i] = cur.lastrowid
+        self.conn.commit()
+
+        # Run the pre-seal commit group (WriteQueue is bypassed under pytest,
+        # so this executes inline on the test connection).
+        _wipe_bot_ghost_pre_seal_internal(100002, 'Scanning')
+
+        for i, (status, filled, expected) in enumerate(matrix):
+            actual = self.conn.execute(
+                "SELECT status FROM bot_orders WHERE id=?", (row_ids[i],)
+            ).fetchone()[0]
+            self.assertEqual(
+                actual, expected,
+                f"row {i}: input status={status!r} filled={filled} "
+                f"expected={expected!r} got={actual!r}",
+            )
+
+        # The bot's status must also have been set to the target.
+        bot_status = self.conn.execute(
+            "SELECT status FROM bots WHERE id=100002").fetchone()[0]
+        self.assertEqual(bot_status, 'Scanning')
