@@ -724,11 +724,11 @@ class CycleLoopMixin:
         # We removed the redundant call to 'update_active_positions_snapshot' here to prevent transaction races.
 
         # 2. Safety Checks (using snapshots)
-        # DISABLE CIRCUIT BREAKER FOR DEBUGGING (False Positives on Testnet)
-        # self.check_circuit_breaker(exchange_snapshot=exchange_snapshot)
-
-        # Signal file checks are handled in the main while loop in __main__.
-        # Keeping a lightweight in-cycle check here as a secondary safety net.
+        # O-1 (position-size) and O-3 (rolling drawdown) run unconditionally.
+        # The original global-equity breaker is gated behind ENABLE_GLOBAL_EQUITY_BREAKER
+        # (default OFF) — its STARTING_EQUITY baseline is stale and false-positives.
+        self.check_circuit_breaker(exchange_snapshot=exchange_snapshot)
+        
         from engine.shutdown_control import is_stop_requested
         if os.path.exists(config.PATHS["EMERGENCY_FILE"]) or is_stop_requested():
             return False  # Main loop will handle the file cleanup and liquidation

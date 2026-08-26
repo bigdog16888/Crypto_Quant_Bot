@@ -1,16 +1,14 @@
 """
-O-10: Hedge-Engagement Watchdog.
+O-10: Hedge-Engagement Watchdog (One-Way Netting Aware).
 
-Verifies that when a parent bot reaches its hedge_trigger_step, the hedge child
-bot (1) is actually configured, and (2) actually holds an offsetting position
-within a reasonable grace window.  If either condition fails, the parent is
-frozen to REQUIRE_MANUAL_PROOF and an alert is raised.  When >=2 distinct
-parents are frozen for hedge-engagement failure within a rolling window, the
-engine escalates to a whole-engine halt.
+Verifies that for each pair with hedge children, the aggregate virtual position
+across ALL active bots matches the exchange's real net position within tolerance.
 
-Deliberately a small, pure, testable module: it inspects only the DB state the
-hedge-signal path is supposed to have produced.  It does NOT mutate exchange
-state and does NOT place/cancel orders.
+This is the one-way netting invariant: sum of signed virtual open_qty == exchange net.
+If they diverge, netting has broken down and the parent(s) must be frozen.
+
+Deliberately small, pure, testable: it reads DB state and exchange state,
+returns a verdict. Caller applies freeze/halt.
 """
 import time
 import logging
@@ -22,6 +20,8 @@ MIN_HEDGE_QTY = 0.0001
 HEDGE_ENGAGE_TIMEOUT_SECONDS = 300
 HEDGE_FAIL_WINDOW_SECONDS = 24 * 3600  # rolling window for escalation (24h)
 FREEZE_MARKER = "HEDGE_ENGAGE_FAILURE:"
+# Pair-level netting tolerance — separate from child fill check
+PAIR_NETTING_TOLERANCE = 0.002
 
 
 def get_config(config=None):
@@ -34,43 +34,14 @@ def get_config(config=None):
         "min_hedge_qty": _g("MIN_HEDGE_QTY", MIN_HEDGE_QTY),
         "engage_timeout": _g("HEDGE_ENGAGE_TIMEOUT_SECONDS", HEDGE_ENGAGE_TIMEOUT_SECONDS),
         "fail_window": _g("HEDGE_FAIL_WINDOW_SECONDS", HEDGE_FAIL_WINDOW_SECONDS),
+        "pair_netting_tolerance": _g("PAIR_NETTING_TOLERANCE", PAIR_NETTING_TOLERANCE),
     }
-
-
-def _child_offset_ok(child_bot_id, parent_direction, conn, min_qty=MIN_HEDGE_QTY):
-    """
-    Returns True if the hedge child holds an offsetting open position.
-
-    Reads the child's virtual position from `trades.open_qty` and its
-    `direction` from `bots`.  A proper hedge must be opposite the parent:
-      parent LONG  -> child SHORT  (negative child direction)
-      parent SHORT -> child LONG   (positive child direction)
-    """
-    if not child_bot_id:
-        return False
-    row = conn.execute(
-        "SELECT b.direction, b.status, COALESCE(t.open_qty, 0) "
-        "FROM bots b LEFT JOIN trades t ON b.id = t.bot_id "
-        "WHERE b.id = ?",
-        (child_bot_id,)
-    ).fetchone()
-    if not row:
-        return False
-    child_dir, child_status, child_qty = row[0], (row[1] or "").upper(), float(row[2] or 0)
-    if child_status in ("REQUIRE_MANUAL_PROOF",):
-        return False
-    if child_qty <= min_qty:
-        return False
-    # Offsetting sign: child direction must oppose parent.
-    return (child_dir == "SHORT") != (parent_direction.upper() == "SHORT")
 
 
 def _count_engine_hedge_failures(conn, now=None, fail_window=None):
     """
     Count distinct parents currently frozen for hedge-engagement failure
-    within the rolling `fail_window`.  A parent counts only if its status is
-    REQUIRE_MANUAL_PROOF and its last_error carries the FREEZE_MARKER and its
-    last_error_time is inside the window.
+    within the rolling `fail_window`.
     """
     now = now if now is not None else time.time()
     fail_window = fail_window or HEDGE_FAIL_WINDOW_SECONDS
@@ -91,25 +62,28 @@ def _count_engine_hedge_failures(conn, now=None, fail_window=None):
     return count
 
 
-def verify_hedge_engagement(parent_bot_id, parent_direction, conn, now=None, config=None):
+def verify_netting_engagement(parent_bot_id, parent_direction, conn, exchange, config=None):
     """
-    Main watchdog entry point.  Called when a parent reaches its trigger step.
+    Main watchdog entry point — pair-level netting verification.
+
+    Called when a parent reaches its trigger step (opportunistic check).
+    Also called periodically by reconciler for all active pairs.
 
     Returns a dict:
       {
-        "engaged": bool,
-        "freeze_parent": bool,   # True => freeze the specific parent
-        "engine_halt": bool,     # True => >=2 parents frozen in window, engineered halt
-        "reason": str,
+        "engaged": bool,           # True if pair netting is within tolerance
+        "freeze_parent": bool,     # True => freeze the specific parent
+        "engine_halt": bool,       # True => >=2 parents frozen in window
+        "reason": str,             # "netting_ok" | "netting_diverged" | "no_hedge_child" | "exchange_unavailable"
         "child_bot_id": int|None,
+        "virtual_net": float,      # Sum of signed open_qty across all active bots on pair
+        "physical_net": float,     # Exchange's actual net position
+        "delta": float,            # physical - virtual
+        "pair": str,               # The pair symbol
       }
-
-    Non-destructive: it only reads DB and returns a verdict.  The caller is
-    responsible for applying the freeze / halt (keeps this pure and testable).
     """
     cfg = get_config(config)
-    min_qty = cfg["min_hedge_qty"]
-    engage_timeout = cfg["engage_timeout"]
+    tol = cfg["pair_netting_tolerance"]
     fail_window = cfg["fail_window"]
 
     result = {
@@ -118,37 +92,54 @@ def verify_hedge_engagement(parent_bot_id, parent_direction, conn, now=None, con
         "engine_halt": False,
         "reason": "",
         "child_bot_id": None,
+        "virtual_net": 0.0,
+        "physical_net": 0.0,
+        "delta": 0.0,
+        "pair": "",
     }
 
-    # 1. Parent must have a configured child
+    # 1. Parent must have a configured child (still required for signal path)
     prow = conn.execute(
-        "SELECT hedge_child_bot_id FROM bots WHERE id = ?", (parent_bot_id,)
+        "SELECT hedge_child_bot_id, pair FROM bots WHERE id = ?", (parent_bot_id,)
     ).fetchone()
     if not prow or not prow[0]:
         result["reason"] = "no_hedge_child_bot_id"
         result["freeze_parent"] = True
-    else:
-        child_bot_id = int(prow[0])
-        result["child_bot_id"] = child_bot_id
-        # 2. Check offsetting position
-        if _child_offset_ok(child_bot_id, parent_direction, conn, min_qty=min_qty):
+        return result
+
+    child_bot_id = int(prow[0])
+    pair = prow[1]
+    result["child_bot_id"] = child_bot_id
+    result["pair"] = pair
+
+    # 2. NEW: Verify PAIR-LEVEL NETTING (the real hedge signal for one-way mode)
+    try:
+        from engine.parity_gates import pair_parity_ok
+        ok, virtual, physical, delta = pair_parity_ok(pair, exchange=exchange, tol=tol)
+        result["virtual_net"] = virtual
+        result["physical_net"] = physical
+        result["delta"] = delta
+
+        if ok:
+            # Netting is working: virtual sum of all bots = exchange net
             result["engaged"] = True
-            result["reason"] = "engaged"
+            result["reason"] = "netting_ok"
             return result
-        result["reason"] = "child_not_offsetting"
+        else:
+            # Netting broken: virtual ≠ physical beyond tolerance
+            result["reason"] = (
+                f"netting_diverged delta={delta:.6f} "
+                f"(virtual={virtual:.6f} vs physical={physical:.6f})"
+            )
+            result["freeze_parent"] = True
 
-    # If we get here, the hedge has NOT engaged (or child unconfigured).
-    # Apply a grace window via child's basket_start_time / last entry attempt?
-    # Simpler, deterministic: we freeze immediately on failure because
-    # `_signal_hedge_child_entry` already placed/attempted the entry this cycle.
-    # (The watch runs at the natural maintain_orders cadence each pass.)
-    result["freeze_parent"] = True
+    except Exception as e:
+        logger.warning(f"[O-10] Pair netting check failed for {pair}: {e}")
+        result["reason"] = f"exchange_unavailable: {e}"
+        result["freeze_parent"] = True  # fail-closed
 
-    # 3. Escalation: if this would be >=2nd distinct parent frozen in window,
-    #    engine-wide halt.
-    existing_failures = _count_engine_hedge_failures(conn, now=now,
-                                                     fail_window=fail_window)
-    # Count the current parent too if it's not already counted.
+    # 3. Escalation: if this would be >=2nd distinct parent frozen in window
+    existing_failures = _count_engine_hedge_failures(conn, now=time.time(), fail_window=fail_window)
     already_frozen = False
     prow2 = conn.execute(
         "SELECT last_error, last_error_time FROM bots WHERE id = ?",
@@ -160,3 +151,37 @@ def verify_hedge_engagement(parent_bot_id, parent_direction, conn, now=None, con
         result["engine_halt"] = True
 
     return result
+
+
+def verify_all_pairs_netting(conn, exchange, config=None):
+    """
+    Periodic check: verify netting for ALL active pairs with hedge children.
+    
+    Called by reconciler/cycle loop, not tied to any specific bot's cycle.
+    Returns list of results (one per pair with hedge children).
+    """
+    cfg = get_config(config)
+    tol = cfg["pair_netting_tolerance"]
+    
+    # Find all active pairs that have at least one parent with a hedge child
+    conn_local = conn
+    rows = conn_local.execute("""
+        SELECT DISTINCT b.pair, b.id as parent_id, b.hedge_child_bot_id, b.direction
+        FROM bots b
+        WHERE b.is_active = 1 
+          AND b.hedge_child_bot_id IS NOT NULL
+          AND b.bot_type != 'hedge_child'
+    """).fetchall()
+    
+    results = []
+    for pair, parent_id, child_id, direction in rows:
+        result = verify_netting_engagement(parent_id, direction, conn_local, exchange, config)
+        results.append(result)
+    
+    return results
+
+
+# Backward compatibility — OLD FUNCTION REMOVED
+# verify_hedge_engagement no longer exists — use verify_netting_engagement instead
+# The old _child_offset_ok (child fill check) is also removed.
+# The new logic checks PAIR-LEVEL NETTING, not individual child fills.
