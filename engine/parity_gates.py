@@ -358,6 +358,26 @@ def gate_trading_allowed(
     exchange=None,
 ) -> Tuple[bool, str]:
     """Block new entries when pair ledger != exchange."""
+    # REQUIRE_MANUAL_PROOF pre-check: a bot locked pending manual proof must
+    # never open new entries regardless of pair parity. Defense in depth — the
+    # executor also filters on status, but the gate is the last line before
+    # order placement.
+    try:
+        from engine.database import get_connection as _get_conn
+        _status_row = _get_conn().execute(
+            "SELECT status FROM bots WHERE id=?", (bot_id,)
+        ).fetchone()
+        if _status_row and str(_status_row[0] or '').upper() == 'REQUIRE_MANUAL_PROOF':
+            reason = (
+                f"Bot {bot_id} status=require_manual_proof — new entries "
+                f"blocked pending manual proof."
+            )
+            logger.error(f"\U0001f6d1 [REQUIRE-MANUAL-PROOF-GATE] {reason}")
+            return False, reason
+    except Exception as _e_status:
+        logger.error(
+            f"[REQUIRE-MANUAL-PROOF-GATE] status pre-check failed for bot {bot_id}: {_e_status}"
+        )
     ok, virtual, physical, delta = pair_parity_ok(pair, exchange=exchange)
     if ok:
         return True, ''
@@ -789,10 +809,25 @@ def _same_sign_qty(a: float, b: float, tol: float) -> bool:
     return (a > tol and b > tol) or (a < -tol and b < -tol)
 
 
-def deflate_pair_ledger_overcount(exchange, pair: str) -> Optional[str]:
+def _deflate_pair_ledger_overcount_internal(
+    exchange,
+    pair: str,
+    *,
+    bot_id: Optional[int] = None,
+    step: Optional[int] = None,
+    new_fill: Optional[float] = None,
+    db_id: Optional[int] = None,
+) -> Optional[str]:
     """
-    Trim entry/grid filled_amount when pair virtual exceeds exchange (same sign).
-    Repairs prior startup [HEALING] double-credits without market orders or wipes.
+    Internal WriteQueue worker for row-level or pair-level ledger deflation.
+
+    Two call modes:
+    1. Row-level (adopt-fill guard): all 6 args provided -> targets exactly one bot_orders row (db_id).
+       Runs exchange guard before terminal-statusing fully-consumed rows.
+    2. Pair-level (startup repair): only exchange + pair -> scans all active bots on the pair,
+       trims across multiple rows to bring virtual down to exchange.
+
+    Returns trimmed message string or None if no work done.
     """
     from engine.database import (
         get_connection,
@@ -801,22 +836,108 @@ def deflate_pair_ledger_overcount(exchange, pair: str) -> Optional[str]:
     )
     from engine.ledger import seal_trade_state
 
+    tol = qty_tolerance()
+
+    if db_id is not None:
+        # --- ROW-LEVEL MODE (adopt-fill guard) ---
+        # Target a single bot_orders row; new_fill is the desired final filled_amount.
+        conn = get_connection()
+        row = conn.execute(
+            """
+            SELECT bo.bot_id, bo.filled_amount, bo.order_type, bo.order_id, 
+                   bo.client_order_id, b.pair as pair, b.normalized_pair as normalized_pair
+            FROM bot_orders bo
+            LEFT JOIN bots b ON b.id = bo.bot_id
+            WHERE bo.id=?
+            """,
+            (db_id,),
+        ).fetchone()
+        if not row:
+            return None
+        bid, cur_fill, otype, order_id_val, client_cid, raw_pair, bot_norm = row
+        bid = int(bid)
+        cur_fill = float(cur_fill or 0)
+
+        # Rule 10: fully-consumed row (new_fill <= 0) -> terminal status with exchange guard
+        if new_fill <= 0:
+            try:
+                from engine.exchange_interface import ExchangeInterface
+                sym = raw_pair or bot_norm or pair
+                ex = exchange if exchange else ExchangeInterface()
+                exchange_order = None
+                if order_id_val:
+                    exchange_order = ex.fetch_order(str(order_id_val), sym)
+                elif client_cid:
+                    exchange_order = ex.fetch_order(str(client_cid), sym)
+                if exchange_order and exchange_order.get('status') == 'filled':
+                    logger.info(
+                        f"[PARITY-GATE] Skip reset_cleared for db_id={db_id} \u2013 "
+                        f"order {order_id_val or client_cid} still filled on exchange."
+                    )
+                    # Exchange says filled -> keep row as-is, don't trim
+                    return None
+                else:
+                    conn.execute(
+                        "UPDATE bot_orders SET status='reset_cleared', filled_amount=0, updated_at=? WHERE id=?",
+                        (int(time.time()), db_id),
+                    )
+            except Exception as _e_ex:
+                logger.warning(
+                    f"[PARITY-GATE] Exchange guard error while resetting db_id={db_id}: {_e_ex}. "
+                    "Proceeding with reset_cleared."
+                )
+                conn.execute(
+                    "UPDATE bot_orders SET status='reset_cleared', filled_amount=0, updated_at=? WHERE id=?",
+                    (int(time.time()), db_id),
+                )
+            conn.commit()
+            seal_trade_state(bid)
+            sync_trades_from_orders(bid)
+            logger.warning(
+                f"\U0001f527 [LEDGER-DEFLATE-ROW] {pair} bot={bid} db_id={db_id}: "
+                f"reset_cleared (fill {cur_fill:.6f} \u2192 0)."
+            )
+            return "reset_cleared"
+        
+        # Trim case: new_fill > 0 and cur_fill > new_fill
+        if cur_fill <= new_fill + 1e-12:
+            return None
+
+        cut = round(cur_fill - new_fill, 8)
+        target_fill = round(new_fill, 8)
+
+        conn.execute(
+            "UPDATE bot_orders SET filled_amount=?, updated_at=? WHERE id=?",
+            (target_fill, int(time.time()), db_id),
+        )
+
+        conn.commit()
+        seal_trade_state(bid)
+        sync_trades_from_orders(bid)
+
+        logger.warning(
+            f"\U0001f527 [LEDGER-DEFLATE-ROW] {pair} bot={bid} db_id={db_id}: "
+            f"trimmed {cut:.6f} (fill {cur_fill:.6f} \u2192 {target_fill:.6f})."
+        )
+        return f"trimmed {cut:.6f}"
+
+    # --- PAIR-LEVEL MODE (startup repair) ---
     physical = get_exchange_signed_net(exchange, pair)
     virtual = get_pair_virtual_net(pair)
-    tol = qty_tolerance()
     if physical is None or not _same_sign_qty(virtual, physical, tol):
         return None
     excess = round(abs(virtual) - abs(physical), 8)
     if excess <= tol:
         return None
+
     norm = normalize_symbol(pair).upper()
     conn = get_connection()
     target_bids = []
-    for bot_id, raw_pair, bot_norm in conn.execute(
+    for bid, raw_pair, bot_norm in conn.execute(
         "SELECT id, pair, normalized_pair FROM bots WHERE is_active=1"
     ).fetchall():
         if (bot_norm or normalize_symbol(raw_pair)).upper() == norm:
-            target_bids.append(bot_id)
+            target_bids.append(bid)
     if not target_bids:
         return None
 
@@ -844,41 +965,22 @@ def deflate_pair_ledger_overcount(exchange, pair: str) -> Optional[str]:
             break
         fill_f = float(fill or 0)
         cut = min(fill_f, remaining)
-        new_fill = round(fill_f - cut, 8)
-        # Rule 10 (§5 A7 RESURRECTED_GHOST): a row whose fill is FULLY neutralized
-        # must be terminal-statused, not left as status='filled' with a trimmed qty.
-        # Otherwise the next seal_trade_state/reconciler cycle re-adopts it as a real
-        # fill and the phantom net resurrects.
-        # Exact-zero (new_fill <= 0), NOT qty_tolerance(): a residual below the pair
-        # tolerance can still be genuine remaining exposure (Rule 10 negative case —
-        # a partially-trimmed row must stay 'filled'), so only a fully-consumed row
-        # is terminal-statused. This matches the codebase's existing
-        # `filled_amount <= 0` / `tp_qty <= 0` exact-zero conventions.
-        # NOTE: Previously we marked rows as ``reset_cleared`` unconditionally when
-        # the trimmed ``new_fill`` reached zero. That caused a race where a real fill
-        # reported by Binance (e.g. order 961145669) was cleared before confirming the
-        # exchange state, leaving the DB with ``reset_cleared`` while the exchange still
-        # shows ``filled``.
-        #
-        # Guard: before marking ``reset_cleared`` we verify the order on the live
-        # exchange. If the exchange reports ``filled`` we keep the row as‑is (the
-        # ``credit_fill`` path already recorded the correct values). Only when the
-        # exchange confirms the order does **not** exist or is not filled do we safely
-        # clear the DB row.
-        if new_fill <= 0:
+        new_fill_val = round(fill_f - cut, 8)
+
+        # Rule 10: fully-consumed row must be terminal-statused with exchange guard
+        if new_fill_val <= 0:
             try:
                 from engine.exchange_interface import ExchangeInterface
-                # Retrieve order identifiers from the DB row before it is overwritten.
                 cur_order = conn.execute(
                     "SELECT order_id, client_order_id, pair FROM bot_orders WHERE id=?",
-                    (db_id,)
+                    (db_id,),
                 ).fetchone()
                 if cur_order:
-                    order_id_val, client_cid, pair = cur_order
+                    order_id_val, client_cid, raw_pair = cur_order
                 else:
-                    order_id_val = client_cid = pair = None
-                sym = pair or locals().get('pair')
-                ex = ExchangeInterface()
+                    order_id_val = client_cid = raw_pair = None
+                sym = raw_pair or pair
+                ex = exchange if exchange else ExchangeInterface()
                 exchange_order = None
                 if order_id_val:
                     exchange_order = ex.fetch_order(str(order_id_val), sym)
@@ -889,6 +991,8 @@ def deflate_pair_ledger_overcount(exchange, pair: str) -> Optional[str]:
                         f"[PARITY-GATE] Skip reset_cleared for db_id={db_id} \u2013 "
                         f"order {order_id_val or client_cid} still filled on exchange."
                     )
+                    # Skip this row; don't consume remaining excess from it
+                    continue
                 else:
                     conn.execute(
                         "UPDATE bot_orders SET status='reset_cleared', filled_amount=0, updated_at=? WHERE id=?",
@@ -906,11 +1010,12 @@ def deflate_pair_ledger_overcount(exchange, pair: str) -> Optional[str]:
         else:
             conn.execute(
                 "UPDATE bot_orders SET filled_amount=?, updated_at=? WHERE id=?",
-                (new_fill, int(time.time()), db_id),
+                (new_fill_val, int(time.time()), db_id),
             )
         remaining -= cut
         trimmed += cut
         touched_bots.add(bid)
+
     if trimmed <= 0:
         return None
 
@@ -920,10 +1025,37 @@ def deflate_pair_ledger_overcount(exchange, pair: str) -> Optional[str]:
         sync_trades_from_orders(bid)
 
     logger.warning(
-        f"🔧 [LEDGER-DEFLATE] {pair}: trimmed {trimmed:.6f} from entry/grid rows "
-        f"(virtual {virtual:.6f} → target exchange {physical:.6f})."
+        f"\U0001f527 [LEDGER-DEFLATE] {pair}: trimmed {trimmed:.6f} from entry/grid rows "
+        f"(virtual {virtual:.6f} \u2192 target exchange {physical:.6f})."
     )
     return f"trimmed {trimmed:.6f}"
+
+
+def deflate_pair_ledger_overcount(
+    exchange,
+    pair: str,
+    *,
+    bot_id: Optional[int] = None,
+    step: Optional[int] = None,
+    new_fill: Optional[float] = None,
+    db_id: Optional[int] = None,
+) -> Optional[str]:
+    """
+    Public wrapper routing through WriteQueue.
+
+    Pair-level mode (startup repair): call with just (exchange, pair).
+    Row-level mode (adopt-fill guard): call with all 6 args (exchange, pair, bot_id, step, new_fill, db_id).
+    """
+    from engine.write_queue import WriteQueue
+    return WriteQueue().put_and_wait(
+        _deflate_pair_ledger_overcount_internal,
+        exchange,
+        pair,
+        bot_id=bot_id,
+        step=step,
+        new_fill=new_fill,
+        db_id=db_id,
+    )
 
 
 def _flatten_exchange_net_market(exchange, pair: str, net: float) -> Tuple[bool, str]:
