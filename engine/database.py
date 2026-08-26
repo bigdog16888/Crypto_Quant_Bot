@@ -2328,7 +2328,12 @@ def safe_wipe_bot(
         cursor, bot_id, exit_price, direction=direction,
         action_label='SYSTEM_WIPE', notes=reason, human_approved=human_approved
     )
-    conn.commit()
+    # FIX (t_9ba7af3e): only commit when THIS function opened the connection.
+    # `conn` is assigned only inside `if cursor is None:` above, so an unconditional
+    # conn.commit() raised UnboundLocalError whenever an external cursor was passed.
+    # With an external cursor the caller owns the transaction and commits itself.
+    if not has_external_cursor:
+        conn.commit()
 
     return True
 

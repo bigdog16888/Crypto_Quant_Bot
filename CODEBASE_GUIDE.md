@@ -771,25 +771,29 @@ Two grace mechanisms legitimately coexist:
 1. **`PASS3-GRACE` (reconciler.py, early check)**: Checks a broader set of order types and checks both `filled_at` and `updated_at` timestamps over a 90s window. It triggers *before* the historical-net agreement check is evaluated.
 2. **Centralized Grace (parity_gates.py, called by reconciler and other gate points)**: Checks a 60s window (or 600s for TP/close orders) via the shared `pair_has_recent_fill()`. It uses `updated_at` (the precise fill-credit commit timestamp) and is size-capped at 20.0 units.
 
-### 3.58. REQUIRE_MANUAL_PROOF Writer Inventory (v5.3.4)
+### 3.58. REQUIRE_MANUAL_PROOF Writer Inventory (v5.3.4, refreshed t_9ba7af3e)
 
-Every location that writes `bots.status = 'REQUIRE_MANUAL_PROOF'` is classified below. This table is CI-enforced: `tests/test_require_proof_writers.py` fails if any new raw SQL write appears outside the whitelisted (B) locations.
+Every location that writes `bots.status = 'REQUIRE_MANUAL_PROOF'` is classified below. This table is CI-enforced: `tests/test_require_proof_writers.py` fails if any new raw SQL write appears outside the whitelisted (B) locations. The scan is scoped to `engine/` only (test fixtures and gitignored scratch artifacts are excluded).
 
 | # | File | Line | Classification | Reason bypass is safe |
 |---|------|------|----------------|-----------------------|
-| 1 | `engine/parity_gates.py` | ~396 | **(A) Grace-checked** — THE centralized write | All (A) callers funnel here; grace check runs inside this function (v5.3.4: size-capped at 20.0 units) |
+| 1 | `engine/parity_gates.py` | ~494 | **(A) Grace-checked** — THE centralized write | All (A) callers funnel here; grace check runs inside this function (v5.3.4: size-capped at 20.0 units) |
 | 2 | `engine/bot_executor.py` | ~626 | **(B) Hard-failure** | Phase 1 two-phase reset: exchange close literally failed |
-| 3 | `engine/database.py` | ~1508 | **(A) Grace-checked** | Converted from raw SQL to `_set_bot_require_manual_proof()` call in v5.3.3 |
-| 4 | `engine/database.py` | ~3808 | **(B) Hard-failure** | `flag_pair_ledger_mismatch`: post-forensic confirmed delta |
-| 5 | `engine/oneway_netting.py` | ~462 | **(B) Hard-failure** | Exchange API unavailable for N consecutive cycles |
-| 6 | `engine/reconciler.py` | ~48 | **(B) Hard-failure** | `flag_bot_manual_proof` local helper — only called from hard-failure paths |
-| 7 | `engine/reconciler.py` | ~5709 | **(B) Hard-failure** | `DIRECTIONAL-MISMATCH`: physical position contradicts bot direction |
-| 8 | `engine/reconciler.py` | ~7971 | **(B) Hard-failure** | `ADOPT-LIMIT-EXCEEDED`: would adopt > `MAX_ADOPTION_QTY_PER_CYCLE` |
-| 9 | `engine/reconciler.py` | ~8588 | **(B) Hard-failure** | `PROOF-FAILED`: forensic scan succeeded but gap persists past grace window |
-| 10 | `engine/reconciler.py` | ~8614 | **(B) Hard-failure** | `PROOF-FAILED`: forensic scan raised exception, gap unresolved |
-| 11 | `engine/runner/cycle_loop.py` | 136 | **(B) Hard-failure** | Exchange close FAILED during pending flatten |
-| 12 | `engine/runner/cycle_loop.py` | 178 | **(B) Hard-failure** | `safe_wipe_bot` refused after close |
-| 13 | `engine/runner/cycle_loop.py` | 190 | **(B) Hard-failure** | `safe_wipe_bot` raised exception |
+| 3 | `engine/bot_executor.py` | ~900 | **(B) Hard-failure** | O-10 hedge-engagement watchdog: hedge failed to engage — parent locked |
+| 4 | `engine/database.py` | ~1323 | **(B) Hard-failure** | `freeze_bot_for_position_oversize`: position > 2x config max |
+| 5 | `engine/database.py` | ~4121 | **(B) Hard-failure** | `flag_pair_ledger_mismatch`: isolated startup drift check |
+| 6 | `engine/database.py` | ~4135 | **(B) Hard-failure** | `flag_pair_ledger_mismatch`: critical startup drift check |
+| 7 | `engine/oneway_netting.py` | ~47 | **(B) Hard-failure** | PA_SYNC: exchange API unreachable for N consecutive cycles (WriteQueue internal) |
+| 8 | `engine/reconciler.py` | ~48 | **(B) Hard-failure** | `flag_bot_manual_proof` local helper — only called from hard-failure paths |
+| 9 | `engine/reconciler.py` | ~5709 | **(B) Hard-failure** | `DIRECTIONAL-MISMATCH`: physical position contradicts bot direction |
+| 10 | `engine/reconciler.py` | ~7958 | **(B) Hard-failure** | `ADOPT-LIMIT-EXCEEDED`: would adopt > `MAX_ADOPTION_QTY_PER_CYCLE` |
+| 11 | `engine/reconciler.py` | ~8566 | **(B) Hard-failure** | `PROOF-FAILED`: forensic scan succeeded but gap persists past grace window |
+| 12 | `engine/reconciler.py` | ~8592 | **(B) Hard-failure** | `PROOF-FAILED`: forensic scan raised exception, gap unresolved |
+| 13 | `engine/runner/cycle_loop.py` | 136 | **(B) Hard-failure** | Exchange close FAILED during pending flatten |
+| 14 | `engine/runner/cycle_loop.py` | 178 | **(B) Hard-failure** | `safe_wipe_bot` refused after close |
+| 15 | `engine/runner/cycle_loop.py` | 190 | **(B) Hard-failure** | `safe_wipe_bot` raised exception |
+
+Note: the former raw write at `engine/database.py` ~1508 (`_reset_bot_after_tp_internal` CycleResetBlocked handler) was converted in v5.3.3 to a `_set_bot_require_manual_proof()` call (classification A) and is therefore not in the raw-SQL whitelist.
 
 **Rule**: Any new (A) write MUST call `_set_bot_require_manual_proof()` (never raw SQL). Any new (B) write MUST be added to the whitelist in `tests/test_require_proof_writers.py` and this table.
 

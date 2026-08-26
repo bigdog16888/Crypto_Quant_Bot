@@ -28,9 +28,9 @@ LINE_TOLERANCE = 15
 WHITELIST = [
     # (relative posix path from repo root, approx line number, description)
     # NOTE: database.py:1508 is NOT here - it was converted to _set_bot_require_manual_proof
-    ("engine/parity_gates.py",   474,  "THE centralized write point - all grace-checked callers funnel here"),
-    ("engine/bot_executor.py",   756,  "Phase 1 two-phase reset: exchange close FAILED - real error not a race"),
-    ("engine/bot_executor.py",  5146,  "O-10 hedge-engagement watchdog: hedge failed to engage - parent locked (hard failure)"),
+    ("engine/parity_gates.py",   494,  "THE centralized write point - all grace-checked callers funnel here"),
+    ("engine/bot_executor.py",   626,  "Phase 1 two-phase reset: exchange close FAILED - real error not a race"),
+    ("engine/bot_executor.py",   900,  "O-10 hedge-engagement watchdog: hedge failed to engage - parent locked (hard failure)"),
     ("engine/database.py",      1323,  "O-1 freeze_bot_for_position_oversize: position > 2x config max (hard failure)"),
     ("engine/database.py",      4121,  "flag_pair_ledger_mismatch: isolated startup drift check"),
     ("engine/database.py",      4135,  "flag_pair_ledger_mismatch: critical startup drift check"),
@@ -56,15 +56,20 @@ RAW_SQL_PATTERN = re.compile(
 
 # Test files are excluded - test fixtures are allowed to write REQUIRE_MANUAL_PROOF directly
 # to simulate gated bot states in test setup.
-SKIP_DIRS = {".git", "__pycache__", ".venv", "venv", "node_modules", "tests"}
+SKIP_DIRS = {".git", "__pycache__", ".venv", "venv", "node_modules", "tests", "scratch"}
 SKIP_FILES = {"test_require_proof_writers.py"}
 
 REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
+# FIX (t_9ba7af3e): this guard polices ENGINE code only (see module docstring).
+# Scope the walk to engine/ so the gitignored scratch/ artifacts and root-level
+# one-off refactor files (recovered_bot_executor.py, _inv31_transform.py,
+# _on_pre_refactor.py) are never scanned -> no false positives.
+ENGINE_ROOT = os.path.join(REPO_ROOT, "engine")
 
 
 def _collect_raw_writes():
     hits = []
-    for dirpath, dirnames, filenames in os.walk(REPO_ROOT):
+    for dirpath, dirnames, filenames in os.walk(ENGINE_ROOT):
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
         for fname in filenames:
             if not fname.endswith(".py") or fname in SKIP_FILES:

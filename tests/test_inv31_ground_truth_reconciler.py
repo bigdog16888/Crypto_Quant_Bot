@@ -277,6 +277,48 @@ class TestINV31GroundTruthReconciler(unittest.TestCase):
             res = database.safe_wipe_bot(100318, 'SUI/USDC:USDC', 'SHORT', 'test own bot check', force=False, cursor=self.conn.cursor(), human_approved=True)
             self.assertFalse(res)
 
+    def test_safe_wipe_bot_external_cursor_no_unbound_local(self):
+        """t_9ba7af3e Fix 1 regression: safe_wipe_bot called WITH an external cursor
+        must NOT raise UnboundLocalError on the final conn.commit().
+
+        Before the fix, `conn` was assigned only inside `if cursor is None:` but
+        `conn.commit()` ran unconditionally, so the external-cursor path crashed.
+        This test proves both paths work:
+          (a) external cursor -> returns True, no exception, caller owns commit
+          (b) internal cursor (cursor=None) -> returns True, function commits itself
+        """
+        # --- (a) external cursor path ---
+        _insert_bot(self.conn, 100319, 'ext cursor bot', 'ADA/USDC:USDC', 'ADAUSDC', 'SHORT', status='pending_close')
+        _insert_trades(self.conn, 100319, open_qty=0.0, cycle_id=7)
+        # No active_positions row for 100319 -> physical flat -> wipe approved.
+        with patch('engine.database.get_connection', return_value=self.conn):
+            try:
+                res_ext = database.safe_wipe_bot(
+                    100319, 'ADA/USDC:USDC', 'SHORT', 'external cursor regression',
+                    force=False, cursor=self.conn.cursor(), human_approved=True,
+                )
+            except UnboundLocalError as e:  # pragma: no cover - the bug we are guarding
+                self.fail(f"safe_wipe_bot raised UnboundLocalError with external cursor: {e}")
+            self.assertTrue(res_ext)
+        # Caller-owned commit: the wipe must be visible on the shared connection.
+        status_ext = self.conn.execute("SELECT status FROM bots WHERE id=100319").fetchone()[0]
+        self.assertEqual(status_ext, 'Scanning')
+
+        # --- (b) internal cursor path (cursor=None) ---
+        _insert_bot(self.conn, 100320, 'int cursor bot', 'ADA/USDC:USDC', 'ADAUSDC', 'SHORT', status='pending_close')
+        _insert_trades(self.conn, 100320, open_qty=0.0, cycle_id=7)
+        with patch('engine.database.get_connection', return_value=self.conn):
+            try:
+                res_int = database.safe_wipe_bot(
+                    100320, 'ADA/USDC:USDC', 'SHORT', 'internal cursor regression',
+                    force=False, cursor=None, human_approved=True,
+                )
+            except UnboundLocalError as e:  # pragma: no cover
+                self.fail(f"safe_wipe_bot raised UnboundLocalError with internal cursor: {e}")
+            self.assertTrue(res_int)
+        status_int = self.conn.execute("SELECT status FROM bots WHERE id=100320").fetchone()[0]
+        self.assertEqual(status_int, 'Scanning')
+
     def test_gtr_oneway_short_position_sign(self):
         """INV-31: Exchange returns SHORT position under One-Way mode. contracts is negative or positionAmt is negative. side says LONG or BOTH. Verifies net is negative."""
         mock_positions = [
