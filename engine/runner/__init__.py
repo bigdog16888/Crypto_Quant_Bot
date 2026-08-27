@@ -285,8 +285,8 @@ class BotRunner(StartupMixin, ShutdownMixin, WebSocketLifecycleMixin, CycleLoopM
 
                 current_equity = total_stablecoin + invested_cost + unrealized_pnl
 
-                # Log for debugging
-                logger.debug(f"Circuit Check: Equity ${current_equity:.2f} (Cash: {total_stablecoin:.2f} + Cost: {invested_cost:.2f} + uPnL: {unrealized_pnl:.2f})")
+                # Log at INFO so operators can verify O-3 is actually running each cycle
+                logger.info(f"Circuit Check: Equity ${current_equity:.2f} (Cash: {total_stablecoin:.2f} + Cost: {invested_cost:.2f} + uPnL: {unrealized_pnl:.2f})")
 
                 # O-3: rolling-window drawdown breaker
                 self._check_rolling_drawdown(current_equity)

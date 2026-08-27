@@ -122,7 +122,7 @@ def get_starting_equity():
 
 def record_equity_snapshot(equity: float, ts: float = None, max_age_hours: float = 48.0) -> None:
     """O-3: Persist an equity snapshot point. Prunes points older than max_age_hours."""
-    ts = ts if ts is not None else time.time()
+    ts = int(ts if ts is not None else time.time())  # INTEGER PRIMARY KEY requires int
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("INSERT OR REPLACE INTO equity_snapshots (ts, equity) VALUES (?, ?)", (ts, float(equity)))

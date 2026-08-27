@@ -493,8 +493,13 @@ class CycleLoopMixin:
                         if snap_pos is not None and snap_orders is not None:
                             ws_cache.populate_from_rest(snap_pos, snap_orders)
 
-                    # Skip fetch_balance — circuit breaker is disabled, no consumer
-                    snap_bal = None
+                    # Fetch balance for O-3 rolling drawdown breaker (equity snapshot).
+                    # One REST call per cycle per market type; cheap on demo FAPI.
+                    try:
+                        snap_bal = ex.fetch_balance()
+                    except Exception as _bal_err:
+                        logger.warning(f"⚠️ [SNAPSHOT] Balance fetch failed for {mt}: {_bal_err}")
+                        snap_bal = None
 
                     # Position Fetch Trace
                     if snap_pos is not None:
