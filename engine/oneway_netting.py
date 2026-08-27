@@ -158,11 +158,30 @@ def reconcile_oneway_pair_open_qty(
     norm = _pair_norm(pair)
     conn = get_connection()
 
-    # Virtual too high → trim LONG open_qty first, then SHORT magnitude
-    if diff > 1e-8:
-        remaining = diff
+    # Sign-aware classification (2026-08-26 fix):
+    # Over-report  = virtual holds MORE position than exchange in the SAME direction
+    #   (LONG pair: virtual > physical; SHORT pair: virtual < physical, more negative).
+    # Under-report = exchange holds MORE than virtual in the same direction.
+    # Sign conflict = opposite signs — never auto-repair.
+    # The old code used `diff > 0 -> trim`, which wrongly trimmed the SHORT bot when
+    # the DB UNDER-reported a net-SHORT pair (virtual=-9.12 vs physical=-15.2 gives
+    # diff=+6.08), corrupting the ledger on every restart. See
+    # tests/test_oneway_repair_sign.py.
+    same_sign = (virtual >= 0 and physical >= 0) or (virtual <= 0 and physical <= 0)
+    if not same_sign:
+        logger.warning(
+            f"⚠️ [ONEWAY-REPAIR] {norm}: sign conflict virtual={virtual:.6f} "
+            f"physical={physical:.6f}. Manual review required."
+        )
+        return f"sign conflict on {norm} — manual review"
+
+    over_reports = abs(virtual) > abs(physical)
+
+    # Virtual over-reports → trim only bots in the direction of the excess
+    if over_reports:
+        remaining = abs(diff)
         reduced_bots = []
-        for target_dir in ('LONG', 'SHORT'):
+        for target_dir in (('LONG',) if virtual > 0 else ('SHORT',)):
             bots: List[Tuple[int, float]] = []
             for bid, bdir, raw_pair, bot_norm, oq in conn.execute(
                 """
@@ -241,8 +260,8 @@ def reconcile_oneway_pair_open_qty(
                 logger.error(f"Failed to seal repaired bot {bid}: {e_seal}")
         return f"trimmed virtual excess {diff:.6f} on {norm}"
 
-    elif diff < -1e-8:
-        # Fix B: Virtual too LOW — system under-reports vs exchange
+    else:
+        # Under-report: exchange holds MORE than virtual in the same direction.
         # Write a diagnostic drift_note; do NOT auto-inflate open_qty
         # (that would require knowing which bot owns the missing qty)
         norm = _pair_norm(pair)

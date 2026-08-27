@@ -337,6 +337,10 @@ class StartupMixin:
             from engine.ledger import seal_all_active_bots
             from engine.oneway_netting import reconcile_oneway_pair_open_qty, sync_pair_to_exchange, detect_bot_ghost, wipe_bot_ghost
             from engine.parity_gates import detect_and_repair_global_wipe, startup_repair_mismatched_pairs
+            from engine.startup_repair_verification import (
+                _pair_has_unexplained_orphan,
+                _mismatch_explainable_by_cid,
+            )
 
             conn = get_connection()
             active_ids = [r[0] for r in conn.execute("SELECT id FROM bots WHERE is_active=1").fetchall()]
@@ -452,9 +456,63 @@ class StartupMixin:
                 for _p, _v, _ph, _d in _mismatches:
                     logger.error(f"❌ [STARTUP-BARRIER-FAIL] {_p}: ledger={_v:.6f} exchange={_ph:.6f} delta={_d:.6f}")
 
+                # ---------------------------------------------------------
+                # STEP 8.5 (O-9 CID self-heal): classify critical mismatches.
+                # Daily-shutdown rule — routine overnight drift from CID-traceable
+                # fills must self-heal automatically; only genuinely unexplainable
+                # divergence (orphaned position / no CID accounting) blocks startup.
+                # See docs/DAILY_SHUTDOWN_SELF_HEALING.md.
+                # ---------------------------------------------------------
+                _genuine_anomalies = []
                 if _critical:
+                    for _p, _v, _ph, _d in _critical:
+                        try:
+                            _has_orphan = _pair_has_unexplained_orphan(_p, _ph, parity_ex)
+                            _explainable = _mismatch_explainable_by_cid(_p, _v, _ph, parity_ex)
+                        except Exception as _cid_err:
+                            logger.error(f"[STARTUP-BARRIER] {_p}: CID verdict errored ({_cid_err}) — treating as genuine anomaly.")
+                            _genuine_anomalies.append((_p, _v, _ph, _d))
+                            continue
+
+                        if _has_orphan or not _explainable:
+                            _genuine_anomalies.append((_p, _v, _ph, _d))
+                            logger.error(
+                                f"🚨 [STARTUP-BARRIER] {_p}: GENUINE ANOMALY — "
+                                f"unexplained_orphan={_has_orphan}, cid_explainable={_explainable}. "
+                                f"Blocking startup; manual review required."
+                            )
+                        else:
+                            logger.warning(
+                                f"🩹 [STARTUP-BARRIER] {_p}: routine CID-traceable drift "
+                                f"(delta={_d:+.6f}). Attempting targeted offline-fill self-heal..."
+                            )
+                            # Credit the CID-matched fills for this pair, then re-audit.
+                            if self._reconciler:
+                                try:
+                                    _heal_stats = self._reconciler.reconstruct_offline_fills(
+                                        since_hours=int(_scan_hours),
+                                        pair_filter=normalize_symbol(_p),
+                                    )
+                                    logger.info(f"🩹 [STARTUP-BARRIER] {_p}: self-heal reconstruction: {_heal_stats}")
+                                except Exception as _heal_err:
+                                    logger.error(f"🩹 [STARTUP-BARRIER] {_p}: self-heal reconstruction failed ({_heal_err}) — treating as genuine anomaly.")
+                                    _genuine_anomalies.append((_p, _v, _ph, _d))
+                                    continue
+                            # Re-audit this pair after crediting. If parity now holds, it's cleared.
+                            _recheck = audit_pair_ledger_vs_exchange(parity_ex)
+                            _still_bad = [m for m in _recheck if m[0] == _p]
+                            if _still_bad:
+                                logger.error(
+                                    f"🚨 [STARTUP-BARRIER] {_p}: still mismatched after self-heal "
+                                    f"({_still_bad[0][1]:.6f} vs {_still_bad[0][2]:.6f}) — escalating to genuine anomaly."
+                                )
+                                _genuine_anomalies.append((_p, _v, _ph, _d))
+                            else:
+                                logger.info(f"✅ [STARTUP-BARRIER] {_p}: self-healed to parity. Cleared.")
+
+                if _genuine_anomalies:
                     if config.TESTING_MODE:
-                        logger.warning("⚠️ [STARTUP-BARRIER-FAIL] Critical mismatch detected on startup, but TESTING_MODE is active. Bypassing strict exit.")
+                        logger.warning("⚠️ [STARTUP-BARRIER-FAIL] Genuine anomaly detected on startup, but TESTING_MODE is active. Bypassing strict exit.")
                     else:
                         # Block start and raise error to abort startup
                         _foreign_hint = ""
@@ -466,10 +524,12 @@ class StartupMixin:
                                 "docs/OPERATOR_MISMATCH_RUNBOOK.md before restarting."
                             )
                         raise RuntimeError(
-                            f"Startup parity verification FAILED for {len(_critical)} critical pair(s). "
+                            f"Startup parity verification FAILED for {len(_genuine_anomalies)} genuine-anomaly pair(s). "
                             f"{_foreign_hint}"
                             "Engine cannot start in a mismatched state. Run scripts/run_startup_heal.py or resolve manually."
                         )
+                elif _critical:
+                    logger.info("✅ [STARTUP-BARRIER] All critical mismatches were routine CID-traceable drift and self-healed. Startup barrier cleared.")
                 else:
                     logger.info("✅ [STARTUP-BARRIER] All mismatches successfully isolated. Startup barrier cleared.")
             else:
