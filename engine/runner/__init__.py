@@ -110,12 +110,24 @@ class BotRunner(StartupMixin, ShutdownMixin, WebSocketLifecycleMixin, CycleLoopM
             raise e
 
     def _calculate_stablecoin_balance(self, balance: dict) -> float:
-        """Calculate total balance across USDT and USDC stablecoins."""
+        """Calculate total balance across USDT and USDC stablecoins.
+        Handles both CCXT-style nested dict (balance['total']['USDT']) and 
+        flat dict (balance['USDT']) for compatibility.
+        """
         total = 0.0
-        for currency in STABLECOINS:
-            curr_bal = balance.get(currency)
-            if isinstance(curr_bal, dict):
-                total += float(curr_bal.get('total', 0.0))
+        # Check for nested 'total' dict first (CCXT style)
+        nested = balance.get('total', {})
+        if isinstance(nested, dict):
+            for currency in STABLECOINS:
+                val = nested.get(currency)
+                if val is not None:
+                    total += float(val)
+        # Fallback to flat dict (legacy style)
+        if total == 0.0:
+            for currency in STABLECOINS:
+                val = balance.get(currency)
+                if val is not None:
+                    total += float(val)
         return total
 
     def sync_all_bots(self):
@@ -234,50 +246,52 @@ class BotRunner(StartupMixin, ShutdownMixin, WebSocketLifecycleMixin, CycleLoopM
                                 balance_fetch_success = True
                         except Exception: pass
 
-            if not balance_fetch_success:
-                logger.warning("Circuit breaker check skipped - balance fetch failed")
-                return
-
-            invested_cost = 0.0
-            for bot in active_bots:
-                t_data = get_bot_status(bot[0])
-                if t_data and t_data.get('total_invested') and t_data['total_invested'] > 0:
-                    invested_cost += float(t_data['total_invested'])
-
-            # Unrealized PnL from snapshot/cache
-            unrealized_pnl = 0.0
-            if exchange_snapshot:
-                for mt, data in exchange_snapshot.items():
-                    positions = data.get('positions', [])
-                    for p in positions:
-                        unrealized_pnl += float(p.get('unrealizedPnl', 0.0) or 0.0)
-            else:
-                # Fallback to manual fetch
-                active_market_types = set()
-                for bot in active_bots:
-                    config_dict = json.loads(bot[5]) if bot[5] else {}
-                    active_market_types.add(normalize_market_type(config_dict.get('market_type', config.MARKET_TYPE)))
-
-                if not active_market_types: active_market_types.add(config.MARKET_TYPE)
-
-                for mt in active_market_types:
-                    if mt in self.exchanges:
-                        try:
-                            positions = self.exchanges[mt].fetch_positions()
-                            for p in positions:
-                                unrealized_pnl += float(p.get('unrealizedPnl', 0.0) or 0.0)
-                        except: pass
-
-            current_equity = total_stablecoin + invested_cost + unrealized_pnl
-
-            # Log for debugging
-            logger.debug(f"Circuit Check: Equity ${current_equity:.2f} (Cash: {total_stablecoin:.2f} + Cost: {invested_cost:.2f} + uPnL: {unrealized_pnl:.2f})")
-
-            # O-3: rolling-window drawdown breaker (always runs)
-            self._check_rolling_drawdown(current_equity)
-
-            # O-1: per-bot position-size breaker (always runs)
+            # O-1: per-bot position-size breaker (DB-only, runs unconditionally)
+            # Only needs total_invested from trades table, never balance
             self._check_position_size(active_bots)
+
+            # O-3: rolling-window drawdown breaker (needs equity snapshot)
+            # Only runs if we successfully fetched a balance
+            if balance_fetch_success:
+                invested_cost = 0.0
+                for bot in active_bots:
+                    t_data = get_bot_status(bot[0])
+                    if t_data and t_data.get('total_invested') and t_data['total_invested'] > 0:
+                        invested_cost += float(t_data['total_invested'])
+
+                # Unrealized PnL from snapshot/cache
+                unrealized_pnl = 0.0
+                if exchange_snapshot:
+                    for mt, data in exchange_snapshot.items():
+                        positions = data.get('positions', [])
+                        for p in positions:
+                            unrealized_pnl += float(p.get('unrealizedPnl', 0.0) or 0.0)
+                else:
+                    # Fallback to manual fetch
+                    active_market_types = set()
+                    for bot in active_bots:
+                        config_dict = json.loads(bot[5]) if bot[5] else {}
+                        active_market_types.add(normalize_market_type(config_dict.get('market_type', config.MARKET_TYPE)))
+
+                    if not active_market_types: active_market_types.add(config.MARKET_TYPE)
+
+                    for mt in active_market_types:
+                        if mt in self.exchanges:
+                            try:
+                                positions = self.exchanges[mt].fetch_positions()
+                                for p in positions:
+                                    unrealized_pnl += float(p.get('unrealizedPnl', 0.0) or 0.0)
+                            except: pass
+
+                current_equity = total_stablecoin + invested_cost + unrealized_pnl
+
+                # Log for debugging
+                logger.debug(f"Circuit Check: Equity ${current_equity:.2f} (Cash: {total_stablecoin:.2f} + Cost: {invested_cost:.2f} + uPnL: {unrealized_pnl:.2f})")
+
+                # O-3: rolling-window drawdown breaker
+                self._check_rolling_drawdown(current_equity)
+            else:
+                logger.warning("O-3 rolling drawdown skipped - balance fetch failed (O-1 still ran)")
 
             # Original global-equity breaker - gated behind config flag (default OFF).
             # Disabled because STARTING_EQUITY is a stale DB constant that
