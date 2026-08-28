@@ -11,7 +11,7 @@ class Config:
     def __init__(self):
         self.TESTNET = os.getenv("TESTNET", "True").lower() == "true"
         self.FUTURES_ONLY_MODE = os.getenv("FUTURES_ONLY_MODE", "True" if self.TESTNET else "False").lower() == "true"
-        
+
         if self.TESTNET:
             self.API_KEY = os.getenv("BINANCE_TESTNET_API_KEY", os.getenv("BINANCE_API_KEY", ""))
             self.API_SECRET = os.getenv("BINANCE_TESTNET_API_SECRET", os.getenv("BINANCE_API_SECRET", ""))
@@ -27,9 +27,9 @@ class Config:
         self.DEMO_TRADING = os.getenv("DEMO_TRADING", "True").lower() == "true"
         self.MARKET_TYPE = os.getenv("MARKET_TYPE", "future").lower()
         self.ALLOWED_SYMBOLS = os.getenv("ALLOWED_SYMBOLS", "BTC/USDT,ETH/USDT,SOL/USDT,BNB/USDT,XRP/USDT,BTC/USDC,ETH/USDC,SOL/USDC").split(",")
-        
+
         self.MAX_ORDER_USD = float(os.getenv("MAX_ORDER_USD", 10000))
-        
+
         # ATR Configuration for UI/Strategy
         self.ATR_TIMEFRAME = os.getenv("ATR_TIMEFRAME", "1h")
         self.ATR_PERIODS = int(os.getenv("ATR_PERIODS", 14))
@@ -54,16 +54,25 @@ class Config:
         # the live balance drifts from it (testnet resets). O-1 and O-3 run unconditionally.
         self.ENABLE_GLOBAL_EQUITY_BREAKER = os.getenv("ENABLE_GLOBAL_EQUITY_BREAKER", "false").lower() == "true"
 
+        # 🛡️ STARTUP EXCLUSION LIST: Explicit bot IDs to skip at startup barrier.
+        # These are bots with genuine anomalies that need manual review — they are
+        # explicitly named so the CID-verification barrier stays strict for ALL other pairs.
+        # Format: comma-separated bot IDs. Default: ETH/LINK frozen bots (Aug 2026 incident).
+        _excluded_default = "10011,10021,100002,100316,100321,100325,10020,100320"
+        self.STARTUP_EXCLUDED_BOT_IDS = set(
+            int(x.strip()) for x in os.getenv("STARTUP_EXCLUDED_BOT_IDS", _excluded_default).split(",")
+        )
+
         # 🛡️ SAFETY TOGGLE: Allow user to disable auto-cancellation of zombie orders
         # 🛡️ SAFETY TOGGLE: Strict Cleanup (True = Kill Manual Orders, False = Protect Them)
         self.STRICT_CLEANUP = os.getenv("STRICT_CLEANUP", "False").lower() == "true"
-        
+
         # TESTING MODE (used to bypass/alter production behavior in unit tests)
         self.TESTING_MODE = os.getenv("TESTING_MODE", "False").lower() in ("true", "1")
-        
+
         # 🛡️ SAFETY TOGGLE: Block autonomous execution in production (requires human approval)
         self.REQUIRE_HUMAN_APPROVAL = os.getenv("REQUIRE_HUMAN_APPROVAL", "False").lower() == "true"
-        
+
         # 🛡️ SAFETY TOGGLE: Auto-detect and repair global position wipe (e.g. testnet reset)
         self.ENABLE_GLOBAL_WIPE_DETECTION = os.getenv("ENABLE_GLOBAL_WIPE_DETECTION", "True").lower() == "true"
 
@@ -98,6 +107,10 @@ class Config:
         # When False (default / Stage A): virtual netting active; PA logic runs in
         # parallel observation-only mode and logs [PA-SYNC] lines for validation.
         # v4.1.6: Proportional Allocation model permanently CANCELLED.
+        self.PROPORTIONAL_ALLOCATION = False
+        # After this many consecutive API failures per pair, set bots to REQUIRE_MANUAL_PROOF.
+        self.PA_SYNC_MAX_STALE_CYCLES = int(os.getenv("PA_SYNC_MAX_STALE_CYCLES", "5"))
+        # ─────────────────────────────────────────────────────────────────────────
         self.PROPORTIONAL_ALLOCATION = False
         # After this many consecutive API failures per pair, set bots to REQUIRE_MANUAL_PROOF.
         self.PA_SYNC_MAX_STALE_CYCLES = int(os.getenv("PA_SYNC_MAX_STALE_CYCLES", "5"))

@@ -1632,10 +1632,9 @@ class BotExecutor:
         # 🛡️ JITTER: Add random sleep to desynchronize parallel bots and reduce race conditions
         time.sleep(random.uniform(0.1, 0.8))
         
-        # 🚀 MANUAL-GATE PROTECTION: Suspend maintenance if bot requires proof verification
-        # The MANUAL GATE is incorrectly blocking maintain_orders for bots that are IN TRADE.
-        # It must NEVER block limit order placement (TP and Grid orders) for bots already IN TRADE.
-        if 'REQUIRE_MANUAL' in bot_status_str.upper() and db_invested <= 0:
+        # 🚀 MANUAL-GATE PROTECTION: Suspend ALL bots requiring manual proof.
+        # REQUIRE_MANUAL_PROOF means human review needed — no actions at all.
+        if 'REQUIRE_MANUAL' in bot_status_str.upper():
             logger.warning(
                 f"🛑 [MANUAL-GATE] Bot {name} ({bot_id}) suspended. "
                 f"Status='{bot_status_str}'. Proof verification required."

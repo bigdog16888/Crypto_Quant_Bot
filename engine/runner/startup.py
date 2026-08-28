@@ -465,6 +465,26 @@ class StartupMixin:
                 # ---------------------------------------------------------
                 _genuine_anomalies = []
                 if _critical:
+                    # Narrow exclusion list: pairs whose ENTIRE active bot roster is
+                    # explicitly named in config.STARTUP_EXCLUDED_BOT_IDS are allowed
+                    # through with a loud warning (frozen bots awaiting manual review).
+                    # The barrier stays fully strict for every other pair and for any
+                    # future anomaly. See config/settings.py STARTUP_EXCLUDED_BOT_IDS.
+                    _excluded_ids = getattr(config, 'STARTUP_EXCLUDED_BOT_IDS', set())
+
+                    def _pair_fully_excluded(_pair):
+                        """Return (True, [bot_ids]) iff every active bot on _pair is in
+                        the exclusion list; (False, []) otherwise."""
+                        if not _excluded_ids:
+                            return False, []
+                        _norm = normalize_symbol(_pair).upper()
+                        _pair_bots = [r[0] for r in conn.execute(
+                            "SELECT id FROM bots WHERE is_active=1 AND (pair=? OR normalized_pair=?)",
+                            (_pair, _norm)).fetchall()]
+                        if not _pair_bots:
+                            return False, []
+                        return all(b in _excluded_ids for b in _pair_bots), _pair_bots
+
                     for _p, _v, _ph, _d in _critical:
                         try:
                             _has_orphan = _pair_has_unexplained_orphan(_p, _ph, parity_ex)
@@ -475,6 +495,17 @@ class StartupMixin:
                             continue
 
                         if _has_orphan or not _explainable:
+                            # Check the narrow exclusion list before blocking
+                            _is_excluded, _excl_bots = _pair_fully_excluded(_p)
+                            if _is_excluded:
+                                logger.critical(
+                                    f"⚠️⚠️ [STARTUP-BARRIER-EXCLUSION] {_p}: GENUINE ANOMALY "
+                                    f"(unexplained_orphan={_has_orphan}, cid_explainable={_explainable}, "
+                                    f"delta={_d:+.6f}) BUT all {len(_excl_bots)} active bots {_excl_bots} are on the "
+                                    f"explicit STARTUP_EXCLUDED_BOT_IDS list. Skipping block — these bots stay "
+                                    f"frozen at REQUIRE_MANUAL_PROOF and will NOT cycle. MANUAL REVIEW STILL REQUIRED."
+                                )
+                                continue
                             _genuine_anomalies.append((_p, _v, _ph, _d))
                             logger.error(
                                 f"🚨 [STARTUP-BARRIER] {_p}: GENUINE ANOMALY — "
