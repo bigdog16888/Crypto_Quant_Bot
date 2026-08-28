@@ -312,8 +312,12 @@ class GroundTruthReconciler:
             )
             try:
                 # Delete all active_positions via WriteQueue
-                def _delete_active_positions(c):
-                    c.execute("DELETE FROM active_positions")
+                def _delete_active_positions():
+                    from engine.database import get_connection
+                    conn = get_connection()
+                    conn.execute("DELETE FROM active_positions")
+                    conn.commit()
+                    conn.close()
             
                 WriteQueue().put_and_wait(_delete_active_positions)
             
@@ -355,11 +359,15 @@ class GroundTruthReconciler:
                     if abs(v_net - ph_net) < 0.001:
                         for share in bot_shares:
                             if share['qty'] > 0:
-                                def _insert_active_positions(c, bot_id, pair, side, size, entry_price, ts):
-                                    c.execute("""
+                                def _insert_active_positions(bot_id, pair, side, size, entry_price, ts):
+                                    from engine.database import get_connection
+                                    conn = get_connection()
+                                    conn.execute("""
                                         INSERT INTO active_positions (bot_id, pair, side, size, entry_price, last_checked)
                                         VALUES (?, ?, ?, ?, ?, ?)
                                     """, (bot_id, pair, side, size, entry_price, ts))
+                                    conn.commit()
+                                    conn.close()
                             
                                 WriteQueue().put_and_wait(
                                     _insert_active_positions, 
@@ -368,11 +376,15 @@ class GroundTruthReconciler:
                     else:
                         avg_price = data['value'] / data['size'] if data['size'] > 0 else 0
                         owner_id = get_active_bot_id_by_symbol_direction(symbol, side) or 0
-                        def _insert_active_positions_mismatch(c, owner_id, symbol, side, size, avg_price, ts):
-                            c.execute("""
+                        def _insert_active_positions_mismatch(owner_id, symbol, side, size, avg_price, ts):
+                            from engine.database import get_connection
+                            conn = get_connection()
+                            conn.execute("""
                                 INSERT INTO active_positions (bot_id, pair, side, size, entry_price, last_checked)
                                 VALUES (?, ?, ?, ?, ?, ?)
                             """, (owner_id, symbol, side, size, avg_price, ts))
+                            conn.commit()
+                            conn.close()
                     
                         WriteQueue().put_and_wait(
                             _insert_active_positions_mismatch,
@@ -380,11 +392,15 @@ class GroundTruthReconciler:
                         )
 
                 if not agg_positions:
-                    def _insert_global_flat(c, ts):
-                        c.execute("""
+                    def _insert_global_flat(ts):
+                        from engine.database import get_connection
+                        conn = get_connection()
+                        conn.execute("""
                             INSERT INTO active_positions (bot_id, pair, side, size, entry_price, last_checked)
                             VALUES (?, ?, ?, ?, ?, ?)
                         """, (0, 'GLOBAL', 'FLAT', 0.0, 0.0, ts))
+                        conn.commit()
+                        conn.close()
                 
                     WriteQueue().put_and_wait(_insert_global_flat, ts)
             except Exception as e:
