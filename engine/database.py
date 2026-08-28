@@ -2022,6 +2022,46 @@ def _reset_bot_after_tp_public_internal(bot_id, exit_price, direction=None, acti
     """
     conn = get_connection()
     try:
+        # 🛡️ OPTION A FIX (fill-credit race): Before opening the reset transaction,
+        # check if any pending orders actually filled on exchange. If so, credit them
+        # FIRST so the reset sees the correct ledger state.
+        # This runs on the WriteQueue worker thread, so credit_fill executes inline
+        # via the reentrancy guard (write_queue.py:87) — no deadlock.
+        if exchange:
+            try:
+                _bot_row = conn.execute("SELECT pair FROM bots WHERE id = ?", (bot_id,)).fetchone()
+                _pair = _bot_row[0] if _bot_row else None
+                if _pair:
+                    _pending = conn.execute(
+                        "SELECT id, order_id, client_order_id, order_type FROM bot_orders "
+                        "WHERE bot_id = ? AND status IN ('open', 'new', 'placing', 'cancelling')",
+                        (bot_id,)
+                    ).fetchall()
+                    for _db_id, _ex_oid, _cid, _otype in _pending:
+                        try:
+                            _detail = exchange.fetch_order(_ex_oid, _pair)
+                            _filled = float(_detail.get('filled', 0) or 0)
+                            if _filled > 0:
+                                logger.info(
+                                    f"💰 [RACE-GUARD] Bot {bot_id} order {_cid} (id={_ex_oid}) "
+                                    f"filled={_filled} on exchange but DB was '{_otype}'. "
+                                    f"Crediting fill before reset."
+                                )
+                                from engine.ledger import credit_fill as _cf_race
+                                _cf_race(
+                                    bot_id=bot_id,
+                                    order_id=str(_ex_oid),
+                                    cumulative_qty=_filled,
+                                    avg_price=float(_detail.get('average', 0) or 0),
+                                    order_type=str(_otype or 'grid').lower(),
+                                    is_cumulative=True,
+                                    caller='race_guard'
+                                )
+                        except Exception as _e_race:
+                            logger.warning(f"[RACE-GUARD] Bot {bot_id}: could not check order {_ex_oid}: {_e_race}")
+            except Exception as _e_rg_outer:
+                logger.warning(f"[RACE-GUARD] Bot {bot_id}: race guard pre-check failed: {_e_rg_outer}")
+
         try:
             conn.execute("BEGIN IMMEDIATE")
         except sqlite3.OperationalError as e:
