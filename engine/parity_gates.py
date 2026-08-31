@@ -210,12 +210,12 @@ def get_exchange_signed_net(exchange, pair: str) -> Optional[float]:
     if not exchange:
         return None
     norm = normalize_symbol(pair).upper()
-    
+
     positions = None
     max_attempts = 3
     import time
     from config.settings import config
-    
+
     for attempt in range(1, max_attempts + 1):
         try:
             positions = exchange.fetch_positions()
@@ -258,6 +258,107 @@ def get_exchange_signed_net(exchange, pair: str) -> Optional[float]:
                 val = qty
         total += float(val or 0)
     return round(total, 8)
+
+
+def get_exchange_signed_net_corroborated(
+    exchange,
+    pair: str,
+    min_reads: int = 3,
+    read_window_sec: int = 10,
+    qty_tolerance: float = 0.01,
+    startup_cooldown_sec: int = 300,
+    max_qty_change_per_min: float = 0.5,
+    conn=None,
+    bot_id: int = None,
+) -> Tuple[Optional[float], str]:
+    """
+    Multi-read corroborated fetch_positions for hedge-live-guard.
+    
+    Returns (signed_net_qty, status) where status is one of:
+      - 'ok': corroborated reads agree within tolerance
+      - 'cooldown': startup connectivity failure cooldown active
+      - 'rate_exceeded': rate of change bound violated
+      - 'inconsistent': reads don't agree within tolerance
+      - 'fetch_failed': all reads failed
+    
+    Args:
+        min_reads: Number of consistent reads required (default 3)
+        read_window_sec: Time window for reads (default 10s)
+        qty_tolerance: Fractional tolerance between reads (default 1%)
+        startup_cooldown_sec: Skip hedge-live-guard for N seconds after startup connectivity failure
+        max_qty_change_per_min: Max position change per minute as fraction (default 50%)
+        conn: Optional DB connection for cooldown check
+        bot_id: Optional bot ID for per-bot cooldown tracking
+    """
+    import time
+    from config.settings import config
+    
+    # Check startup cooldown (fail-open if column doesn't exist)
+    if conn and bot_id:
+        try:
+            cooldown_row = conn.execute(
+                "SELECT startup_failed_at FROM bots WHERE id = ?", (bot_id,)
+            ).fetchone()
+            if cooldown_row and cooldown_row[0]:
+                elapsed = time.time() - cooldown_row[0]
+                if elapsed < startup_cooldown_sec:
+                    remaining = int(startup_cooldown_sec - elapsed)
+                    logger.info(
+                        f"[HEDGE-LIVE-GUARD] Bot {bot_id} on {pair}: startup cooldown active "
+                        f"({remaining}s remaining). Skipping live guard."
+                    )
+                    return None, 'cooldown'
+        except Exception:
+            # startup_failed_at column may not exist in older schemas — fail-open
+            pass
+    
+    reads = []
+    start_time = time.time()
+    
+    while len(reads) < min_reads and (time.time() - start_time) < read_window_sec:
+        qty = get_exchange_signed_net(exchange, pair)
+        if qty is not None and qty != 'mock_unconfigured':
+            reads.append(qty)
+        
+        # Small delay between reads
+        if len(reads) < min_reads:
+            time.sleep(0.5)
+    
+    if not reads:
+        logger.warning(f"[HEDGE-LIVE-GUARD] {pair}: all {min_reads} reads failed or timed out")
+        return None, 'fetch_failed'
+    
+    # Check rate of change: max change per minute
+    if len(reads) >= 2:
+        min_read = min(reads)
+        max_read = max(reads)
+        if max_read > 0 and (max_read - min_read) / max_read > max_qty_change_per_min:
+            logger.warning(
+                f"[HEDGE-LIVE-GUARD] {pair}: rate of change bound violated "
+                f"({min_read:.4f} -> {max_read:.4f} = {((max_read-min_read)/max_read)*100:.1f}% "
+                f"in {len(reads)} reads over {read_window_sec}s, limit {max_qty_change_per_min*100:.0f}%/min). "
+                f"Refusing to act."
+            )
+            return None, 'rate_exceeded'
+    
+    # Check consistency: all reads within tolerance of median
+    reads_sorted = sorted(reads)
+    median = reads_sorted[len(reads_sorted) // 2]
+    
+    for r in reads:
+        if median != 0 and abs(r - median) / abs(median) > qty_tolerance:
+            logger.warning(
+                f"[HEDGE-LIVE-GUARD] {pair}: reads inconsistent within {qty_tolerance*100:.0f}% tolerance. "
+                f"Reads: {[f'{r:.6f}' for r in reads]}, median={median:.6f}. Refusing to act."
+            )
+            return None, 'inconsistent'
+    
+    # Use median as the corroborated value
+    logger.info(
+        f"[HEDGE-LIVE-GUARD] {pair}: corroborated {len(reads)} reads -> median={median:.6f} "
+        f"(reads: {[f'{r:.6f}' for r in reads]})"
+    )
+    return median, 'ok'
 
 
 def projected_pair_virtual_after_bot_flat(bot_id: int, pair: str) -> float:

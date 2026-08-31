@@ -2785,11 +2785,27 @@ class BotExecutor:
 
                                 if delta > tolerance:
                                     # ── LIVE EXCHANGE GUARD (INV-30) ──
-                                    # Check live net to avoid double catch-ups if the DB has been wiped or aligned.
+                                    # Check live net with corroboration to avoid double catch-ups if the DB has been wiped or aligned.
                                     try:
-                                        from engine.parity_gates import get_exchange_signed_net as _gesn
-                                        live_signed_net = _gesn(exchange, pair)
-                                        if live_signed_net is not None and not isinstance(live_signed_net, str):
+                                        from engine.parity_gates import get_exchange_signed_net_corroborated as _gesn_corroborated
+                                        # Read config for corroboration parameters (use module-level config, no local import to avoid shadowing)
+                                        min_reads = getattr(config, 'HEDGE_LIVE_GUARD_MIN_READS', 3)
+                                        read_window_sec = getattr(config, 'HEDGE_LIVE_GUARD_READ_WINDOW_SEC', 10)
+                                        qty_tolerance = getattr(config, 'HEDGE_LIVE_GUARD_QTY_TOLERANCE', 0.01)
+                                        startup_cooldown_sec = getattr(config, 'HEDGE_LIVE_GUARD_STARTUP_COOLDOWN_SEC', 300)
+                                        max_qty_change_per_min = getattr(config, 'HEDGE_LIVE_GUARD_MAX_QTY_CHANGE_PER_MIN', 0.5)
+
+                                        live_signed_net, status = _gesn_corroborated(
+                                            exchange, pair,
+                                            min_reads=min_reads,
+                                            read_window_sec=read_window_sec,
+                                            qty_tolerance=qty_tolerance,
+                                            startup_cooldown_sec=startup_cooldown_sec,
+                                            max_qty_change_per_min=max_qty_change_per_min,
+                                            conn=_hc_enforce_conn,
+                                            bot_id=bot_id,
+                                        )
+                                        if status == 'ok' and live_signed_net is not None:
                                             child_direction_early = _hc_enforce_conn.execute("SELECT direction FROM bots WHERE id=?", (bot_id,)).fetchone()[0]
                                             _parent_target_calc = pre_trigger_accumulated_qty + parent_step_qty
                                             if child_direction_early.upper() == 'SHORT':
@@ -2871,6 +2887,26 @@ class BotExecutor:
                                                     )
                                                 delta = adjusted_delta
                                                 running_child_open_qty = _corrected_qty
+                                        elif status == 'cooldown':
+                                            logger.info(
+                                                f"[HEDGE-LIVE-GUARD-INV30] Child {bot_id} on {pair}: startup cooldown active, "
+                                                f"skipping live guard check, proceeding with catch-up delta={delta:.6f}."
+                                            )
+                                        elif status == 'rate_exceeded':
+                                            logger.warning(
+                                                f"[HEDGE-LIVE-GUARD-INV30] Child {bot_id} on {pair}: rate of change bound exceeded, "
+                                                f"refusing to act on live guard, proceeding with catch-up delta={delta:.6f}."
+                                            )
+                                        elif status == 'inconsistent':
+                                            logger.warning(
+                                                f"[HEDGE-LIVE-GUARD-INV30] Child {bot_id} on {pair}: reads inconsistent, "
+                                                f"refusing to act on live guard, proceeding with catch-up delta={delta:.6f}."
+                                            )
+                                        elif status == 'fetch_failed':
+                                            logger.warning(
+                                                f"[HEDGE-LIVE-GUARD-INV30] Child {bot_id} on {pair}: all reads failed, "
+                                                f"refusing to act on live guard, proceeding with catch-up delta={delta:.6f}."
+                                            )
                                     except Exception as _live_guard_err:
                                         logger.warning(
                                             f"[HEDGE-LIVE-GUARD-INV30] Could not fetch live net for {pair}: {_live_guard_err}."

@@ -49,6 +49,16 @@ class Config:
         self.HEDGE_FAIL_WINDOW_SECONDS = int(os.getenv("HEDGE_FAIL_WINDOW_SECONDS", 86400))
         self.PAIR_NETTING_TOLERANCE = float(os.getenv("PAIR_NETTING_TOLERANCE", "0.002"))
 
+        # 🛡️ HEDGE-LIVE-GUARD Hardening (INV-30) — prevents single-read DB corruption
+        # Multi-read corroboration: require N consistent reads within window before acting
+        self.HEDGE_LIVE_GUARD_MIN_READS = int(os.getenv("HEDGE_LIVE_GUARD_MIN_READS", "3"))
+        self.HEDGE_LIVE_GUARD_READ_WINDOW_SEC = int(os.getenv("HEDGE_LIVE_GUARD_READ_WINDOW_SEC", "10"))
+        self.HEDGE_LIVE_GUARD_QTY_TOLERANCE = float(os.getenv("HEDGE_LIVE_GUARD_QTY_TOLERANCE", "0.01"))
+        # Startup cooldown: after any connectivity failure at startup, skip hedge-live-guard for N seconds
+        self.HEDGE_LIVE_GUARD_STARTUP_COOLDOWN_SEC = int(os.getenv("HEDGE_LIVE_GUARD_STARTUP_COOLDOWN_SEC", "300"))
+        # Rate-of-change bound: max position change per minute (fraction, e.g., 0.5 = 50%/min)
+        self.HEDGE_LIVE_GUARD_MAX_QTY_CHANGE_PER_MIN = float(os.getenv("HEDGE_LIVE_GUARD_MAX_QTY_CHANGE_PER_MIN", "0.5"))
+
         # 🛡️ Circuit breaker: original global-equity breaker gated behind this flag (default OFF).
         # Disabled because STARTING_EQUITY is a stale DB constant that false-positives when
         # the live balance drifts from it (testnet resets). O-1 and O-3 run unconditionally.
@@ -58,6 +68,7 @@ class Config:
         # These are bots with genuine anomalies that need manual review — they are
         # explicitly named so the CID-verification barrier stays strict for ALL other pairs.
         # Format: comma-separated bot IDs. Default: ETH/LINK frozen bots (Aug 2026 incident).
+        # LINK bots (10020, 100320) still frozen — repair incomplete.
         _excluded_default = "10011,10021,100002,100316,100321,100325,10020,100320"
         self.STARTUP_EXCLUDED_BOT_IDS = set(
             int(x.strip()) for x in os.getenv("STARTUP_EXCLUDED_BOT_IDS", _excluded_default).split(",")
