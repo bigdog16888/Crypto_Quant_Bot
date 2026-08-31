@@ -2890,23 +2890,27 @@ class BotExecutor:
                                         elif status == 'cooldown':
                                             logger.info(
                                                 f"[HEDGE-LIVE-GUARD-INV30] Child {bot_id} on {pair}: startup cooldown active, "
-                                                f"skipping live guard check, proceeding with catch-up delta={delta:.6f}."
+                                                f"skipping live guard check AND catch-up for this cycle."
                                             )
+                                            continue
                                         elif status == 'rate_exceeded':
                                             logger.warning(
                                                 f"[HEDGE-LIVE-GUARD-INV30] Child {bot_id} on {pair}: rate of change bound exceeded, "
-                                                f"refusing to act on live guard, proceeding with catch-up delta={delta:.6f}."
+                                                f"skipping live guard AND catch-up for this cycle."
                                             )
+                                            continue
                                         elif status == 'inconsistent':
                                             logger.warning(
                                                 f"[HEDGE-LIVE-GUARD-INV30] Child {bot_id} on {pair}: reads inconsistent, "
-                                                f"refusing to act on live guard, proceeding with catch-up delta={delta:.6f}."
+                                                f"skipping live guard AND catch-up for this cycle."
                                             )
+                                            continue
                                         elif status == 'fetch_failed':
                                             logger.warning(
                                                 f"[HEDGE-LIVE-GUARD-INV30] Child {bot_id} on {pair}: all reads failed, "
-                                                f"refusing to act on live guard, proceeding with catch-up delta={delta:.6f}."
+                                                f"skipping live guard AND catch-up for this cycle."
                                             )
+                                            continue
                                     except Exception as _live_guard_err:
                                         logger.warning(
                                             f"[HEDGE-LIVE-GUARD-INV30] Could not fetch live net for {pair}: {_live_guard_err}."

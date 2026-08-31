@@ -68,8 +68,8 @@ class Config:
         # These are bots with genuine anomalies that need manual review — they are
         # explicitly named so the CID-verification barrier stays strict for ALL other pairs.
         # Format: comma-separated bot IDs. Default: ETH/LINK frozen bots (Aug 2026 incident).
-        # LINK bots (10020, 100320) still frozen — repair incomplete.
-        _excluded_default = "10011,10021,100002,100316,100321,100325,10020,100320"
+        # LINK bots (10020, 100320) still frozen — repair incomplete. ETH bots unfrozen after Phase 1.
+        _excluded_default = "10020,100320"  # LINK bots only — ETH unfrozen after Phase 1 fix
         self.STARTUP_EXCLUDED_BOT_IDS = set(
             int(x.strip()) for x in os.getenv("STARTUP_EXCLUDED_BOT_IDS", _excluded_default).split(",")
         )
