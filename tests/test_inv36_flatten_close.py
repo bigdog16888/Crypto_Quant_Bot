@@ -12,7 +12,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from engine import database
 from engine.ledger import credit_fill, seal_trade_state, handle_tp_completion
-from engine.ws_event_handlers import start_db_worker, stop_db_worker
 from engine.oneway_netting import gate_oneway_opposite_entry
 
 
