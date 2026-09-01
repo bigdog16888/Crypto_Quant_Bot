@@ -13,11 +13,13 @@ with the exact open items.
 - Status: GREEN (forward-testing in progress, TESTNET/DEMO)
 - Last verified: 2026-07-17 (full four-way pair reconciliation: BTC +0.007, SUI -79.4, XRP +14.7 — all matched exchange via get_pair_virtual_net / bot_orders / fetch_positions / active_positions)
 - Last known mismatch: NONE at verify time. Bot 10016 BTC was deflated 0.284->0.007 via run_startup_heal.py --execute (A7 fix, commit 72ba4be); 5 rows terminal-statused reset_cleared (A7 resurrection prevented).
-- Test gate: 455 passed; only test_ghost_clearing.py x2 fail (ENVIRONMENTAL "unable to open database file", unrelated to any change).
+- Test gate: 2026-09-02 (this cleanup t_33caaa9d): full suite via Py310 = 516 passed / 19 failed. All 19 failures pre-exist at 4d3ba20 (verified by baseline worktree run); a54daf1 healed exactly 2 (test_inv32_safe_wipe_not_blocked_by_sibling, test_inv35 manual_close_succeeds_when_exchange_flat — the safe_wipe_bot external-cursor UnboundLocalError) and added 1 passing regression test. Collection errors FIXED: test_inv36_flatten_close.py (removed dead start_db_worker/stop_db_worker import), test_verify_fill_on_exchange.py (retired — tested phantom _verify_fill_on_exchange function that never existed; real API verify_filled_orders_against_exchange covered by test_verify_filled_orders_timeout.py), test_inv34.py (dead import committed).
 - Ongoing job (Track A, Hermes): continue watching engine.log / active_positions for drift, ghost positions, mismatches. This is continuous, not one-time.
 
 ## Open items
+- [URGENT / OPERATOR] Engine DOWN since 14:11 (crashed mid-startup-barrier); restart attempt at 15:20 (PID 7000, post-fix code) FATAL'd at startup parity gate: ETH/USDC:USDC ledger=0.079 vs exchange=3.076 (delta 2.997 ETH, ~$7,412) — manual proof required per docs/OPERATOR_MISMATCH_RUNBOOK.md. Run scripts/run_startup_heal.py or resolve manually. Pre-existing divergence (first visible 2026-08-28 DNA-B4-STALE), NOT caused by a54daf1.
 - [TRACK A / Hermes] auth2015: -2015 on fapiPrivateGetIncome. NARROWED to income/read-permission scope disabled on the API key (NOT IP, NOT invalid key — fetch_positions/fetch_ticker/fetch_my_trades all succeed from same IP+key). Bot NEVER calls it in production. PARKED — no action; operator's call whether to enable the permission in Binance UI. Tagged: opened 2026-07-17 by Hermes.
+- [TEST DEBT] RESOLVED 2026-09-02 via t_33caaa9d: test_inv36_flatten_close.py + test_verify_fill_on_exchange.py collection errors fixed; test_inv34.py dead import committed. Bare pytest now collects cleanly.
 - [Memory store] was in fail-loop 2026-07-17; junk entry cleaned 2026-07-17 (attempt 2). Store now 2,080/2,200, 8 valid entries. No open memory item.
 
 ## OS-level redundancy (ACTIVE)
