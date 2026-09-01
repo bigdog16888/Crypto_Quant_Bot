@@ -101,6 +101,17 @@ class Config:
         self.PROPORTIONAL_ALLOCATION = False
         # After this many consecutive API failures per pair, set bots to REQUIRE_MANUAL_PROOF.
         self.PA_SYNC_MAX_STALE_CYCLES = int(os.getenv("PA_SYNC_MAX_STALE_CYCLES", "5"))
+
+        # 🛡️ STARTUP EXCLUSION LIST: Explicit bot IDs to skip at startup barrier.
+        # These are bots with genuine anomalies that need manual review — they are
+        # explicitly named so the CID-verification barrier stays strict for ALL other pairs.
+        # Format: comma-separated bot IDs. Default: ETH/LINK frozen bots (Aug 2026 incident).
+        # LINK bots (10020, 100320) still frozen — repair incomplete.
+        # ETH bots (10011,10021,100002,100316,100321,100325) re-frozen after startup barrier failure.
+        _excluded_default = "10011,10021,100002,100316,100321,100325,10020,100320"
+        self.STARTUP_EXCLUDED_BOT_IDS = set(
+            int(x.strip()) for x in os.getenv("STARTUP_EXCLUDED_BOT_IDS", _excluded_default).split(",")
+        )
         # ─────────────────────────────────────────────────────────────────────────
 
         self.ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

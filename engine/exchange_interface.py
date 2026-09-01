@@ -970,17 +970,21 @@ class ExchangeInterface:
 
         return result
 
-    def fetch_order(self, order_id: str, symbol: str):
+    def fetch_order(self, order_id: str, symbol: str, params: dict = None):
         try:
             if config.TESTNET or config.DEMO_TRADING:
                  endpoint = '/fapi/v1/order'
-                 params = {'symbol': normalize_symbol(symbol)}
+                 merged_params = {'symbol': normalize_symbol(symbol)}
                  if str(order_id).isdigit():
-                     params['orderId'] = order_id
+                     merged_params['orderId'] = order_id
                  else:
-                     params['origClientOrderId'] = order_id
+                     merged_params['origClientOrderId'] = order_id
+                 
+                 # Merge with any additional params (e.g., timeout)
+                 if params:
+                     merged_params.update(params)
                      
-                 res = self._raw_request(endpoint, params=params)
+                 res = self._raw_request(endpoint, params=merged_params)
                  if res:
                      raw_avg = float(res.get('avgPrice', 0) or 0)
                      raw_price = float(res.get('price', 0) or 0)
@@ -999,9 +1003,12 @@ class ExchangeInterface:
                  return None
                  
             if str(order_id).isdigit():
-                return self.exchange.fetch_order(order_id, symbol)
+                return self.exchange.fetch_order(order_id, symbol, params=params)
             else:
-                return self.exchange.fetch_order(order_id, symbol, params={'origClientOrderId': order_id})
+                extra_params = {'origClientOrderId': order_id}
+                if params:
+                    extra_params.update(params)
+                return self.exchange.fetch_order(order_id, symbol, params=extra_params)
         except Exception as e:
             self.logger.error(f"Fetch Order Error for {order_id} (Symbol: {symbol}): {e}")
             raise e
