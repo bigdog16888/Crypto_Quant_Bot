@@ -4190,15 +4190,20 @@ def verify_filled_orders_against_exchange(exchange, bot_id: int = None) -> int:
             exch_order = None
             try:
                 if oid:
-                    exch_order = exchange.fetch_order(str(oid), pair)
-            except Exception:
-                pass
+                    # Add timeout to prevent DNS hang
+                    exch_order = exchange.fetch_order(str(oid), pair, params={'timeout': 15000})
+            except Exception as e:
+                logger.warning(f"[EXCHANGE-FILL-HEAL] Bot {bid} {otype} fetch_order timeout/error: {e}")
+                exch_order = None
             if not exch_order:
                 try:
-                    exch_order = exchange.fetch_order_by_client_order_id(pair, cid)
-                except Exception:
-                    pass
+                    # Add timeout to prevent DNS hang
+                    exch_order = exchange.fetch_order_by_client_order_id(pair, cid, params={'timeout': 15000})
+                except Exception as e:
+                    logger.warning(f"[EXCHANGE-FILL-HEAL] Bot {bid} {otype} fetch_order_by_client_order_id timeout/error: {e}")
+                    exch_order = None
             if not exch_order:
+                logger.warning(f"[EXCHANGE-FILL-HEAL] Bot {bid} {otype} cid={cid}: Could not fetch order after timeout, skipping")
                 continue
 
             ex_fill = float(

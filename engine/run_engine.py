@@ -112,6 +112,10 @@ if __name__ == "__main__":
     last_heartbeat = 0
     last_cleanup = 0
     cycle_sleep = 15.0
+    # Cycle watchdog: track when cycle_count was last incremented
+    last_cycle_count = runner.cycle_count
+    last_cycle_time = time.time()
+    CYCLE_WATCHDOG_SECONDS = 180  # 3 minutes
 
     if not runner.running:
         shutdown_fast = True
@@ -184,6 +188,16 @@ if __name__ == "__main__":
                 cycle_sleep = result
             else:
                 cycle_sleep = 15.0
+            # Cycle watchdog: check if cycle_count has incremented
+            if runner.cycle_count > last_cycle_count:
+                last_cycle_count = runner.cycle_count
+                last_cycle_time = time.time()
+            elif time.time() - last_cycle_time > CYCLE_WATCHDOG_SECONDS:
+                logger.critical(
+                    f"🚨 [CYCLE-WATCHDOG] cycle_count stuck at {runner.cycle_count} "
+                    f"for {time.time() - last_cycle_time:.0f}s (>{CYCLE_WATCHDOG_SECONDS}s). "
+                    f"Cycle loop may be stalled."
+                )
 
             failures = 0
 
