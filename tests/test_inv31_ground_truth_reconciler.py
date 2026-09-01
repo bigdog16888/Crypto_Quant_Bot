@@ -277,6 +277,27 @@ class TestINV31GroundTruthReconciler(unittest.TestCase):
             res = database.safe_wipe_bot(100318, 'SUI/USDC:USDC', 'SHORT', 'test own bot check', force=False, cursor=self.conn.cursor(), human_approved=True)
             self.assertFalse(res)
 
+    def test_safe_wipe_bot_external_cursor_no_unbound_local(self):
+        """Regression test for UnboundLocalError when safe_wipe_bot receives an external cursor.
+        
+        When an external cursor is passed (as in test_inv32_safe_wipe_not_blocked_by_sibling),
+        the variable `conn` must be derived from cursor.connection to avoid UnboundLocalError
+        at conn.commit() when has_external_cursor is True.
+        """
+        _insert_bot(self.conn, 200001, 'test bot', 'BTC/USDC:USDC', 'BTCUSDC', 'LONG', status='pending_close')
+        _insert_trades(self.conn, 200001, open_qty=0.0, cycle_id=5)
+
+        # Call safe_wipe_bot with external cursor - this used to raise UnboundLocalError
+        with patch('engine.database.get_connection', return_value=self.conn):
+            res = database.safe_wipe_bot(
+                200001, 'BTC/USDC:USDC', 'LONG', 
+                'test external cursor no UnboundLocalError', 
+                force=False, 
+                cursor=self.conn.cursor(), 
+                human_approved=True
+            )
+            self.assertTrue(res)
+
     def test_gtr_oneway_short_position_sign(self):
         """INV-31: Exchange returns SHORT position under One-Way mode. contracts is negative or positionAmt is negative. side says LONG or BOTH. Verifies net is negative."""
         mock_positions = [

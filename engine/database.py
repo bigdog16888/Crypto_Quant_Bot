@@ -2113,6 +2113,8 @@ def safe_wipe_bot(
     if cursor is None:
         conn = get_connection()
         cursor = conn.cursor()
+    else:
+        conn = cursor.connection
 
     # ── Guard -1: Human Approval Gate ────────────────────────────────────
     from config.settings import config
@@ -2328,7 +2330,8 @@ def safe_wipe_bot(
         cursor, bot_id, exit_price, direction=direction,
         action_label='SYSTEM_WIPE', notes=reason, human_approved=human_approved
     )
-    conn.commit()
+    if not has_external_cursor:
+        conn.commit()
 
     return True
 
