@@ -11,7 +11,7 @@ class Config:
     def __init__(self):
         self.TESTNET = os.getenv("TESTNET", "True").lower() == "true"
         self.FUTURES_ONLY_MODE = os.getenv("FUTURES_ONLY_MODE", "True" if self.TESTNET else "False").lower() == "true"
-        
+
         if self.TESTNET:
             self.API_KEY = os.getenv("BINANCE_TESTNET_API_KEY", os.getenv("BINANCE_API_KEY", ""))
             self.API_SECRET = os.getenv("BINANCE_TESTNET_API_SECRET", os.getenv("BINANCE_API_SECRET", ""))
@@ -27,9 +27,9 @@ class Config:
         self.DEMO_TRADING = os.getenv("DEMO_TRADING", "True").lower() == "true"
         self.MARKET_TYPE = os.getenv("MARKET_TYPE", "future").lower()
         self.ALLOWED_SYMBOLS = os.getenv("ALLOWED_SYMBOLS", "BTC/USDT,ETH/USDT,SOL/USDT,BNB/USDT,XRP/USDT,BTC/USDC,ETH/USDC,SOL/USDC").split(",")
-        
+
         self.MAX_ORDER_USD = float(os.getenv("MAX_ORDER_USD", 10000))
-        
+
         # ATR Configuration for UI/Strategy
         self.ATR_TIMEFRAME = os.getenv("ATR_TIMEFRAME", "1h")
         self.ATR_PERIODS = int(os.getenv("ATR_PERIODS", 14))
@@ -43,27 +43,47 @@ class Config:
         # 🛡️ O-3: Rolling-window portfolio drawdown breaker
         self.DRAWDOWN_WINDOW_HOURS = float(os.getenv("DRAWDOWN_WINDOW_HOURS", 24))
         self.DRAWDOWN_PCT = float(os.getenv("DRAWDOWN_PCT", 20.0))
-
-        # 🛡️ O-10: Hedge-engagement watchdog
+        # 🛡️ O-10: Pair-level netting verification
         self.MIN_HEDGE_QTY = float(os.getenv("MIN_HEDGE_QTY", 0.0001))
         self.HEDGE_ENGAGE_TIMEOUT_SECONDS = int(os.getenv("HEDGE_ENGAGE_TIMEOUT_SECONDS", 300))
         self.HEDGE_FAIL_WINDOW_SECONDS = int(os.getenv("HEDGE_FAIL_WINDOW_SECONDS", 86400))
-        
+        self.PAIR_NETTING_TOLERANCE = float(os.getenv("PAIR_NETTING_TOLERANCE", "0.002"))
+
+        # 🛡️ HEDGE-LIVE-GUARD Hardening (INV-30) — prevents single-read DB corruption
+        # Multi-read corroboration: require N consistent reads within window before acting
+        self.HEDGE_LIVE_GUARD_MIN_READS = int(os.getenv("HEDGE_LIVE_GUARD_MIN_READS", "3"))
+        self.HEDGE_LIVE_GUARD_READ_WINDOW_SEC = int(os.getenv("HEDGE_LIVE_GUARD_READ_WINDOW_SEC", "10"))
+        self.HEDGE_LIVE_GUARD_QTY_TOLERANCE = float(os.getenv("HEDGE_LIVE_GUARD_QTY_TOLERANCE", "0.01"))
+        # Startup cooldown: after any connectivity failure at startup, skip hedge-live-guard for N seconds
+        self.HEDGE_LIVE_GUARD_STARTUP_COOLDOWN_SEC = int(os.getenv("HEDGE_LIVE_GUARD_STARTUP_COOLDOWN_SEC", "300"))
+        # Rate-of-change bound: max position change per minute (fraction, e.g., 0.5 = 50%/min)
+        self.HEDGE_LIVE_GUARD_MAX_QTY_CHANGE_PER_MIN = float(os.getenv("HEDGE_LIVE_GUARD_MAX_QTY_CHANGE_PER_MIN", "0.5"))
+
+        # 🛡️ Circuit breaker: original global-equity breaker gated behind this flag (default OFF).
+        # Disabled because STARTING_EQUITY is a stale DB constant that false-positives when
+        # the live balance drifts from it (testnet resets). O-1 and O-3 run unconditionally.
+        self.ENABLE_GLOBAL_EQUITY_BREAKER = os.getenv("ENABLE_GLOBAL_EQUITY_BREAKER", "false").lower() == "true"
+
+        # 🛡️ STARTUP EXCLUSION LIST: Explicit bot IDs to skip at startup barrier.
+        # These are bots with genuine anomalies that need manual review — they are
+        # explicitly named so the CID-verification barrier stays strict for ALL other pairs.
+        # Format: comma-separated bot IDs. Default: ETH/LINK frozen bots (Aug 2026 incident).
+        # LINK bots (10020, 100320) still frozen — repair incomplete. ETH bots unfrozen after Phase 1.
+        _excluded_default = "10020,100320"  # LINK bots only — ETH unfrozen after Phase 1 fix
+        self.STARTUP_EXCLUDED_BOT_IDS = set(
+            int(x.strip()) for x in os.getenv("STARTUP_EXCLUDED_BOT_IDS", _excluded_default).split(",")
+        )
+
         # 🛡️ SAFETY TOGGLE: Allow user to disable auto-cancellation of zombie orders
-        self.AUTO_FIX_ZOMBIES = os.getenv("AUTO_FIX_ZOMBIES", "True").lower() == "true"
-        
-        # 🛡️ SAFETY LIMIT: Maximum account drawdown percentage before blocking new entries (Default 80%)
-        self.MAX_ACCOUNT_DRAWDOWN_PERCENT = float(os.getenv("MAX_ACCOUNT_DRAWDOWN_PERCENT", 80.0))
-        
         # 🛡️ SAFETY TOGGLE: Strict Cleanup (True = Kill Manual Orders, False = Protect Them)
         self.STRICT_CLEANUP = os.getenv("STRICT_CLEANUP", "False").lower() == "true"
-        
+
         # TESTING MODE (used to bypass/alter production behavior in unit tests)
         self.TESTING_MODE = os.getenv("TESTING_MODE", "False").lower() in ("true", "1")
-        
+
         # 🛡️ SAFETY TOGGLE: Block autonomous execution in production (requires human approval)
         self.REQUIRE_HUMAN_APPROVAL = os.getenv("REQUIRE_HUMAN_APPROVAL", "False").lower() == "true"
-        
+
         # 🛡️ SAFETY TOGGLE: Auto-detect and repair global position wipe (e.g. testnet reset)
         self.ENABLE_GLOBAL_WIPE_DETECTION = os.getenv("ENABLE_GLOBAL_WIPE_DETECTION", "True").lower() == "true"
 
@@ -112,6 +132,10 @@ class Config:
         self.STARTUP_EXCLUDED_BOT_IDS = set(
             int(x.strip()) for x in os.getenv("STARTUP_EXCLUDED_BOT_IDS", _excluded_default).split(",")
         )
+        # ─────────────────────────────────────────────────────────────────────────
+        self.PROPORTIONAL_ALLOCATION = False
+        # After this many consecutive API failures per pair, set bots to REQUIRE_MANUAL_PROOF.
+        self.PA_SYNC_MAX_STALE_CYCLES = int(os.getenv("PA_SYNC_MAX_STALE_CYCLES", "5"))
         # ─────────────────────────────────────────────────────────────────────────
 
         self.ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

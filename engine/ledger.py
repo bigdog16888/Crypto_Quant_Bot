@@ -11,6 +11,8 @@ ARCHITECTURE INVARIANT:
 DESIGN PRINCIPLES:
   - seal_trade_state() is idempotent: calling it N times yields identical DB state.
   - credit_fill() is the ONLY path to record fills in bot_orders.
+  - mark_order_filled() is the ONLY path to set status='filled' without credit_fill().
+    REQUIRES exchange_fill_id (exchange order ID) as proof of real fill.
   - handle_tp_completion() is the atomic TP cascade (cancel → history → reset).
   - handle_flatten() is the atomic Force Close cascade (cancel → close → history → reset).
 
@@ -18,7 +20,7 @@ FILL LIFECYCLE:
   WS event → credit_fill(bot_id, order_id, cumulative_qty, price)
            → _pending_tp_cascade.add() [if TP]
            → seal_trade_state(bot_id)   [enqueued, idempotent]
-  
+
   runner.run_cycle() → drain_tp_cascade(exchange)
                      → handle_tp_completion(bot_id, price, pair, exchange)
 
@@ -35,6 +37,150 @@ import threading
 from typing import Optional, Tuple, Set, Dict, Any
 
 logger = logging.getLogger("Ledger")
+
+
+def mark_order_filled(
+    bot_id: int,
+    order_id: str,
+    exchange_fill_id: str,
+    filled_qty: float,
+    avg_price: float,
+    order_type: str = 'entry',
+    caller: str = ''
+) -> bool:
+    """
+    Mark an order as FILLED with exchange proof.
+    
+    This is the ONLY function allowed to set bot_orders.status = 'filled'
+    without going through credit_fill(). It requires a real exchange fill ID
+    as evidence that the fill actually occurred on the exchange.
+    
+    Args:
+        bot_id: The bot that owns this order.
+        order_id: The client_order_id or order_id of our bot_orders row.
+        exchange_fill_id: The REAL exchange order_id (from exchange API) that filled.
+                         This is the proof that prevents phantom fills.
+        filled_qty: Quantity filled.
+        avg_price: Average fill price.
+        order_type: For audit logging (entry/grid/tp/close/sl/etc).
+        caller: Debug label for audit trail.
+    
+    Returns:
+        True if successfully marked filled, False if not found or already filled.
+    
+    Raises:
+        ValueError: If exchange_fill_id is missing or empty.
+    
+    Usage:
+        # When we have a real exchange fill from REST fetch
+        mark_order_filled(bot_id, client_order_id, exchange_order_id, qty, price, 'tp')
+    """
+    if not exchange_fill_id or not str(exchange_fill_id).strip():
+        raise ValueError(
+            f"[MARK-FILLED-REJECTED] Bot {bot_id} order {order_id}: "
+            f"exchange_fill_id is REQUIRED. Cannot mark filled without exchange proof. "
+            f"Caller: {caller}"
+        )
+    
+    from engine.database import get_connection
+    
+    conn = get_connection()
+    
+    try:
+        # Find the bot_orders row
+        row = conn.execute(
+            "SELECT id, filled_amount, amount, status, step, cycle_id, filled_at FROM bot_orders "
+            "WHERE (order_id = ? OR client_order_id = ?) AND bot_id = ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (order_id, order_id, bot_id)
+        ).fetchone()
+        
+        if not row:
+            logger.warning(
+                f"[MARK-FILLED] Bot {bot_id} order {order_id}: no bot_orders row found. "
+                f"Cannot mark filled. Caller: {caller}"
+            )
+            return False
+        
+        db_id, existing_fill, order_amount, current_status, row_step, row_cycle, existing_filled_at = row
+        existing_fill = float(existing_fill or 0)
+        order_amount = float(order_amount or 0)
+        
+        # Check if already filled
+        if current_status in ('filled', 'closed'):
+            logger.debug(
+                f"[MARK-FILLED] Bot {bot_id} order {order_id}: already status={current_status}. "
+                f"Caller: {caller}"
+            )
+            return True  # Idempotent - already filled
+        
+        # Prevent marking cancelled/rejected orders as filled (state machine blocks this)
+        if current_status in ('cancelled', 'canceled', 'rejected', 'failed', 'expired'):
+            logger.warning(
+                f"[MARK-FILLED-REJECTED] Bot {bot_id} order {order_id}: status={current_status} "
+                f"cannot transition to filled. Caller: {caller}"
+            )
+            return False
+        
+        # Record the fill with exchange_fill_id as proof
+        # We use filled_amount as the evidence and set filled_at if not set
+        actual_fill_ts = int(time.time())
+        
+        conn.execute(
+            "UPDATE bot_orders SET "
+            "filled_amount = ?, "
+            "price = ?, "
+            "status = 'filled', "
+            "filled_at = CASE WHEN filled_at = 0 THEN ? ELSE filled_at END, "
+            "updated_at = ?, "
+            "notes = COALESCE(notes, '') || ? "
+            "WHERE id = ?",
+            (
+                filled_qty,
+                avg_price if avg_price > 0 else 0.0,
+                actual_fill_ts,
+                actual_fill_ts,
+                f" | mark_order_filled: exchange_fill_id={exchange_fill_id}, caller={caller}, ts={actual_fill_ts}",
+                db_id
+            )
+        )
+        conn.commit()
+        
+        logger.info(
+            f"[MARK-FILLED] Bot {bot_id} order {order_id} (db_id={db_id}): "
+            f"marked FILLED with exchange_fill_id={exchange_fill_id}, "
+            f"qty={filled_qty:.6f} @ {avg_price:.6f}, caller={caller}"
+        )
+        
+        # Also increment open_qty for entry-type orders (same logic as credit_fill)
+        _ENTRY_TYPES = ('entry', 'grid', 'adoption_add', 'adoption', 'forensic_adoption_add')
+        if order_type in _ENTRY_TYPES:
+            delta = filled_qty - existing_fill
+            if delta > 0:
+                conn.execute(
+                    "UPDATE trades SET open_qty = ROUND(COALESCE(open_qty, 0) + ?, 8) WHERE bot_id = ?",
+                    (delta, bot_id)
+                )
+                conn.commit()
+        
+        # Trigger seal_trade_state to sync trades table
+        from engine.ledger import seal_trade_state
+        seal_trade_state(bot_id)
+        
+        return True
+        
+    except ValueError:
+        raise
+    except Exception as e:
+        logger.error(
+            f"[MARK-FILLED-ERROR] Bot {bot_id} order {order_id}: {e}. Caller: {caller}"
+        )
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False
+
 
 # ---------------------------------------------------------------------------
 # Global TP Cascade Registry

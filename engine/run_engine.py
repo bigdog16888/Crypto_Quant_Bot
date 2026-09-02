@@ -228,14 +228,16 @@ if __name__ == "__main__":
     remove_pid()
     clear_stop_signal()
 
-    _db_timeout = 3.0 if shutdown_fast else 15.0
     try:
-        from engine.ws_event_handlers import stop_db_worker
-        logger.info(f"Flushing async DB write queue before exit (timeout={_db_timeout}s)...")
-        stop_db_worker(timeout=_db_timeout)
-        logger.info("✅ DB write queue flushed.")
+        # INV-31: the WS-side parallel queue (_db_write_queue) was removed;
+        # WriteQueue is now the single write path. Flush it before exit.
+        # (Mirrors engine/runner/shutdown.py — stop_db_worker no longer exists.)
+        from engine.write_queue import WriteQueue
+        logger.info("Flushing WriteQueue before exit...")
+        WriteQueue().flush()
+        logger.info("✅ WriteQueue flushed.")
     except Exception as e:
-        logger.error(f"Failed to flush DB write queue: {e}")
+        logger.error(f"Failed to flush WriteQueue: {e}")
 
     if not shutdown_fast:
         try:

@@ -110,12 +110,24 @@ class BotRunner(StartupMixin, ShutdownMixin, WebSocketLifecycleMixin, CycleLoopM
             raise e
 
     def _calculate_stablecoin_balance(self, balance: dict) -> float:
-        """Calculate total balance across USDT and USDC stablecoins."""
+        """Calculate total balance across USDT and USDC stablecoins.
+        Handles both CCXT-style nested dict (balance['total']['USDT']) and 
+        flat dict (balance['USDT']) for compatibility.
+        """
         total = 0.0
-        for currency in STABLECOINS:
-            curr_bal = balance.get(currency)
-            if isinstance(curr_bal, dict):
-                total += float(curr_bal.get('total', 0.0))
+        # Check for nested 'total' dict first (CCXT style)
+        nested = balance.get('total', {})
+        if isinstance(nested, dict):
+            for currency in STABLECOINS:
+                val = nested.get(currency)
+                if val is not None:
+                    total += float(val)
+        # Fallback to flat dict (legacy style)
+        if total == 0.0:
+            for currency in STABLECOINS:
+                val = balance.get(currency)
+                if val is not None:
+                    total += float(val)
         return total
 
     def sync_all_bots(self):
@@ -190,12 +202,15 @@ class BotRunner(StartupMixin, ShutdownMixin, WebSocketLifecycleMixin, CycleLoopM
 
     def check_circuit_breaker(self, exchange_snapshot=None):
         """
-        Global Circuit Breaker: Checks if account equity has dropped below safe limits.
+        Safety breakers: O-3 rolling drawdown + O-1 position-size always run.
+        The original global-equity breaker is gated behind ENABLE_GLOBAL_EQUITY_BREAKER
+        (default OFF) because its STARTING_EQUITY baseline is a stale DB constant
+        that false-positives when the live balance drifts from it.
         """
         if getattr(config, 'NO_API_MODE', False):
             return
 
-        if self.circuit_breaker_triggered or self.initial_equity <= 0:
+        if self.circuit_breaker_triggered:
             return
 
         try:
@@ -231,77 +246,108 @@ class BotRunner(StartupMixin, ShutdownMixin, WebSocketLifecycleMixin, CycleLoopM
                                 balance_fetch_success = True
                         except Exception: pass
 
-            if not balance_fetch_success:
-                logger.warning("Circuit breaker check skipped - balance fetch failed")
-                return
+            # O-1: per-bot position-size breaker (DB-only, runs unconditionally)
+            # Only needs total_invested from trades table, never balance
+            self._check_position_size(active_bots)
 
-            invested_cost = 0.0
-            for bot in active_bots:
-                t_data = get_bot_status(bot[0])
-                if t_data and t_data.get('total_invested') and t_data['total_invested'] > 0:
-                    invested_cost += float(t_data['total_invested'])
-
-            # Unrealized PnL from snapshot/cache
-            unrealized_pnl = 0.0
-            if exchange_snapshot:
-                for mt, data in exchange_snapshot.items():
-                    positions = data.get('positions', [])
-                    for p in positions:
-                        unrealized_pnl += float(p.get('unrealizedPnl', 0.0) or 0.0)
-            else:
-                # Fallback to manual fetch
-                active_market_types = set()
+            # O-3: rolling-window drawdown breaker (needs equity snapshot)
+            # Only runs if we successfully fetched a balance
+            if balance_fetch_success:
+                invested_cost = 0.0
                 for bot in active_bots:
-                    config_dict = json.loads(bot[5]) if bot[5] else {}
-                    active_market_types.add(normalize_market_type(config_dict.get('market_type', config.MARKET_TYPE)))
+                    t_data = get_bot_status(bot[0])
+                    if t_data and t_data.get('total_invested') and t_data['total_invested'] > 0:
+                        invested_cost += float(t_data['total_invested'])
 
-                if not active_market_types: active_market_types.add(config.MARKET_TYPE)
+                # Unrealized PnL from snapshot/cache
+                unrealized_pnl = 0.0
+                if exchange_snapshot:
+                    for mt, data in exchange_snapshot.items():
+                        positions = data.get('positions', [])
+                        for p in positions:
+                            unrealized_pnl += float(p.get('unrealizedPnl', 0.0) or 0.0)
+                else:
+                    # Fallback to manual fetch
+                    active_market_types = set()
+                    for bot in active_bots:
+                        config_dict = json.loads(bot[5]) if bot[5] else {}
+                        active_market_types.add(normalize_market_type(config_dict.get('market_type', config.MARKET_TYPE)))
 
-                for mt in active_market_types:
-                    if mt in self.exchanges:
-                        try:
-                            positions = self.exchanges[mt].fetch_positions()
-                            for p in positions:
-                                unrealized_pnl += float(p.get('unrealizedPnl', 0.0) or 0.0)
-                        except: pass
+                    if not active_market_types: active_market_types.add(config.MARKET_TYPE)
 
-            current_equity = total_stablecoin + invested_cost + unrealized_pnl
+                    for mt in active_market_types:
+                        if mt in self.exchanges:
+                            try:
+                                positions = self.exchanges[mt].fetch_positions()
+                                for p in positions:
+                                    unrealized_pnl += float(p.get('unrealizedPnl', 0.0) or 0.0)
+                            except: pass
 
-            # Log for debugging
-            logger.debug(f"Circuit Check: Equity ${current_equity:.2f} (Cash: {total_stablecoin:.2f} + Cost: {invested_cost:.2f} + uPnL: {unrealized_pnl:.2f})")
-            # O-3: Record equity snapshot + rolling-window drawdown breaker
-            try:
-                from engine.database import record_equity_snapshot, get_equity_snapshot_series, compute_rolling_drawdown
-                now = time.time()
-                record_equity_snapshot(current_equity, ts=now)
-                window_h = float(getattr(config, "DRAWDOWN_WINDOW_HOURS", 24))
-                threshold_pct = float(getattr(config, "DRAWDOWN_PCT", 20.0))
-                series = get_equity_snapshot_series(ts_from=now - window_h * 3600)
-                if len(series) >= 2:
-                    rolling_drawdown, base = compute_rolling_drawdown(series, current_equity)
-                    if base and base > 0:
-                        if rolling_drawdown >= threshold_pct:
-                            logger.critical(f"O-3 ROLLING-WINDOW DRAWDOWN TRIGGERED! {rolling_drawdown:.2f}% drop over {window_h}h window")
-                            self.circuit_breaker_triggered = True
-                            with open(config.PATHS["EMERGENCY_FILE"], "w") as f:
-                                f.write(f"O-3 Rolling-Window Drawdown Triggered at {rolling_drawdown:.2f}% over {window_h}h")
-                            self.handle_emergency_liquidation()
-                            return
-            except Exception as e:
-                logger.error(f"O-3 rolling-window check failed: {e}")
+                current_equity = total_stablecoin + invested_cost + unrealized_pnl
 
+                # Log at INFO so operators can verify O-3 is actually running each cycle
+                logger.info(f"Circuit Check: Equity ${current_equity:.2f} (Cash: {total_stablecoin:.2f} + Cost: {invested_cost:.2f} + uPnL: {unrealized_pnl:.2f})")
 
-            if self.initial_equity > 0:
+                # O-3: rolling-window drawdown breaker
+                self._check_rolling_drawdown(current_equity)
+            else:
+                logger.warning("O-3 rolling drawdown skipped - balance fetch failed (O-1 still ran)")
+
+            # Original global-equity breaker - gated behind config flag (default OFF).
+            # Disabled because STARTING_EQUITY is a stale DB constant that
+            # false-positives when the live balance drifts from it.
+            if getattr(config, 'ENABLE_GLOBAL_EQUITY_BREAKER', False) and self.initial_equity > 0:
                 drawdown = (self.initial_equity - current_equity) / self.initial_equity * 100
                 if drawdown >= config.GLOBAL_STOP_LOSS_PCT:
-                    logger.critical(f"CIRCUIT BREAKER TRIGGERED! Drawdown: {drawdown:.2f}%")
+                    logger.critical(f"GLOBAL EQUITY BREAKER TRIGGERED! Drawdown: {drawdown:.2f}%")
                     self.circuit_breaker_triggered = True
                     with open(config.PATHS["EMERGENCY_FILE"], "w") as f:
-                        f.write(f"Circuit Breaker Triggered at {drawdown:.2f}% drawdown")
+                        f.write(f"Global Equity Breaker Triggered at {drawdown:.2f}% Drawdown")
                     self.handle_emergency_liquidation()
+                    return
+
         except Exception as e:
             logger.error(f"Circuit breaker check failed: {e}")
 
+    def _check_rolling_drawdown(self, current_equity: float):
+        """O-3: Record equity snapshot + rolling-window drawdown breaker."""
+        try:
+            from engine.database import record_equity_snapshot, get_equity_snapshot_series, compute_rolling_drawdown
+            now = time.time()
+            record_equity_snapshot(current_equity, ts=now)
+            window_h = float(getattr(config, "DRAWDOWN_WINDOW_HOURS", 24))
+            threshold_pct = float(getattr(config, "DRAWDOWN_PCT", 20.0))
+            series = get_equity_snapshot_series(ts_from=now - window_h * 3600)
+            if len(series) >= 2:
+                rolling_drawdown, base = compute_rolling_drawdown(series, current_equity)
+                if base and base > 0:
+                    if rolling_drawdown >= threshold_pct:
+                        logger.critical(f"O-3 ROLLING-WINDOW DRAWDOWN TRIGGERED! {rolling_drawdown:.2f}% drop over {window_h}h window")
+                        self.circuit_breaker_triggered = True
+                        with open(config.PATHS["EMERGENCY_FILE"], "w") as f:
+                            f.write(f"O-3 Rolling-Window Drawdown Triggered at {rolling_drawdown:.2f}% over {window_h}h")
+                        self.handle_emergency_liquidation()
+        except Exception as e:
+            logger.error(f"O-3 rolling-window check failed: {e}")
+
+    def _check_position_size(self, active_bots):
+        """O-1: Per-bot position-size circuit breaker (config-based theoretical max)."""
+        try:
+            from engine.database import (
+                check_position_size_circuit_breaker,
+                freeze_bot_for_position_oversize,
+            )
+            for _bot in active_bots:
+                _bid = _bot[0]
+                _sf, _cur, _cmax = check_position_size_circuit_breaker(_bid)
+                if _sf:
+                    logger.critical(
+                        f"O-1 POS-SIZE-CB: bot {_bid} invested ${_cur:.2f} "
+                        f"> 2x config max ${_cmax:.2f} - freezing"
+                    )
+                    freeze_bot_for_position_oversize(_bid, _cur, _cmax)
+        except Exception as e:
+            logger.error(f"O-1 position-size circuit breaker check failed: {e}")
     def get_active_bots(self):
         """Fetches all bots and their current status."""
         conn = get_connection()
