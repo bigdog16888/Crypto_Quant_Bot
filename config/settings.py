@@ -64,16 +64,6 @@ class Config:
         # the live balance drifts from it (testnet resets). O-1 and O-3 run unconditionally.
         self.ENABLE_GLOBAL_EQUITY_BREAKER = os.getenv("ENABLE_GLOBAL_EQUITY_BREAKER", "false").lower() == "true"
 
-        # 🛡️ STARTUP EXCLUSION LIST: Explicit bot IDs to skip at startup barrier.
-        # These are bots with genuine anomalies that need manual review — they are
-        # explicitly named so the CID-verification barrier stays strict for ALL other pairs.
-        # Format: comma-separated bot IDs. Default: ETH/LINK frozen bots (Aug 2026 incident).
-        # LINK bots (10020, 100320) still frozen — repair incomplete. ETH bots unfrozen after Phase 1.
-        _excluded_default = "10020,100320"  # LINK bots only — ETH unfrozen after Phase 1 fix
-        self.STARTUP_EXCLUDED_BOT_IDS = set(
-            int(x.strip()) for x in os.getenv("STARTUP_EXCLUDED_BOT_IDS", _excluded_default).split(",")
-        )
-
         # 🛡️ SAFETY TOGGLE: Allow user to disable auto-cancellation of zombie orders
         # 🛡️ SAFETY TOGGLE: Strict Cleanup (True = Kill Manual Orders, False = Protect Them)
         self.STRICT_CLEANUP = os.getenv("STRICT_CLEANUP", "False").lower() == "true"
@@ -132,10 +122,6 @@ class Config:
         self.STARTUP_EXCLUDED_BOT_IDS = set(
             int(x.strip()) for x in os.getenv("STARTUP_EXCLUDED_BOT_IDS", _excluded_default).split(",")
         )
-        # ─────────────────────────────────────────────────────────────────────────
-        self.PROPORTIONAL_ALLOCATION = False
-        # After this many consecutive API failures per pair, set bots to REQUIRE_MANUAL_PROOF.
-        self.PA_SYNC_MAX_STALE_CYCLES = int(os.getenv("PA_SYNC_MAX_STALE_CYCLES", "5"))
         # ─────────────────────────────────────────────────────────────────────────
 
         self.ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
