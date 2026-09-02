@@ -317,8 +317,6 @@ class GroundTruthReconciler:
                     conn = get_connection()
                     conn.execute("DELETE FROM active_positions")
                     conn.commit()
-                    conn.close()
-            
                 WriteQueue().put_and_wait(_delete_active_positions)
             
                 agg_positions = {}
@@ -367,8 +365,6 @@ class GroundTruthReconciler:
                                         VALUES (?, ?, ?, ?, ?, ?)
                                     """, (bot_id, pair, side, size, entry_price, ts))
                                     conn.commit()
-                                    conn.close()
-                            
                                 WriteQueue().put_and_wait(
                                     _insert_active_positions, 
                                     share['id'], symbol, share['dir'], share['qty'], share['avg'], ts
@@ -384,8 +380,6 @@ class GroundTruthReconciler:
                                 VALUES (?, ?, ?, ?, ?, ?)
                             """, (owner_id, symbol, side, size, avg_price, ts))
                             conn.commit()
-                            conn.close()
-                    
                         WriteQueue().put_and_wait(
                             _insert_active_positions_mismatch,
                             owner_id, symbol, side, data['size'], avg_price, ts
@@ -400,8 +394,6 @@ class GroundTruthReconciler:
                             VALUES (?, ?, ?, ?, ?, ?)
                         """, (0, 'GLOBAL', 'FLAT', 0.0, 0.0, ts))
                         conn.commit()
-                        conn.close()
-                
                     WriteQueue().put_and_wait(_insert_global_flat, ts)
             except Exception as e:
                 logger.error(f"[GTR] Failed to refresh active_positions: {e}")
@@ -417,23 +409,25 @@ class GroundTruthReconciler:
                 f"Force-resetting ledger to Scanning."
             )
         
-            def _heal_ghost_virtual_internal(c, bot_id, cycle_id):
-                c.execute("""
+            def _heal_ghost_virtual_internal(bot_id, cycle_id):
+                from engine.database import get_connection
+                conn = get_connection()
+                conn.execute("""
                     UPDATE trades SET 
                         open_qty=0, total_invested=0, avg_entry_price=0,
                         current_step=0, entry_confirmed=0,
                         cycle_id = cycle_id + 1
                     WHERE bot_id=?
                 """, (bot_id,))
-                c.execute(
+                conn.execute(
                     "UPDATE bots SET status='Scanning', cascade_started_at=0 WHERE id=?", (bot_id,)
                 )
-                c.execute("""
+                conn.execute("""
                     UPDATE bot_orders SET status='reset_cleared', updated_at=?
                     WHERE bot_id=? AND cycle_id=?
                     AND status NOT IN ('reset_cleared','auto_closed','filled','cancelled')
                 """, (int(time.time()), bot_id, cycle_id))
-        
+                conn.commit()
             WriteQueue().put_and_wait(_heal_ghost_virtual_internal, bot_id, cycle_id)
         
             logger.warning(
@@ -463,16 +457,18 @@ class GroundTruthReconciler:
                 )
             elif status == 'pending_hedge_close' and open_qty <= 0.001:
                 # Parent waiting for child that already closed
-                def _reset_hedge_close(c, bot_id):
-                    c.execute(
+                def _reset_hedge_close(bot_id):
+                    from engine.database import get_connection
+                    conn = get_connection()
+                    conn.execute(
                         "UPDATE bots SET status='Scanning', cascade_started_at=0 WHERE id=?", (bot_id,)
                     )
-                    c.execute("""
+                    conn.execute("""
                         UPDATE trades SET cycle_id=cycle_id+1, current_step=0,
                         open_qty=0, total_invested=0, avg_entry_price=0,
                         entry_confirmed=0 WHERE bot_id=?
                     """, (bot_id,))
-            
+                    conn.commit()
                 WriteQueue().put_and_wait(_reset_hedge_close, bot_id)
                 logger.warning(
                     f"[GTR-INV31] Bot {name}: pending_hedge_close with open_qty=0. "
@@ -484,9 +480,11 @@ class GroundTruthReconciler:
                     f"[GTR-INV31] Bot {name}: stuck {status} with open_qty={open_qty}. "
                     f"Setting pending_flatten for runner to re-execute close."
                 )
-                def _set_pending_flatten(c, bot_id, ts):
-                    c.execute(
+                def _set_pending_flatten(bot_id, ts):
+                    from engine.database import get_connection
+                    conn = get_connection()
+                    conn.execute(
                         "UPDATE bots SET status='pending_flatten', cascade_started_at=? WHERE id=?", (ts, bot_id)
                     )
-            
+                    conn.commit()
                 WriteQueue().put_and_wait(_set_pending_flatten, bot_id, int(time.time()))
