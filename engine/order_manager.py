@@ -12,6 +12,25 @@ class OrderManager:
         Implements basic 'order chasing' logic.
         If the order isn't filled immediately, cancel and replace at a better price.
         """
+        # 🛡️ FREEZE-GUARD: frozen bots must not place orders
+        if bot_id is not None:
+            from config.settings import config
+            _fg_row = None
+            try:
+                from engine.database import get_connection as _fg_gc
+                _fg_conn = _fg_gc()
+                _fg_row = _fg_conn.execute("SELECT status FROM bots WHERE id=?", (bot_id,)).fetchone()
+            except Exception:
+                pass
+            _fg_status = _fg_row[0] if _fg_row else None
+            if config.is_bot_frozen(bot_id, _fg_status):
+                self.logger.critical(
+                    f"🛑 [FREEZE-GUARD] Bot {bot_id} blocked from chase_limit_order: frozen "
+                    f"(excluded={bot_id in config.STARTUP_EXCLUDED_BOT_IDS}, "
+                    f"manual_proof={_fg_status == 'REQUIRE_MANUAL_PROOF'})"
+                )
+                return None
+
         self.logger.info(f"Starting limit chase for {side} {amount} {symbol} (Bot: {bot_id})")
         
         # Get current ticker using safe wrapper

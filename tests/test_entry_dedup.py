@@ -295,8 +295,10 @@ class TestEntryDedupGuard(unittest.TestCase):
 
     @patch('engine.bot_executor.logger')
     def test_entry_placed_when_previous_excluded(self, mock_logger):
+        # Use bot IDs OUTSIDE STARTUP_EXCLUDED_BOT_IDS so the freeze guard
+        # does not block these tests — we are testing DEDUP-GUARD behavior, not freeze guard.
         for idx, excluded_status in enumerate(('reset_cleared', 'auto_closed', 'rejected')):
-            bot_id = 10009 + idx
+            bot_id = 90001 + idx
             pair = "SOL/USDC:USDC"
             direction = "LONG"
             

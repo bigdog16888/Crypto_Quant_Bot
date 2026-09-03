@@ -121,6 +121,19 @@ def resolve_gated_bot(
             f"live exchange data — aborting to prevent silent ledger corruption."
         )
 
+    # 🛡️ FREEZE-GUARD: startup-excluded bots must never be resolved/flattened via recovery.
+    # REQUIRE_MANUAL_PROOF bots are exactly what this function is designed to resolve,
+    # so we only block the config-driven exclusion set here, not the status itself.
+    from config.settings import config
+    if bot_id in config.STARTUP_EXCLUDED_BOT_IDS:
+        logger.critical(
+            f"🛑 [FREEZE-GUARD] Bot {bot_id} blocked from resolve_gated_bot ({action_label}): startup-excluded frozen bot"
+        )
+        raise RuntimeError(
+            f"Bot {bot_id}: startup-excluded frozen bot — recovery refused by FREEZE-GUARD. "
+            f"Bot remains gated. DB not wiped."
+        )
+
     # Step 4: Compute closeable quantity
     closeable_qty = compute_closeable_qty(direction, open_qty, live_net)
     unphysical_remainder = round(open_qty - closeable_qty, 8)

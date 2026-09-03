@@ -1619,6 +1619,20 @@ def handle_flatten(
     from engine.database import get_connection, get_bot_status, reset_bot_after_tp, log_trade
     from engine.exchange_interface import normalize_symbol
 
+    # 🛡️ FREEZE-GUARD: frozen bots must not be flattened (config + status)
+    _fg_conn = get_connection()
+    _fg_row = _fg_conn.execute("SELECT status, name FROM bots WHERE id=?", (bot_id,)).fetchone()
+    _fg_status = _fg_row[0] if _fg_row else None
+    _fg_name = _fg_row[1] if _fg_row else str(bot_id)
+    from config.settings import config as _fg_config
+    if _fg_config.is_bot_frozen(bot_id, _fg_status):
+        logger.critical(
+            f"🛑 [FREEZE-GUARD] Bot {bot_id} ({_fg_name}) blocked from handle_flatten ({reason}): frozen "
+            f"(excluded={bot_id in _fg_config.STARTUP_EXCLUDED_BOT_IDS}, "
+            f"manual_proof={_fg_status == 'REQUIRE_MANUAL_PROOF'})"
+        )
+        return False
+
     logger.warning(f"[FLATTEN] ▶ Starting {reason} flatten for Bot {bot_id} {pair}")
 
     try:

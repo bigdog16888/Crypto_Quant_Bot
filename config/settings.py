@@ -3,6 +3,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
 class Config:
     VERSION = "5.3.7"  # v5.3.7: Refactored grid grace age check and cached indicators
 
@@ -122,9 +123,8 @@ class Config:
         self.STARTUP_EXCLUDED_BOT_IDS = set(
             int(x.strip()) for x in os.getenv("STARTUP_EXCLUDED_BOT_IDS", _excluded_default).split(",")
         )
-        # ─────────────────────────────────────────────────────────────────────────
 
-        self.ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        # ─────────────────────────────────────────────────────────────────────────
         self.PATHS = {
             "PID_FILE": os.path.join(self.ROOT_DIR, "engine.pid"),
             "STOP_FILE": os.path.join(self.ROOT_DIR, "engine.stop"),
@@ -132,5 +132,26 @@ class Config:
             "LOG_FILE": os.path.join(self.ROOT_DIR, "engine.log"),
             "DB_FILE": os.path.join(self.ROOT_DIR, "crypto_bot.db"),
         }
+
+    def is_bot_frozen(self, bot_id: int, bot_status: str = None) -> bool:
+        """
+        Centralized freeze guard — single source of truth for 'this bot must not trade'.
+
+        Checks both config-driven exclusion (STARTUP_EXCLUDED_BOT_IDS) and 
+        DB-driven exclusion (REQUIRE_MANUAL_PROOF status).
+
+        Returns True if the bot is frozen and must not place any exchange orders.
+        Call at the START of any runtime path that can place real orders.
+        """
+        # Config-driven exclusion (survives restart, explicit operator intent)
+        if bot_id in self.STARTUP_EXCLUDED_BOT_IDS:
+            return True
+
+        # DB-driven exclusion (set by barrier/GTR when anomalies detected)
+        if bot_status == 'REQUIRE_MANUAL_PROOF':
+            return True
+
+        return False
+
 
 config = Config()

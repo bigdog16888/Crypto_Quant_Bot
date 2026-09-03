@@ -2384,6 +2384,14 @@ class BotExecutor:
         return 5.0, None
 
     def execute_entry(self, bot_id, name, pair, side, amount, direction, price=None, params=None, exchange=None, market_snapshot=None, bot_config=None, bot_status=None) -> Optional[Dict[str, Any]]:
+        # 🛡️ FREEZE-GUARD: frozen bots must not place new entries
+        if config.is_bot_frozen(bot_id, (bot_status or {}).get('status')):
+            logger.critical(
+                f"🛑 [FREEZE-GUARD] Bot {bot_id} ({name}) blocked from ENTRY path: frozen "
+                f"(excluded={bot_id in config.STARTUP_EXCLUDED_BOT_IDS}, "
+                f"manual_proof={(bot_status or {}).get('status') == 'REQUIRE_MANUAL_PROOF'})"
+            )
+            return None
         if not config.TRADING_ENABLED and not config.DRY_RUN:
             logger.info(f"🛑 [ORDER-BLOCKED] Trading disabled. Bot {name} cannot maintain orders for {pair}.")
             return
@@ -2802,6 +2810,15 @@ class BotExecutor:
             logger.info(f"🛑 [EXIT-BLOCKED] Trading disabled. Bot {name} cannot execute TP for {pair}.")
             return
 
+        # 🛡️ FREEZE-GUARD: frozen bots must not have TP placed/maintained/closed
+        if config.is_bot_frozen(bot_id, bot_status.get('status')):
+            logger.critical(
+                f"🛑 [FREEZE-GUARD] Bot {bot_id} ({name}) blocked from TP path: frozen "
+                f"(excluded={bot_id in config.STARTUP_EXCLUDED_BOT_IDS}, "
+                f"manual_proof={bot_status.get('status') == 'REQUIRE_MANUAL_PROOF'})"
+            )
+            return
+
         logger.info(f"🎯 {name}: Executing TP exit for {pair} at step {bot_status['current_step']}")
         # In Virtual Position mode, the TP order should already be on the exchange
         # We just need to ensure it fills and update DB state
@@ -3082,7 +3099,13 @@ class BotExecutor:
 
                         # 4. Check if over-hedged first
                         if aggregate_drift < -tolerance:
-                            if child_status == 'REQUIRE_MANUAL_PROOF':
+                            if config.is_bot_frozen(bot_id, child_status):
+                                logger.critical(
+                                    f"🛑 [FREEZE-GUARD] Bot {bot_id} ({pair}) blocked from INV-30 pending_flatten transition: frozen "
+                                    f"(excluded={bot_id in config.STARTUP_EXCLUDED_BOT_IDS}, "
+                                    f"manual_proof={child_status == 'REQUIRE_MANUAL_PROOF'})"
+                                )
+                            elif child_status == 'REQUIRE_MANUAL_PROOF':
                                 logger.info(
                                     f"[INV-30] Bot {bot_id} is over-hedged but already gated in "
                                     f"REQUIRE_MANUAL_PROOF. Skipping status overwrite."
@@ -4306,13 +4329,14 @@ class BotExecutor:
                                 if ccxt_params is None:
                                     pass  # Early exit handled inside _prepare_tp_order_params, but inside inside place block we just let it skip
                                 elif ccxt_params == 'DUST_CHASER':
-                                    # 🚀 MARKET DUST FLUSH: Multi-bot pair, sub-threshold virtual position.
-                                    # A limit TP is impossible (min notional rejection, no reduceOnly allowed).
-                                    # Correct architecture: fire a net-REDUCING market order to zero the virtual position.
-                                    # In One-Way mode, this is always safe: it's just netting against the pair's physical position.
-                                    # The CID tags it to this bot only — sibling bots are fully unaffected.
-                                    # Check cooldown to prevent rapid retries on failure
-                                    if time.time() < _DUST_FLUSH_COOLDOWN.get(bot_id, 0.0):
+                                    # 🛡️ FREEZE-GUARD: frozen bots must not fire dust-close market orders
+                                    if config.is_bot_frozen(bot_id, bot_status.get('status')):
+                                        logger.critical(
+                                            f"🛑 [FREEZE-GUARD] Bot {bot_id} ({name}) blocked from DUST-FLUSH path: frozen "
+                                            f"(excluded={bot_id in config.STARTUP_EXCLUDED_BOT_IDS}, "
+                                            f"manual_proof={bot_status.get('status') == 'REQUIRE_MANUAL_PROOF'})"
+                                        )
+                                    elif time.time() < _DUST_FLUSH_COOLDOWN.get(bot_id, 0.0):
                                         logger.info(f"🧹 [DUST-FLUSH] {name}: Dust close is in cooldown. Skipping.")
                                     else:
                                         logger.warning(f"🧹 [DUST-FLUSH] {name}: Virtual position ${bot_status.get('total_invested', 0):.2f} below min notional. Firing market dust-close.")

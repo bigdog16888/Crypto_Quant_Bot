@@ -3341,6 +3341,25 @@ class StateReconciler:
 
             # 'pair' here is normalized
 
+            # 🛡️ FREEZE-GUARD (reconciler): if ANY active bot on this pair is frozen
+            # (STARTUP_EXCLUDED_BOT_IDS or REQUIRE_MANUAL_PROOF), skip ALL repair/heal/
+            # dust-chaser/flatten actions for the pair. Frozen means frozen everywhere.
+            try:
+                from config.settings import config as _fz_cfg
+                _fz_gated = [
+                    (b.bot_id, getattr(b, 'status', None))
+                    for b in bots
+                    if _fz_cfg.is_bot_frozen(b.bot_id, getattr(b, 'status', None))
+                ]
+                if _fz_gated:
+                    logger.critical(
+                        f"🛑 [FREEZE-GUARD] Pair {pair}: frozen bots {_fz_gated} — "
+                        f"skipping resolve_net_mismatch repair actions for this pair."
+                    )
+                    continue
+            except Exception as _fz_err:
+                logger.warning(f"[FREEZE-GUARD] Reconciler pair-skip check failed: {_fz_err}")
+
             # 1. Calc Virtual GROSS per direction (not signed net)
 
             # In One-Way mode, multiple bots may trade the same pair in the same direction.

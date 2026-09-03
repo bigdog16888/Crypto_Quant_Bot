@@ -53,6 +53,18 @@ class CycleLoopMixin:
         from engine.recovery import compute_closeable_qty, resolve_gated_bot
         from engine.parity_gates import get_exchange_signed_net
 
+        # 🛡️ FREEZE-GUARD: frozen bots must not execute forced closes
+        _fb_row = conn.execute("SELECT status, name FROM bots WHERE id=?", (bot_id,)).fetchone()
+        _fb_status = _fb_row[0] if _fb_row else None
+        _fb_name = _fb_row[1] if _fb_row else str(bot_id)
+        if config.is_bot_frozen(bot_id, _fb_status):
+            logger.critical(
+                f"🛑 [FREEZE-GUARD] Bot {bot_id} ({_fb_name}) blocked from PENDING-FLATTEN forced close: frozen "
+                f"(excluded={bot_id in config.STARTUP_EXCLUDED_BOT_IDS}, "
+                f"manual_proof={_fb_status == 'REQUIRE_MANUAL_PROOF'})"
+            )
+            return False
+
         logger.warning(
             f"[PENDING-FLATTEN] Bot {bot_id} ({pair}): executing netting-aware forced "
             f"close for open_qty={open_qty:.6f}. Checking live exchange net first."

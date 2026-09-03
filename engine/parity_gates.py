@@ -77,7 +77,17 @@ def _orphan_repair_allowed(exchange, pair: str) -> Tuple[bool, str]:
     ).fetchall()
     if gated_bots:
         return False, f"bots {[b[0] for b in gated_bots]} require manual proof"
-    
+
+    # 3b. FREEZE-GUARD: pair-level config exclusion (STARTUP_EXCLUDED_BOT_IDS)
+    # If ANY active bot on this pair is in the exclusion list, the pair is frozen.
+    _pair_bots = conn.execute(
+        "SELECT id FROM bots WHERE is_active=1 AND (normalized_pair=? OR pair=?)",
+        (norm, norm)
+    ).fetchall()
+    _frozen_ids = [b[0] for b in _pair_bots if b[0] in config.STARTUP_EXCLUDED_BOT_IDS]
+    if _frozen_ids:
+        return False, f"bots {_frozen_ids} frozen via STARTUP_EXCLUDED_BOT_IDS (FREEZE-GUARD)"
+
     return True, ""
 
 
@@ -1257,6 +1267,15 @@ def reconcile_pair_to_exchange(exchange, pair: str) -> Optional[str]:
         if gated_bots:
             logger.warning(f"[REPAIR-SKIPPED] {pair}: bots {[b[0] for b in gated_bots]} are REQUIRE_MANUAL_PROOF — skipping orphan repair.")
             return None
+        # 🛡️ FREEZE-GUARD: pair-level config exclusion at reconcile level
+        _pair_bots_r = conn.execute(
+            "SELECT id FROM bots WHERE is_active=1 AND (normalized_pair=? OR pair=?)",
+            (norm, norm)
+        ).fetchall()
+        _frozen_ids_r = [b[0] for b in _pair_bots_r if b[0] in config.STARTUP_EXCLUDED_BOT_IDS]
+        if _frozen_ids_r:
+            logger.warning(f"[REPAIR-SKIPPED] {pair}: bots {_frozen_ids_r} frozen via STARTUP_EXCLUDED_BOT_IDS (FREEZE-GUARD) — skipping orphan repair.")
+            return None
         return repair_exchange_orphan_when_ledger_flat(exchange, pair, virtual, physical)
 
     if _same_sign_qty(virtual, physical, tol) and abs(virtual) > abs(physical) + 1e-12:
@@ -1427,7 +1446,23 @@ def proof_flatten_pair(
     if not human_approved:
         return {'success': False, 'error': 'human_approved required for proof flatten'}
 
+    # 🛡️ FREEZE-GUARD: pair-level freeze check — frozen pairs must not be flattened
     from engine.database import get_connection, reset_bot_after_tp
+    _norm_fg = normalize_symbol(pair).upper()
+    _conn_fg = get_connection()
+    _pair_bots_fg = _conn_fg.execute(
+        "SELECT id, status FROM bots WHERE is_active=1 AND (normalized_pair=? OR pair=?)",
+        (_norm_fg, _norm_fg)
+    ).fetchall()
+    _frozen_on_pair = [
+        (b[0], b[1]) for b in _pair_bots_fg
+        if config.is_bot_frozen(b[0], b[1])
+    ]
+    if _frozen_on_pair:
+        logger.critical(
+            f"🛑 [FREEZE-GUARD] pair {pair} blocked from proof_flatten_pair: frozen bots {_frozen_on_pair}"
+        )
+        return {'success': False, 'error': f'pair {pair} has frozen bots: {_frozen_on_pair}'}
 
     result: Dict[str, Any] = {
         'success': False,

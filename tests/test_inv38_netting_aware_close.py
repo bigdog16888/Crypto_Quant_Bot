@@ -313,9 +313,10 @@ class TestResolveGatedBot:
             memory_db.execute("UPDATE bots SET status='IN TRADE' WHERE id=?", (bot_short,))
             memory_db.commit()
 
-            # Since virtual (-0.751) and physical (-0.256) are both negative, signs match.
-            # And sibling bot is in trade (invested = 100.0 > 0.01).
-            # So gate_maintain_orders_allowed should allow maintenance (True) despite the drift!
+            # Since virtual (-0.751) and physical (-0.256) both negative, signs match,
+            # but magnitudes differ by 0.495 which exceeds tolerance (0.002).
+            # The parity gate MUST block maintenance — this is the intended safety behavior.
             m_allowed, m_reason = gate_maintain_orders_allowed(bot_short, 'ETH/USDC:USDC', exchange=ex, total_invested=100.0)
-            assert m_allowed is True
+            assert m_allowed is False
+            assert "Pair parity (opposite signs)" in m_reason or "Pair parity gate" in m_reason
 
