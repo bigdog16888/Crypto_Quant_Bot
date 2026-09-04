@@ -126,7 +126,14 @@ class ShutdownMixin:
                 if not config.DRY_RUN and mt in ['future', 'swap']:
                     # For futures, fetch positions properly
                     try:
-                        positions = ex.exchange.fetch_positions()
+                        # REL-1 fix (2026-09-04, docs/REL1_EMERGENCY_PATH_ROOT_CAUSE_20260904.md):
+                        # use the WRAPPER's raw-request fetch_positions. ccxt-native
+                        # calls sign against production FAPI endpoints; the demo key
+                        # gets -2015 on every call (live-probed 2026-09-04) — this was
+                        # the only native-bypass in the engine and made the emergency
+                        # CLOSE path dead-on-arrival while the CANCEL half still worked.
+                        # Wrapper position dicts use the same keys ('symbol', 'contracts').
+                        positions = ex.fetch_positions()
                         # Normalize symbol for comparison
                         target_pair_clean = pair.replace('/', '').split(':')[0]
 
