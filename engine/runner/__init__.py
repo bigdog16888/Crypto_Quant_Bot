@@ -283,10 +283,22 @@ class BotRunner(StartupMixin, ShutdownMixin, WebSocketLifecycleMixin, CycleLoopM
                                     unrealized_pnl += float(p.get('unrealizedPnl', 0.0) or 0.0)
                             except: pass
 
-                current_equity = total_stablecoin + invested_cost + unrealized_pnl
+                # A1 (2026-09-04, docs/O3_FALSE_FIRE_ROOT_CAUSE_20260904.md):
+                # O-3 equity = WALLET + uPnL. DB Cost is EXCLUDED — the futures
+                # wallet already carries open-position cost inside margin, so
+                # adding the DB's total_invested DOUBLE-COUNTS open positions.
+                # The live 37.14% "cliff" was exactly this double-count
+                # disappearing when a flatten wiped Cost mid-run.
+                # invested_cost is still computed and logged for operator
+                # visibility, but it is NOT part of equity.
+                current_equity = total_stablecoin + unrealized_pnl
 
                 # Log at INFO so operators can verify O-3 is actually running each cycle
-                logger.info(f"Circuit Check: Equity ${current_equity:.2f} (Cash: {total_stablecoin:.2f} + Cost: {invested_cost:.2f} + uPnL: {unrealized_pnl:.2f})")
+                logger.info(
+                    f"Circuit Check: Equity ${current_equity:.2f} "
+                    f"(Wallet: {total_stablecoin:.2f} + uPnL: {unrealized_pnl:.2f} "
+                    f"| Info-only Cost: {invested_cost:.2f})"
+                )
 
                 # O-3: rolling-window drawdown breaker
                 self._check_rolling_drawdown(current_equity)
@@ -310,23 +322,64 @@ class BotRunner(StartupMixin, ShutdownMixin, WebSocketLifecycleMixin, CycleLoopM
             logger.error(f"Circuit breaker check failed: {e}")
 
     def _check_rolling_drawdown(self, current_equity: float):
-        """O-3: Record equity snapshot + rolling-window drawdown breaker."""
+        """O-3: Record equity snapshot + rolling-window drawdown breaker.
+
+        2026-09-04 hardening (docs/O3_FALSE_FIRE_ROOT_CAUSE_20260904.md):
+        - A1: current_equity is WALLET + uPnL (Cost excluded — see caller).
+        - B: compute_rolling_drawdown itself medians the CURRENT side from the
+          snapshot tail, so a single transient read cannot fire the breaker.
+        - C: trigger requires the threshold breach on 2 CONSECUTIVE checks
+          (self._o3_consecutive_hits) — one breach logs pending, no action.
+        - D: only THIS run's snapshots count (ts >= ENGINE_STARTED_AT), so a
+          quick-bounce restart can never measure the new run's reads against
+          the previous run's baseline (gap detection alone needs >1.5h).
+        """
         try:
-            from engine.database import record_equity_snapshot, get_equity_snapshot_series, compute_rolling_drawdown
+            from engine.database import (
+                record_equity_snapshot,
+                get_equity_snapshot_series,
+                compute_rolling_drawdown,
+                get_engine_started_at,
+            )
             now = time.time()
             record_equity_snapshot(current_equity, ts=now)
             window_h = float(getattr(config, "DRAWDOWN_WINDOW_HOURS", 24))
             threshold_pct = float(getattr(config, "DRAWDOWN_PCT", 20.0))
             series = get_equity_snapshot_series(ts_from=now - window_h * 3600)
+
+            # D: this run's snapshots only (rebase to ENGINE_STARTED_AT)
+            started_at = get_engine_started_at()
+            if started_at > 0:
+                series = [(ts, eq) for ts, eq in series if ts >= started_at]
+
             if len(series) >= 2:
                 rolling_drawdown, base = compute_rolling_drawdown(series, current_equity)
                 if base and base > 0:
                     if rolling_drawdown >= threshold_pct:
-                        logger.critical(f"O-3 ROLLING-WINDOW DRAWDOWN TRIGGERED! {rolling_drawdown:.2f}% drop over {window_h}h window")
-                        self.circuit_breaker_triggered = True
-                        with open(config.PATHS["EMERGENCY_FILE"], "w") as f:
-                            f.write(f"O-3 Rolling-Window Drawdown Triggered at {rolling_drawdown:.2f}% over {window_h}h")
-                        self.handle_emergency_liquidation()
+                        hits = int(getattr(self, "_o3_consecutive_hits", 0)) + 1
+                        self._o3_consecutive_hits = hits
+                        if hits >= 2:
+                            logger.critical(
+                                f"O-3 ROLLING-WINDOW DRAWDOWN TRIGGERED! "
+                                f"{rolling_drawdown:.2f}% drop over {window_h}h window "
+                                f"(confirmed on {hits} consecutive checks)"
+                            )
+                            self.circuit_breaker_triggered = True
+                            with open(config.PATHS["EMERGENCY_FILE"], "w") as f:
+                                f.write(
+                                    f"O-3 Rolling-Window Drawdown Triggered at "
+                                    f"{rolling_drawdown:.2f}% over {window_h}h "
+                                    f"(confirmed on {hits} consecutive checks)"
+                                )
+                            self.handle_emergency_liquidation()
+                        else:
+                            logger.warning(
+                                f"O-3 drawdown {rolling_drawdown:.2f}% >= "
+                                f"{threshold_pct}% threshold — confirmation "
+                                f"pending ({hits}/2 consecutive checks)"
+                            )
+                    else:
+                        self._o3_consecutive_hits = 0
         except Exception as e:
             logger.error(f"O-3 rolling-window check failed: {e}")
 

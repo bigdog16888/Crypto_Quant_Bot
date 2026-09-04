@@ -115,9 +115,12 @@ class TestBalanceFetchFix:
 
         mock_o1.assert_called_once()
         mock_o3.assert_called_once()
-        # equity = 10000 (balance) + 100 (invested) + 0 (uPnL) = 10100
+        # A1 (2026-09-04): equity = wallet + uPnL. DB Cost EXCLUDED (futures
+        # wallet already carries position cost in margin — adding DB Cost
+        # double-counted open positions and caused the live 37.14% false fire).
+        # equity = 10000 (balance) + 0 (uPnL) = 10000
         current_equity = mock_o3.call_args[0][0]
-        assert current_equity == 10100.0, f"Expected equity 10100, got {current_equity}"
+        assert current_equity == 10000.0, f"Expected equity 10000, got {current_equity}"
 
     def test_o1_and_o3_run_with_exchange_snapshot_and_upnl(self):
         """When exchange_snapshot has balance + positions, both run and equity includes uPnL."""
@@ -145,9 +148,10 @@ class TestBalanceFetchFix:
 
         mock_o1.assert_called_once()
         mock_o3.assert_called_once()
-        # equity = 5000 (balance) + 100 (invested) + 30 (uPnL) = 5130
+        # A1 (2026-09-04): equity = wallet + uPnL (Cost excluded).
+        # equity = 5000 (balance) + 30 (uPnL) = 5030
         current_equity = mock_o3.call_args[0][0]
-        assert current_equity == 5130.0, f"Expected equity 5130, got {current_equity}"
+        assert current_equity == 5030.0, f"Expected equity 5030, got {current_equity}"
 
 
 if __name__ == '__main__':

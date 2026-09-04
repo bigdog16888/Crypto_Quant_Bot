@@ -120,6 +120,25 @@ def get_starting_equity():
     row = cursor.fetchone()
     return float(row[0]) if row else 10000.0
 
+def get_engine_started_at() -> float:
+    """O-3 (2026-09-04): Read ENGINE_STARTED_AT from system_equity.
+
+    Written by run_engine.py at process start. Used by _check_rolling_drawdown
+    (part D of the O-3 hardening) to rebase the drawdown window to the CURRENT
+    engine run — a quick-bounce restart must never measure the new run's
+    snapshots against the previous run's baseline. Returns 0.0 if missing
+    (filter disabled; gap detection alone then applies).
+    """
+    try:
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT value FROM system_equity WHERE key = 'ENGINE_STARTED_AT'"
+        ).fetchone()
+        conn.close()
+        return float(row[0]) if row else 0.0
+    except Exception:
+        return 0.0
+
 def record_equity_snapshot(equity: float, ts: float = None, max_age_hours: float = 48.0) -> None:
     """O-3: Persist an equity snapshot point. Prunes points older than max_age_hours."""
     ts = int(ts if ts is not None else time.time())  # INTEGER PRIMARY KEY requires int
@@ -143,19 +162,29 @@ def get_equity_snapshot_series(ts_from: float = None) -> list:
     conn.close()
     return [(float(ts), float(eq)) for ts, eq in rows]
 
-def compute_rolling_drawdown(series, current_equity: float, gap_threshold_h: float = 1.5) -> tuple:
+def compute_rolling_drawdown(series, current_equity: float = None, gap_threshold_h: float = 1.5) -> tuple:
     """O-3: Robust rolling drawdown — ignores restart-gap data and single-tick spikes.
 
-    Algorithm:
+    Contract (2026-09-04 hardening — docs/O3_FALSE_FIRE_ROOT_CAUSE_20260904.md):
+
     1. Detect gaps > gap_threshold_h in the snapshot series (engine restarts).
     2. Use only post-gap snapshots (the current engine run's data). A drawdown
        measured across a restart gap is not a rolling drawdown — pre-restart
-       snapshots include restart-transient equity reads (double-counted
-       position+cash windows) that poison the baseline.
+       snapshots include restart-transient equity reads that poison the baseline.
     3. Peak = MEDIAN of the top 3 positive equity values in the post-gap
-       window (removes single-tick spikes; a spike never becomes the peak
-       because it is not the middle of the top-3).
-    4. Drawdown = (peak - current) / peak * 100.
+       window (a single-tick UP-spike never becomes the peak).
+    4. Current = MEDIAN of the last up-to-3 positive snapshots in the post-gap
+       window (a single-tick DOWN-transient never becomes the current — the
+       live caller records the current read BEFORE calling, so it is the tail
+       of the series; one bad read cannot be the median of 3). The scalar
+       current_equity argument is a FALLBACK, used only when the tail holds
+       fewer than 2 positive snapshots (cold start with a single point).
+    5. Drawdown = (peak - current) / peak * 100.
+
+    Live incident this hardening replays: 2026-09-04 09:08:29 — post-gap
+    series [15094.10, 15088.81, 9485.24(transient)] fired 37.14% under the
+    old contract (trusted scalar current); under this contract the median
+    tail is 15088.81 -> 0.00% drawdown.
 
     Returns (drawdown_pct, peak_equity) or (0.0, None) when insufficient data.
     """
@@ -178,7 +207,7 @@ def compute_rolling_drawdown(series, current_equity: float, gap_threshold_h: flo
     if len(post_gap) < 2:
         return 0.0, None
 
-    # 3. Peak = median of top-3 positive values (spike-immune)
+    # 3. Peak = median of top-3 positive values (up-spike immune)
     candidates = sorted(
         (float(eq) for _, eq in post_gap if float(eq) > 0),
         reverse=True,
@@ -196,7 +225,25 @@ def compute_rolling_drawdown(series, current_equity: float, gap_threshold_h: flo
     if peak_equity <= 0:
         return 0.0, None
 
-    drawdown = (peak_equity - float(current_equity)) / peak_equity * 100
+    # 4. Current = median of the last up-to-3 positive snapshots
+    #    (down-transient immune; scalar fallback only when tail < 2 points)
+    tail = sorted([float(eq) for _, eq in post_gap if float(eq) > 0][-3:])
+    if len(tail) >= 2:
+        tn = len(tail)
+        tmid = tn // 2
+        if tn % 2 == 1:
+            current = tail[tmid]
+        else:
+            current = (tail[tmid - 1] + tail[tmid]) / 2.0
+    elif current_equity is not None and float(current_equity) > 0:
+        current = float(current_equity)
+    else:
+        current = tail[0] if tail else 0.0
+
+    if current <= 0:
+        return 0.0, None
+
+    drawdown = (peak_equity - current) / peak_equity * 100
     return max(0.0, drawdown), peak_equity
 
 
