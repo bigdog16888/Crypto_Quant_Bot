@@ -109,17 +109,23 @@ class GetEquitySnapshotSeries(_DBTestBase):
 
 class ComputeRollingDrawdown(_DBTestBase):
     def test_basic_drawdown(self):
-        # base = 10000 at t0, current = 8500 -> drawdown = 15%
+        # New behavior: peak = median of top 3 values
+        # series: [10000, 9500], current=8500
+        # top 3 = [10000, 9500] → median = 9750
+        # drawdown = (9750 - 8500) / 9750 = 12.82%
         series = [(time.time(), 10000.0), (time.time() + 3600, 9500.0)]
-        drawdown, base = db.compute_rolling_drawdown(series, 8500.0)
-        assert base == 10000.0
-        assert abs(drawdown - 15.0) < 0.001
+        drawdown, peak = db.compute_rolling_drawdown(series, 8500.0)
+        assert peak == 9750.0
+        assert abs(drawdown - 12.8205) < 0.01
 
     def test_zero_base_returns_zero(self):
+        # New behavior: zero reads are excluded from peak candidates.
+        # series: [0 (bad read), 5000], current=1000
+        # candidates = [5000] -> peak = 5000, drawdown = (5000-1000)/5000 = 80%
         series = [(time.time(), 0.0), (time.time() + 3600, 5000.0)]
-        drawdown, base = db.compute_rolling_drawdown(series, 1000.0)
-        assert drawdown == 0.0
-        assert base is None
+        drawdown, peak = db.compute_rolling_drawdown(series, 1000.0)
+        assert peak == 5000.0
+        assert abs(drawdown - 80.0) < 0.01
 
     def test_empty_series_returns_zero(self):
         drawdown, base = db.compute_rolling_drawdown([], 8500.0)
@@ -133,10 +139,57 @@ class ComputeRollingDrawdown(_DBTestBase):
         assert base is None
 
     def test_no_drawdown_when_current_higher(self):
+        # series: [10000, 10500], current=11000
+        # top 3 = [10500, 10000] → median = 10250
+        # current > peak → drawdown = 0
         series = [(time.time(), 10000.0), (time.time() + 3600, 10500.0)]
-        drawdown, base = db.compute_rolling_drawdown(series, 11000.0)
+        drawdown, peak = db.compute_rolling_drawdown(series, 11000.0)
         assert drawdown == 0.0
-        assert base == 10000.0
+        assert peak == 10250.0
+
+    def test_gap_detection_splits_window(self):
+        # Restart gap: 11h between t0 and t1. Post-gap data (t1, t2) must be
+        # used exclusively; pre-gap 10000 must NOT set the baseline.
+        now = time.time()
+        series = [
+            (now - 12*3600, 10000.0),   # pre-gap (would give 20% dd if used)
+            (now - 1*3600, 9000.0),     # post-gap
+            (now - 0.5*3600, 9100.0),   # post-gap
+        ]
+        current = 8000.0
+        # post-gap candidates = [9100, 9000] -> top-2 median = 9050
+        drawdown, peak = db.compute_rolling_drawdown(series, current, gap_threshold_h=1.5)
+        assert peak == 9050.0
+        assert abs(drawdown - 11.60) < 0.05  # (9050-8000)/9050
+
+    def test_single_post_gap_point_no_drawdown(self):
+        # A restart leaves ONE new snapshot: baseline cannot be established.
+        # The breaker must NOT measure against pre-restart data (real incident:
+        # 33,931 pre-restart spike + 14,845 post-restart current = false 42% fire).
+        now = time.time()
+        series = [
+            (now - 25*3600, 33931.0),  # pre-restart spike (bad read)
+            (now - 0.1*3600, 14832.0), # first snapshot of new run
+        ]
+        drawdown, peak = db.compute_rolling_drawdown(series, 14845.0, gap_threshold_h=1.5)
+        assert drawdown == 0.0
+        assert peak is None
+
+    def test_outlier_ignored_median_of_top3(self):
+        # Single-tick spike 33931 among normal ~21000 values
+        now = time.time()
+        series = [
+            (now - 5*3600, 21000.0),
+            (now - 4*3600, 21100.0),
+            (now - 3*3600, 33931.0),  # outlier spike
+            (now - 2*3600, 21050.0),
+            (now - 1*3600, 20950.0),
+        ]
+        current = 14845.0
+        # top 3 = [33931, 21100, 21050] → median = 21100
+        drawdown, peak = db.compute_rolling_drawdown(series, current, gap_threshold_h=100)
+        assert peak == 21100.0
+        assert abs(drawdown - 29.64) < 0.01  # (21100-14845)/21100
 
 
 if __name__ == "__main__":

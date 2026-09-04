@@ -143,17 +143,61 @@ def get_equity_snapshot_series(ts_from: float = None) -> list:
     conn.close()
     return [(float(ts), float(eq)) for ts, eq in rows]
 
-def compute_rolling_drawdown(series, current_equity: float) -> tuple:
-    """O-3: Given [(ts, equity), ...] (oldest first) and current equity, return"""
-    """(rolling_drawdown_pct, base_equity) where base_equity is the window-start"""
-    """equity (earliest in series). Drawdown = (base - current) / base * 100."""
+def compute_rolling_drawdown(series, current_equity: float, gap_threshold_h: float = 1.5) -> tuple:
+    """O-3: Robust rolling drawdown — ignores restart-gap data and single-tick spikes.
+
+    Algorithm:
+    1. Detect gaps > gap_threshold_h in the snapshot series (engine restarts).
+    2. Use only post-gap snapshots (the current engine run's data). A drawdown
+       measured across a restart gap is not a rolling drawdown — pre-restart
+       snapshots include restart-transient equity reads (double-counted
+       position+cash windows) that poison the baseline.
+    3. Peak = MEDIAN of the top 3 positive equity values in the post-gap
+       window (removes single-tick spikes; a spike never becomes the peak
+       because it is not the middle of the top-3).
+    4. Drawdown = (peak - current) / peak * 100.
+
+    Returns (drawdown_pct, peak_equity) or (0.0, None) when insufficient data.
+    """
     if not series or len(series) < 2:
         return 0.0, None
-    base_equity = float(series[0][1])
-    if base_equity <= 0:
+
+    # 1. Detect restart gaps
+    gap_seconds = gap_threshold_h * 3600
+    gap_indices = [
+        i for i in range(1, len(series))
+        if series[i][0] - series[i - 1][0] > gap_seconds
+    ]
+
+    # 2. Post-gap data only (current engine run)
+    start_idx = gap_indices[-1] if gap_indices else 0
+    post_gap = series[start_idx:]
+
+    # One post-gap point cannot establish a baseline. Return no-drawdown;
+    # the next snapshot (~10s later in live operation) completes the pair.
+    if len(post_gap) < 2:
         return 0.0, None
-    drawdown = (base_equity - float(current_equity)) / base_equity * 100
-    return max(0.0, drawdown), base_equity
+
+    # 3. Peak = median of top-3 positive values (spike-immune)
+    candidates = sorted(
+        (float(eq) for _, eq in post_gap if float(eq) > 0),
+        reverse=True,
+    )
+    if not candidates:
+        return 0.0, None
+    top = sorted(candidates[:3])  # ascending for median
+    n = len(top)
+    mid = n // 2
+    if n % 2 == 1:
+        peak_equity = top[mid]
+    else:
+        peak_equity = (top[mid - 1] + top[mid]) / 2.0
+
+    if peak_equity <= 0:
+        return 0.0, None
+
+    drawdown = (peak_equity - float(current_equity)) / peak_equity * 100
+    return max(0.0, drawdown), peak_equity
 
 
 def backup_database():
