@@ -317,7 +317,7 @@ def _credit_fill_internal(
 
         # Find the bot_orders row — try order_id first, then client_order_id
         row = conn.execute(
-            "SELECT id, filled_amount, amount, status, step, cycle_id FROM bot_orders "
+            "SELECT id, filled_amount, amount, status, step, cycle_id, client_order_id FROM bot_orders "
             "WHERE (order_id = ? OR client_order_id = ?) AND bot_id = ? "
             "ORDER BY created_at DESC LIMIT 1",
             (order_id, order_id, bot_id)
@@ -330,41 +330,10 @@ def _credit_fill_internal(
             )
             return False
 
-        db_id, existing_fill, order_amount, current_status, row_step, row_cycle = row
+        db_id, existing_fill, order_amount, current_status, row_step, row_cycle, row_cid = row
         existing_fill = float(existing_fill or 0)
         order_amount = float(order_amount or 0)
 
-        # ── INV-20: fill_claims singleton guard ─────────────────────────────────
-        # Atomically claim this (bot_id, order_id) slot. INSERT OR IGNORE ensures
-        # only the first concurrent caller proceeds; all subsequent callers for the
-        # same fill event see 0 rows_affected and early-return.
-        # This eliminates the TOCTOU race where WS + REST both observe 0 filled_amount
-        # and both attempt to credit the same fill.
-        _claim_caller = caller or 'credit_fill'
-        try:
-            _claim_result = conn.execute(
-                "INSERT OR IGNORE INTO fill_claims (bot_id, order_id, caller, claimed_at) "
-                "VALUES (?, ?, ?, ?)",
-                (bot_id, str(order_id), _claim_caller, int(time.time()))
-            )
-            conn.commit()
-            if _claim_result.rowcount == 0:
-                # Another caller already claimed this fill — this is a benign duplicate.
-                logger.debug(
-                    f"[FILL-CLAIM] Bot {bot_id} order {order_id}: already claimed "
-                    f"(caller={_claim_caller}). Skipping duplicate credit."
-                )
-                return False
-            logger.debug(
-                f"[FILL-CLAIM] Bot {bot_id} order {order_id}: claimed by {_claim_caller}."
-            )
-        except Exception as _claim_err:
-            # fill_claims table not yet created (first-run race) — fail-open to preserve fills.
-            logger.warning(
-                f"[FILL-CLAIM] Guard check failed for bot {bot_id} order {order_id}: "
-                f"{_claim_err}. Proceeding without claim (fill_claims may not exist yet)."
-            )
-        # ────────────────────────────────────────────────────────────────────────
 
         # Never credit more than the order's declared size (+5% rounding tolerance).
         # Prevents unit bugs (e.g. amount=0.002 but exchange reports filled=1.0) from
@@ -396,12 +365,73 @@ def _credit_fill_internal(
         fully_filled = order_amount > 0 and (cumulative_qty / order_amount) >= 0.99
         new_status = 'filled' if (fully_filled and not suppress_cascade) else 'partially_filled'
 
-        # Only reject truly administrative terminal statuses
+        # ── Fix 1 of the catchup fill-credit race (2026-09-04): record-on-terminal ──
+        # A late WS fill on a terminal row is REAL exposure: the physical position
+        # grew on the exchange, so the ledger row must carry the truth even though
+        # the row was administratively cleared. We record the fill data on the row
+        # WITHOUT un-terminalizing it and WITHOUT touching trades.open_qty — the
+        # virtual-net contribution stays excluded (every reader filters on terminal
+        # status), and attribution/adoption of the qty remains GTR/SNAP's audited
+        # job. This mirrors the FILL-RESURRECTION precedent for 'cancelled' rows,
+        # extended to administrative terminals with the safety of no re-credit.
         if current_status in ('reset_cleared', 'auto_closed'):
-            logger.debug(
-                f"[CREDIT-FILL] Bot {bot_id} order {order_id}: status is {current_status} — skip."
+            _terminal_fill = float(cumulative_qty or 0)
+            if _terminal_fill <= existing_fill:
+                # Already recorded (idempotent MAX() semantics) — nothing new.
+                logger.debug(
+                    f"[CREDIT-FILL] Bot {bot_id} order {order_id}: status is {current_status} "
+                    f"and cumulative {_terminal_fill:.6f} <= recorded {existing_fill:.6f} — skip."
+                )
+                return False
+            logger.warning(
+                f"📝 [FILL-LATE-TERMINAL] Bot {bot_id} order {order_id} was {current_status} "
+                f"but WS delivered fill ({cumulative_qty:.6f} @ {avg_price:.6f}). "
+                f"Recording fill on row for exchange truth; status stays {current_status}; "
+                f"open_qty NOT incremented (adoption is GTR/SNAP's audited path)."
             )
-            return False
+            conn.execute(
+                "UPDATE bot_orders SET filled_amount = ?, price = ?, "
+                "filled_at = CASE WHEN filled_at = 0 THEN ? ELSE filled_at END, "
+                "updated_at = ? WHERE id = ?",
+                (cumulative_qty, avg_price if avg_price > 0 else None,
+                 int(fill_ts if fill_ts > 0 else time.time()), int(time.time()), db_id)
+            )
+            conn.commit()
+            return 'recorded_terminal'
+
+        # ── INV-20: fill_claims singleton guard (post-status-check position —
+        # Fix 2 of the catchup fill-credit race, 2026-09-04: claims must NOT burn
+        # on refused fills; only a real credit attempt claims the slot) ────────
+        # Atomically claim this (bot_id, order_id) slot. INSERT OR IGNORE ensures
+        # only the first concurrent caller proceeds; all subsequent callers for the
+        # same fill event see 0 rows_affected and early-return.
+        # This eliminates the TOCTOU race where WS + REST both observe 0 filled_amount
+        # and both attempt to credit the same fill.
+        _claim_caller = caller or 'credit_fill'
+        try:
+            _claim_result = conn.execute(
+                "INSERT OR IGNORE INTO fill_claims (bot_id, order_id, caller, claimed_at) "
+                "VALUES (?, ?, ?, ?)",
+                (bot_id, str(order_id), _claim_caller, int(time.time()))
+            )
+            conn.commit()
+            if _claim_result.rowcount == 0:
+                # Another caller already claimed this fill — this is a benign duplicate.
+                logger.debug(
+                    f"[FILL-CLAIM] Bot {bot_id} order {order_id}: already claimed "
+                    f"(caller={_claim_caller}). Skipping duplicate credit."
+                )
+                return False
+            logger.debug(
+                f"[FILL-CLAIM] Bot {bot_id} order {order_id}: claimed by {_claim_caller}."
+            )
+        except Exception as _claim_err:
+            # fill_claims table not yet created (first-run race) — fail-open to preserve fills.
+            logger.warning(
+                f"[FILL-CLAIM] Guard check failed for bot {bot_id} order {order_id}: "
+                f"{_claim_err}. Proceeding without claim (fill_claims may not exist yet)."
+            )
+        # ────────────────────────────────────────────────────────────────────────
 
         # If it was cancelled but we are now recording a fill, log the resurrection
         if current_status in ('cancelled', 'canceled'):
@@ -467,25 +497,46 @@ def _credit_fill_internal(
                 capacity_limit = order_amount * 1.05  # 5% tolerance for rounding
 
                 if already_credited > 0 and (already_credited + delta_proposed) > capacity_limit:
-                    # Step is already saturated by another order_id. This is a GTX chase
-                    # duplicate. Mark this row auto_closed and do NOT credit open_qty.
-                    logger.warning(
-                        f"🛡️ [STEP-SATURATED] Bot {bot_id} {order_type} step={row_step} cycle={row_cycle}: "
-                        f"already credited {already_credited:.6f} via other order_id(s). "
-                        f"Proposed delta {delta_proposed:.6f} would exceed capacity {capacity_limit:.6f}. "
-                        f"Marking order {order_id} (db_id={db_id}) as auto_closed. "
-                        f"open_qty NOT incremented — ledger integrity preserved."
-                    )
-                    conn.execute(
-                        "UPDATE bot_orders SET status='auto_closed', notes=?, updated_at=? WHERE id=?",
-                        (
-                            f"STEP_SATURATED:already_credited={already_credited:.6f},capacity={capacity_limit:.6f}",
-                            int(time.time()),
-                            db_id
+                    # Step is already saturated by another order_id. Normally this is
+                    # a GTX chase duplicate: mark the row auto_closed and do not
+                    # credit open_qty.
+                    # ── Fix 3a of the catchup fill-credit race (2026-09-04) ──
+                    # INV-30 catchup entries are NOT chase retries. They are NEW
+                    # exchange orders placed because the child step is UNDER-covered,
+                    # and INV-30 already counts inflight sibling amounts in its delta
+                    # at placement time (status IN open/new/placing/cancelling), so a
+                    # second catchup for the same step only exists when coverage was
+                    # genuinely still short. Their fills are additive-by-design
+                    # exposure: crediting them keeps virtual == physical. Refusing
+                    # them (the pre-fix behavior) lost the fill and froze the pair.
+                    _is_catchup = '_CATCHUP_' in str(row_cid or '') or '_CATCHUP_' in str(order_id or '')
+                    if _is_catchup:
+                        logger.warning(
+                            f"🛡️ [STEP-SATURATED-CATCHUP-EXEMPT] Bot {bot_id} {order_type} "
+                            f"step={row_step} cycle={row_cycle}: already credited "
+                            f"{already_credited:.6f} via other order_id(s), but {order_id} is a "
+                            f"catchup order (additive-by-design exposure). CREDITING its fill "
+                            f"normally — virtual follows physical; no auto_close."
                         )
-                    )
-                    conn.commit()
-                    return False  # Do not credit open_qty
+                        # Fall through to the normal credit path below.
+                    else:
+                        logger.warning(
+                            f"🛡️ [STEP-SATURATED] Bot {bot_id} {order_type} step={row_step} cycle={row_cycle}: "
+                            f"already credited {already_credited:.6f} via other order_id(s). "
+                            f"Proposed delta {delta_proposed:.6f} would exceed capacity {capacity_limit:.6f}. "
+                            f"Marking order {order_id} (db_id={db_id}) as auto_closed. "
+                            f"open_qty NOT incremented — ledger integrity preserved."
+                        )
+                        conn.execute(
+                            "UPDATE bot_orders SET status='auto_closed', notes=?, updated_at=? WHERE id=?",
+                            (
+                                f"STEP_SATURATED:already_credited={already_credited:.6f},capacity={capacity_limit:.6f}",
+                                int(time.time()),
+                                db_id
+                            )
+                        )
+                        conn.commit()
+                        return False  # Do not credit open_qty
             except Exception as _sg_err:
                 # Non-fatal: if the guard itself fails, log and continue with the credit
                 # to avoid losing legitimate fills. The seal_trade_state cross-check will
@@ -1059,10 +1110,9 @@ def _seal_trade_state_internal(
                 else:
                     logger.info(f"🌉 [SEAL-CYCLE-SKIP] Bot {bot_id}: Not transitioning from active state (status={curr_status}). Cycle NOT incremented.")
             
-            try:
-                conn.execute("DELETE FROM fill_claims WHERE bot_id = ?", (bot_id,))
-            except sqlite3.OperationalError:
-                pass
+            # Fix 4 (catchup fill-credit race, 2026-09-04): fill_claims are kept —
+            # dedup history must survive seals so late/re-delivered fills can't
+            # double-credit. Pruning is handled by 30-day retention.
 
         conn.commit()
 
