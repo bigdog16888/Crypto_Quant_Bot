@@ -1813,10 +1813,11 @@ def _reset_bot_after_tp_internal(cursor, bot_id, exit_price, direction=None, act
         )
 
     cursor.execute("UPDATE bot_orders SET status = 'auto_closed', updated_at = ? WHERE bot_id = ? AND status IN ('open', 'new', 'placing', 'cancelling')", (now_ts, bot_id))
-    try:
-        cursor.execute("DELETE FROM fill_claims WHERE bot_id = ?", (bot_id,))
-    except sqlite3.OperationalError:
-        pass
+    # Fix 4 (catchup fill-credit race, 2026-09-04): fill_claims are NO LONGER
+    # deleted on reset. Late fills arriving after a wipe must keep their dedup
+    # history so the same fill can't be double-credited after a restart
+    # re-delivers it; and refused/recorded fills keep their slots for later
+    # legitimate paths. Claims are tiny and pruned by 30-day retention.
 
     # ── HEDGE PRESERVATION GATE ──────────────────────────────────────────────
     # Hedge orders represent REAL physical SHORT positions on the exchange.
@@ -4822,10 +4823,8 @@ def sync_trades_from_orders(bot_id: int) -> bool:
                 resting_status = 'hedge_standby' if bot_type == 'hedge_child' else 'Scanning'
                 
                 cursor.execute("UPDATE bots SET status = ? WHERE id = ?", (resting_status, bot_id))
-                try:
-                    cursor.execute("DELETE FROM fill_claims WHERE bot_id = ?", (bot_id,))
-                except sqlite3.OperationalError:
-                    pass
+                # Fix 4 (catchup fill-credit race, 2026-09-04): keep fill_claims —
+                # see the SYSTEM_WIPE site note. Dedup history survives wipes.
                 conn.commit()
                 return True
             return False
