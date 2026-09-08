@@ -1,0 +1,33 @@
+#!/bin/sh
+# CQB kanban-tripwire (commit-msg hook) — 2026-09-08
+# Rejects any commit whose message references a kanban task id (t_xxxxxxxx)
+# unless the operator flag .git/KANBAN_COMMIT_ALLOWED exists at commit time.
+#
+# WHY: kanban workers committed to the live trading tree unattended twice
+# (t_34529c74 -> 395f522 on 2026-09-07, and t_d0a8526f on 2026-09-02) while
+# the engine ran. Workers follow conventions, not adversarial paths: this hook
+# holds in practice. KNOWN BYPASS: git commit --no-verify skips hooks entirely
+# (documented, accepted limitation).
+#
+# USAGE (operator override for a deliberate commit):
+#   touch .git/KANBAN_COMMIT_ALLOWED   # before committing
+#   rm  .git/KANBAN_COMMIT_ALLOWED     # right after
+
+msg_file="$1"
+[ -f "$msg_file" ] || exit 0
+
+if [ -f "$(git rev-parse --git-dir)/KANBAN_COMMIT_ALLOWED" ]; then
+    exit 0
+fi
+
+if grep -Eqi '\bt_[0-9a-f]{6,}\b' "$msg_file"; then
+    echo "" >&2
+    echo "KANBAN-TRIPWIRE: commit message references a kanban task id." >&2
+    echo "Unattended kanban workers are not allowed to commit to the live CQB tree." >&2
+    echo "If this is YOUR deliberate commit:" >&2
+    echo "  touch .git/KANBAN_COMMIT_ALLOWED && git commit ..." >&2
+    echo "  rm .git/KANBAN_COMMIT_ALLOWED   # immediately after" >&2
+    echo "" >&2
+    exit 1
+fi
+exit 0
