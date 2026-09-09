@@ -4109,7 +4109,7 @@ class BotExecutor:
                     update_order_status(o['id'], 'cancelled', bot_id=bot_id, filled_qty=filled_qty)
                 except Exception as _e:
                     logger.debug(f'[EXPECTED] excess grid cancel: {_e}')
-            valid_grid_orders = [grid_orders[0]] if get_step_from_cid(grid_orders[0].get('clientOrderId',''), 'GRID') == expected_grid_step else []
+            valid_grid_orders = [grid_orders[0]] if get_cycle_step_from_cid(grid_orders[0].get('clientOrderId',''), 'GRID') == expected_grid_step else []
             existing_grid_order = grid_orders[0]
         else:
             existing_grid_order = valid_grid_orders[0] if valid_grid_orders else None
@@ -4120,12 +4120,15 @@ class BotExecutor:
             def _tp_sort_key(x):
                 # Priority 1: Step matches expected_tp_step (100 pts)
                 # Priority 2: Stored ID matches (50 pts)
-                # Priority 3: Quantity matches target virtual_qty (25 pts)
+                # Priority 3: Quantity matches the position the TP must cover (25 pts).
+                #   V2.4.2 latent bug (unmasked 2026-09-09): referenced `virtual_qty`,
+                #   never assigned in maintain_orders — free-variable crash once the
+                #   get_step_from_cid NameError above it was fixed.
                 # Priority 4: Newer order (1-0.9 pts)
                 score = 0
-                if get_step_from_cid(x.get('clientOrderId', ''), 'TP') == expected_tp_step: score += 100
+                if get_cycle_step_from_cid(x.get('clientOrderId', ''), 'TP') == expected_tp_step: score += 100
                 if stored_tp_id and x.get('id', '') == stored_tp_id: score += 50
-                if abs(float(x.get('amount', 0) or 0) - virtual_qty) < 1e-8: score += 25
+                if abs(float(x.get('amount', 0) or 0) - float(bot_status.get('open_qty', 0) or 0)) < 1e-8: score += 25
                 score += (float(x.get('timestamp', 0)) / 2e12) # Subtle bias for newer
                 return score
 
@@ -4140,7 +4143,7 @@ class BotExecutor:
             
             # Re-verify that the chosen winner actually matches the target step
             best_order = tp_orders[0]
-            if get_step_from_cid(best_order.get('clientOrderId',''), 'TP') == expected_tp_step or (stored_tp_id and best_order.get('id', '') == stored_tp_id):
+            if get_cycle_step_from_cid(best_order.get('clientOrderId',''), 'TP') == expected_tp_step or (stored_tp_id and best_order.get('id', '') == stored_tp_id):
                 valid_tp_orders = [best_order]
             else:
                 valid_tp_orders = []
