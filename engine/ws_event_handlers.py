@@ -142,6 +142,41 @@ def _credit_fill_with_retry(bot_id: int, order_id: str, client_id: str,
         return False
 
 
+def _fill_credited_by_sibling(bot_id: int, order_id: str, client_id: str, qty: float) -> bool:
+    """
+    Fix (retry-queue sibling stand-down, 2026-09-09): True when this fill was
+    claimed by a caller other than this queue's attempts AND the ledger row
+    already carries the fill. In that state the claim guard (8edcb76 Fix 2,
+    working as designed) makes every retry return False — which the OLD code
+    read as "still no DB row", burned all retries, and escalated a FALSE
+    REQUIRE_MANUAL_PROOF (2026-09-09 bot 10018: gate fired 26s after the
+    step-lock winner had already credited; pair parity was green 3s later).
+    Only returns True when the credit ACTUALLY landed on the row — a claim
+    without the fill (crash mid-commit) keeps retrying and escalates normally.
+    """
+    try:
+        from engine.database import get_connection
+        conn = get_connection()
+        claimed = conn.execute(
+            "SELECT caller FROM fill_claims WHERE bot_id=? AND (order_id=? OR order_id=?) "
+            "ORDER BY rowid DESC LIMIT 1",
+            (bot_id, str(order_id), str(client_id) if client_id else str(order_id)),
+        ).fetchone()
+        if not claimed:
+            return False
+        row = conn.execute(
+            "SELECT filled_amount, status FROM bot_orders "
+            "WHERE bot_id=? AND (order_id=? OR client_order_id=?) LIMIT 1",
+            (bot_id, str(order_id), str(client_id) if client_id else str(order_id)),
+        ).fetchone()
+        if not row:
+            return False
+        filled_amount = float(row[0] or 0)
+        return filled_amount >= qty * 0.99 or str(row[1]) in ('filled', 'partially_filled', 'closed')
+    except Exception:
+        return False
+
+
 def _drain_pending_fills() -> None:
     """
     Re-attempt credit_fill for all pending fills. Called at the top of every
@@ -176,7 +211,17 @@ def _drain_pending_fills() -> None:
 
         # Hard ceiling — something is very wrong if still unresolved after 30 s
         if retries >= PENDING_FILL_MAX_RETRIES or age >= PENDING_FILL_MAX_AGE_S:
-            to_escalate.append((order_id, bid, client_id, qty, price, otype, fill_ts, symbol, retries, age))
+            # Stand-down check (2026-09-09): if a sibling caller already claimed
+            # AND credited this fill, escalation is a false alarm — remove quietly.
+            if _fill_credited_by_sibling(bid, order_id, client_id, qty):
+                logger.info(
+                    f"[PENDING-FILL-STAND-DOWN] Bot {bid} {otype} order {order_id}: "
+                    f"already credited by a sibling caller (claim guard refusing "
+                    f"duplicates by design). Removing from retry queue — no escalation."
+                )
+                to_remove.append(order_id)
+            else:
+                to_escalate.append((order_id, bid, client_id, qty, price, otype, fill_ts, symbol, retries, age))
             continue
 
         credited = _credit_fill_with_retry(bid, order_id, client_id, qty, price, otype, fill_ts)
@@ -189,11 +234,21 @@ def _drain_pending_fills() -> None:
             )
             to_remove.append(order_id)
         else:
+            # Stand-down check on the retry path too: claim-guard refusals look
+            # like failures here. If the sibling already credited the row, stop
+            # retrying instead of burning the remaining attempts.
+            if _fill_credited_by_sibling(bid, order_id, client_id, qty):
+                logger.info(
+                    f"[PENDING-FILL-STAND-DOWN] Bot {bid} {otype} order {order_id}: "
+                    f"already credited by a sibling caller. Removing from retry queue."
+                )
+                to_remove.append(order_id)
+                continue
             with _pending_fills_lock:
                 if order_id in _pending_fills:
                     _pending_fills[order_id]['retries'] += 1
             logger.warning(
-                f"[PENDING-FILL-RETRY] Bot {bid} {otype}: retry #{retries + 1} still no DB row "
+                f"[PENDING-FILL-RETRY] Bot {bid} {otype}: retry #{retries + 1} not yet credited "
                 f"for order {order_id}. {PENDING_FILL_MAX_RETRIES - retries - 1} attempt(s) left."
             )
 

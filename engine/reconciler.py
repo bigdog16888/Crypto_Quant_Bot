@@ -1076,7 +1076,18 @@ class StateReconciler:
 
                             # 🚀 Fix 5: If there is a fill (even if status=canceled/expired), it's valid.
 
-                            new_status = 'open' if o_status in ('open','new','partially_filled','partiallyfilled') else 'filled'
+                            # ── Partial-fill status mapping (operator review 2026-09-09) ──
+                            # In-session semantics: PARTIALLY_FILLED → row status 'partially_filled'
+                            # (netting-recognized — recompute_invested_from_orders includes it, so the
+                            # credit flows into trades.open_qty via seal). An exchange-reported
+                            # NEW/OPEN order with executedQty>0 is a PARTIAL fill in progress: mapping
+                            # it to bare 'open' left the credited qty excluded from virtual net until
+                            # the order resolved (virtual≠physical interim). Map executedQty>0 partials
+                            # to 'partially_filled' so the downtime path matches in-session credit.
+                            if o_status in ('open', 'new') and o_filled > 1e-8:
+                                new_status = 'partially_filled'
+                            else:
+                                new_status = 'open' if o_status in ('open','new','partially_filled','partiallyfilled') else 'filled'
 
                             _place_cur.execute("""
 
@@ -1110,6 +1121,54 @@ class StateReconciler:
                                 )
 
                                 seal_trade_state(bot_id)
+
+                                # ── Fix (downtime-credit cycle advance, 2026-09-09) ──────────────
+                                # A TP that fills while the engine is DOWN lands here: PRE-COMMIT-RESOLVE
+                                # credits the fill and seals, but the fill-credit path never runs the TP
+                                # cascade — so reset_bot_after_tp (the ONLY cycle_id advance in trades)
+                                # never fires, cycle_id stays frozen, and the next entry CID
+                                # (CQB_<bot>_ENTRY_<frozen>_1) collides with the old cycle's filled row
+                                # → DEDUP-GUARD blocks every entry forever (2026-09-07 four-bot wedge,
+                                # 2026-09-09 10016 wedge; both needed manual cycle_id heals).
+                                # The in-session path is WS-fill → register_tp_cascade → cycle_loop TP-DRAIN
+                                # → handle_tp_completion → reset_bot_after_tp. Route downtime TPs through
+                                # the same registry so the drain executes the identical, well-tested reset.
+                                if otype == 'tp':
+                                    # FULL-FILL test by RATIO ONLY (operator review 2026-09-09):
+                                    # the in-session semantic is PARTIALLY_FILLED → credit-only
+                                    # (cycle stays open, remainder waits on the resting TP);
+                                    # only a FILLED TP triggers the cascade. A partial downtime
+                                    # TP fill must credit WITHOUT cascading — cascading would
+                                    # fire handle_tp_completion → open_qty>0 → PARTIAL_CLOSE_PENDING
+                                    # → force-close the remainder, diverging from in-session
+                                    # behavior. new_status == 'filled' is NOT a safe criterion
+                                    # here: this branch also maps canceled/expired-with-partial-
+                                    # fill to 'filled' (Fix 5 semantics), which must NOT cascade.
+                                    # When the ratio cannot be proven (amount unknown),
+                                    # credit-only is the conservative path — the Fix 1b DEDUP
+                                    # self-heal and _audit_pending_exits are the backstops.
+                                    _tp_full = (
+                                        o_filled > 1e-8
+                                        and amount > 0
+                                        and (o_filled / float(amount)) >= 0.99
+                                    )
+                                    if _tp_full:
+                                        from .ledger import register_tp_cascade
+                                        _fill_ts = 0
+                                        try:
+                                            _fill_ts = int((exch_order.get('lastTradeTimestamp') or exch_order.get('timestamp') or 0) / 1000)
+                                        except Exception:
+                                            pass
+                                        register_tp_cascade(bot_id, pair, o_price, exit_fill_ts=_fill_ts)
+                                        logger.info(
+                                            f"🌉 [PRE-COMMIT-TP-CASCADE] Bot {bot_id} {otype} cid={cid} fully filled during downtime "
+                                            f"— TP cascade registered (reset path will advance cycle_id)."
+                                        )
+                                    else:
+                                        logger.info(
+                                            f"🌉 [PRE-COMMIT-TP-PARTIAL] Bot {bot_id} {otype} cid={cid} partially filled during downtime "
+                                            f"({o_filled:.8f}/{amount}): credited, cycle stays open (in-session partial-TP semantic)."
+                                        )
 
                         else:
 

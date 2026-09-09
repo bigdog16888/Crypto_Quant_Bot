@@ -2714,8 +2714,58 @@ class BotExecutor:
                          ).fetchone()[0]
                          logger.info(f"🔍 [DEDUP-GUARD-DEBUG] client_order_id={client_order_id_base} count={_existing_count}")
                          if _existing_count > 0:
-                             logger.warning(f"🛡️ [DEDUP-GUARD] Entry already exists for this CID: {client_order_id_base}. Skipping placement.")
-                             return None
+                             # ── Belt-and-suspenders (downtime-credit cycle advance, 2026-09-09) ──
+                             # A collision on CQB_<bot>_ENTRY_<cycle>_1 where the bot is FLAT (no open
+                             # qty, nothing resting on the exchange) and its trades row still carries
+                             # that same cycle with a completed exit (close_type set) is the stale-
+                             # cycle wedge: the cycle ended (e.g. TP filled during downtime) but the
+                             # cycle_id advance was missed. Instead of blocking forever, advance the
+                             # cycle_id by one — exactly what reset_bot_after_tp would have written —
+                             # and let THIS call place the entry under the next cycle. Guards:
+                             #   - open_qty must be 0 AND entry_confirmed 0 (no live position)
+                             #   - colliding row must be the bot's OWN row (same bot_id in CID)
+                             #   - only for the _1 base CID shape (a fresh cycle's first entry)
+                             # If any guard fails, fall through to the original block.
+                             _wedge_advanced = False
+                             try:
+                                 _t_row = _dedup_conn.execute(
+                                     "SELECT open_qty, entry_confirmed, cycle_id, close_type FROM trades WHERE bot_id = ?",
+                                     (bot_id,)
+                                 ).fetchone()
+                                 _cid_cycle = str(client_order_id_base).split('_')
+                                 _own_row = (
+                                     _t_row is not None
+                                     and abs(float(_t_row[0] or 0)) < 1e-9
+                                     and int(_t_row[1] or 0) == 0
+                                     and int(_t_row[2] or 0) == cycle_id
+                                     and str(_t_row[3] or '') != ''
+                                     and len(_cid_cycle) >= 5
+                                     and _cid_cycle[1] == str(bot_id)
+                                     and _cid_cycle[2] == 'ENTRY'
+                                     and _cid_cycle[4] == '1'
+                                     and str(client_order_id_base).endswith(f'_{cycle_id}_1')
+                                 )
+                                 if _own_row:
+                                     _dedup_conn.execute(
+                                         "UPDATE trades SET cycle_id = ? WHERE bot_id = ? AND cycle_id = ?",
+                                         (cycle_id + 1, bot_id, cycle_id)
+                                     )
+                                     _dedup_conn.commit()
+                                     _wedge_advanced = True
+                                     logger.warning(
+                                         f"🛡️ [DEDUP-GUARD] Bot {bot_id}: stale-cycle wedge self-healed "
+                                         f"(cycle {cycle_id} → {cycle_id + 1}; cycle {cycle_id} closed with "
+                                         f"close_type={_t_row[3]}, bot flat). Retrying entry under new cycle."
+                                     )
+                             except Exception as _wedge_err:
+                                 logger.error(f"❌ {name}: [DEDUP-GUARD] wedge self-heal check failed: {_wedge_err}")
+                             if _wedge_advanced:
+                                 cycle_id = cycle_id + 1
+                                 client_order_id_base = self._generate_deterministic_id(bot_id, 'ENTRY', cycle_id, 1, for_check=True)
+                                 client_order_id = self._generate_deterministic_id(bot_id, 'ENTRY', cycle_id, 1)
+                             else:
+                                 logger.warning(f"🛡️ [DEDUP-GUARD] Entry already exists for this CID: {client_order_id_base}. Skipping placement.")
+                                 return None
                     except Exception as _dedup_err:
                          logger.error(f"❌ {name}: [DEDUP-GUARD] check failed: {_dedup_err}")
                     
