@@ -228,6 +228,57 @@ counter; `bot_orders` rows are tagged with the cycle they belong to.
 
 ---
 
+## 7. Symbol / venue handling — pair types, formatting, and the two call paths
+
+This section answers, with evidence: *is XAU/USDT more failure-prone than USDC pairs on this exchange?* (asked after the 2026-09-10 stuck-cancel on 10019). **Direct answer: no.** Every "XAU is special" hypothesis tested false; the real threads are (a) order **age**/session, (b) an unnormalized-symbol bug class in specific call paths, and (c) one wrapper-vs-ccxt incompatibility. Evidence below.
+
+### 7.1 The pair types this system trades
+
+| Pair | Venue listing | Notes |
+|---|---|---|
+| `BTC/USDC:USDC`, `SOL/USDC:USDC`, `SUI/USDC:USDC`, `BNB/USDC:USDC`, `ETH/USDC:USDC`, `LINK/USDC:USDC`, `XRP/USDC:USDC` | USDC-quoted perps | Main fleet. |
+| `XAU/USDT:USDT` (short gold) | USDT-quoted, `contractType: TRADIFI_PERPETUAL` (only non-standard contract type in the fleet; BTCUSDC/SOLUSDC are `PERPETUAL`) | Newest instrument (onboarded 2025-12; next-newest is 2024-01). |
+| `TEST/USDC:USDC` | **NOT LISTED** on demo FAPI exchangeInfo | 7 legacy test bots (id 99xxx). Every market call for them 400s `-1121 Invalid symbol` — because the instrument does not exist, not because of formatting. Harmless: bots inactive, net 0, consensus OK. |
+| USD1 pairs (future) | `USD1USDT` not listed; assume unverified until added | Treat any new quote asset as a new venue case: verify listing + precision before enabling bots. |
+
+Symbol formats in play: CCXT form `XAU/USDT:USDT` (DB `bots.pair`), normalized form `XAUUSDT` (Binance raw API), and normalized-with-colon variants in logs. `normalize_symbol()` (exchange_interface.py:~340) does `replace('/','').replace('-','').split(':')[0].upper()` — deterministic, order-independent, quote-agnostic. **Formatting is not pair-type-specific and is not the XAU problem** — mechanism test 2026-09-10: `XAUUSDT` → 200, `XAU/USDT:USDT` raw → -1121, `TESTUSDC` → -1121 (unlisted), `BTCUSDC` → 200.
+
+### 7.2 The two call paths — wrapper vs raw — and why both exist
+
+- **Raw path** (`_raw_request`, exchange_interface.py:172): hand-signed HMAC requests to `https://demo-fapi.binance.com`. Exists because the demo FAPI is ccxt-incompatible (the REL-1 lesson): ccxt-native calls sign against **production** FAPI and the demo key gets `-2015 Invalid API-key` on every call. The wrapper's raw path is the only way this venue works. **Corollary: on a production venue the raw path is unnecessary; ccxt-native works.**
+- **Wrapper path**: `ExchangeInterface` methods (`fetch_open_orders`, `cancel_order`, `create_order`, `fetch_ticker`, …) that (in demo mode) translate to raw calls, or (in live mode) pass through to ccxt. Engine code must go through the wrapper — REL-1 (commit 4fcd5da) proved a direct `ex.exchange.fetch_positions()` bypass leaves emergency paths dead-on-arrival; a source tripwire in `tests/test_emergency_liquidation.py` guards against re-introduction.
+- **`fetch_ticker` is the one deliberate exception** (added 2026-07-17): it delegates straight to ccxt `fetch_ticker` — public endpoint, no signing, works on demo. It returns ccxt-format pairs; harmless for reads but is a known asymmetry.
+
+### 7.3 Pair-specific quirks found so far (evidence-graded)
+
+1. **XAU/USDT stuck cancel (2026-09-10, order 583851054)** — NOT pair-type. The same engine path cancelled 10019's *current-session* TP (`TP_14_6` → re-placed 584369951, clean) minutes earlier; only the 09-08-placed ghost refused `-2011 Unknown order` in all three ID forms while still listed `NEW` in both order-status and openOrders endpoints. Older-session orders surviving across an engine restart + DNS-outage window (09-08) appear to lose cancel-ability on the venue — **order-age/session state corruption, exchange-side**. USDC-pair cancels of similar age (e.g. 1200768834 BTC, placed 09-09, cancelled clean 09-10 09:35:37) also worked; the distinction is session age, not quote asset. Logged -2011 count in engine logs: **zero** on the engine paths (the stuck ones were my raw probes).
+2. **-1121 Invalid symbol bursts** (10-43/day across 09-04→09-10 logs) — attribution: the burst lines themselves don't carry the symbol (logging gap). Proven sources: (a) TEST/USDC unlisted instrument (the 7 test bots' periodic audits), (b) any call that skips `normalize_symbol` before a raw call. These bursts coincide with XAU 10019 audit windows in logs only because 10019's audits dominate those windows — **proximity, not causation**; the identical error appears in non-XAU windows (09-04 15:40, bots 10004/10005 RECOMPUTE) and TESTUSDC windows.
+3. **XAU entry rejects 09-08** (`Quantity less than or equal to zero`) — sizing/precision path (minQty step for a $-large instrument), not symbol formatting; resolved by config sizing. XAUUSDT precision itself (tick 0.01, step 0.001) is normal.
+4. **OHLCV/Price errors on XAU 09-08 08:25** — the DNS-outage window, all pairs affected equally (LINK/SOL in the same second). **Not pair-specific.**
+5. **-2008/-1121 fallback note**: `fetch_open_orders` falls back to raw "because CCXT might hit -2008" — the fallback list of symbol quirks is short and none are quote-type.
+
+### 7.4 Standing rules (until a tested fix lands)
+
+1. **Never assume quote type changes behavior** — verify instrument listing (`exchangeInfo`) and precision first. Both steps live in one public GET.
+2. **All raw calls must pass `normalize_symbol()` output** — 11 raw call sites audited 2026-09-10; all normalize. The residual -1121 sources are unlisted-instrument calls (TEST bots) — cleanup candidate, not urgent.
+3. **A cancel returning None means "venue says order gone", which is a lie twice this week** — treat None as *unverified*, cross-check with `fetch_order` before logging "cancelled" (backlog: silent-cancel defect, URGENT).
+4. **ccxt-native calls only via wrapper** — REL-1 tripwire; demo venue cannot sign them.
+5. When onboarding USD1 (or any new pair): run the §7.1 listing+precision probe, then a round-trip place/cancel in the pair before enabling bots.
+
+### Appendix (section 7): where the code lives
+
+| Claim | Pointer |
+|---|---|
+| `normalize_symbol` | `engine/exchange_interface.py:~340` |
+| Raw signing + error swallow (400 Unknown order → None) | `engine/exchange_interface.py:172-237`, the -2011→None at `:220-223` |
+| `cancel_order` wrapper | `engine/exchange_interface.py:1074-1086` |
+| Raw call-site inventory (11 sites, all normalized) | audit 2026-09-10 in session log |
+| REL-1 wrapper-vs-ccxt lesson + tripwire | commit `4fcd5da`, `tests/test_emergency_liquidation.py` |
+| fetch_ticker ccxt exception | `engine/exchange_interface.py:~960` |
+| XAUUSDT TRADIFI_PERPETUAL / TESTUSDC unlisted | `fapi/v1/exchangeInfo` probes 2026-09-10 |
+
+---
+
 ## Appendix: where the code lives (claim-checkable)
 
 | Behavior | Code |
