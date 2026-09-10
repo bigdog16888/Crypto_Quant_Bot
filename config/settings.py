@@ -40,6 +40,12 @@ class Config:
         self.GLOBAL_STOP_LOSS_PCT = float(os.getenv("GLOBAL_STOP_LOSS_PCT", 50.0))
         self.MAX_RETRIES = int(os.getenv("MAX_RETRIES", 3))
         self.RETRY_DELAY = int(os.getenv("RETRY_DELAY", 2))
+        # 🛡️ P1 silent-cancel-swallow fix (2026-09-10): consecutive failed cancel
+        # attempts (neither cancelled nor verifiably gone) before a CRITICAL
+        # [CANCEL-ESCALATION] is logged per exchange order id. 3 failures ≈ 30s
+        # of looped cancels (maintain cadence ~10s) instead of hours of silence
+        # (live evidence: SUI 10018 looped 1127x on 2026-09-09).
+        self.CANCEL_STREAK_ESCALATION = int(os.getenv("CANCEL_STREAK_ESCALATION", 3))
 
         # 🛡️ O-3: Rolling-window portfolio drawdown breaker
         self.DRAWDOWN_WINDOW_HOURS = float(os.getenv("DRAWDOWN_WINDOW_HOURS", 24))

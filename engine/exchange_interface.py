@@ -8,7 +8,9 @@ import hmac
 import hashlib
 from urllib.parse import urlencode
 from typing import Dict, List, Optional, Any, Tuple
-from engine.exceptions import APIError, NetworkError
+from engine.exceptions import (
+    APIError, NetworkError, OrderAlreadyGoneError, CancelFailedError
+)
 from config.settings import config
 
 logger = logging.getLogger("ExchangeInterface")
@@ -218,10 +220,33 @@ class ExchangeInterface:
             if response.status_code == 200:
                 return response.json()
             elif response.status_code == 400 and 'Unknown order' in response.text:
-                # Expected: order was already filled/cancelled on exchange
-                self.logger.debug(f"Cancel-order 400 (order already gone): {response.text}")
-                return None
+                # P1 silent-cancel-swallow fix (2026-09-10): the order is already
+                # terminal on the exchange (-2011 "Unknown order sent"). NEVER
+                # collapse this to None — callers cannot distinguish "already
+                # gone" from "failed" and mark rows cancelled while the order
+                # still rests live (live evidence: SUI over-sell 2026-09-09,
+                # 1127 looped cancel attempts, zero surfaced errors). Raise a
+                # typed exception carrying the raw body so callers treat it as
+                # a confirmed terminal outcome.
+                err_code = None
+                try:
+                    err_code = int(response.json().get('code', 0) or 0)
+                except Exception:
+                    pass
+                # Always surface the raw body at WARNING — this branch was
+                # previously DEBUG-only, making the failure invisible at INFO
+                # level (0 error lines logged during the whole incident).
+                self.logger.warning(
+                    f"Cancel target already terminal on exchange "
+                    f"(HTTP 400, code={err_code}): {response.text}"
+                )
+                raise OrderAlreadyGoneError(
+                    f"Order already gone: {response.text}",
+                    error_code=err_code,
+                    raw_body=response.text,
+                )
             else:
+                # Always log the raw response body for any other error class.
                 self.logger.error(f"Raw API Error {response.status_code}: {response.text}")
                 # 🚀 FUNDAMENTAL FIX: Bubble up the actual Binance Error so we don't mask it
                 try:
@@ -230,7 +255,11 @@ class ExchangeInterface:
                 except:
                     error_msg = response.text
                 raise APIError(f"Binance API {response.status_code}: {error_msg}")
-        except APIError:
+        except (APIError, OrderAlreadyGoneError, CancelFailedError):
+            # Typed exchange errors pass through unchanged — the generic
+            # Exception wrapper below must not mask the cancel-outcome types
+            # (P1 2026-09-10: wrapped OrderAlreadyGoneError was indistinguishable
+            # from a generic failure at the caller).
             raise
         except Exception as e:
             self.logger.error(f"Raw Request Failed ({endpoint}): {e}")
@@ -1071,7 +1100,64 @@ class ExchangeInterface:
             self.logger.error(f"Validation exception: {e}")
             return False, amount, price, str(e)
 
+    # P1 silent-cancel-swallow fix (2026-09-10): consecutive-failure streak per
+    # exchange order id. Tracks consecutive cancel attempts that could NOT be
+    # confirmed (neither cancelled nor verifiably gone). A cancel that doesn't
+    # land must never look like success, and must escalate after N consecutive
+    # failures instead of looping silently every ~10s for hours (live evidence:
+    # SUI 10018 TP_20_3 cancel looped 1127x, 11:10-14:29 2026-09-09).
+    _cancel_fail_streaks: Dict[str, int] = {}
+    _cancel_fail_streak_lock = threading.Lock()
+
+    @classmethod
+    def _note_cancel_outcome(cls, order_id, ok: bool, detail: str = ""):
+        """Update the consecutive-failure streak for one exchange order id.
+
+        ok=True (cancel confirmed or order confirmed gone) resets the streak.
+        ok=False increments it; reaching CANCEL_STREAK_ESCALATION triggers a
+        CRITICAL log so the operator/UI sees the stuck cancel immediately.
+        """
+        if ok:
+            with cls._cancel_fail_streak_lock:
+                cls._cancel_fail_streaks.pop(str(order_id), None)
+            return
+        threshold = int(getattr(config, 'CANCEL_STREAK_ESCALATION', 3))
+        with cls._cancel_fail_streak_lock:
+            streak = cls._cancel_fail_streaks.get(str(order_id), 0) + 1
+            cls._cancel_fail_streaks[str(order_id)] = streak
+        # Fire CRITICAL at the threshold, then every 10th consecutive failure
+        # — loud enough to surface immediately, sparse enough not to flood
+        # the log if the stuck state persists for hours (SUI ran 3h).
+        if streak == threshold or (streak > threshold and streak % 10 == 0):
+            logger.critical(
+                f"🚨 [CANCEL-ESCALATION] Order {order_id}: {streak} consecutive "
+                f"cancel attempts FAILED without confirmation ({detail}). The "
+                f"order may still be LIVE on the exchange — DB state must not "
+                f"assume it is cancelled. Manual verification required."
+            )
+
     def cancel_order(self, order_id, symbol):
+        """Cancel one order. NEVER silently swallows a failed cancel.
+
+        P1 silent-cancel-swallow fix (2026-09-10). Outcomes:
+          - dict  -> cancel CONFIRMED by the exchange (DELETE 200).
+          - None  -> order CONFIRMED already gone (terminal on the exchange,
+                     established either by -2011/-2013 on the DELETE or by the
+                     post-failure verify-GET showing a terminal status).
+          - raises CancelFailedError -> cancel did NOT land and the exchange
+                     did NOT confirm the order gone (still live, or status
+                     unverifiable). Callers must not mark the row cancelled.
+
+        Live failure shape replayed: SUI 2026-09-09 — DELETE returned
+        -2011 for an order that stayed NEW on the exchange for 3h; previous
+        code collapsed it to None, callers logged 'Cancelled stale' 1127x
+        and the TP later filled during downtime (over-sell).
+        """
+        # Synthetic placeholders never reach the exchange
+        if order_id and any(str(order_id).startswith(p) for p in ('PENDING_', 'PLACING_', 'GHOST_')):
+            self.logger.info(f"[CANCEL] Skipping synthetic order id {order_id} — treated as already gone.")
+            return None
+
         try:
             if config.TESTNET or config.DEMO_TRADING:
                 endpoint = '/fapi/v1/order'
@@ -1079,11 +1165,82 @@ class ExchangeInterface:
                     'symbol': normalize_symbol(symbol),
                     'orderId': order_id
                 }
-                return self._raw_request(endpoint, method='DELETE', params=params)
-            return self.exchange.cancel_order(order_id, symbol)
+                res = self._raw_request(endpoint, method='DELETE', params=params)
+                self._note_cancel_outcome(order_id, True)
+                return res
+            # Mainnet (ccxt) path
+            res = self.exchange.cancel_order(order_id, symbol)
+            self._note_cancel_outcome(order_id, True)
+            return res
+        except OrderAlreadyGoneError as e:
+            # The DELETE claims the order is already terminal (-2011/-2013) —
+            # but the exchange can LIE: XAU 583851054 returned -2011 on all three
+            # cancel forms while the order stayed NEW on the exchange for hours
+            # (2026-09-09). A -2011 alone is NOT proof of gone; verify by GET.
+            raw_body = getattr(e, 'raw_body', '') or ''
+            gone = self._verify_cancel_gone(order_id, symbol)
+            if gone == 'gone':
+                self.logger.info(
+                    f"[CANCEL] Order {order_id} confirmed terminal by verify-GET "
+                    f"after DELETE said already-gone: {e}"
+                )
+                self._note_cancel_outcome(order_id, True)
+                return None
+            detail = f"DELETE said already-gone but verify-GET shows {gone}: {e}"
+            self._note_cancel_outcome(order_id, False, detail)
+            raise CancelFailedError(detail, raw_body=raw_body)
         except Exception as e:
-            self.logger.error(f"Cancel Order Failed: {e}")
-            return None
+            # Cancel did not land. Verify by GET before declaring anything:
+            # only a POSITIVE terminal status (canceled/filled/expired/rejected)
+            # counts as gone; live statuses (new/partially_filled) or an
+            # unverifiable state are a FAILURE. Raw response body is always
+            # logged by _raw_request / the exception carriers.
+            raw_body = getattr(e, 'raw_body', '') or ''
+            try:
+                self.logger.warning(
+                    f"[CANCEL] Cancel attempt for {order_id} ({symbol}) failed: {e}"
+                    + (f" | raw: {raw_body[:300]}" if raw_body else "")
+                )
+            except Exception:
+                pass
+            gone = self._verify_cancel_gone(order_id, symbol)
+            if gone == 'gone':
+                self.logger.info(f"[CANCEL] Order {order_id} verified terminal via GET after failed cancel.")
+                self._note_cancel_outcome(order_id, True)
+                return None
+            detail = f"verify-GET shows {gone} after error: {e}"
+            self._note_cancel_outcome(order_id, False, detail)
+            raise CancelFailedError(detail, raw_body=raw_body)
+
+    def _verify_cancel_gone(self, order_id, symbol) -> str:
+        """Verify by GET whether an order is truly gone from the exchange.
+
+        P1 silent-cancel-swallow fix (2026-09-10). 'gone' is returned ONLY on
+        positive evidence: a terminal status (canceled/cancelled/filled/closed/
+        expired/rejected) or the GET itself confirming the order does not exist
+        (-2011/-2013 class). A live status returns 'live:<status>'. An
+        unreadable/failed GET returns 'unknown:<reason>' — treated as NOT gone
+        (safe side: never declare an order gone without positive evidence).
+        """
+        try:
+            verify = self.fetch_order(order_id, symbol)
+        except Exception as ve:
+            ve_str = str(ve)
+            ve_low = ve_str.lower()
+            if ('-2013' in ve_str or '-2011' in ve_str
+                    or 'does not exist' in ve_low or 'unknown order' in ve_low
+                    or 'order not found' in ve_low):
+                # The GET itself confirms the order is absent from the exchange.
+                return 'gone'
+            return f"unknown: {ve_str[:200]}"
+        if verify is None:
+            return "unknown: empty GET response"
+        status = str(verify.get('status', '') or '').lower()
+        if status in ('canceled', 'cancelled', 'filled', 'closed', 'expired', 'rejected'):
+            return 'gone'
+        if status:
+            return f"live: {status}"
+        return "unknown: no status in GET response"
 
     def cancel_orders_by_bot_id(self, bot_id: int, symbol: str):
         cancelled_count = 0
@@ -1135,9 +1292,23 @@ class ExchangeInterface:
                         )
                         update_order_status(order_id, 'cancelled', bot_id=bot_id, filled_qty=ex_filled)
                     
-                    # 3. Call cancel_order()
-                    self.cancel_order(order_id, symbol)
-                    cancelled_count += 1
+                    # 3. Call cancel_order() — outcome-aware (P1 2026-09-10):
+                    #    dict  -> cancel CONFIRMED by exchange
+                    #    None  -> order CONFIRMED already gone (terminal)
+                    #    CancelFailedError -> NOT cancelled and NOT confirmed
+                    #             gone; must not be counted as cancelled, and
+                    #             must not abort the remaining sweep (REL-1
+                    #             emergency path uses this same primitive).
+                    try:
+                        self.cancel_order(order_id, symbol)
+                        cancelled_count += 1
+                    except CancelFailedError as cfe:
+                        self.logger.error(
+                            f"❌ [CANCEL-SWEEP] Bot {bot_id}: cancel of order "
+                            f"{order_id} ({client_id}) FAILED without confirmation: "
+                            f"{cfe}. Order may still be LIVE on exchange — NOT "
+                            f"counted as cancelled. Continuing sweep."
+                        )
         except Exception as e:
             self.logger.error(f"Error in cancel_orders_by_bot_id: {e}")
         return cancelled_count

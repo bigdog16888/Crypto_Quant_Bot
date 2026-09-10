@@ -24,6 +24,7 @@ from engine.database import (
     update_bot_error
 )
 from engine.exchange_interface import ExchangeInterface, normalize_symbol, normalize_market_type
+from engine.exceptions import CancelFailedError
 from engine.strategies.martingale_strategy import MartingaleStrategy
 from engine.manager import calculate_early_exit_decay
 from config.settings import config
@@ -448,6 +449,12 @@ def _cancel_non_tp_orders(bot_id: int, exchange, conn):
             try:
                 exchange.cancel_order(order_id, pair)
                 logger.info(f"🚫 [BE-ONLY] Cancelled non-TP order {client_id} on exchange.")
+            except CancelFailedError:
+                # P1 (2026-09-10): NOT cancelled and not confirmed gone — do
+                # NOT mark the DB row cancelled below; leave it open so the
+                # next cycle retries and the streak counter escalates.
+                logger.error(f"⛔ [BE-ONLY] Cancel of {client_id} FAILED unconfirmed — DB row left open.")
+                continue
             except Exception as e_cancel:
                 logger.warning(f"⚠️ [BE-ONLY] Failed to cancel order {client_id} on exchange: {e_cancel}")
             
@@ -1783,17 +1790,43 @@ class BotExecutor:
             cancel_response = None
             filled_qty = 0.0
             inv18_corrected = False
+            # P1 silent-cancel-swallow fix (2026-09-10): cancel_order returns
+            # dict (cancel CONFIRMED) / None (order confirmed gone) / raises
+            # CancelFailedError (NOT cancelled, may still be live). The old code
+            # fell through on ANY exception (cancel_response stayed None), then
+            # marked the DB row 'cancelled' at line ~1882 below — while the
+            # order rested live on the exchange (XAU 583851054, 2026-09-09:
+            # DB said cancelled, order stayed NEW for hours, ghost replacement
+            # TP placed on top). Now: CancelFailedError aborts the replacement
+            # (no new TP placed, no DB cancel mark) and the streak counter
+            # escalates after N consecutive failures.
             try:
                 cancel_response = exchange.cancel_order(tp_order_id, pair)
-                
                 # 🚀 CACHE EVICTION (v2.3.5)
                 # Immediately remove the cancelled order from the memory cache 
-                # so the NEXT loop cycle (which might be in < 1s) doesn't see it as "open".
+                # so the NEXT loop cycle (which might be in < 1s) doesn't see it as "open". 
                 try:
                     from engine.ws_cache import get_ws_cache
                     get_ws_cache().remove_order(tp_order_id)
                 except Exception as _e:
                     logger.debug(f'[CACHE] remove_order after cancel: {_e}')
+                if cancel_response is None:
+                    # Confirmed already terminal on the exchange — fetch its
+                    # final state so the partial-fill accounting below sees
+                    # the truth.
+                    logger.info(f"♻️ [TP-SYNC] {name}: Old TP {tp_order_id} confirmed already gone on exchange.")
+                    try:
+                        cancel_response = exchange.fetch_order(tp_order_id, pair)
+                    except Exception:
+                        cancel_response = None
+            except CancelFailedError as cfe:
+                logger.error(
+                    f"⛔ [TP-SYNC] {name}: Cancel of stale TP {tp_order_id} FAILED "
+                    f"without exchange confirmation ({cfe}). ABORTING replacement TP — "
+                    f"the old TP may still be LIVE. DB row left open; streak "
+                    f"counter will escalate after N consecutive failures."
+                )
+                return None
             except Exception as e:
                 logger.warning(f"[TP-SYNC] {name}: Cancel failed ({e}). Attempting to fetch order status...")
                 try:
@@ -3358,8 +3391,48 @@ class BotExecutor:
                             _cf_catch(bot_id=bot_id, order_id=str(ex_oid), cumulative_qty=f_amt, avg_price=float(c_price or 0), order_type=str(c_type or 'grid').lower(), is_cumulative=True)
                             _sts_catch(bot_id)
                         else:
-                            logger.info(f"🗑️ [CANCEL-PURGE] Stale order {c_cid} has 0 fills and is confirmed gone. Deleting DB row.")
-                            WriteQueue().put_and_wait(_maintain_cancel_purge_order_internal, db_id)
+                            # P1 silent-cancel-swallow fix (2026-09-10): the open-orders
+                            # snapshot can be stale (race/cached) — never delete the DB
+                            # row on the snapshot alone. Verify by GET: only a positive
+                            # terminal status (or a not-found GET) confirms gone; a live
+                            # status or an unverifiable GET keeps the row for next cycle.
+                            # Same hardening as the BUG 4 FIX block in execute_exit_sl.
+                            _verified_gone = False
+                            try:
+                                _verify_info = exchange.fetch_order(str(ex_oid), pair)
+                                if _verify_info:
+                                    _ex_filled_verify = float(_verify_info.get('filled', 0) or 0)
+                                    _ex_status_verify = str(_verify_info.get('status', '')).lower()
+                                    if _ex_filled_verify > 0:
+                                        # Exchange says there IS a fill — credit instead of delete
+                                        logger.warning(
+                                            f"💰 [CANCEL-LATE-FILL] {c_cid}: exchange confirms "
+                                            f"fill={_ex_filled_verify} despite DB showing 0. Crediting."
+                                        )
+                                        from engine.database import update_order_status as _uos_catch2
+                                        from engine.ledger import credit_fill as _cf_catch2, seal_trade_state as _sts_catch2
+                                        if not _uos_catch2(ex_oid, 'filled', bot_id=bot_id, filled_qty=_ex_filled_verify):
+                                            logger.error(f"🚨 [STATE-GUARD ERROR] Update failure for catch-fill-verify order {ex_oid}.")
+                                        _cf_catch2(bot_id=bot_id, order_id=str(ex_oid), cumulative_qty=_ex_filled_verify,
+                                                   avg_price=float(_verify_info.get('average') or _verify_info.get('price') or c_price or 0),
+                                                   order_type=str(c_type or 'grid').lower(), is_cumulative=True, caller='cancel_verify')
+                                        _sts_catch2(bot_id)
+                                    elif _ex_status_verify in ('canceled', 'cancelled', 'expired', 'rejected'):
+                                        _verified_gone = True
+                                    else:
+                                        logger.warning(f"⏳ [CANCEL-AMBIGUOUS] {c_cid}: exchange status='{_ex_status_verify}' fill=0 — leaving for next cycle.")
+                                else:
+                                    logger.warning(f"⏳ [CANCEL-AMBIGUOUS] {c_cid}: fetch_order returned empty — leaving for next cycle.")
+                            except Exception as _verify_err:
+                                _err_str = str(_verify_err)
+                                if any(code in _err_str for code in ('-2013', '-2011', 'Order does not exist', 'Unknown order', 'OrderNotFound')):
+                                    _verified_gone = True
+                                    logger.debug(f"[CANCEL-VERIFY] {c_cid}: not-found on exchange — confirmed gone.")
+                                else:
+                                    logger.warning(f"⚠️ [CANCEL-VERIFY] fetch_order failed for {c_cid}: {_verify_err}. Leaving for next cycle.")
+                            if _verified_gone:
+                                logger.info(f"🗑️ [CANCEL-PURGE] Stale order {c_cid} confirmed gone by exchange (verify-GET). Deleting DB row.")
+                                WriteQueue().put_and_wait(_maintain_cancel_purge_order_internal, db_id)
                     else:
                         logger.warning(f"⏳ [CANCEL-WAIT] Stale order {c_cid} is still open on exchange. Waiting another cycle.")
             except Exception as e_cancelling:
@@ -3423,14 +3496,22 @@ class BotExecutor:
                             _gwsc().update_order(str(local_tp_id), order_status)
                         else:
                             logger.warning(f"⏳ [HEDGE-MAINTAIN] Stored TP {local_tp_id} status is {status_str}, unrecognised. Evicting.")
+                            _evict_confirmed = True
                             try:
                                 exchange.cancel_order(local_tp_id, pair)
+                            except CancelFailedError as _cfe:
+                                # P1 (2026-09-10): NOT cancelled and not confirmed
+                                # gone — do NOT mark cancelled / clear the TP lock
+                                # (replacement would stack on a live order).
+                                logger.error(f"⛔ [HEDGE-MAINTAIN] Cancel of unrecognised TP {local_tp_id} FAILED unconfirmed — retaining state.")
+                                _evict_confirmed = False
                             except Exception as _e:
                                 logger.debug(f'[EXPECTED] cancel unrecognised TP status (hedge-maintain): {_e}')
-                            from engine.database import update_order_status as _uos
-                            _uos(local_tp_id, 'cancelled', bot_id=bot_id)
-                            WriteQueue().put_and_wait(_maintain_tp_clear_internal, bot_id)
-                            local_tp_id = None
+                            if _evict_confirmed:
+                                from engine.database import update_order_status as _uos
+                                _uos(local_tp_id, 'cancelled', bot_id=bot_id)
+                                WriteQueue().put_and_wait(_maintain_tp_clear_internal, bot_id)
+                                local_tp_id = None
                     except Exception as _evict_err:
                         err_str = str(_evict_err).lower()
                         if "not found" in err_str or "-2013" in err_str:
@@ -4090,9 +4171,29 @@ class BotExecutor:
                             f"Will be reconciled by reconciler when step genuinely advances."
                         )
                         continue
-                    exchange.cancel_order(o['id'], pair)
-                    update_order_status(o['id'], 'cancelling', bot_id=bot_id, filled_qty=filled_qty)
-                    logger.info(f"🔥 Cancelled stale {o.get('clientOrderId')} (No fill, set to cancelling for 1-cycle buffer)")
+                    # P1 silent-cancel-swallow fix (2026-09-10): require a CONFIRMED
+                    # outcome before marking the row cancelled. cancel_order now
+                    # returns dict (confirmed cancel) / None (confirmed gone) /
+                    # raises CancelFailedError (NOT cancelled — DB must keep the row
+                    # open so the loop retries, and the streak counter escalates at
+                    # N=3 consecutive failures). Previously the result was ignored
+                    # and the row was flagged 'cancelling' + "🔥 Cancelled stale"
+                    # logged even when the DELETE never landed (SUI TP_20_3 looped
+                    # 1127x on 2026-09-09 and later filled during downtime).
+                    cancel_result = exchange.cancel_order(o['id'], pair)
+                    if cancel_result is None:
+                        # Confirmed already gone on the exchange — terminal in DB.
+                        update_order_status(o['id'], 'cancelled', bot_id=bot_id, filled_qty=filled_qty)
+                        logger.info(f"🔥 Stale order {o.get('clientOrderId')} confirmed already gone — marked cancelled.")
+                    else:
+                        # Cancel confirmed by the exchange — 1-cycle buffer as before.
+                        update_order_status(o['id'], 'cancelling', bot_id=bot_id, filled_qty=filled_qty)
+                        logger.info(f"🔥 Cancelled stale {o.get('clientOrderId')} (confirmed by exchange, set to cancelling for 1-cycle buffer)")
+                except CancelFailedError as cfe:
+                    logger.error(
+                        f"⛔ FAILED to cancel stale {o.get('clientOrderId')} ({o['id']}) — "
+                        f"NOT cancelled on exchange, DB row left open: {cfe}"
+                    )
                 except Exception as e:
                     logger.error(f"Failed to cancel stale {o['id']}: {e}")
 
@@ -4268,17 +4369,26 @@ class BotExecutor:
                     else:
                          # Truly unrecognised status — treat as ghost and evict.
                          logger.warning(f"⏳ {name}: Stored TP {local_tp_id} status is {status_str}, unrecognised. Forcing CANCEL and Eviction.")
+                         _evict_confirmed = True
                          try:
                              exchange.cancel_order(local_tp_id, pair)
+                         except CancelFailedError as _cfe:
+                             # P1 (2026-09-10): NOT cancelled and not confirmed
+                             # gone — retain the TP lock; a replacement would
+                             # stack on a possibly-live order (XAU 583851054
+                             # ghost-TP shape, 2026-09-09).
+                             logger.error(f"⛔ {name}: Cancel of unrecognised TP {local_tp_id} FAILED unconfirmed — retaining state.")
+                             _evict_confirmed = False
                          except Exception as _e:
                              logger.debug(f'[EXPECTED] cancel unrecognised TP status: {_e}')
-                         from engine.database import get_connection as _gc
-                         from engine.database import update_order_status as _uos
-                         if _uos(local_tp_id, 'cancelled', bot_id=bot_id):
-                             WriteQueue().put_and_wait(_maintain_tp_clear_internal, bot_id)
-                             local_tp_id = None # Allow immediate replacement below!
-                         else:
-                             logger.warning(f"⚠️ {name}: Stored TP {local_tp_id} cancelled update was rejected (likely filled). Retaining state.")
+                         if _evict_confirmed:
+                             from engine.database import get_connection as _gc
+                             from engine.database import update_order_status as _uos
+                             if _uos(local_tp_id, 'cancelled', bot_id=bot_id):
+                                 WriteQueue().put_and_wait(_maintain_tp_clear_internal, bot_id)
+                                 local_tp_id = None # Allow immediate replacement below!
+                             else:
+                                 logger.warning(f"⚠️ {name}: Stored TP {local_tp_id} cancelled update was rejected (likely filled). Retaining state.")
                 except Exception as _evict_err:
                      err_str = str(_evict_err).lower()
                      if "not found" in err_str or "-2013" in err_str:
@@ -4908,13 +5018,21 @@ class BotExecutor:
                           local_grid_ids = []  # Clear locals to unblock
                       else:
                           logger.warning(f"⏳ {name}: Stored Grid {latest_grid_id} status is {status_str}, but missing from open_orders! Forcing CANCEL and Eviction.")
+                          _evict_confirmed = True
                           try:
                                exchange.cancel_order(latest_grid_id, pair)
+                          except CancelFailedError as _cfe:
+                               # P1 (2026-09-10): NOT cancelled and not confirmed
+                               # gone — keep local_grid_ids so the grid logic does
+                               # not immediately re-place on a possibly-live order.
+                               logger.error(f"⛔ {name}: Cancel of unrecognised grid {latest_grid_id} FAILED unconfirmed — retaining state.")
+                               _evict_confirmed = False
                           except Exception as _e:
                               logger.debug(f'[EXPECTED] cancel unrecognised grid status: {_e}')
-                          from engine.database import update_order_status as _uos
-                          _uos(latest_grid_id, 'cancelled', bot_id=bot_id)
-                          local_grid_ids = []  # Clear to allow grid logic below to immediately fire
+                          if _evict_confirmed:
+                              from engine.database import update_order_status as _uos
+                              _uos(latest_grid_id, 'cancelled', bot_id=bot_id)
+                              local_grid_ids = []  # Clear to allow grid logic below to immediately fire
                   except Exception as _evict_err:
                       err_str = str(_evict_err).lower()
                       if "not found" in err_str or "-2013" in err_str:
