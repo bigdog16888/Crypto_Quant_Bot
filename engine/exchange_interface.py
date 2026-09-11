@@ -9,7 +9,7 @@ import hashlib
 from urllib.parse import urlencode
 from typing import Dict, List, Optional, Any, Tuple
 from engine.exceptions import (
-    APIError, NetworkError, OrderAlreadyGoneError, CancelFailedError
+    APIError, NetworkError, OrderAlreadyGoneError, CancelFailedError, RateLimitError
 )
 from config.settings import config
 
@@ -30,6 +30,13 @@ class ExchangeInterface:
     _position_mode_hedge = None # None=Unknown, True=Hedge, False=One-Way
     _position_mode_lock = threading.Lock()
     _time_offset = None
+    # Operability (2026-09-11): periodic clock re-sync replaces the one-shot.
+    _last_offset_sync: float = 0.0
+    # Operability (2026-09-11): per-order cancel back-off registry. Order id ->
+    # monotonic-until timestamp; set when the failure streak reaches
+    # CANCEL_STREAK_ESCALATION, cleared on any confirmed outcome.
+    _cancel_backoff_until: Dict[str, float] = {}
+    _cancel_backoff_lock = threading.Lock()
 
     def __init__(self, market_type='future'):
         self.logger = logging.getLogger(f"ExchangeInterface.{market_type}")
@@ -40,8 +47,16 @@ class ExchangeInterface:
         self._detect_position_mode()
 
     def _sync_time_offset(self):
-        """Fetches the server time to calculate the offset for raw requests."""
-        if ExchangeInterface._time_offset is not None:
+        """Fetches the server time to calculate the offset for raw requests.
+
+        Operability (2026-09-11): periodic re-sync. The original one-shot
+        check drifted on long headless runs (live evidence: -147ms synced
+        once at 14:05 startup, never again) and real FAPI rejects >1s skew
+        with -1021. Re-syncs once CLOCK_RESYNC_INTERVAL has elapsed.
+        """
+        now = time.time()
+        if (ExchangeInterface._time_offset is not None
+                and now - ExchangeInterface._last_offset_sync < getattr(config, 'CLOCK_RESYNC_INTERVAL', 1800)):
             return
         try:
             url = 'https://demo-fapi.binance.com/fapi/v1/time' if (config.TESTNET or config.DEMO_TRADING) else 'https://fapi.binance.com/fapi/v1/time'
@@ -49,11 +64,20 @@ class ExchangeInterface:
             if res.status_code == 200:
                 server_time = res.json()['serverTime']
                 local_time = int(time.time() * 1000)
+                prev = ExchangeInterface._time_offset
                 ExchangeInterface._time_offset = server_time - local_time
-                self.logger.info(f"🕒 Time offset synced: {ExchangeInterface._time_offset}ms")
+                ExchangeInterface._last_offset_sync = now
+                if prev is not None:
+                    self.logger.info(
+                        f"🕒 Time offset re-synced: {prev}ms -> "
+                        f"{ExchangeInterface._time_offset}ms"
+                    )
+                else:
+                    self.logger.info(f"🕒 Time offset synced: {ExchangeInterface._time_offset}ms")
         except Exception as e:
             self.logger.warning(f"Failed to sync time offset: {e}")
-            ExchangeInterface._time_offset = 0
+            if ExchangeInterface._time_offset is None:
+                ExchangeInterface._time_offset = 0
 
     def _get_adjusted_timestamp(self) -> int:
         if ExchangeInterface._time_offset is None:
@@ -217,8 +241,40 @@ class ExchangeInterface:
                 self.logger.debug(f"🚀 RAW POST: {url} | Body: {body}")
                 response = requests.request(method, url, headers=headers, data=body, timeout=10)
 
+            # Operability (2026-09-11): feed the exchange-reported 1-minute
+            # weight usage from every response into the rate governor
+            # (docs/RATE_LIMIT_WEIGHT_MAP.md — real FAPI caps at 2400/min).
+            try:
+                _used = response.headers.get('X-MBX-USED-WEIGHT-1M')
+                if _used is not None:
+                    from engine.rate_governor import governor
+                    governor.note_weight(int(_used))
+            except Exception:
+                pass
+
             if response.status_code == 200:
                 return response.json()
+            elif response.status_code == 429 or (
+                    response.status_code == 400 and '-1003' in response.text):
+                # Operability (2026-09-11): rate-limit rejection is a typed,
+                # never-swallowed error carrying the raw body and the
+                # exchange's Retry-After so callers back off correctly.
+                retry_after = None
+                try:
+                    _ra = response.headers.get('Retry-After')
+                    if _ra is not None:
+                        retry_after = int(float(_ra))
+                except Exception:
+                    pass
+                self.logger.error(
+                    f"RATE-LIMITED {response.status_code} (Retry-After="
+                    f"{retry_after}): {response.text}"
+                )
+                raise RateLimitError(
+                    f"Binance rate limit hit ({response.status_code}): {response.text}",
+                    raw_body=response.text,
+                    retry_after=retry_after,
+                )
             elif response.status_code == 400 and 'Unknown order' in response.text:
                 # P1 silent-cancel-swallow fix (2026-09-10): the order is already
                 # terminal on the exchange (-2011 "Unknown order sent"). NEVER
@@ -255,7 +311,7 @@ class ExchangeInterface:
                 except:
                     error_msg = response.text
                 raise APIError(f"Binance API {response.status_code}: {error_msg}")
-        except (APIError, OrderAlreadyGoneError, CancelFailedError):
+        except (APIError, OrderAlreadyGoneError, CancelFailedError, RateLimitError):
             # Typed exchange errors pass through unchanged — the generic
             # Exception wrapper below must not mask the cancel-outcome types
             # (P1 2026-09-10: wrapped OrderAlreadyGoneError was indistinguishable
@@ -1120,11 +1176,25 @@ class ExchangeInterface:
         if ok:
             with cls._cancel_fail_streak_lock:
                 cls._cancel_fail_streaks.pop(str(order_id), None)
+            with cls._cancel_backoff_lock:
+                cls._cancel_backoff_until.pop(str(order_id), None)
             return
         threshold = int(getattr(config, 'CANCEL_STREAK_ESCALATION', 3))
         with cls._cancel_fail_streak_lock:
             streak = cls._cancel_fail_streaks.get(str(order_id), 0) + 1
             cls._cancel_fail_streaks[str(order_id)] = streak
+        # Operability (2026-09-11): once the streak reaches the escalation
+        # threshold, arm per-order exponential back-off (5s, 10s, 20s, 30s
+        # cap) so one stuck order cannot hammer the exchange (rate-cap
+        # math: docs/RATE_LIMIT_WEIGHT_MAP.md §4). Re-arming on each new
+        # failure keeps growing the window until it hits the cap.
+        if streak >= threshold:
+            base = int(getattr(config, 'CANCEL_BACKOFF_BASE_SECONDS', 5))
+            cap = int(getattr(config, 'CANCEL_BACKOFF_MAX_SECONDS', 30))
+            exp = min(streak - threshold, 6)  # overflows int64 safety margin
+            window = min(base * (2 ** exp), cap)
+            with cls._cancel_backoff_lock:
+                cls._cancel_backoff_until[str(order_id)] = time.time() + window
         # Fire CRITICAL at the threshold, then every 10th consecutive failure
         # — loud enough to surface immediately, sparse enough not to flood
         # the log if the stuck state persists for hours (SUI ran 3h).
@@ -1136,7 +1206,7 @@ class ExchangeInterface:
                 f"assume it is cancelled. Manual verification required."
             )
 
-    def cancel_order(self, order_id, symbol):
+    def cancel_order(self, order_id, symbol, force: bool = False):
         """Cancel one order. NEVER silently swallows a failed cancel.
 
         P1 silent-cancel-swallow fix (2026-09-10). Outcomes:
@@ -1157,6 +1227,22 @@ class ExchangeInterface:
         if order_id and any(str(order_id).startswith(p) for p in ('PENDING_', 'PLACING_', 'GHOST_')):
             self.logger.info(f"[CANCEL] Skipping synthetic order id {order_id} — treated as already gone.")
             return None
+
+        # Operability (2026-09-11): per-order back-off gate. When the failure
+        # streak has armed this order's back-off window, a NON-FORCED cancel
+        # raises immediately without touching the exchange — the stale-sweep
+        # retries every cycle (~10s), and rate-cap math says N stuck orders x
+        # (DELETE + verify-GET)/cycle must not scale toward the 1200 orders/min
+        # cap (docs/RATE_LIMIT_WEIGHT_MAP.md §4). force=True (emergency sweep
+        # / position closing) bypasses the gate entirely.
+        if not force:
+            with ExchangeInterface._cancel_backoff_lock:
+                until = ExchangeInterface._cancel_backoff_until.get(str(order_id), 0.0)
+            if until > time.time():
+                raise CancelFailedError(
+                    f"cancel of {order_id} deferred by per-order back-off "
+                    f"(retry after {until - time.time():.0f}s)"
+                )
 
         try:
             if config.TESTNET or config.DEMO_TRADING:
@@ -1299,8 +1385,11 @@ class ExchangeInterface:
                     #             gone; must not be counted as cancelled, and
                     #             must not abort the remaining sweep (REL-1
                     #             emergency path uses this same primitive).
+                    #    Operability (2026-09-11): force=True — the sweep is
+                    #    the emergency/position-closing path and must never
+                    #    be starved by per-order back-off.
                     try:
-                        self.cancel_order(order_id, symbol)
+                        self.cancel_order(order_id, symbol, force=True)
                         cancelled_count += 1
                     except CancelFailedError as cfe:
                         self.logger.error(

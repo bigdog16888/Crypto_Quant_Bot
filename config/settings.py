@@ -47,6 +47,30 @@ class Config:
         # (live evidence: SUI 10018 looped 1127x on 2026-09-09).
         self.CANCEL_STREAK_ESCALATION = int(os.getenv("CANCEL_STREAK_ESCALATION", 3))
 
+        # 🛡️ Operability session (2026-09-11): per-order cancel back-off.
+        # Once the failure streak reaches CANCEL_STREAK_ESCALATION, retries
+        # for that order back off exponentially (base doubling, capped) so a
+        # stuck order cannot hammer the exchange (rate-cap math:
+        # docs/RATE_LIMIT_WEIGHT_MAP.md §4 — N stuck orders x (DELETE +
+        # verify-GET)/min scales toward the 1200 orders/min cap).
+        # The emergency sweep (cancel_orders_by_bot_id) bypasses via force=True.
+        self.CANCEL_BACKOFF_BASE_SECONDS = int(os.getenv("CANCEL_BACKOFF_BASE_SECONDS", 5))
+        self.CANCEL_BACKOFF_MAX_SECONDS = int(os.getenv("CANCEL_BACKOFF_MAX_SECONDS", 30))
+        # 🛡️ Operability: periodic clock re-sync (one-shot at 7a5948c; a
+        # headless box drifts and real FAPI rejects >1s skew with -1021).
+        self.CLOCK_RESYNC_INTERVAL = int(os.getenv("CLOCK_RESYNC_INTERVAL", 1800))
+        # 🛡️ Operability: weight/429 governance (real FAPI cap is 2400/min;
+        # demo allowed 6000 — live-measured in docs/RATE_LIMIT_WEIGHT_MAP.md).
+        self.RATE_LIMIT_WEIGHT_CAP = int(os.getenv("RATE_LIMIT_WEIGHT_CAP", 2400))
+        self.RATE_LIMIT_SOFT_PCT = float(os.getenv("RATE_LIMIT_SOFT_PCT", 0.8))
+        # 🛡️ Operability: alert channel (Telegram push; empty token = push
+        # disabled, DB notification rows still written). Dedup window per
+        # alert key (live evidence: 24 CANCEL-ESCALATION CRITICALs in 30 min
+        # on one order — one push per order per window).
+        self.ALERT_TELEGRAM_TOKEN = os.getenv("ALERT_TELEGRAM_TOKEN", "")
+        self.ALERT_TELEGRAM_CHAT_ID = os.getenv("ALERT_TELEGRAM_CHAT_ID", "")
+        self.ALERT_DEDUP_WINDOW = int(os.getenv("ALERT_DEDUP_WINDOW", 3600))
+
         # 🛡️ O-3: Rolling-window portfolio drawdown breaker
         self.DRAWDOWN_WINDOW_HOURS = float(os.getenv("DRAWDOWN_WINDOW_HOURS", 24))
         self.DRAWDOWN_PCT = float(os.getenv("DRAWDOWN_PCT", 20.0))

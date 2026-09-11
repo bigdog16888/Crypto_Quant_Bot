@@ -78,3 +78,7 @@ engine.emergency
 
 # Rotated log files
 engine.log.*
+
+# Operability runtime artifacts (test/engine side-effects)
+engine.heartbeat
+backups/

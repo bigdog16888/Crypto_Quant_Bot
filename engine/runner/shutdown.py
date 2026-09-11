@@ -227,6 +227,17 @@ class ShutdownMixin:
         except Exception as _lsts_err:
             logger.warning(f"[SHUTDOWN] Could not write last_shutdown.ts: {_lsts_err}")
 
+        # Operability (2026-09-11): DB backup on every graceful shutdown via
+        # the sqlite online-backup API (safe on a live DB). Best-effort —
+        # shutdown must never fail because a backup did.
+        if not shutdown_fast:
+            try:
+                from engine.ops import backup_database
+                _bk = backup_database()
+                logger.info(f"✅ [SHUTDOWN-BACKUP] DB backed up to {_bk}")
+            except Exception as _bk_err:
+                logger.warning(f"[SHUTDOWN-BACKUP] backup failed: {_bk_err}")
+
         # Pass the recorded shutdown reason (signal/exception/manual) so future
         # restart gaps are unambiguous. Default if nothing recorded.
         _reason = getattr(self, "_shutdown_reason", None) or (

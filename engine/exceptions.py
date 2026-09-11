@@ -57,3 +57,19 @@ class CancelFailedError(ExchangeError):
         super().__init__(message)
         self.error_code = error_code
         self.raw_body = raw_body
+
+class RateLimitError(ExchangeError):
+    """Exchange rejected the request for rate-limit reasons (HTTP 429, or
+    400 with Binance -1003 "Too many requests").
+
+    Raised by _raw_request() with the raw response body and the exchange's
+    Retry-After header (when present) so callers can back off correctly
+    instead of retrying into the same rejection. Never collapsed to None
+    and never masked as a generic APIError (operability session, 2026-09-11).
+    """
+    def __init__(self, message: str, error_code: int = None, raw_body: str = "",
+                 retry_after=None):
+        super().__init__(message)
+        self.error_code = error_code
+        self.raw_body = raw_body
+        self.retry_after = retry_after

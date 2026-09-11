@@ -69,6 +69,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger("BotRunner")
 
+# Operability (2026-09-11): route ERROR+ records to the alert channel
+# (Telegram push when configured + DB notification row, deduped per order
+# key). Attached only outside TESTING_MODE so test runs never push.
+if not getattr(config, "TESTING_MODE", False):
+    try:
+        from engine.alerting import get_router
+        logging.getLogger().addHandler(get_router())
+    except Exception as _alert_err:
+        logger.warning(f"[ALERTING] could not attach alert router: {_alert_err}")
+
 # NOISE REDUCTION: Silence non-critical network warnings
 logging.getLogger('ccxt').setLevel(logging.ERROR)
 logging.getLogger('urllib3').setLevel(logging.ERROR)

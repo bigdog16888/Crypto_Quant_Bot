@@ -193,6 +193,10 @@ class CancelHarnessMixin:
     def reset_streaks(self):
         from engine.exchange_interface import ExchangeInterface
         ExchangeInterface._cancel_fail_streaks = {}
+        # Operability (2026-09-11): also clear the per-order back-off registry
+        # — a stale armed window from a previous test would gate this suite's
+        # own post-escalation retries and cross-contaminate cases.
+        ExchangeInterface._cancel_backoff_until = {}
 
 
 class TestRawRequestNeverCollapsesToNone(unittest.TestCase, CancelHarnessMixin):
@@ -298,12 +302,18 @@ class TestStreakEscalation(unittest.TestCase, CancelHarnessMixin):
         self.assertIn('CANCEL-ESCALATION', crit_records[0].getMessage())
         self.assertIn('179430957', crit_records[0].getMessage())
 
-        # 4th failure does not re-fire (threshold, then every 10th)
+        # 4th failure does not re-fire (threshold, then every 10th).
+        # Operability (2026-09-11): with back-off armed at streak 3 the 4th
+        # attempt is correctly DEFERRED (raises before reaching the exchange)
+        # — expire the window to keep exercising the raw streak semantics
+        # this test owns.
         with self.assertRaises(CancelFailedError):
             ex.cancel_order(179430957, PAIR)
         self.assertEqual(len(crit_records), 1)
 
         # success resets the streak
+        from engine.exchange_interface import ExchangeInterface
+        ExchangeInterface._cancel_backoff_until[str(179430957)] = 0.0
         fake.liar_ids.discard('179430957')
         res = ex.cancel_order(179430957, PAIR)
         self.assertIsInstance(res, dict)
@@ -432,6 +442,10 @@ class TestSweepViaMaintainOrders(_DbBacked):
         while the order rested live and later filled (over-sell).
         GREEN: row stays 'open', failure surfaced, streak counted.
         """
+        # Operability (2026-09-11): expire any back-off armed by earlier
+        # tests so THIS test exercises the raw sweep + verify-GET path.
+        from engine.exchange_interface import ExchangeInterface
+        ExchangeInterface._cancel_backoff_until.pop(str(self.TP_OID), None)
         self.fake.liar_ids.add(self.TP_OID)
         self._run_maintain()
         self.assertEqual(self._row_status(self.TP_OID), 'open',

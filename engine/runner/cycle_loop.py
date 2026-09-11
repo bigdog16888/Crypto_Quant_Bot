@@ -946,6 +946,15 @@ class CycleLoopMixin:
             except Exception as e:
                 logger.error(f"❌ Failed to perform atomic snapshot update: {e}")
 
+        # Operability (2026-09-11): dead-man heartbeat — one beat per cycle.
+        # check_heartbeat() (Task Scheduler / scripts/check_heartbeat.py)
+        # flags staleness; push-only, nothing auto-restarts the engine.
+        try:
+            from engine.ops import write_heartbeat
+            write_heartbeat()
+        except Exception:
+            pass
+
         # 🚀 FUNDAMENTAL FIX: Active Positions are now updated atomically in 'update_full_snapshot' above.
         # We removed the redundant call here to prevent transaction races.
         # Ensure 'update_full_snapshot' is ALWAYS called even if no trade updates, if we have positions.
