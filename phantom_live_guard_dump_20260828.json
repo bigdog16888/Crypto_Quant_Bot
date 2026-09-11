@@ -1,0 +1,71 @@
+{
+  "dump_timestamp": "2026-08-28T14:58:29.925778",
+  "engine_state": "DOWN",
+  "exchange_position": 0.0,
+  "phantom_rows": [
+    {
+      "id": 2403,
+      "client_order_id": "CQB_100320_LIVE_GUARD_RECON_1_3",
+      "status": "reset_cleared",
+      "filled_amount": 109.3,
+      "position_side": "LONG",
+      "order_type": "entry",
+      "step": 3,
+      "cycle_id": 1,
+      "created_at": 1787897296,
+      "created_at_iso": "2026-08-28T14:08:16",
+      "filled_at": 0,
+      "filled_at_iso": null,
+      "cumulative_filled": 0.0,
+      "notes": "Live-guard DB sync: hedge already present on exchange after wipe/alignment."
+    },
+    {
+      "id": 2431,
+      "client_order_id": "CQB_100320_LIVE_GUARD_INV30_1_3",
+      "status": "reset_cleared",
+      "filled_amount": 174.26,
+      "position_side": "LONG",
+      "order_type": "entry",
+      "step": 3,
+      "cycle_id": 1,
+      "created_at": 1787897559,
+      "created_at_iso": "2026-08-28T14:12:39",
+      "filled_at": 0,
+      "filled_at_iso": null,
+      "cumulative_filled": 0.0,
+      "notes": "Live-guard INV30 DB sync: hedge already present on exchange."
+    },
+    {
+      "id": 2432,
+      "client_order_id": "CQB_100320_LIVE_GUARD_INV30_1_1",
+      "status": "filled",
+      "filled_amount": 68.12,
+      "position_side": "LONG",
+      "order_type": "entry",
+      "step": 1,
+      "cycle_id": 1,
+      "created_at": 1787897588,
+      "created_at_iso": "2026-08-28T14:13:08",
+      "filled_at": 0,
+      "filled_at_iso": null,
+      "cumulative_filled": 0.0,
+      "notes": "Live-guard INV30 DB sync: hedge already present on exchange."
+    },
+    {
+      "id": 2433,
+      "client_order_id": "CQB_100320_LIVE_GUARD_INV30_1_2",
+      "status": "filled",
+      "filled_amount": 103.16,
+      "position_side": "LONG",
+      "order_type": "entry",
+      "step": 2,
+      "cycle_id": 1,
+      "created_at": 1787897589,
+      "created_at_iso": "2026-08-28T14:13:09",
+      "filled_at": 0,
+      "filled_at_iso": null,
+      "cumulative_filled": 0.0,
+      "notes": "Live-guard INV30 DB sync: hedge already present on exchange."
+    }
+  ]
+}

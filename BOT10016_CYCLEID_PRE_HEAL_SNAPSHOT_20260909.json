@@ -1,0 +1,24 @@
+{
+ "when": "2026-09-09 09:06:05",
+ "trades_row": {
+  "bot_id": 10016,
+  "current_step": 0,
+  "total_invested": 0.0,
+  "avg_entry_price": 0.0,
+  "target_tp_price": 0.0,
+  "last_exit_price": 79203.5,
+  "last_exit_time": 1787818269,
+  "basket_start_time": 0,
+  "entry_confirmed": 0,
+  "entry_order_id": null,
+  "tp_order_id": null,
+  "bot_position_id": null,
+  "close_type": "TP_HIT",
+  "cycle_id": 19,
+  "cycle_phase": "IDLE",
+  "open_qty": 0.0,
+  "wipe_wall_ts": 1788833921,
+  "position_side": "LONG",
+  "cycle_start_time": 1788833921
+ }
+}
