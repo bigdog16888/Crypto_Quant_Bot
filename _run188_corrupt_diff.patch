@@ -1,0 +1,71 @@
+diff --git a/engine/bot_executor.py b/engine/bot_executor.py
+index 204ff1f..c4883e2 100644
+--- a/engine/bot_executor.py
++++ b/engine/bot_executor.py
+@@ -23,6 +23,7 @@ from engine.database import (
+     flag_bot_pos_limit,
+     update_bot_error
+ )
++from engine.write_queue import WriteQueue
+ from engine.exchange_interface import ExchangeInterface, normalize_symbol, normalize_market_type
+ from engine.strategies.martingale_strategy import MartingaleStrategy
+ from engine.manager import calculate_early_exit_decay
+@@ -670,12 +671,54 @@ def _reset_to_hedge_standby(child_bot_id: int, conn, parent_cycle_id: int, excha
+         cycle_id=parent_cycle_id
+     )
+     logger.warning(
+-        f"🛡️ [HEDGE-ENFORCE] Child bot {child_bot_id} reset to hedge_standby (cycle_id={parent_cycle_id}). "
+-        f"Parent state: {parent_info_str}"
+-    )
++            f"🛡️ [HEDGE-ENFORCE] Child bot {child_bot_id} reset to hedge_standby (cycle_id={parent_cycle_id}). "
++            f"Parent state: {parent_info_str}"
++        )
++
++
++    def _reset_to_hedge_standby_internal(child_bot_id: int):
++        """
++        Internal: Reset child bot to hedge_standby status (Phase 2 only).
++        Called via WriteQueue.
++        """
++        from engine.database import get_connection
++        conn = get_connection()
++        conn.execute(
++            "UPDATE trades SET cycle_id = ? WHERE bot_id = ?",
++            (parent_cycle_id, child_bot_id)
++        )
++        conn.execute(
++            "UPDATE bots SET status = 'hedge_standby', cascade_started_at = 0 WHERE id = ?",
++            (child_bot_id,)
++        )
++        conn.commit()
++
++        # After commit — seal reads the new cycle_id, finds no fills, returns zeros
++        from engine.ledger import seal_trade_state
++        seal_trade_state(child_bot_id, force_recompute=True)
++
++        # Force status to hedge_standby if seal overwrote it
++        conn.execute(
++            "UPDATE bots SET status = 'hedge_standby', cascade_started_at = 0 WHERE id = ?",
++            (child_bot_id,)
++        )
++        conn.commit()
++
++        # Audit row (always written)
++        drift_cid = f"CQB_{child_bot_id}_DF_RST_{int(time.time())}"
++        save_bot_order(
++            child_bot_id, 'drift_note', drift_cid,
++            price=0.0, amount=0.0, step=0, status='audit',
++            client_order_id=drift_cid,
++            notes=f"[HEDGE-ENFORCE][INV-15] Phase 2 DB reset complete.",
++            cycle_id=parent_cycle_id
++        )
++        logger.warning(
++            f"🛡️ [HEDGE-ENFORCE] Child bot {child_bot_id} Phase 2 DB reset to hedge_standby."
++        )
+ 
+ 
+-class BotExecutor:
++    class BotExecutor:
+     # 🛡️ Binance margin and position limit rejection signals
+     _MARGIN_SIGNALS = [
+         "-2019", "-2027", "-4131", "-4003", "-4118",
