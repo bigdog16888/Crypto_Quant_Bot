@@ -78,13 +78,14 @@ def _handle_fill_with_pending_retry(
     bot_id: int, order_id: str, client_id: str,
     qty: float, price: float, order_type: str,
     fill_ts: int, symbol: str,
+    side: str = '',  # ← REAL EXCHANGE SIDE
 ) -> None:
     """
     Attempt credit_fill immediately. If no DB row exists yet (race), enqueue
     in _pending_fills for retry on the next WS cycle rather than dropping or
     invoking forensic adoption.
     """
-    credited = _credit_fill_with_retry(bot_id, order_id, client_id, qty, price, order_type, fill_ts)
+    credited = _credit_fill_with_retry(bot_id, order_id, client_id, qty, price, order_type, fill_ts, side=side)
     if credited:
         from engine.ledger import seal_trade_state
         WriteQueue().put_and_wait(seal_trade_state, bot_id)
@@ -102,6 +103,7 @@ def _handle_fill_with_pending_retry(
                 'order_type': order_type,
                 'fill_ts':    fill_ts,
                 'symbol':     symbol,
+                'side':       side,  # ← STORE REAL EXCHANGE SIDE
                 'retries':    0,
                 'first_seen': int(time.time()),
             }
@@ -113,7 +115,7 @@ def _handle_fill_with_pending_retry(
 
 def _credit_fill_with_retry(bot_id: int, order_id: str, client_id: str,
                             qty: float, price: float, order_type: str,
-                            fill_ts: int) -> bool:
+                            fill_ts: int, side: str = '') -> bool:
     """
     Try credit_fill by exchange order_id first, then by client_order_id.
     Returns True on success.
@@ -125,6 +127,7 @@ def _credit_fill_with_retry(bot_id: int, order_id: str, client_id: str,
             cumulative_qty=qty, avg_price=price,
             order_type=order_type, is_cumulative=True, fill_ts=fill_ts,
             caller='ws',
+            side=side,  # ← PASS REAL EXCHANGE SIDE
         )
         if ok:
             return True
@@ -135,6 +138,7 @@ def _credit_fill_with_retry(bot_id: int, order_id: str, client_id: str,
                 cumulative_qty=qty, avg_price=price,
                 order_type=order_type, is_cumulative=True, fill_ts=fill_ts,
                 caller='ws',
+                side=side,  # ← PASS REAL EXCHANGE SIDE
             )
         return ok
     except Exception as e:
@@ -224,7 +228,7 @@ def _drain_pending_fills() -> None:
                 to_escalate.append((order_id, bid, client_id, qty, price, otype, fill_ts, symbol, retries, age))
             continue
 
-        credited = _credit_fill_with_retry(bid, order_id, client_id, qty, price, otype, fill_ts)
+        credited = _credit_fill_with_retry(bid, order_id, client_id, qty, price, otype, fill_ts, side=pf.get('side', ''))
         if credited:
             from engine.ledger import seal_trade_state
             WriteQueue().put_and_wait(seal_trade_state, bid)
@@ -717,6 +721,7 @@ def _handle_order_partial_fill(bot_id: int, order_type: str, event: Dict):
     avg_price = raw_avg_price if raw_avg_price > 0 else raw_limit_price
     cumulative_filled = float(event.get('filled_qty', 0) or 0)
     symbol = event.get('symbol', '')
+    fill_side = event.get('side', '')  # 'BUY' or 'SELL' from exchange
 
     if avg_price <= 0 or cumulative_filled <= 0:
         return
@@ -745,6 +750,7 @@ def _handle_order_partial_fill(bot_id: int, order_type: str, event: Dict):
             is_cumulative=True,
             fill_ts=fill_ts,
             caller='ws',
+            side=fill_side,  # ← REAL EXCHANGE SIDE
         )
 
         if credited:
@@ -783,6 +789,7 @@ def _handle_order_filled(bot_id: int, order_type: str, event: Dict):
     realized_pnl = float(event.get('realized_pnl', 0) or 0)
     symbol = event.get('symbol')
     client_id = str(event.get('client_order_id', event.get('clientOrderId', '')))
+    fill_side = event.get('side', '')  # 'BUY' or 'SELL' from exchange
 
     logger.info(
         f"[WS-FILL] Bot {bot_id} {order_type} FILLED @ {avg_price:.6f} "
@@ -810,6 +817,7 @@ def _handle_order_filled(bot_id: int, order_type: str, event: Dict):
                 is_cumulative=True,
                 fill_ts=fill_ts,
                 caller='ws',
+                side=fill_side,  # ← REAL EXCHANGE SIDE
             )
             if symbol:
                 register_tp_cascade(bot_id, symbol, avg_price, exit_fill_ts=fill_ts)
@@ -841,6 +849,7 @@ def _handle_order_filled(bot_id: int, order_type: str, event: Dict):
                 order_type=order_type.lower(),
                 fill_ts=fill_ts,
                 symbol=symbol,
+                side=fill_side,  # ← REAL EXCHANGE SIDE
             )
             # Note: credit_fill OK / retry-queued logging is inside _handle_fill_with_pending_retry
         except Exception as e:

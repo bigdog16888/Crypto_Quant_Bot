@@ -133,6 +133,7 @@ def sync_stale_open_orders(bot_id: int, exchange: ExchangeInterface, conn, max_a
 
             # If exchange has recorded a higher filled amount, credit it first
             if ex_filled > db_filled:
+                fill_side = order_info.get('side', '')  # 'BUY' or 'SELL' from exchange
                 credit_fill(
                     bot_id=bot_id,
                     order_id=order_id,
@@ -142,6 +143,7 @@ def sync_stale_open_orders(bot_id: int, exchange: ExchangeInterface, conn, max_a
                     is_cumulative=True,
                     sync_to_exchange=True,
                     caller='stale_sync',
+                    side=fill_side,  # ← REAL EXCHANGE SIDE
                 )
                 logger.warning(
                     f"[ORDER-SYNC] Bot {bot_name}: order {client_order_id} had new partial fill of {ex_filled - db_filled} "
@@ -168,14 +170,16 @@ def sync_stale_open_orders(bot_id: int, exchange: ExchangeInterface, conn, max_a
                     db_filled = float(filled_amount or 0)
                     if db_filled > 0:
                         # DB already has a fill amount (WS may have updated it); credit it before deleting
+                        fill_side = order_info.get('side', '')  # 'BUY' or 'SELL' from exchange
                         credit_fill(
-                            bot_id=bot_id,
-                            order_id=order_id,
-                            cumulative_qty=db_filled,
-                            avg_price=ex_avg_price or float(price or 0),
-                            order_type=order_type,
-                            is_cumulative=True,
-                            caller='cancel_verify',
+                        bot_id=bot_id,
+                        order_id=order_id,
+                        cumulative_qty=db_filled,
+                        avg_price=ex_avg_price or float(price or 0),
+                        order_type=order_type,
+                        is_cumulative=True,
+                        caller='cancel_verify',
+                        side=fill_side,  # ← REAL EXCHANGE SIDE
                         )
                         conn.execute(
                             "UPDATE bot_orders SET status = 'filled', filled_amount = ?, updated_at = ? WHERE id = ?",

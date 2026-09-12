@@ -163,6 +163,7 @@ def _compute_netting_status(
 ) -> tuple:
     """Returns (netting_per_pair, worst_gap_usd, mismatch_count, orphan_positions)."""
     from engine.database import get_pair_virtual_net, get_manual_whitelists
+    from engine.position_ledger import compute_pair_position
 
     netting: Dict[str, Any] = {}
     worst_gap = 0.0
@@ -172,15 +173,31 @@ def _compute_netting_status(
     try:
         conn = sqlite3.connect(db_path, timeout=10)
         rows = conn.execute(
-            """SELECT b.id, b.name, b.pair, b.direction, t.open_qty, t.avg_entry_price
+            """SELECT b.id, b.name, b.pair, b.direction, t.open_qty, t.avg_entry_price, t.cycle_id
                FROM bots b LEFT JOIN trades t ON b.id = t.bot_id
                WHERE b.is_active = 1"""
         ).fetchall()
-        conn.close()
+
+        # Also get cycles per pair for exact-cycle compute_pair_position
+        cycle_rows = conn.execute(
+            """SELECT b.id, t.cycle_id
+               FROM bots b LEFT JOIN trades t ON b.id = t.bot_id
+               WHERE b.is_active = 1 AND t.total_invested > 0.01"""
+        ).fetchall()
+
+        # Map pair -> current cycle (use max cycle for that pair)
+        pair_cycle_map = {}
+        for bot_id, cycle_id in cycle_rows:
+            if cycle_id:
+                bot_row = conn.execute("SELECT pair, normalized_pair FROM bots WHERE id = ?", (bot_id,)).fetchone()
+                if bot_row:
+                    p_key = norm_fn(bot_row[0] or bot_row[1] or '')
+                    if p_key and (p_key not in pair_cycle_map or cycle_id > pair_cycle_map[p_key]):
+                        pair_cycle_map[p_key] = cycle_id
 
         canonical_pairs: Dict[str, str] = {}
         pair_bot_map: Dict[str, List[Dict]] = {}
-        for bot_id, bot_name, pair, direction, open_qty, avg_price in rows:
+        for bot_id, bot_name, pair, direction, open_qty, avg_price, cycle_id in rows:
             p_key = norm_fn(pair)
             canonical_pairs.setdefault(p_key, pair)
             pair_bot_map.setdefault(p_key, []).append(dict(
@@ -188,12 +205,29 @@ def _compute_netting_status(
                 open_qty=float(open_qty or 0), avg_price=float(avg_price or 0),
             ))
 
-        virtual_nets: Dict[str, float] = {}
+        conn.close()
+
+        # PRIMARY: compute_pair_position (from immutable exchange_fills log)
+        # CROSS-CHECK: get_pair_virtual_net (from trades table - legacy)
+        primary_nets: Dict[str, float] = {}
+        crosscheck_nets: Dict[str, float] = {}
         for p_key, canon_pair in canonical_pairs.items():
+            # Primary: position_ledger (authoritative)
+            cycle = pair_cycle_map.get(p_key)
             try:
-                virtual_nets[p_key] = get_pair_virtual_net(canon_pair)
+                if cycle:
+                    primary_nets[p_key] = compute_pair_position(canon_pair, conn=None, cycle_floor=cycle, cycle_ceiling=cycle).net_qty
+                else:
+                    primary_nets[p_key] = compute_pair_position(canon_pair, conn=None).net_qty
+            except Exception as e:
+                logger.warning(f"[NETTING] compute_pair_position failed for {p_key}: {e}")
+                primary_nets[p_key] = 0.0
+            
+            # Cross-check: legacy virtual_net (for comparison/logging)
+            try:
+                crosscheck_nets[p_key] = get_pair_virtual_net(canon_pair)
             except Exception:
-                virtual_nets[p_key] = 0.0
+                crosscheck_nets[p_key] = 0.0
 
         physical_nets: Dict[str, float] = {}
         ref_prices: Dict[str, float] = {}
@@ -212,9 +246,17 @@ def _compute_netting_status(
                 logger.warning(f"[health] fetch_positions failed: {ex}")
 
         tol = qty_tolerance_fn()
-        for p in sorted(set(virtual_nets) | set(physical_nets)):
-            v_net = virtual_nets.get(p, 0.0)
+        for p in sorted(set(primary_nets) | set(physical_nets)):
+            # Primary net used for drift/orphan detection
+            p_net = primary_nets.get(p, 0.0)
+            # Cross-check for logging
+            c_net = crosscheck_nets.get(p, 0.0)
             ph_net = physical_nets.get(p, 0.0)
+            
+            # Cross-check logging - compare primary vs legacy
+            if abs(p_net - c_net) > 0.0001:
+                logger.warning(f"[NETTING-CROSSCHECK] Pair {p}: primary={p_net:.6f} legacy={c_net:.6f} DIFF={abs(p_net - c_net):.6f}")
+
             try:
                 for w in get_manual_whitelists(p):
                     adj = float(w["qty"])
@@ -223,18 +265,18 @@ def _compute_netting_status(
                 pass
 
             ref_price = ref_prices.get(p, 1.0)
-            diff_qty = round(abs(v_net - ph_net), 8)
+            diff_qty = round(abs(p_net - ph_net), 8)
             diff_usd = diff_qty * ref_price
             if diff_usd > worst_gap:
                 worst_gap = diff_usd
 
-            # Drift is detected if the gap exceeds the quantity tolerance OR if the USD value of the gap exceeds $5.00
+            # Drift detection uses PRIMARY (position_ledger)
             drift = (diff_qty > tol or diff_usd > 5.0) and not startup_suppression
             if drift:
                 mismatch_count += 1
 
             netting[p] = dict(
-                pair=p, virtual_net=v_net, physical_net=ph_net,
+                pair=p, primary_net=p_net, crosscheck_net=c_net, physical_net=ph_net,
                 diff_qty=diff_qty, diff_usd=diff_usd,
                 drift_detected=drift, ref_price=ref_price,
                 tolerance=tol, bots=pair_bot_map.get(p, []),

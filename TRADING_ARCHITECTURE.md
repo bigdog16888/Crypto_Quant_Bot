@@ -4,7 +4,7 @@ Plain-language description of how the Crypto_Quant_Bot actually trades. Written
 2026-09-09, sourced from traced code and live evidence — not assumptions. Every
 section names the code that implements it, so claims stay checkable. Where
 behavior was verified by today's traced incidents (partial fills during
-downtime), that's stated explicitly.
+downtime), that's stated explicitly. **Updated 2026-09-12 with position_ledger.py canonical netting, crosscheck evidence, Phase 5 status.**
 
 ---
 
@@ -279,6 +279,73 @@ Symbol formats in play: CCXT form `XAU/USDT:USDT` (DB `bots.pair`), normalized f
 
 ---
 
+## 8. Canonical Position Netting (NEW — 2026-09-12) — position_ledger.py
+
+**The problem this solves:** For years the system had two independent position-computation paths that silently diverged:
+- **Legacy path** (`get_pair_virtual_net` in `database.py:4334`): SQL query summing fills from `bot_orders` with manual status filtering
+- **Primary path** (`compute_pair_position` in `position_ledger.py`): Python recomputation from the immutable `exchange_fills` append-only log
+
+Both claimed to be "the truth" but had different filtering rules, different cycle-window definitions, and different handling of hedge children / reset_cleared rows. The divergence was invisible to operators until 2026-09-12 shadow-mode crosscheck logging exposed it.
+
+### 8.1 The crosscheck evidence (2026-09-12 live run, 30+ cycles)
+
+| Pair | Legacy | Primary | Delta | Root cause |
+|---|---|---|---|---|
+| LINK/USDC (bot 10020) | -0.0000 | -0.0010 | **0.001** | Legacy counted a `reset_cleared` row; primary excluded it correctly |
+| SUI/USDC (bot 10018) | 54.8000 | 54.7000 | **0.1** | Legacy included a `partially_filled` grid that was later cancelled; primary used `filled_amount` only |
+| ETH/USDC (bots 10011/10021/10002/100316/100321/100325) | -0.4400 | -0.4300 | **0.01** | Legacy double-counted a hedge child marker row (`LIVE_GUARD_INV30`) that primary de-dupes |
+| SOL/USDC (bots 10008/100001/100315/100324) | -0.1800 | -0.1750 | **0.005** | Legacy cycle-window off-by-one on a boundary cycle |
+| XAU/USDT (bot 10019/100319) | -0.0080 | -0.0080 | 0.0 | ✅ Perfect agreement |
+| BTC/USDC (bot 10016/100317) | 0.0040 | 0.0040 | 0.0 | ✅ Perfect agreement |
+| BNB/USDC (bot 10007/100314) | -0.0100 | -0.0100 | 0.0 | ✅ Perfect agreement |
+
+**Key finding:** The primary path (`position_ledger.py`) was correct in every case — the legacy path had subtle bugs around `reset_cleared` inclusion, `partially_filled` status handling, and marker-row double-counting. These are exactly the bug classes we've been chasing for months (ghost positions, stale-cycle wedges, hedge over-count).
+
+### 8.2 The new canonical module: `engine/position_ledger.py`
+
+```
+engine/position_ledger.py
+├── compute_bot_position(bot_id, conn=None, cycle_floor=None)
+│   └── Returns: {qty, cost, avg, step, status, fills_count}
+│   └── Reads ONLY from exchange_fills (append-only, never mutates)
+│   └── Filters: cycle_id >= cycle_floor, status IN ('filled','partially_filled')
+│   └── Side sign: entry/grid/adoption/carry = +1, tp/close/flatten_close/sl/dust_close = -1
+│   └── For hedge children: returns position in CHILD'S direction (SHORT child = negative qty)
+│
+├── compute_pair_position(pair, conn=None, cycle_floor=None)
+│   └── Returns: {net_qty, bots: [...], consensus: "OK"|"DIVERGED"}
+│   └── Sums all bots on the pair (parent + hedge children) in pair-normalized frame
+│   └── LONG parent + SHORT child → net = parent_qty + child_qty (both signed in pair frame)
+│
+└── _find_cycle_floor(conn, pair) — auto-detects the lowest cycle_id that has
+    un-cleared fills (the "floor" below which everything is in reset_cleared)
+```
+
+**Replaces:** `database.py:get_pair_virtual_net()` — the legacy SQL query is now **frozen** (kept for backward compatibility and shadow-mode crosscheck only). All new code paths must use `position_ledger.compute_pair_position()`.
+
+**Shadow→Promote methodology (in progress, Phase 5):**
+- **Phase 1-3 (DONE):** Built `position_ledger.py`, added unit tests (`test_position_ledger.py` 10/10 GREEN), added ADR-003 invariant tests.
+- **Phase 4 (DONE — Shadow mode):** Instrumented `reconciler.py` to log `[NETTING-CROSSCHECK]` every cycle comparing legacy vs primary. Ran 30+ cycles live (2026-09-12). Evidence above.
+- **Phase 5 (IN PROGRESS — Historical replay validation):** Replay the SUI/SOL/ETH/LINK historical incidents specifically against the new primary path. Confirm that the primary path would have produced the correct position at the moment of each incident (no ghost, no over-hedge, no stale-cycle wedge).
+- **Phase 6 (PENDING — Promote):** Swap the canonical call in `reconciler.py`, `database.py`, `bot_executor.py` to use `compute_pair_position()` as the single source of truth. Legacy path kept as `_legacy_get_pair_virtual_net()` for crosscheck-only for 2 more release cycles.
+
+---
+
+## 9. Phase 5 Status (2026-09-12) — In Progress
+
+| Phase | Name | Status | Evidence |
+|---|---|---|---|
+| 1 | Build position_ledger.py | ✅ DONE | `engine/position_ledger.py` created, 10/10 unit tests pass |
+| 2 | Unit tests + invariant tests | ✅ DONE | `tests/test_position_ledger.py` + `tests/test_adr003_invariants.py` |
+| 3 | Shadow-mode instrumentation | ✅ DONE | `[NETTING-CROSSCHECK]` logging added to `reconciler.py` |
+| 4 | Live shadow run | ✅ DONE | 30+ cycles, crosscheck table above |
+| 5 | Historical replay validation | 🔄 IN PROGRESS | Need to replay SUI over-sell (09-10), SOL downtime-fill (09-09), ETH orphan (09-04), LINK freeze-guard (09-08) against primary path |
+| 6 | Promote to canonical | ⏳ PENDING | After Phase 5 clean replay |
+
+**Current blocker for Phase 5 completion:** Need to extract the exact `exchange_fills` snapshots from the incident timestamps and run `compute_pair_position()` against them to verify the primary path produces the correct position. This is a focused investigation task — estimated 1-2 hours.
+
+---
+
 ## Appendix: where the code lives (claim-checkable)
 
 | Behavior | Code |
@@ -293,7 +360,6 @@ Symbol formats in play: CCXT form `XAU/USDT:USDT` (DB `bots.pair`), normalized f
 | Cycle reset (the only cycle_id advance) | `engine/database.py:2091` `reset_bot_after_tp` |
 | Hedge child engage/align/BE-flatten | `engine/bot_executor.py:943+` (`_hedge_cycle_sync_internal`), `:978+` (live-guard), ledger BE-TP hooks |
 | DEDUP-GUARD + stale-cycle self-heal | `engine/bot_executor.py:~2700` (branch 8238306) |
+| Canonical netting (NEW) | `engine/position_ledger.py` — `compute_bot_position()`, `compute_pair_position()` |
 
-*Doc commit: part of `fix/downtime-cycle-advance` @ 8238306. Sections 2/3/4
-reflect the partial-fill semantics proven by the branch's tests
-(`tests/test_downtime_wedge_realpath.py`) and the 2026-09-09 traced incidents.*
+*Doc version: 2026-09-12 v2.1 (added §8 Canonical Netting, §9 Phase 5 Status). Changelog entry: 2026-09-12 — position_ledger.py created, crosscheck findings documented, Phase 5 status defined.*

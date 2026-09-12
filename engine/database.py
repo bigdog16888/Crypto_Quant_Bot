@@ -1061,6 +1061,37 @@ def init_db():
         """)
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_whitelist_pair ON manual_whitelists(pair)')
 
+        # 🛡️ IMMUTABLE FILL LOG (Phase 1) — exchange_fills table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS exchange_fills (
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                exchange_order_id  TEXT NOT NULL,
+                client_order_id    TEXT,
+                symbol             TEXT NOT NULL,
+                side               TEXT NOT NULL CHECK (side IN ('BUY', 'SELL')),
+                qty                REAL NOT NULL,
+                price              REAL NOT NULL,
+                fee                REAL DEFAULT 0,
+                fee_asset          TEXT,
+                fill_ts            INTEGER NOT NULL,
+                source             TEXT NOT NULL,
+                bot_id             INTEGER,
+                order_type         TEXT,
+                step               INTEGER,
+                cycle_id           INTEGER,
+                raw_json           TEXT,
+                created_at         INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+        
+                UNIQUE(exchange_order_id, fill_ts, qty, price)
+            )
+        """)
+        
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_exchange_fills_symbol_ts ON exchange_fills(symbol, fill_ts)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_exchange_fills_bot_cycle ON exchange_fills(bot_id, cycle_id, step)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_exchange_fills_cid ON exchange_fills(client_order_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_exchange_fills_source ON exchange_fills(source)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_exchange_fills_exch_oid ON exchange_fills(exchange_order_id)')
+
         # FUNDAMENTAL FIX: Clear stale active positions on startup
         # This prevents the UI from showing "Green" (Synced) against old data before the first poll cycle
         cursor.execute('DELETE FROM active_positions')
@@ -1072,9 +1103,9 @@ def init_db():
         # Create schema_migrations table
         conn.execute("""
             CREATE TABLE IF NOT EXISTS schema_migrations (
-                version     TEXT PRIMARY KEY,
-                applied_at  INTEGER NOT NULL,
-                description TEXT
+        version     TEXT PRIMARY KEY,
+        applied_at  INTEGER NOT NULL,
+        description TEXT
             )
         """)
         conn.commit()
@@ -5772,4 +5803,55 @@ def bot_has_recent_order_activity(bot_id: int, window_seconds: int = 60, cursor 
         return False
     except Exception as e:
         logger.error(f"Failed to check recent order activity for bot {bot_id}: {e}")
+        return False
+
+
+def record_exchange_fill(
+    conn,
+    exchange_order_id: str,
+    client_order_id: str,
+    symbol: str,
+    side: str,                      # REQUIRED — 'BUY' or 'SELL' from exchange
+    qty: float,
+    price: float,
+    fill_ts: int,
+    source: str,
+    bot_id: int = None,
+    order_type: str = None,
+    step: int = None,
+    cycle_id: int = None,
+    raw_json: str = None,
+    fee: float = 0.0,
+    fee_asset: str = None
+) -> bool:
+    """
+    Idempotent insert into exchange_fills.
+    side MUST be the real exchange-reported side, never inferred.
+    Returns True if inserted, False if duplicate (UNIQUE conflict).
+    """
+    import json
+    if not side or side.upper() not in ('BUY', 'SELL'):
+        logger.error(f"[EXCHANGE-FILLS] Refusing to log fill without valid exchange side: {side}")
+        return False
+    
+    raw = json.dumps(raw_json) if raw_json is not None else None
+    
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT OR IGNORE INTO exchange_fills (
+                exchange_order_id, client_order_id, symbol, side, qty, price,
+                fee, fee_asset, fill_ts, source, bot_id, order_type,
+                step, cycle_id, raw_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            str(exchange_order_id), client_order_id or '', symbol, side.upper(),
+            float(qty), float(price), float(fee), fee_asset,
+            int(fill_ts), source, bot_id, order_type, step, cycle_id,
+            raw, int(time.time())
+        ))
+        conn.commit()
+        return True
+    except Exception as e:
+        logger.warning(f"[EXCHANGE-FILLS] Insert failed: {e}")
         return False

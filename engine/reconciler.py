@@ -1109,7 +1109,8 @@ class StateReconciler:
 
                                 from .ledger import credit_fill, seal_trade_state
 
-                                credit_fill(bot_id=bot_id, order_id=o_id, cumulative_qty=o_filled, avg_price=o_price, order_type=otype, is_cumulative=True, caller='reconciler')
+                                fill_side = (exch_order.get('side') or exch_order.get('info', {}).get('side') or '').upper() or None
+                                credit_fill(bot_id=bot_id, order_id=o_id, cumulative_qty=o_filled, avg_price=o_price, order_type=otype, is_cumulative=True, caller='reconciler', side=fill_side)
 
                                 # BUG 3 FIX: Unconditionally promote the DB row status to match exchange truth.
                                 # credit_fill() may return False (fill_claims already claimed, or MAX() guard),
