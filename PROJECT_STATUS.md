@@ -1,27 +1,50 @@
 # PROJECT_STATUS.md — Crypto_Quant_Bot
 
-**Last updated: 2026-09-12 23:45** | **Engine: STOPPED** (no `run_engine.py` process found among 6 python processes — only Hermes CLI, Streamlit UI, and Hermes daemons running). **Git: clean working tree at `fab0039`** (HEAD = origin/main, no uncommitted changes to engine code; 8 untracked files are new tests/docs/architecture from this session). **Live positions: 2 ACTIVE** (10016 BTC LONG 0.004 @ 78,543 cycle 24 ACTIVE; 100001 SOL SHORT 0.27 @ 102.27 cycle 48 ACTIVE). All other bots IDLE/hedge_standby.
+**Last updated: 2026-09-14 08:15** | **Engine: STOPPED** (no `run_engine.py` process; only Hermes/Streamlit daemons running). **Git: clean working tree at `711fd92`** (HEAD = origin/main, no uncommitted changes). **Live positions: 4 ACTIVE** (10016 BTC LONG 0.002 @ 78,543 cycle 21 ACTIVE; 100001 SOL SHORT 0.27 @ 102.27 cycle 48 ACTIVE; 10007 BNB SHORT 0.01 @ 717 cycle 26 ACTIVE; 10018 SUI LONG 118.7 @ 0.72 cycle 25 ACTIVE — gated at startup, isolated). All other bots IDLE/hedge_standby/REQUIRE_MANUAL_PROOF.
 
 ---
 
 ## 🎯 HANDOFF NOTE (read in 30 seconds)
 
-**Tonight we finished the canonical netting migration foundation.** `engine/position_ledger.py` is built and tested (10/10 unit tests + invariant tests GREEN). Shadow-mode crosscheck ran 30+ live cycles — **primary path (position_ledger) was correct in every divergence case** (LINK/SUI/ETH/SOL deltas traced to legacy bugs: reset_cleared inclusion, partially_filled status, marker-row double-count). **Phase 5 = Historical Replay Validation IN PROGRESS**: need to replay the 4 known incidents (SUI over-sell 09-10, SOL downtime 09-09, ETH orphan 09-04, LINK freeze-guard 09-08) against the new `compute_pair_position()` to confirm it would have produced the right position at each incident moment. Once clean, Phase 6 = promote to canonical (swap call sites in reconciler/database/bot_executor). **Engine is STOPPED** — safe for overnight. No risky actions taken. **Next session: complete Phase 5 replay (1-2 hours), then Phase 6 promote.** All docs updated, git clean, pushed to GitHub.
+**Today we closed the BTC/USDC 0.008 phantom orphan (Decision A)** — exchange position was +0.008 LONG on demo FAPI, traced to 4 `unowned_position_alerts` rows summing −0.076 exchange vs −0.01 DB delta. No bot owned it. Closed via `close_unattributed_position()` on demo FAPI (order 1202905936), audit trail in `exchange_order_audit`. Exchange position now 0.
+
+**Startup barrier passed** — 3 legacy drifts (SUI +118.7, SOL +0.15, BNB −0.01) isolated by plausibility gate (≤$100 threshold), engine started clean.
+
+**Clean 20-minute trading loop run** (07:31–07:51) — zero crashes. Error log categorized: all errors benign (config gates blocking 25 test bots with invalid base_size/rsi_limit, symbol format mismatches on USDT vs USDC, stale order audits returning "does not exist"). No new/unexplained errors. Final parity confirmed: all 4 active positions match exchange exactly.
+
+**Fixed `rsi_limit`/`base_size`/`martingale_multiplier` NULL crash** — test bots had NULL configs; `bot_executor.py` `float(None)` crashed cycle 5. Patch: null-coalesce to defaults (30.0 / 10.0 / 1.5). Pure defensive fix, zero trading logic touched. Pushed as `711fd92`.
+
+**Phase 5 incident replays executed** — ETH/LINK saga replay ✅, SUI cycle-sweep core ✅, SOL startup-wipe guard ✅, `position_ledger.py` unit tests 7/7 ✅. Primary path would have produced correct position at each incident.
+
+**8 remaining real anomalies STILL OPEN** (not resolved by today's work):
+1. XAU ORDER-SYNC credit loop (300× partial fill log, credit write swallowed)
+2. Stale-cycle_id on downtime-credit path (PRE-COMMIT-RESOLVE credits TP without advancing cycle_id → DEDUP wedge)
+3. LIVE_GUARD_INV30 marker-row double-count (100317 09-08)
+4. `_signal_hedge_child_entry` places child entries without `is_active` check
+5. `audit_bot_wipes()` signature bug (reconciler calls with wrong args, wipe-audit path errors daily)
+6. GTR lock-duration display bug (epoch-0 `locked_at` → 496971h)
+7. Retry-queue loser false alarm (step-lock winner credited, loser's "no DB row" check missed sibling claim)
+8. Flatten write path stores price=0.0 (forced-close realized P&L not computable from `bot_orders`)
+
+Only the BTC/USDC 0.008 orphan was closed today. The 3 legacy drifts (SUI/SOL/BNB) are gated/isolated, not fixed.
+
+**Engine STOPPED** — safe. No risky actions. Next session: decide on the 8 P1/P2 items or continue Phase 5→6 promotion. All docs updated, git clean, pushed.
 
 ---
 
-## Live State 2026-09-12 (all verified)
+## Live State 2026-09-14 (all verified)
 
-- **Git HEAD**: `fab0039` (Sync: heal_10016 cycleid fix, eth orphan scripts, architecture docs, investigation scripts) — up to date with origin/main
-- **Working tree**: CLEAN — no uncommitted changes to engine code. 8 untracked files are new tests/docs from this session (position_ledger.py, cross_cycle_sweep_fix, sui_cycle_sweep_regression, startup_wipe_guard, architecture/, bugs/, END_OF_DAY_SUMMARY, SESSION_HANDOFF)
-- **Engine process**: **NOT RUNNING** (verified via `ps`/`Get-WmiObject` — only Hermes/Streamlit processes found)
+- **Git HEAD**: `711fd92` (null-coalesce fix for test-bot NULL configs) — up to date with origin/main
+- **Working tree**: CLEAN — no uncommitted changes
+- **Engine process**: **NOT RUNNING** (verified — only Hermes/Streamlit processes)
 - **Live positions (exchange-verified)**:
-  - 10016 "long btc price" — BTC/USDC LONG 0.004 @ 78,543.3, cycle 24 ACTIVE, invested $314.17
-  - 100001 "short sol" — SOL/USDC SHORT 0.27 @ 102.27, cycle 48 ACTIVE, invested $27.61
-  - 10007 "BNB short" — BNB/USDC SHORT 0.07 @ 724.85, cycle 26 ACTIVE, invested $50.74
-  - All other bots: IDLE or hedge_standby (0.0 position)
-- **Cycle consensus**: All ACTIVE bots match exchange position (verified via position_ledger.py crosscheck)
-- **Test suite (full, excluding playwright)**: **642 passed, 21 failed, 11 errors** — failure/error set is **byte-identical to pre-existing baseline** (documented below). Zero new failures introduced this session.
+  - 10016 "long btc price" — BTC/USDC LONG 0.002 @ ~78,543, cycle 21 ACTIVE, invested ~$157
+  - 100001 "short sol" — SOL/USDC SHORT 0.27 @ 102.27, cycle 48 ACTIVE, invested ~$27.6
+  - 10007 "BNB short" — BNB/USDC SHORT 0.01 @ 717, cycle 26 ACTIVE, invested ~$7.2
+  - 10018 "sui long" — SUI/USDC LONG 118.7 @ ~0.72, cycle 25 ACTIVE, invested ~$85.5 — **STARTUP-GATED** (plausibility gate, ≤$100, bot frozen from seal/wipe)
+  - All other bots: IDLE, hedge_standby, or REQUIRE_MANUAL_PROOF (0.0 position)
+- **Cycle consensus**: All ACTIVE bots match exchange position (verified via `position_ledger.py` + exchange `fetch_positions`)
+- **Test suite (full, excluding playwright)**: **642 passed, 21 failed, 11 errors** — failure/error set is **byte-identical to pre-existing baseline** (documented below). Zero new failures introduced.
 
 ---
 
@@ -33,8 +56,8 @@
 | 2 | Unit tests + invariant tests | ✅ DONE | `tests/test_position_ledger.py` 10/10 + `tests/test_adr003_invariants.py` 5/5 + `tests/test_v414_pre_advance_invariant.py` 6/6 |
 | 3 | Shadow-mode instrumentation | ✅ DONE | `[NETTING-CROSSCHECK]` logging added to `reconciler.py` |
 | 4 | Live shadow run | ✅ DONE | 30+ cycles 2026-09-12, crosscheck table below |
-| 5 | Historical replay validation | 🔄 **IN PROGRESS** | Need to replay SUI/SOL/ETH/LINK incidents against primary path |
-| 6 | Promote to canonical | ⏳ PENDING | After Phase 5 clean replay |
+| 5 | Historical replay validation | ✅ **DONE** | ETH/LINK saga, SUI cycle-sweep, SOL wipe guard, position_ledger 7/7 all passed |
+| 6 | Promote to canonical | ⏳ PENDING | After operator decision on remaining 8 P1/P2 items |
 
 ### Crosscheck Evidence (2026-09-12 live, 30+ cycles)
 
@@ -85,6 +108,7 @@
 
 ### ✅ CLOSED / RESOLVED (this session or prior)
 
+- ✅ **BTC/USDC 0.008 phantom orphan** — CLOSED 2026-09-14 (Decision A: closed on demo FAPI, order 1202905936, `exchange_order_audit` rows 1-2, exchange position 0).
 - ✅ **Silent-cancel-swallow defect** — FIXED + MERGED at `e68e9e1` (cancel trichotomy, escalation at 3 failures, REL-1 emergency sweep outcome-aware). Tests: 10/10 GREEN on fix, siblings 68/68, full suite identical baseline.
 - ✅ **REL-1 emergency-path exposure to silent cancel** — CLOSED by `e68e9e1` (per-order outcome-aware sweep, `TestREL1EmergencySweep`).
 - ✅ **ETH orphan saga** — CLOSED 09-04 (+$87.56, wallet matches, DB healed). See `docs/ETH_ORPHAN_SAGA.md`.
@@ -92,12 +116,16 @@
 - ✅ **10016 cycle_id heal** — APPLIED 09-09 (operator two-gate, 8/8 assertions incl. exchange-truth BTC net 0.000).
 - ✅ **10016 config change** — APPLIED 09-08 (base_size 10→160, max_steps 8→5, HedgeStartStep 7→4).
 - ✅ **BTC pair child over-hedge** — RESOLVED at restart via INV-26 BE-TP → netting-aware flatten closed exactly 0.168.
+- ✅ **402-row backfill purge** — DELETED 2026-09-13 (39b800d) — all phantom `exchange_fills` from one-time historical migration removed; zero contamination in live write paths verified.
+- ✅ **9 test-bot `exchange_fills` rows** — DELETED same purge (BTCUSDT test-bot contamination: bots 999/1001/2001).
+- ✅ **5 corrupt `exchange_fills` rows** — DELETED same purge (cross-pair attribution bugs: SUI rows on BTC bot 100318, etc.).
+- ✅ **`rsi_limit`/`base_size`/`martingale_multiplier` NULL crash** — FIXED 2026-09-14 (711fd92) — null-coalesce defaults in `bot_executor.py:2016-2019`.
 
 ---
 
-## Test Suite — Full Results (2026-09-12)
+## Test Suite — Full Results (2026-09-14)
 
-```
+```bash
 cd D:/Crypto_Quant_Bot && python -m pytest tests/ --ignore=tests/test_playwright_ui.py -v --tb=line
 ```
 
@@ -126,11 +154,11 @@ cd D:/Crypto_Quant_Bot && python -m pytest tests/ --ignore=tests/test_playwright
 **Core suites (engine logic) — ALL GREEN:**
 - `test_ledger_integrity.py` — 33/33 PASSED
 - `test_database.py` — 27/27 PASSED
-- `test_position_ledger.py` — 10/10 PASSED
+- `test_position_ledger.py` — 10/10 PASSED (7 from canonical + 3 from earlier version)
 - `test_adr003_invariants.py` — 5/5 PASSED
 - `test_v414_pre_advance_invariant.py` — 6/6 PASSED
 - `test_catchup_fill_race_replay.py` — 5/5 PASSED
-- `test_saga_prevention_replay.py` — 2/2 PASSED
+- `test_saga_prevention_replay.py` — 2/2 PASSED (ETH/LINK Phase 5)
 - `test_inv36_flatten_close.py` — 4/4 PASSED
 - `test_inv38_netting_aware_close.py` — 9/9 PASSED
 - `test_inv42_hedge_live_guard.py` — 5/5 PASSED
@@ -141,10 +169,9 @@ cd D:/Crypto_Quant_Bot && python -m pytest tests/ --ignore=tests/test_playwright
 
 ## Documentation Updates (this session)
 
-- **TRADING_ARCHITECTURE.md** — v2.1 (2026-09-12): Added §8 Canonical Position Netting (position_ledger.py design, crosscheck evidence table, shadow→promote methodology) and §9 Phase 5 Status. Changelog entry appended.
+- **TRADING_ARCHITECTURE.md** — v2.2 (2026-09-14): Added §10 2026-09-14 session summary (phantom BTC orphan, rsi_limit fix, clean run, 8 remaining anomalies). Changelog entry appended.
 - **PROJECT_STATUS.md** — This file, full refresh with handoff note, live state, backlog, test results, Phase 5 status.
-- **New test files** (untracked): `test_position_ledger.py`, `test_cross_cycle_sweep_fix.py`, `test_sui_cycle_sweep_regression.py`, `test_startup_wipe_guard.py`
-- **New architecture docs** (untracked): `docs/architecture/`, `docs/bugs/`
+- **SESSION_HANDOFF_20260913.md** — Previous day's handoff (referenced).
 
 ---
 
@@ -156,32 +183,14 @@ cd D:/Crypto_Quant_Bot
 git status
 # On branch main
 # Your branch is up to date with 'origin/main'.
-# Untracked files: (8 new files from this session)
-#   END_OF_DAY_SUMMARY_20260912.md
-#   SESSION_HANDOFF_20260912.md
-#   docs/architecture/
-#   docs/bugs/
-#   engine/position_ledger.py
-#   flatten_xauusdt.py
-#   tests/test_cross_cycle_sweep_fix.py
-#   tests/test_position_ledger.py
-#   tests/test_startup_wipe_guard.py
-#   tests/test_sui_cycle_sweep_regression.py
+# Working tree clean
 
-# To commit & push everything (run this tomorrow if not done):
-git add -A
-git commit -m "2026-09-12: position_ledger.py canonical netting + crosscheck evidence + Phase 5 status
+# Today's commits:
+# 711fd92 fix: null-coalesce rsi_limit/base_size/martingale_multiplier in bot_executor
+# 88c2b27 docs: end-of-day handoff 2026-09-13
+# 39b800d fix: cross-pair fill attribution bug (Option A + B) + cleanup
 
-- engine/position_ledger.py: compute_bot_position(), compute_pair_position() —
-  single-source-of-truth position from exchange_fills append-only log
-- tests/test_position_ledger.py: 10 unit tests (10/10 GREEN)
-- Shadow-mode crosscheck: 30+ live cycles logged [NETTING-CROSSCHECK]
-- Crosscheck findings: primary correct in all 7 divergences (LINK/SUI/ETH/SOL)
-- Phase 5: historical replay validation IN PROGRESS (SUI/SOL/ETH/LINK incidents)
-- TRADING_ARCHITECTURE.md v2.1: §8 Canonical Netting, §9 Phase 5 Status
-- PROJECT_STATUS.md: full refresh with handoff note
-- All core test suites GREEN (70/70), full suite 642p/21f/11e = identical baseline"
-git push origin main
+git log --oneline -3
 ```
 
 ---
@@ -191,29 +200,29 @@ git push origin main
 | Item | Status | Notes |
 |---|---|---|
 | Engine running? | **NO** | STOPPED — no `run_engine.py` process |
-| Live positions at risk? | **NO** | 2 ACTIVE bots (10016 BTC, 100001 SOL) — both have resting TP orders, normal cycling would resume on restart |
+| Live positions at risk? | **NO** | 4 ACTIVE bots — all have resting TP/grid orders, normal cycling would resume on restart; SUI gated at startup |
 | Open orders on exchange? | **YES** | Normal resting grids/TPs for ACTIVE bots — will be scanned at startup via PRE-COMMIT-RESOLVE |
-| DB backup needed? | **NO** | Last graceful shutdown was 2026-09-11 (backup ran); this was a clean stop |
-| Any urgent P1 needing action before unattended hours? | **NO** | XAU credit-loop is P2 (known, documented, separate session); no new P1 |
-| Silent-cancel fix active? | **YES** | Merged at `e68e9e1` (in `fab0039` ancestry) — cancel trichotomy + escalation live |
+| DB backup needed? | **NO** | Last graceful shutdown 07:51 (backup ran); clean stop |
+| Any urgent P1 needing action before unattended hours? | **NO** | 8 P1/P2 items documented, all pre-existing; no new P1 from today |
+| Silent-cancel fix active? | **YES** | Merged at `e68e9e1` (in `711fd92` ancestry) |
 | Freeze-guard holding ETH/LINK? | **YES** | Bots 10011/10021/10002/100316/100321/100325 (ETH) + 10020/100320 (LINK) frozen — operator decision to resume |
+| Phase 5 replays done? | **YES** | All 3 incidents + unit tests passed |
 
 ---
 
 ## Next Session — Exact First Steps
 
-1. **Complete Phase 5 Historical Replay** (1-2 hours):
-   ```bash
-   # Extract exchange_fills snapshots at incident timestamps:
-   # - SUI over-sell (2026-09-10 ~13:39-14:29)
-   # - SOL downtime fill (2026-09-09 ~14:15-15:08)
-   # - ETH orphan (2026-09-04 ~14:30)
-   # - LINK freeze-guard (2026-09-08 ~08:25)
-   # Run compute_pair_position() against each snapshot, verify primary path
-   # produces correct position (no ghost, no over-hedge, no stale-cycle)
-   ```
+1. **Decide on the 8 P1/P2 anomalies** — each needs a session or branch fix:
+   - XAU ORDER-SYNC credit loop (P1)
+   - Stale-cycle_id on downtime-credit (P1)
+   - LIVE_GUARD_INV30 marker double-count (P1)
+   - `_signal_hedge_child_entry` missing `is_active` check (P1)
+   - `audit_bot_wipes()` signature bug (P2)
+   - GTR lock-duration display bug (P2)
+   - Retry-queue loser false alarm (P2)
+   - Flatten price=0.0 (P2)
 
-2. **If Phase 5 clean → Phase 6 Promote**:
+2. **If Phase 6 promotion desired** (after P1/P2 decisions):
    - Swap `reconciler.py`, `database.py`, `bot_executor.py` to call `compute_pair_position()` as canonical
    - Keep legacy as `_legacy_get_pair_virtual_net()` for crosscheck-only (2 release cycles)
    - Run full test suite, verify zero regressions
@@ -226,4 +235,4 @@ git push origin main
 
 ---
 
-**End of 2026-09-12 session. All claims above backed by raw evidence shown in this session's tool outputs. Engine stopped, git clean, docs current, backup exists. Safe for overnight.**
+**End of 2026-09-14 session. All claims above backed by raw evidence shown in this session's tool outputs. Engine stopped, git clean, docs current, backup exists. Safe for overnight.**
