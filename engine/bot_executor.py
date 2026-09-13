@@ -2013,10 +2013,10 @@ class BotExecutor:
         config_json = bot_data[5]
         db_invested = float(bot_data[6]) if len(bot_data) > 6 else 0.0
         db_step = int(bot_data[7]) if len(bot_data) > 7 else 0
-        rsi_limit = float(bot_data[8]) if len(bot_data) > 8 else 30.0
+        rsi_limit = float(bot_data[8]) if len(bot_data) > 8 and bot_data[8] is not None else 30.0
         is_active = bool(bot_data[9]) if len(bot_data) > 9 else True
-        base_size = float(bot_data[10]) if len(bot_data) > 10 else 10.0
-        martingale_multiplier = float(bot_data[11]) if len(bot_data) > 11 else 1.5
+        base_size = float(bot_data[10]) if len(bot_data) > 10 and bot_data[10] is not None else 10.0
+        martingale_multiplier = float(bot_data[11]) if len(bot_data) > 11 and bot_data[11] is not None else 1.5
         bot_status_str = str(bot_data[12] or '') if len(bot_data) > 12 else ''
 
         import random
