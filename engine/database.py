@@ -4110,10 +4110,13 @@ def consolidate_duplicate_bot_orders(bot_id: int = None) -> int:
 def audit_pair_ledger_vs_exchange(exchange, qty_tolerance: float = None) -> list:
     """
     Compare proof-based virtual net per pair to live signed exchange position.
+    PRIMARY: uses position_ledger (compute_pair_position from exchange_fills).
+    CROSS-CHECK: get_pair_virtual_net (from trades table - legacy).
     Returns list of (pair, virtual_qty, physical_qty, delta) for mismatches.
     Uses PAIR_PARITY_QTY_TOLERANCE from config when qty_tolerance is omitted.
     """
     from engine.exchange_interface import normalize_symbol
+    from engine.position_ledger import compute_pair_position
 
     if qty_tolerance is None:
         from engine.parity_gates import qty_tolerance as _pair_tol
@@ -4144,10 +4147,19 @@ def audit_pair_ledger_vs_exchange(exchange, qty_tolerance: float = None) -> list
 
     for pair in pairs:
         norm = normalize_symbol(pair).upper()
-        virtual = get_pair_virtual_net(pair)
+        # PRIMARY: position_ledger (exchange_fills based)
+        pp = compute_pair_position(pair, conn)
+        primary_net = pp.net_qty
+        # CROSS-CHECK: legacy trades-based
+        crosscheck_net = get_pair_virtual_net(pair)
         physical = physical_by_norm.get(norm, 0.0)
-        if abs(virtual - physical) > qty_tolerance + 1e-9:
-            mismatches.append((pair, virtual, physical, physical - virtual))
+        
+        # Use primary for drift detection
+        if abs(primary_net - physical) > qty_tolerance + 1e-9:
+            mismatches.append((pair, primary_net, physical, physical - primary_net))
+            # Log cross-check for comparison
+            if abs(primary_net - crosscheck_net) > 0.0001:
+                logger.warning(f"[PAIR-AUDIT] Cross-check diff for {pair}: primary={primary_net:.6f} legacy={crosscheck_net:.6f} DIFF={abs(primary_net - crosscheck_net):.6f}")
 
     return mismatches
 

@@ -1,7 +1,7 @@
 # Architecture v3.5 — Crypto Quant Bot
 
 > **Current architecture reference.** Read this for the big picture.
-> **Version:** 5.3.7 | **Last updated:** 2026-08-31
+> **Version:** 5.4.0 | **Last updated:** 2026-09-13
 
 ---
 
@@ -18,6 +18,7 @@ A multi-bot, per-directional grid trading engine for Binance Futures USDC, desig
 | **Idempotent** | `seal_trade_state()` can be called N times safely. |
 | **Independent accounting** | Each bot tracks its own position. Pair net is emergent, not enforced. |
 | **Write serialization** | All `trades`/`bot_orders` writes go through `WriteQueue` singleton. |
+| **Immutable fill log** | `exchange_fills` append-only log is the single source of truth for position computation (Phase 4+). |
 
 ---
 
@@ -106,6 +107,66 @@ runner.run_cycle():
   → GTR every 10 cycles → pair-level physical-vs-virtual comparison
   → Parity gates → cycle reset gate, entry gate, heal gates
 ```
+
+---
+
+## 3.5. Immutable Fill Log & Canonical Reconciliation (Phase 4+)
+
+### New authoritative layer
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  0. Immutable Fill Log: exchange_fills (append-only)           │
+│     credit_fill() → exchange_fills INSERT (unique on           │
+│     exchange_order_id + bot_id + side + cycle_id)              │
+│     → NEVER loses a real exchange fill regardless of timing    │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Canonical Reconciliation (engine/position_ledger.py)          │
+│  compute_bot_position(), compute_pair_position()               │
+│  Pure, read-only, deterministic — same input → same output     │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+All call sites now PRIMARY on position_ledger:
+  - compute_system_health()        ← engine/health.py
+  - audit_pair_ledger_vs_exchange() ← engine/database.py
+  - SNAP-ALLOCATE / UI / Telegram  ← position_ledger direct
+  - Cycle sweep / Preflight check  ← position_ledger direct
+```
+
+### Migration status (v5.4.0)
+
+| Call Site | Migration | Test |
+|-----------|-----------|------|
+| `get_pair_virtual_net()` | → `compute_pair_position()` | Compare output for 30 days |
+| Startup barrier | → `reconcile_bot()` per bot | Verify no new gaps |
+| Cycle sweep | → `compute_bot_position()` (read-only) | Verify cycles 6/10 correctly NOT swept |
+| SNAP-ALLOCATE | → `compute_pair_position()` | Verify allocation matches |
+| Parity gates / hedge watchdog | → `compute_bot_position()` | Verify alerts match |
+| UI / Telegram commands | → `compute_pair_position()` | Verify numbers match |
+
+**Each migration**: Deployed behind feature flag → run in shadow mode → compare → cutover.
+
+### Key invariant: Proof-only holds
+
+The `exchange_fills` log is written by:
+1. `credit_fill()` — WS fill events
+2. `sync_stale_open_orders()` — REST poll reconciliation  
+3. `reconstruct_offline_fills()` — gap detection (INV-31 GTR)
+
+Every row has `exchange_order_id` (unique on exchange) — **no invented fills possible**.
+
+### What this fixes
+
+| Old Problem | New Behavior |
+|-------------|--------------|
+| Phantom fills in `bot_orders` with `status='reset_cleared'` | Ignored — `position_ledger` reads `exchange_fills` only |
+| Hedge bots invisible in `trades.open_qty` | Visible — all bots with fills in `exchange_fills` computed |
+| `trades.total_invested` drift after wipe/restart | Impossible — recomputed from immutable log |
+| Cross-cycle sweep double-counting | Impossible — `cycle_ceiling` bounds exact cycle |
 
 ---
 

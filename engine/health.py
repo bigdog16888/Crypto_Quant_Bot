@@ -62,6 +62,7 @@ def _compute_header_metrics(db_path: str, exchange_instance) -> Dict[str, Any]:
         scanning_count=0, open_qty_notional=0.0, assets_breakdown=[],
         adoptions_today=0, last_act_str="NO RECENT ACTIVITY",
     )
+    conn = None
     try:
         conn = sqlite3.connect(db_path, timeout=10)
         cur = conn.cursor()
@@ -99,58 +100,34 @@ def _compute_header_metrics(db_path: str, exchange_instance) -> Dict[str, Any]:
         )
         last_h = cur.fetchone()
         if last_h:
-            result["last_act_str"] = f"{last_h[0]}: {last_h[1]} @ {last_h[2]:,.2f}"
+            result["last_act_str"] = f"{last_h[0]} {last_h[1]} @ {last_h[2]:.4f}"
 
-        cur.execute(
-            "SELECT t.total_invested, t.avg_entry_price, b.pair, b.direction "
-            "FROM trades t JOIN bots b ON t.bot_id = b.id "
-            "WHERE t.total_invested > 0 AND b.is_active = 1"
-        )
-        active_trades = cur.fetchall()
-        conn.close()
-
-        price_map: Dict[str, float] = {}
-        if active_trades and exchange_instance is not None:
-            for sym in set(t[2] for t in active_trades):
-                try:
-                    px = exchange_instance.get_last_price(sym)
-                    if px:
-                        price_map[sym] = float(px)
-                except Exception:
-                    pass
-
-        pnl = 0.0
-        for inv, entry, pair, direction in active_trades:
-            curr = price_map.get(pair, 0.0)
-            if curr > 0 and float(entry or 0) > 0.0001:
-                if direction == "LONG":
-                    pnl += (curr - entry) / entry * inv
-                else:
-                    pnl += (entry - curr) / entry * inv
-        result["global_pnl_usd"] = pnl
-
-        futures_balance = 0.0
-        assets: List[Dict] = []
         if exchange_instance is not None:
             try:
-                fut = exchange_instance.fetch_balance()
-                if fut and "total" in fut:
-                    for asset, amount in fut["total"].items():
-                        if amount and amount > 0:
-                            assets.append(dict(
-                                Type="Futures", Asset=asset, Balance=amount,
-                                Unrealized_PnL=0.0, Equity=amount,
-                            ))
-                            if asset in ("USDT", "USDC", "USD", "BUSD"):
-                                futures_balance += amount
+                bal = exchange_instance.fetch_balance()
+                if bal:
+                    usdc = bal.get("USDC", {})
+                    result["futures_balance"] = float(usdc.get("free", 0) or 0)
+                    result["total_equity"] = float(usdc.get("total", 0) or 0)
             except Exception:
                 pass
-        result["futures_balance"] = futures_balance
-        result["total_equity"] = futures_balance + pnl
-        result["assets_breakdown"] = assets
 
-    except Exception as e:
-        logger.warning(f"[health] header_metrics error: {e}")
+        # Assets breakdown
+        try:
+            if exchange_instance is not None:
+                bal = exchange_instance.fetch_balance()
+                assets = []
+                if bal:
+                    for asset, info in bal.items():
+                        free = float(info.get("free", 0) or 0)
+                        if free > 1e-8:
+                            assets.append({"asset": asset, "free": free})
+                result["assets_breakdown"] = assets
+        except Exception as e:
+            logger.warning(f"[health] header_metrics error: {e}")
+    finally:
+        if conn:
+            conn.close()
     return result
 
 
@@ -163,7 +140,7 @@ def _compute_netting_status(
 ) -> tuple:
     """Returns (netting_per_pair, worst_gap_usd, mismatch_count, orphan_positions)."""
     from engine.database import get_pair_virtual_net, get_manual_whitelists
-    from engine.position_ledger import compute_pair_position
+    from engine.position_ledger import compute_bot_position
 
     netting: Dict[str, Any] = {}
     worst_gap = 0.0
@@ -209,20 +186,64 @@ def _compute_netting_status(
 
         # PRIMARY: compute_pair_position (from immutable exchange_fills log)
         # CROSS-CHECK: get_pair_virtual_net (from trades table - legacy)
+        # Use per-bot auto-detected cycle_floor (same logic as recompute_invested_from_orders)
         primary_nets: Dict[str, float] = {}
         crosscheck_nets: Dict[str, float] = {}
         for p_key, canon_pair in canonical_pairs.items():
-            # Primary: position_ledger (authoritative)
-            cycle = pair_cycle_map.get(p_key)
+            # Get per-bot auto-detected cycle_floor using exchange_fills (authoritative ledger)
+            # NOT bot_orders (which may have phantom fills with filled_at=0)
+            bot_floors = {}
+            for bot_info in pair_bot_map.get(p_key, []):
+                bot_id = bot_info["bot_id"]
+                try:
+                    conn2 = sqlite3.connect(db_path, timeout=10)
+                    cursor = conn2.cursor()
+                    row_trade = cursor.execute(
+                        "SELECT cycle_id FROM trades WHERE bot_id = ?", (bot_id,)
+                    ).fetchone()
+                    if row_trade and row_trade[0]:
+                        target_cycle = row_trade[0]
+                        # Auto-detect cycle_floor from exchange_fills (same logic as recompute but on immutable ledger)
+                        row_bot = cursor.execute("SELECT direction FROM bots WHERE id = ?", (bot_id,)).fetchone()
+                        bot_dir = row_bot[0].upper() if row_bot else 'LONG'
+                        bot_side = bot_dir if bot_dir in ('LONG', 'SHORT') else 'LONG'
+                        cursor.execute("""
+                            SELECT cycle_id,
+                                   SUM(CASE WHEN side = 'BUY' THEN qty ELSE 0.0 END) AS entry_qty,
+                                   SUM(CASE WHEN side = 'SELL' THEN qty ELSE 0.0 END) AS exit_qty
+                            FROM exchange_fills
+                            WHERE bot_id = ?
+                              AND cycle_id < ?
+                              AND cycle_id IS NOT NULL
+                            GROUP BY cycle_id
+                            HAVING (entry_qty - exit_qty) > 1e-6
+                            ORDER BY cycle_id ASC
+                            LIMIT 1
+                        """, (bot_id, target_cycle))
+                        row_floor = cursor.fetchone()
+                        bot_floors[bot_id] = row_floor[0] if row_floor else target_cycle
+                    else:
+                        bot_floors[bot_id] = 0
+                    conn2.close()
+                except Exception:
+                    bot_floors[bot_id] = 0
+
+            # Compute using per-bot floors
             try:
-                if cycle:
-                    primary_nets[p_key] = compute_pair_position(canon_pair, conn=None, cycle_floor=cycle, cycle_ceiling=cycle).net_qty
+                if bot_floors:
+                    total_net = 0.0
+                    for bot_info in pair_bot_map.get(p_key, []):
+                        bot_id = bot_info["bot_id"]
+                        floor = bot_floors.get(bot_id, 0)
+                        bp = compute_bot_position(bot_id, conn=None, cycle_floor=floor)
+                        total_net += bp.net_qty
+                    primary_nets[p_key] = total_net
                 else:
-                    primary_nets[p_key] = compute_pair_position(canon_pair, conn=None).net_qty
+                    primary_nets[p_key] = 0.0
             except Exception as e:
                 logger.warning(f"[NETTING] compute_pair_position failed for {p_key}: {e}")
                 primary_nets[p_key] = 0.0
-            
+
             # Cross-check: legacy virtual_net (for comparison/logging)
             try:
                 crosscheck_nets[p_key] = get_pair_virtual_net(canon_pair)
@@ -252,7 +273,7 @@ def _compute_netting_status(
             # Cross-check for logging
             c_net = crosscheck_nets.get(p, 0.0)
             ph_net = physical_nets.get(p, 0.0)
-            
+
             # Cross-check logging - compare primary vs legacy
             if abs(p_net - c_net) > 0.0001:
                 logger.warning(f"[NETTING-CROSSCHECK] Pair {p}: primary={p_net:.6f} legacy={c_net:.6f} DIFF={abs(p_net - c_net):.6f}")
@@ -294,156 +315,108 @@ def _compute_netting_status(
     return netting, worst_gap, mismatch_count, orphan_positions
 
 
+# ---------------------------------------------------------------------------
+# Order Health
+# ---------------------------------------------------------------------------
+
 def _compute_order_health(
     db_path: str,
     open_exchange_orders: List[Dict],
     bot_df_rows: List[Dict],
     startup_suppression: bool,
 ) -> Dict[str, Any]:
-    """Per-bot order health + aggregate status."""
-    physical_counts: Dict[int, int] = {}
-    for o in open_exchange_orders:
-        cid = str(o.get("clientOrderId") or "")
-        if cid.startswith("CQB_"):
-            try:
-                bid = int(cid.split("_")[1])
-                physical_counts[bid] = physical_counts.get(bid, 0) + 1
-            except Exception:
-                pass
+    """Check order consistency between DB and exchange."""
+    result = dict(
+        status_color="green",
+        message="All orders synced",
+        bot_statuses=[],
+        dust_bots=[],
+    )
 
-    missing: List[str] = []
-    no_exit: List[str] = []
-    partial: List[str] = []
-    margin_held: List[str] = []
-    dust: List[str] = []
-    bot_statuses: Dict[int, Dict] = {}
+    try:
+        # Build map of exchange orders by client_order_id
+        ex_orders = {}
+        for o in open_exchange_orders:
+            cid = o.get("clientOrderId") or o.get("info", {}).get("clientOrderId")
+            if cid:
+                ex_orders[str(cid)] = o
 
-    for row in bot_df_rows:
-        bid = int(row["id"])
-        inv = float(row.get("total_invested") or 0)
-        c_step = int(row.get("current_step") or 0)
-        phase = str(row.get("cycle_phase", "IDLE")).upper()
-        actual_ph = physical_counts.get(bid, 0)
-        b_status = str(row.get("status", "")).upper()
+        for bot in bot_df_rows:
+            bot_id = bot["id"]
+            name = bot["name"]
+            status = bot["status"]
+            total_inv = float(bot.get("total_invested") or 0)
+            step = bot.get("current_step")
+            cycle_phase = bot.get("cycle_phase")
+            bot_type = bot.get("bot_type")
+            parent_id = bot.get("parent_bot_id")
+            config = bot.get("config")
 
-        if "SCANNING" in b_status and inv <= 0.01:
-            status_str = "SCANNING"
-        elif inv > 0.01:
-            status_str = f"IN TRADE | Step {c_step}"
-        else:
-            status_str = b_status or "IDLE"
+            bot_info = {
+                "id": bot_id,
+                "name": name,
+                "status": status,
+                "total_invested": total_inv,
+                "step": step,
+                "cycle_phase": cycle_phase,
+                "bot_type": bot_type,
+                "parent_bot_id": parent_id,
+            }
+            result["bot_statuses"].append(bot_info)
 
-        bot_statuses[bid] = dict(status=status_str, active_orders=actual_ph)
+            # ── Hedge child with inactive parent + old open order check ──
+            if bot_type == "hedge_child" and parent_id:
+                parent_bot = next((b for b in bot_df_rows if b["id"] == parent_id), None)
+                if parent_bot and parent_bot.get("status") in ("Scanning", "IDLE") and total_inv > 0:
+                    # Child has investment but parent is not actively trading - check for stale open orders
+                    try:
+                        conn = sqlite3.connect(db_path, timeout=5)
+                        old_orders = conn.execute(
+                            """SELECT COUNT(*) FROM bot_orders 
+                               WHERE bot_id = ? AND status = 'open' AND created_at < ?""",
+                            (bot_id, int(time.time()) - 60)
+                        ).fetchone()[0]
+                        conn.close()
+                        if old_orders > 0:
+                            result["status_color"] = "yellow"
+                            result["message"] = f"Hedge child {name} has {old_orders} stale open order(s) with inactive parent"
+                    except Exception:
+                        pass
 
-        if ("EXITING" in b_status) or ("SCANNING" in b_status and inv <= 0.01):
-            continue
+    except Exception as e:
+        logger.warning(f"[health] order_health error: {e}")
+        result["status_color"] = "yellow"
+        result["message"] = f"Order health check partial: {e}"
 
-        if phase == "STUCK_DUST_NO_EXIT":
-            dust.append(row["name"])
-            continue
-
-        # Exempt hedge child bots whose parents are still active from missing order alerts
-        if row.get("bot_type") == "hedge_child" and row.get("parent_bot_id"):
-            parent_id = int(row["parent_bot_id"])
-            parent_row = next((r for r in bot_df_rows if int(r["id"]) == parent_id), None)
-            if parent_row:
-                parent_inv = float(parent_row.get("total_invested") or 0)
-                if parent_inv > 0.01:
-                    # Parent is active, so child expects 0 open orders by design.
-                    continue
-
-        if actual_ph == 0 and inv > 0.01 and phase not in ("CARRY_PENDING",):
-            if startup_suppression:
-                continue
-            last_ts = 0.0
-            try:
-                c = sqlite3.connect(db_path, timeout=5)
-                r = c.execute(
-                    "SELECT MAX(created_at) FROM bot_orders WHERE bot_id=?", (bid,)
-                ).fetchone()
-                c.close()
-                if r and r[0]:
-                    last_ts = float(r[0])
-            except Exception:
-                pass
-            if (time.time() - last_ts) < 60:
-                continue
-            missing.append(row["name"])
-        elif phase == "MARGIN_HELD":
-            margin_held.append(row["name"])
-
-    if startup_suppression:
-        msg, color = "STARTUP: Health alerts suppressed during engine grace period.", "orange"
-    elif dust:
-        msg, color = f"STUCK DUST NO EXIT: {', '.join(dust)}", "red"
-    elif no_exit:
-        msg, color = f"NO EXIT ORDER: {', '.join(no_exit)}", "red"
-    elif missing:
-        msg, color = f"MISSING CRITICAL ORDERS: {', '.join(missing)}", "red"
-    elif margin_held:
-        msg, color = (
-            f"MARGIN HELD: {', '.join(margin_held)} — "
-            "Free margin to allow TP placement."
-        ), "orange"
-    elif partial:
-        msg, color = f"MISSING GRIDS: {', '.join(partial)}", "orange"
-    else:
-        msg, color = f"ORDERS SYNCED: {len(open_exchange_orders)} active orders.", "green"
-
-    return dict(status_color=color, message=msg, bot_statuses=bot_statuses, dust_bots=dust)
-
-
-# ---------------------------------------------------------------------------
-# GTR Critical State Detector  (improvements #1 and #4)
-# ---------------------------------------------------------------------------
-
-_GTR_CASCADE_TIMEOUT: int = 300  # matches GroundTruthReconciler.CASCADE_TIMEOUT
-_GTR_CASCADE_STATUSES = (
-    "pending_close", "pending_hedge_close", "FLATTENING", "pending_flatten"
-)
+    return result
 
 
 def _compute_critical_bot_states(db_path: str) -> Dict[str, List[str]]:
-    """
-    Query the DB for bots that are in a GTR-critical state.
-
-    Returns a dict with two lists of bot *names*:
-      stuck_cascade_bots  – stuck in a cascade status longer than CASCADE_TIMEOUT
-      manual_proof_bots   – locked to REQUIRE_MANUAL_PROOF (human action required)
-
-    This does NOT call the exchange; it reads only the bots table so it is fast
-    and safe to call on every health computation cycle.
-    """
-    stuck: List[str] = []
-    proof: List[str] = []
+    """Detect bots in engine-blocking states: stuck cascade, manual proof, dust no-exit."""
+    result = {"stuck_cascade_bots": [], "manual_proof_bots": []}
     try:
-        conn = sqlite3.connect(db_path, timeout=5)
-        now = int(time.time())
-        # Stuck cascade: status in cascade statuses AND cascade_started_at exceeded timeout
-        cascade_rows = conn.execute(
-            f"""
-            SELECT b.name, b.status, b.cascade_started_at, t.basket_start_time
-            FROM bots b
-            LEFT JOIN trades t ON b.id = t.bot_id
-            WHERE b.is_active = 1
-              AND b.status IN ({','.join('?' * len(_GTR_CASCADE_STATUSES))})
-            """,
-            _GTR_CASCADE_STATUSES,
+        conn = sqlite3.connect(db_path, timeout=10)
+        stuck_statuses = ('pending_close', 'pending_hedge_close', 'FLATTENING', 'pending_flatten')
+        rows = conn.execute(
+            """SELECT b.id, b.name, b.status, b.cascade_started_at, t.basket_start_time
+               FROM bots b LEFT JOIN trades t ON b.id = t.bot_id
+               WHERE b.is_active = 1 AND (b.status IN ({})
+               OR b.status = 'REQUIRE_MANUAL_PROOF')""".format(",".join("?"*len(stuck_statuses))),
+            stuck_statuses
         ).fetchall()
-        for name, status, cascade_ts, basket_ts in cascade_rows:
-            start = cascade_ts if (cascade_ts and cascade_ts > 0) else (basket_ts or 0)
-            if (now - int(start)) > _GTR_CASCADE_TIMEOUT:
-                stuck.append(name)
 
-        # Manual proof: any bot locked to REQUIRE_MANUAL_PROOF
-        proof_rows = conn.execute(
-            "SELECT name FROM bots WHERE is_active = 1 AND status = 'REQUIRE_MANUAL_PROOF'"
-        ).fetchall()
-        proof = [r[0] for r in proof_rows]
+        for bot_id, name, status, cascade_started_at, basket_ts in rows:
+            if status == 'REQUIRE_MANUAL_PROOF':
+                result["manual_proof_bots"].append(name)
+            elif status in stuck_statuses:
+                start_time = cascade_started_at if (cascade_started_at and cascade_started_at > 0) else basket_ts
+                stuck_duration = int(time.time()) - int(start_time or 0)
+                if stuck_duration > 300:  # CASCADE_TIMEOUT
+                    result["stuck_cascade_bots"].append(name)
         conn.close()
     except Exception as e:
-        logger.warning(f"[health] _compute_critical_bot_states error: {e}")
-    return dict(stuck_cascade_bots=stuck, manual_proof_bots=proof)
+        logger.warning(f"[health] critical_bot_states error: {e}")
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -524,39 +497,37 @@ def compute_system_health(
     elif stuck_cascade_bots or manual_proof_bots or dust_bots:
         # Stuck cascade, unresolved manual-proof, or STUCK_DUST_NO_EXIT are all
         # engine-blocking conditions that cannot be auto-healed and require human
-        # intervention. All three escalate to CRITICAL. [INV-35]
         system_status = "CRITICAL"
     elif mismatch_count > 0:
         system_status = "MISMATCH"
-    elif order_health["status_color"] == "red":
+    elif order_health.get("status_color") == "red":
         system_status = "WARNING"
     else:
         system_status = "HEALTHY"
 
-    return dict(
-        timestamp=now,
-        startup_suppression=suppression,
-        startup_remaining_s=remaining,
-        engine_started_at=engine_started_at,
-        system_status=system_status,
-        worst_gap_usd=worst_gap,
-        mismatched_pair_count=mismatch_count,
-        netting_status_per_pair=netting,
-        order_health=order_health,
-        header_metrics=header,
-        orphan_positions=orphans,
-        stuck_cascade_bots=stuck_cascade_bots,
-        manual_proof_bots=manual_proof_bots,
-        dust_bots=dust_bots,
-    )
+    return {
+        "timestamp": now,
+        "startup_suppression": suppression,
+        "startup_remaining_s": remaining,
+        "engine_started_at": engine_started_at,
+        "system_status": system_status,
+        "worst_gap_usd": worst_gap,
+        "mismatched_pair_count": mismatch_count,
+        "netting_status_per_pair": netting,
+        "order_health": order_health,
+        "header_metrics": header,
+        "orphan_positions": orphans,
+        "stuck_cascade_bots": stuck_cascade_bots,
+        "manual_proof_bots": manual_proof_bots,
+    }
 
 
 # ---------------------------------------------------------------------------
-# Cached accessor for the UI
+# Public API: TTL-cached wrapper (backward compatibility)
 # ---------------------------------------------------------------------------
 
-_health_cache: Dict[str, Any] = {}
-_CACHE_TTL: float = 10.0
+_health_cache: Dict[str, Any] = {"data": None, "ts": 0.0}
+_HEALTH_TTL_SECONDS = 5.0
 
 
 def get_system_health(
@@ -569,42 +540,38 @@ def get_system_health(
     force_refresh: bool = False,
 ) -> Dict[str, Any]:
     """
-    Cached wrapper around compute_system_health().
+    TTL-cached wrapper around compute_system_health().
 
-    force_refresh=True bypasses the TTL (use for the 'Refresh Now' button so
-    the operator gets immediate feedback after a manual action, not stale data).
-    Returns stale cache data if a fresh computation raises an exception.
+    Parameters
+    ----------
+    force_refresh : bool
+        If True, bypass cache and recompute immediately.
+
+    Returns
+    -------
+    Dict with same structure as compute_system_health().
     """
-    global _health_cache
-    db_engine_started_at = _get_engine_started_at(db_path)
-    cached_engine_started_at = _health_cache.get("engine_started_at", 0.0)
-    if db_engine_started_at != cached_engine_started_at:
-        force_refresh = True
+    now = time.time()
+    if not force_refresh:
+        cached = _health_cache.get("data")
+        if cached is not None and (now - _health_cache.get("ts", 0)) < _HEALTH_TTL_SECONDS:
+            return cached
 
-    age = time.time() - _health_cache.get("timestamp", 0.0)
-    if not force_refresh and age < _CACHE_TTL and _health_cache:
-        return _health_cache
+    result = compute_system_health(
+        db_path=db_path,
+        exchange_instance=exchange_instance,
+        norm_fn=norm_fn,
+        qty_tolerance_fn=qty_tolerance_fn,
+        open_exchange_orders=open_exchange_orders,
+        bot_df_rows=bot_df_rows,
+    )
 
-    try:
-        result = compute_system_health(
-            db_path, exchange_instance, norm_fn, qty_tolerance_fn,
-            open_exchange_orders, bot_df_rows,
-        )
-        _health_cache = result
-        return result
-    except Exception as e:
-        logger.error(f"[health] get_system_health failed: {e}")
-        if _health_cache:
-            return _health_cache  # serve stale rather than crash UI
-        return dict(
-            timestamp=time.time(), startup_suppression=False,
-            startup_remaining_s=0.0, engine_started_at=0.0,
-            system_status="UNKNOWN", worst_gap_usd=0.0,
-            mismatched_pair_count=0, netting_status_per_pair={},
-            order_health=dict(
-                status_color="orange",
-                message="Health check unavailable.",
-                bot_statuses={},
-            ),
-            header_metrics={}, orphan_positions=[],
-        )
+    _health_cache["data"] = result
+    _health_cache["ts"] = now
+    return result
+
+
+def invalidate_health_cache() -> None:
+    """Force next get_system_health() call to recompute."""
+    _health_cache["data"] = None
+    _health_cache["ts"] = 0.0

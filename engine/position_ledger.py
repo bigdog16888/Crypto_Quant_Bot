@@ -71,14 +71,34 @@ class PairPosition:
 
 
 def _fetch_fills_for_bot(conn: sqlite3.Connection, bot_id: int, cycle_floor: int = None, cycle_ceiling: int = None) -> List[Fill]:
-    """Fetch all fills for a bot, optionally filtered by cycle_floor/cycle_ceiling."""
+    """Fetch all fills for a bot, optionally filtered by cycle_floor/cycle_ceiling.
+    
+    Filters by the bot's configured pair (both CCXT format and normalized WS format)
+    to prevent cross-pair contamination from backfill errors.
+    """
+    from engine.exchange_interface import normalize_symbol
+    
+    # Get bot's configured pair to filter fills by symbol
+    bot_config = _get_bot_config(conn, bot_id)
+    if not bot_config:
+        return []  # Bot not found, no fills
+    
+    # Use normalized_pair if available, otherwise normalize the pair field
+    bot_pair_raw = bot_config.get('normalized_pair') or bot_config.get('pair', '')
+    bot_norm = normalize_symbol(bot_pair_raw).upper()
+    bot_pair = bot_config.get('pair', '')  # Keep original for exact match fallback
+    
+    # Register normalize_symbol as SQLite UDF (idempotent - safe to call multiple times)
+    conn.create_function("normalize_symbol", 1, lambda s: normalize_symbol(s).upper() if s else "")
+    
     sql = """
         SELECT exchange_order_id, client_order_id, symbol, side, qty, price,
                fee, fee_asset, fill_ts, source, bot_id, order_type, step, cycle_id, raw_json
         FROM exchange_fills
         WHERE bot_id = ?
+          AND (symbol = ? OR normalize_symbol(symbol) = ?)
     """
-    params = [bot_id]
+    params = [bot_id, bot_pair, bot_norm]
     if cycle_floor is not None:
         sql += " AND cycle_id >= ?"
         params.append(cycle_floor)
@@ -146,13 +166,13 @@ def _fetch_fills_for_pair(conn: sqlite3.Connection, pair: str, cycle_floor: int 
 
 
 def _get_bot_config(conn: sqlite3.Connection, bot_id: int) -> Optional[Dict[str, Any]]:
-    """Fetch bot config (pair, direction)."""
+    """Fetch bot config (pair, normalized_pair, direction)."""
     row = conn.execute(
-        "SELECT id, name, pair, direction FROM bots WHERE id = ?",
+        "SELECT id, name, pair, normalized_pair, direction FROM bots WHERE id = ?",
         (bot_id,)
     ).fetchone()
     if row:
-        return {'id': row[0], 'name': row[1], 'pair': row[2], 'direction': row[3]}
+        return {'id': row[0], 'name': row[1], 'pair': row[2], 'normalized_pair': row[3], 'direction': row[4]}
     return None
 
 
@@ -399,7 +419,8 @@ def backfill_exchange_fills_from_bot_orders(
     """
     Backfill exchange_fills from historical bot_orders data.
     Useful for populating the immutable log with pre-existing fills.
-    Only inserts where exchange_order_id is present and status indicates fill.
+    Only inserts where exchange_order_id is present, status indicates fill,
+    AND there is REAL exchange confirmation (filled_at > 0).
     """
     sql = """
         SELECT bo.bot_id, bo.order_id, bo.client_order_id, bo.order_type, bo.filled_amount, bo.price,
@@ -410,6 +431,7 @@ def backfill_exchange_fills_from_bot_orders(
           AND bo.order_id IS NOT NULL
           AND bo.order_id != ''
           AND bo.status IN ('filled', 'partially_filled', 'reset_cleared')
+          AND bo.filled_at > 0
     """
     params = []
     if bot_id:

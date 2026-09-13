@@ -2,6 +2,27 @@
 
 All notable **architecture** changes are documented here. Version numbers match `CODEBASE_GUIDE.md`, `config/settings.py`, and `docs/ARCHITECTURE_v3.x.md`.
 
+## v5.4.0 — 2026-09-13 — Phase 4/5: Immutable Fills Architecture Migration Complete
+
+**Phase 4: Promote canonical reconciliation to primary, legacy as cross-check**
+- **engine/position_ledger.py** (NEW): Canonical position computation from immutable `exchange_fills` log. Pure, read-only, deterministic. Replaces fragile dual-write state (`trades.total_invested`, `bot_orders.status`, `trades.open_qty`).
+- **engine/health.py** (REWRITTEN): Single authoritative `compute_system_health()` now uses `compute_pair_position()` as PRIMARY netting source. Legacy `get_pair_virtual_net()` demoted to CROSS-CHECK ONLY with explicit diff logging.
+- **engine/database.py**: `audit_pair_ledger_vs_exchange()` now uses `compute_pair_position()` as primary; `get_pair_virtual_net()` retained as legacy cross-check.
+- **engine/parity_gates.py**: Consumes `compute_pair_position()` output for all parity decisions.
+- **ui/views/monitor.py** & Telegram commands: Routed through `compute_pair_position()`.
+
+**Phase 5: Migration cleanup & per-bot verification**
+- Startup heal (`scripts/run_startup_heal.py`): All 11 canonical pairs pass 0.0 delta legacy vs live exchange.
+- Per-bot verification complete: 156 phantom rows removed affected bots 10018, 100318, 100323 (SUI), 10008/100001/100315/100324 (SOL), 10016/10022/100317 (BTC), 10011/10021/100002/100316/100325 (ETH), 10007/100314 (BNB).
+- **Key finding**: Legacy `trades` table only tracked primary bot per pair — hedge bots invisible. New `position_ledger` correctly includes ALL bots from `exchange_fills`.
+- Live engine cycling (30+ min, `--no-trading`): No CRITICAL errors on active trading bots. Expected `PAIR-LEDGER-MISMATCH` errors on hedged pairs (primary sums all bots, exchange shows net).
+
+**Remaining before production-ready** (tracked in `docs/PHASE_4_5_COMPLETION_REPORT.md`):
+- Phase 4 deprecation: Remove `status='reset_cleared'` mutations, replace with `cycle_is_closed()` query
+- Phase 5 cleanup: Remove `trades.open_qty`, `wipe_wall_ts`, `cycle_phase` as authoritative
+- Hedge-aware netting in pair parity gates (compare direction-netted sum to exchange net)
+- 2-week shadow mode divergence monitoring
+
 ## v5.3.7 — 2026-07-10 — bot_has_recent_order_activity helper & monitor.py refactor
 - **engine/database.py**:
   - Added thread-safe `bot_has_recent_order_activity()` database helper.
