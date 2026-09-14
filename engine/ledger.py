@@ -240,6 +240,7 @@ def credit_fill(
     exchange = None,
     suppress_cascade: bool = False,
     caller: str = '',
+    side: str = '',  # REAL EXCHANGE SIDE ('BUY' or 'SELL')
 ) -> bool:
     from engine.write_queue import WriteQueue
     return WriteQueue().put_and_wait(
@@ -255,6 +256,7 @@ def credit_fill(
         exchange=exchange,
         suppress_cascade=suppress_cascade,
         caller=caller,
+        side=side,
     )
 
 def _credit_fill_internal(
@@ -269,6 +271,7 @@ def _credit_fill_internal(
     exchange = None,
     suppress_cascade: bool = False,
     caller: str = '',
+    side: str = '',  # REAL EXCHANGE SIDE ('BUY' or 'SELL')
 ) -> bool:
     """
     Record a fill (or partial fill) in bot_orders.
@@ -600,6 +603,58 @@ def _credit_fill_internal(
         # One-way shared book netting logic removed under ADR-006. Independent accounting active.
 
         conn.commit()
+
+        # ── DUAL-WRITE TO IMMUTABLE EXCHANGE_FILLS LOG ──────────────────────────
+        # Write the confirmed fill to the append-only exchange_fills log for
+        # canonical position computation (position_ledger). Uses real exchange
+        # side if provided, otherwise infers from bot direction + order_type.
+        try:
+            if side and side.upper() in ('BUY', 'SELL'):
+                fill_side = side.upper()
+            else:
+                # Infer side: LONG bots BUY entries, SELL exits; SHORT bots SELL entries, BUY exits
+                _bot_dir = conn.execute(
+                    "SELECT direction FROM bots WHERE id = ?", (bot_id,)
+                ).fetchone()
+                _is_long = _bot_dir and 'long' in str(_bot_dir[0]).lower()
+                if _otype_lower in _ENTRY_TYPES:
+                    fill_side = 'BUY' if _is_long else 'SELL'
+                else:
+                    fill_side = 'SELL' if _is_long else 'BUY'
+
+            # Guard (2026-09-14): delta<=0 on a cumulative call = replay or
+            # sync-reduction — nothing NEW to log (writing cumulative_qty would
+            # double-count the earlier delta row; UNIQUE(exchange_order_id,
+            # fill_ts, qty, price) does not dedupe it — qty differs).
+            # Incremental calls (is_cumulative=False) are exempt: their
+            # cumulative_qty parameter IS the new increment.
+            _log_fill = not (delta <= 0 and is_cumulative)
+
+            from engine.database import record_exchange_fill
+            _pair = conn.execute(
+                "SELECT pair FROM bots WHERE id = ?", (bot_id,)
+            ).fetchone()
+            _symbol = _pair[0] if _pair else 'UNKNOWN'
+            
+            if _log_fill:
+                record_exchange_fill(
+                    conn=conn,
+                    exchange_order_id=order_id,
+                    client_order_id=row_cid or '',
+                    symbol=_symbol,
+                    side=fill_side,
+                    qty=delta if delta > 0 else cumulative_qty,  # delta for new cumulative credit; cumulative_qty for incremental calls
+                    price=avg_price if avg_price > 0 else 0.0,
+                    fill_ts=actual_fill_ts,
+                    source=caller or 'unknown',
+                    bot_id=bot_id,
+                    order_type=order_type,
+                    step=row_step,
+                    cycle_id=row_cycle,
+                )
+        except Exception as _ef_err:
+            logger.warning(f"[EXCHANGE-FILLS] Dual-write failed for bot {bot_id} order {order_id}: {_ef_err}")
+        # ─────────────────────────────────────────────────────────────────────────
 
         # Trigger hedge child signal if parent bot grid/entry fill is credited
         # This is for Fix 3A (real-time/online path)
