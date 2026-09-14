@@ -16,6 +16,9 @@ Keys returned
   worst_gap_usd          float
   mismatched_pair_count  int
   netting_status_per_pair dict  - keyed by normalised pair string
+    per pair: drift_detected (tier-1: floor..now ledger net vs exchange),
+              ledger_net / ledger_imbalance / ledger_diff_qty / ledger_diff_usd
+              (tier-2: FULL-HISTORY exchange_fills net vs exchange physical)
   order_health           dict   - {status_color, message, bot_statuses}
   header_metrics         dict   - all header tile values
   orphan_positions       list   - exchange positions with no bot ownership
@@ -188,6 +191,7 @@ def _compute_netting_status(
         # CROSS-CHECK: get_pair_virtual_net (from trades table - legacy)
         # Use per-bot auto-detected cycle_floor (same logic as recompute_invested_from_orders)
         primary_nets: Dict[str, float] = {}
+        ledger_nets: Dict[str, float] = {}  # tier-2: full-history net per pair
         crosscheck_nets: Dict[str, float] = {}
         for p_key, canon_pair in canonical_pairs.items():
             # Get per-bot auto-detected cycle_floor using exchange_fills (authoritative ledger)
@@ -229,20 +233,40 @@ def _compute_netting_status(
                     bot_floors[bot_id] = 0
 
             # Compute using per-bot floors
+            # TWO-TIER CHECK:
+            #   tier-1 (drift)  = net from auto-detected cycle_floor onward (unchanged semantics)
+            #   tier-2 (ledger) = net from cycle 0 onward = FULL HISTORY (new)
+            # Both calls now use an explicit connection bound to THIS db_path.
+            # The old conn=None fallback (get_connection()) silently bound every
+            # caller to the live DB instead of the db_path passed in.
+            conn_pair = None
             try:
                 if bot_floors:
                     total_net = 0.0
+                    total_net_full = 0.0
+                    conn_pair = sqlite3.connect(db_path, timeout=10)
                     for bot_info in pair_bot_map.get(p_key, []):
                         bot_id = bot_info["bot_id"]
                         floor = bot_floors.get(bot_id, 0)
-                        bp = compute_bot_position(bot_id, conn=None, cycle_floor=floor)
+                        bp = compute_bot_position(bot_id, conn=conn_pair, cycle_floor=floor)
                         total_net += bp.net_qty
+                        bp_full = compute_bot_position(bot_id, conn=conn_pair, cycle_floor=0, cycle_ceiling=None)
+                        total_net_full += bp_full.net_qty
                     primary_nets[p_key] = total_net
+                    ledger_nets[p_key] = total_net_full
                 else:
                     primary_nets[p_key] = 0.0
+                    ledger_nets[p_key] = 0.0
             except Exception as e:
                 logger.warning(f"[NETTING] compute_pair_position failed for {p_key}: {e}")
                 primary_nets[p_key] = 0.0
+                ledger_nets[p_key] = 0.0
+            finally:
+                if conn_pair is not None:
+                    try:
+                        conn_pair.close()
+                    except Exception:
+                        pass
 
             # Cross-check: legacy virtual_net (for comparison/logging)
             try:
@@ -273,6 +297,7 @@ def _compute_netting_status(
             # Cross-check for logging
             c_net = crosscheck_nets.get(p, 0.0)
             ph_net = physical_nets.get(p, 0.0)
+            l_net = ledger_nets.get(p, 0.0)  # tier-2: full-history ledger net
 
             # Cross-check logging - compare primary vs legacy
             if abs(p_net - c_net) > 0.0001:
@@ -291,13 +316,20 @@ def _compute_netting_status(
             if diff_usd > worst_gap:
                 worst_gap = diff_usd
 
-            # Drift detection uses PRIMARY (position_ledger)
+            # Tier-2: full-history ledger imbalance vs exchange physical position
+            ledger_diff_qty = round(abs(l_net - ph_net), 8)
+            ledger_diff_usd = ledger_diff_qty * ref_price
+            ledger_imbalance = (ledger_diff_qty > tol or ledger_diff_usd > 5.0) and not startup_suppression
+
+            # Tier-1 drift detection uses PRIMARY (position_ledger, floor..now window)
             drift = (diff_qty > tol or diff_usd > 5.0) and not startup_suppression
             if drift:
                 mismatch_count += 1
 
             netting[p] = dict(
                 pair=p, primary_net=p_net, crosscheck_net=c_net, physical_net=ph_net,
+                ledger_net=l_net, ledger_imbalance=ledger_imbalance,
+                ledger_diff_qty=ledger_diff_qty, ledger_diff_usd=ledger_diff_usd,
                 diff_qty=diff_qty, diff_usd=diff_usd,
                 drift_detected=drift, ref_price=ref_price,
                 tolerance=tol, bots=pair_bot_map.get(p, []),
@@ -498,7 +530,8 @@ def compute_system_health(
         # Stuck cascade, unresolved manual-proof, or STUCK_DUST_NO_EXIT are all
         # engine-blocking conditions that cannot be auto-healed and require human
         system_status = "CRITICAL"
-    elif mismatch_count > 0:
+    elif mismatch_count > 0 or any(v.get("ledger_imbalance") for v in netting.values()):
+        # Tier-2: full-history ledger imbalance also escalates to MISMATCH
         system_status = "MISMATCH"
     elif order_health.get("status_color") == "red":
         system_status = "WARNING"
