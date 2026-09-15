@@ -4418,6 +4418,7 @@ def verify_filled_orders_against_exchange(exchange, bot_id: int = None) -> int:
                     order_type=str(otype).lower(),
                     is_cumulative=True,
                     sync_to_exchange=True,
+                    side=exch_order.get('side', ''),  # REAL EXCHANGE SIDE
                 )
                 bots_sealed.add(bid)
                 healed += 1
@@ -4451,6 +4452,7 @@ def verify_filled_orders_against_exchange(exchange, bot_id: int = None) -> int:
                 avg_price=ex_price,
                 order_type=str(otype).lower(),
                 is_cumulative=True,
+                side=exch_order.get('side', ''),  # REAL EXCHANGE SIDE
             )
             bots_sealed.add(bid)
             healed += 1

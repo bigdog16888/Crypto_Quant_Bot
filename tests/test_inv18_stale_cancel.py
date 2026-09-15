@@ -269,6 +269,7 @@ class TestInv18StaleCancel(unittest.TestCase):
                     order_type='grid',
                     is_cumulative=True,
                     caller='cancel_verify',
+                    side='',  # mocked exchange order carries no side (2026-09-15 wiring)
                 )
                 mock_seal.assert_called_once_with(bot_id)
 

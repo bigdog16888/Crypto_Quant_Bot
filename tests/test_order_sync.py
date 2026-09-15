@@ -100,6 +100,7 @@ class TestOrderSync(unittest.TestCase):
                 is_cumulative=True,
                 sync_to_exchange=True,
                 caller='stale_sync',
+                side='',  # mocked exchange order carries no side -> empty passthrough (2026-09-15 wiring)
             )
             mock_seal.assert_called_once_with(10018)
 
@@ -312,6 +313,7 @@ class TestOrderSync(unittest.TestCase):
                 is_cumulative=True,
                 sync_to_exchange=True,
                 caller='stale_sync',
+                side='',  # mocked exchange order carries no side -> empty passthrough (2026-09-15 wiring)
             )
             mock_tp_comp.assert_not_called()
 
@@ -506,7 +508,8 @@ class TestOrderSync(unittest.TestCase):
                 avg_price=1.2,
                 order_type='grid',
                 is_cumulative=True,
-                suppress_cascade=True
+                suppress_cascade=True,
+                side=''  # mocked exchange order carries no side (2026-09-15 wiring)
             )
             self.assertEqual(call_order, ['credit_fill', 'cancel_order'])
             

@@ -1865,7 +1865,8 @@ class BotExecutor:
                             cumulative_qty=filled_qty,
                             avg_price=float(cancel_response.get('average') or cancel_response.get('price') or 0),
                             order_type='tp',
-                            is_cumulative=True
+                            is_cumulative=True,
+                            side=cancel_response.get('side', ''),  # REAL EXCHANGE SIDE
                         )
                     except Exception as _sync_err:
                         logger.warning(f"[TP-SYNC] Ledger sync failed: {_sync_err}")
@@ -2629,6 +2630,9 @@ class BotExecutor:
                     _oid, _cid, _filled, _px, _status = _row
                     if _filled and float(_filled) > 0 and float(bot_status.get('total_invested', 0)) <= 0:
                         from engine.ledger import credit_fill, seal_trade_state
+                        # side= intentionally omitted (2026-09-15): ENTRY-ANCHOR reads a bot_orders
+                        # DB row — no exchange response in scope; recovery stays on direction+
+                        # order_type inference (exact for entries).
                         _ok = credit_fill(bot_id, str(_oid), float(_filled), float(_px), 'entry', is_cumulative=True)
                         if _ok:
                             seal_trade_state(bot_id)
@@ -2849,7 +2853,8 @@ class BotExecutor:
                                     cumulative_qty=order_filled,
                                     avg_price=order_avg,
                                     order_type='entry',
-                                    is_cumulative=True
+                                    is_cumulative=True,
+                                    side=order.get('side', ''),  # REAL EXCHANGE SIDE
                                 )
                                 if credited:
                                     seal_trade_state(bot_id)

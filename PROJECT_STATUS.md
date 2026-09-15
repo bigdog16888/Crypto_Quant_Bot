@@ -17,8 +17,9 @@
 **WARNING for next engine start:** the two-tier path has never run in production. Whitelisted migration-era orphans (BNBUSDC SHORT 0.04, SOLUSDC LONG 0.6, SUIUSDC LONG 202, XAUUSDT LONG 0.016) may legitimately trip tier-2 `ledger_imbalance` → MISMATCH on first start. **Expected, not a regression** — resolve via whitelist/manual proof, not by weakening the check.
 
 **Open follow-ups from tonight (do not lose):**
-1. `side=` caller-wiring — no production caller passes `side=` yet; all live dual-writes use inferred side (correct for verified hedge children, but unwired design intent).
+1. `side=` caller-wiring — RESOLVED 09-15: all 7 exchange-response call sites now pass the real exchange side; ENTRY-ANCHOR (~2632) stays on inference by design (documented inline). Verified by `tests/test_explicit_side_wiring.py` (explicit `side=` beats SHORT-entry inference, end-to-end through WriteQueue to `exchange_fills`).
 2. `test_gate_blocks_when_require_manual_proof` — fails identically at clean HEAD (pre-existing, needs root-cause).
+3. **Playwright (backlog, low priority)** — `pytest-playwright` missing from BOTH venvs (Hermes 3.11 and Py3.10), so `tests/test_playwright_ui.py` errors at collection. Blocks UI tests only, no money logic. Install on Py3.10 when convenient: `py -3.10 -m pip install pytest-playwright`.
 
 **Morning's work (unchanged, see below for detail):** BTC 0.008 phantom orphan closed (Decision A), rsi_limit NULL crash fixed (`711fd92`), clean 20-min run, Phase 5 replays ✅.
 

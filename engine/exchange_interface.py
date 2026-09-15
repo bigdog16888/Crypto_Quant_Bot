@@ -1374,7 +1374,8 @@ class ExchangeInterface:
                             avg_price=avg_price,
                             order_type=order_type,
                             is_cumulative=True,
-                            suppress_cascade=True
+                            suppress_cascade=True,
+                            side=order.get('side', ''),  # REAL EXCHANGE SIDE
                         )
                         update_order_status(order_id, 'cancelled', bot_id=bot_id, filled_qty=ex_filled)
                     
