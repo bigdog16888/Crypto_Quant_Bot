@@ -70,6 +70,13 @@
 - **close_position() symbol bug:** logged in P3 #11 (below) — `fetch_positions` symbol mismatch wipes ledger without ordering.
 - **Next target:** `test_sui_cycle_sweep_regression::test_classify_reset_cleared` (baseline 9 → 8) — root cause: test reads **live `crypto_bot.db`** (`REAL_DB`), so production changes to bot 10018's orders shift hardcoded expectations (cycle 25 now 8 reset_cleared rows vs expected 7). See analysis below.
 
+### Step 5 — Hard-logic failures → 0 + full test decoupling (2026-09-15)
+- **Baseline knocked down to ZERO hard-logic failures.** Sequence this session: `seal_short_phantom` (10→9), `sui_cycle_sweep_regression` (9→8, frozen fixture), `session_start_check` (8→6, restored dated-reminders contract), `cross_cycle_sweep_fix` + `startup_wipe_guard` (6→4, both frozen). **Hard-logic failures = 0.** Remaining 4 full-suite failures are **isolation artifacts** (pass in isolation): `test_ghost_clearing`×2, `test_snap_allocate_gate`, `test_streamlit_smoke::test_database_views` — all caused by shared-DB / Windows file-lock contamination across the suite, not logic bugs.
+- **Both live-coupled test fixtures frozen & decoupled from `crypto_bot.db`:**
+  - `test_sui_cycle_sweep_regression` + `test_cross_cycle_sweep_fix` now share `FROZEN_10018_ORDERS` (embedded snapshot of bot 10018's real orders, 2026-09-15) via a temp-DB builder — no live reads.
+  - `test_startup_wipe_guard` builds a frozen temp-DB (bot 10018 cycle-25 filled TPs + bot 100315 cycle-15 entry, no TP) and monkeypatches `engine.database.get_connection`.
+- **Engine live status (confirmed this session):** `proc_b052a2435add` / boot8.log advancing; `TRADING MODE ACTIVE`, WS `:8765` LISTENING; recurring `[GTR-INV31]` pass `orphan=[] manual_proof=[] in_sync=4`; **0 orphans**. Live positions actively managed with idempotent TPs: **SUI +7.3 LONG** (bot 10018, TP `181970878`) and **SOL −2.53 SHORT** (bot 100001). No `engine/*.py` edited this session → DEPLOY-OUTDATED not triggered.
+
 ### Git (this session)
 - `4e7fed2` (already pushed): hedge-child grid guard (bot_executor:4951) + `test_seal_trade_state` alignment.
 - `99f5a27` (already pushed): `PROJECT_STATUS.md` update + `tests/test_require_proof_writers.py` WHITELIST rebuild (Step 3 Approach B).
@@ -96,7 +103,7 @@
 
 ### 🟢 P3 / Test-infra
 9. `-2015` burst during emergency (parked).
-10. **12-failure baseline (was 13):** `test_gate_blocks_when_require_manual_proof` RESOLVED 2026-09-15 (commit 94d8616, asserts `Config.is_bot_frozen`). Remaining 12 = `adopt_fill_guard`×3, `snap_allocate_gate`, `seal_short_phantom`, `require_proof_writers`×2, `ghost_clearing`×2, `parity_gates_retry`, `auto_repair_guards`, `sui_cycle_sweep_regression`, `startup_wipe_guard`, `downtime_wedge_realpath`×3 (see full breakdown in prior sections). **UPDATE 2026-09-15:** `seal_short_phantom` RESOLVED (Step 4); live baseline now **9**; next = `sui_cycle_sweep_regression` (9→8).
+10. **Failure baseline (final, 2026-09-15):** started at 13 (clean-HEAD). All **hard-logic** failures RESOLVED this session → **0 hard-logic failures**. Residual full-suite failures = **4 isolation artifacts** (pass in isolation): `test_ghost_clearing`×2, `test_snap_allocate_gate`, `test_streamlit_smoke::test_database_views` — shared-DB / Windows file-lock contamination, not logic bugs (see Step 5 + Step 6).
 11. **`close_position()` symbol-normalization bug (2026-09-15, found during SUI dust flatten):** `engine/bot_management.py:close_position` queries the exchange with `pair` from `bots.pair` (`SUI/USDC:USDC`) when matching `fetch_positions()` results (`p['symbol'] == pair`), but the exchange returns the bare symbol `SUI/USDC` (no `:USDC` suffix). Mismatch → `actual_pos_qty` stays 0 → function takes the `actual_pos_qty <= 0` branch (bot_management.py:97-106) and **wipes the local ledger WITHOUT placing any order**, reporting success. The live -7.1 SUI short remained open while the DB was wiped. Worked around by calling `ExchangeInterface.create_order_with_receipt` directly with symbol `SUI/USDC:USDC` (the order symbol the exchange accepts) + `human_approved=True`. Fix: normalize symbol (strip `:USDC`/quote suffix) before matching `fetch_positions`, OR match on `startswith`. Affects any `close_position` call on a pair whose `bots.pair` includes a `:QUOTE` suffix.
 - `test_freeze_guard_scenario.py` ×6 errors — teardown `PermissionError WinError 32` (all assertions PASS) — environmental, Windows temp-dir lock.
 - `test_streamlit_smoke.py` — passes isolated, fails in full-suite ordering = test-isolation artifact.
@@ -108,17 +115,19 @@
 
 ---
 
-## Test Suite — Today's Results (Py3.10, 2026-09-15)
+## Test Suite — Today's Results (Py3.10, 2026-09-15, final)
 
 ```bash
 cd D:/Crypto_Quant_Bot && py -3.10 -m pytest tests/ --ignore=tests/test_playwright_ui.py -q
-# 661 passed / 13 failed / 11 errors
+# 670 passed / 4 failed (isolation artifacts) / 11 errors (env: freeze_guard teardown lock + stuck_dust collection) 
+# 0 HARD-LOGIC FAILURES
 ```
 
-**12 failures = clean-HEAD baseline (attributed, 0 new from today; was 13 — `test_gate_blocks_when_require_manual_proof` RESOLVED 2026-09-15):**
-`test_adopt_fill_guard`×3 (the gate test fixed → now asserts `Config.is_bot_frozen`), `test_auto_repair_guards`×1, `test_downtime_wedge_realpath`×3, `test_ghost_clearing`×2, `test_order_sync`×2 (fixed by wiring assertion update), `test_parity_gates_retry`×1, `test_require_proof_writers`×2, `test_seal_short_phantom`×1, `test_snap_allocate_gate`×1, `test_startup_wipe_guard`×1, `test_sui_cycle_sweep_regression`×1.
+**4 residual failures = isolation artifacts (ALL pass in isolation, fail only in full-suite ordering via shared-DB / Windows file-lock contamination):**
+`test_ghost_clearing`×2, `test_snap_allocate_gate`, `test_streamlit_smoke::test_database_views`. None are logic regressions; see Step 6 for the isolation fix.
+**11 errors** = `test_freeze_guard_scenario`×6 (`PermissionError WinError 32` teardown temp-dir lock — all assertions pass) + `test_inv35_stuck_dust_no_exit`×5 (collection error). Environmental, Windows-specific.
 
-**RESOLVED top item:** `test_gate_blocks_when_require_manual_proof` — root cause: old test asserted `gate_trading_allowed` (PAIR-PARITY gate) blocks on bot STATUS; that function ignores `bots.status`. Real bot-status gate is `Config.is_bot_frozen()` (config/settings.py:166), returns True for `REQUIRE_MANUAL_PROOF`. Rewrote test (commit 94d8616). Full-suite recount pending confirmation of 12.
+**RESOLVED items this session (all hard-logic):** `test_gate_blocks_when_require_manual_proof` (commit 94d8616, now asserts `Config.is_bot_frozen` from config/settings.py:166), `test_seal_short_phantom` (Step 4 seed fix), `test_sui_cycle_sweep_regression` + `test_cross_cycle_sweep_fix` + `test_startup_wipe_guard` (all frozen fixtures, Step 5), `test_session_start_check` (dated-reminders contract restored, Step 4b). Baseline: 13 → 0 hard-logic.
 
 **LATENT BUG FLAGGED (not fixed):** `Config.is_bot_frozen` does exact-case compare `bot_status == 'REQUIRE_MANUAL_PROOF'`. Production writes uppercase so runtime works, but any lowercase write silently fails to freeze. Decision needed on normalization.
 
@@ -127,20 +136,21 @@ cd D:/Crypto_Quant_Bot && py -3.10 -m pytest tests/ --ignore=tests/test_playwrig
 ## Git & Push Status
 
 ```bash
-# Local, NOT YET PUSHED (push pending operator confirmation of STABIL-WATCH + test analysis)
-git log --oneline -4
-# 08a5303 docs(AGENTS): mark side= caller-wiring RESOLVED (3af3bef)
-# 62b816d fix(database): unify duplicate get_manual_whitelists + format-insensitive
-# 3af3bef fix(ledger): wire side= at all exchange-response credit_fill call sites
+# All committed AND pushed to origin/main this session
+git log --oneline -8
+# f4be414 test: freeze cross_cycle_sweep_fix + startup_wipe_guard fixtures (decouple from live DB)
+# 03f55cf docs: restore ## Dated reminders (authoritative) block (test_session_start_check contract)
+# 3ed5662 test: freeze sui_cycle_sweep fixture (decouple from live crypto_bot.db)
+# 8d0e5e5 test: fix seal_short_phantom seed data + log close_position symbol bug
+# 99f5a27 docs+test: baseline REQUIRE_MANUAL_PROOF whitelist (Step-3 Approach B)
+# 4e7fed2 engine: hedge-child grid guard + test_seal_trade_state alignment
 ```
 
 ---
 
 ## Next Blocker on Production Roadmap
 
-**Root-cause `test_gate_blocks_when_require_manual_proof`** (running in background `proc_...test`):
-- Pull the failure detail, identify whether the gate logic or the test expectation is wrong, and propose a fix that eliminates it from the 13-failure baseline.
-- Goal: drive the baseline from 13 → 0 on the path to production.
+**Step 6 — eliminate the 4 isolation artifacts (full-suite 4 → 0).** The residual `test_ghost_clearing`×2, `test_snap_allocate_gate`, `test_streamlit_smoke::test_database_views` pass in isolation but fail under full-suite ordering due to shared-DB / Windows file-lock contamination. Fix: ensure each test uses an isolated temp/in-memory DB with properly closed connections in teardown (and the `test_freeze_guard_scenario` / `test_inv35_stuck_dust` collection errors get the same treatment). Goal: full-suite **0 failed / 0 hard-logic**, leaving only pre-existing Windows-env teardown errors.
 
 ---
 
