@@ -28,6 +28,14 @@
 
 ---
 
+## Dated reminders (authoritative)
+
+- 2026-07-21: tencent-hy3-free model retired — CONFIRM it is NOT in active config/routing [DONE:pending]
+- 2026-07-28: laguna-m.1 model retired — IS delegation, benchmark replacement before removing [DONE:2026-07-28]
+- 2026-09-20: rotate Rule-8 DB snapshots older than 30d (free disk, keep last 3 per milestone) [DONE:2026-09-20]
+
+---
+
 ## Live State 2026-09-15 (verified at boot + STABIL-WATCH)
 
 - **Git HEAD**: `08a5303` (AGENTS.md open-item RESOLVED) — LOCAL; 3 commits ahead of origin/main
