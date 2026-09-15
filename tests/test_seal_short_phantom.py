@@ -71,7 +71,7 @@ def test_short_entry_and_flatten_seal(temp_db):
         BOT_ID, 1, 'entry', '961145669', 'CQB_100317_ENTRY_3_1',
         64823.8, 0.071, 0.071, 'filled',
         now - 100, now - 100, now - 100,
-        CYCLE_ID, 'SELL'
+        CYCLE_ID, 'SHORT'
     ))
 
     # Insert flatten close fill (BUY) – 0.050 BTC @ 64914.6 USDC
@@ -85,7 +85,7 @@ def test_short_entry_and_flatten_seal(temp_db):
         BOT_ID, 2, 'flatten_close', '962590689', 'CQB_100317_FLATTEN_3_0',
         64914.6, 0.050, 0.050, 'filled',
         now - 50, now - 50, now - 50,
-        CYCLE_ID, 'BUY'
+        CYCLE_ID, 'SHORT'
     ))
     conn.commit()
 
