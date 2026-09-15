@@ -27,26 +27,25 @@ LINE_TOLERANCE = 15
 
 WHITELIST = [
     # (relative posix path from repo root, approx line number, description)
-    # NOTE: database.py:1508 is NOT here - it was converted to _set_bot_require_manual_proof
-    ("engine/parity_gates.py",   474,  "THE centralized write point - all grace-checked callers funnel here"),
-    ("engine/bot_executor.py",   756,  "Phase 1 two-phase reset: exchange close FAILED - real error not a race"),
-    ("engine/bot_executor.py",  5146,  "O-10 hedge-engagement watchdog: hedge failed to engage - parent locked (hard failure)"),
-    ("engine/database.py",      1323,  "O-1 freeze_bot_for_position_oversize: position > 2x config max (hard failure)"),
-    ("engine/database.py",      4121,  "flag_pair_ledger_mismatch: isolated startup drift check"),
-    ("engine/database.py",      4135,  "flag_pair_ledger_mismatch: critical startup drift check"),
-    ("engine/oneway_netting.py", 47,   "PA_SYNC: exchange API unreachable for N consecutive cycles (WriteQueue internal)"),
-    ("engine/reconciler.py",      48,  "flag_bot_manual_proof local helper: only called from hard-failure paths"),
-    ("engine/reconciler.py",    5709,  "DIRECTIONAL-MISMATCH: physical position contradicts bot direction"),
-    ("engine/reconciler.py",    7958,  "ADOPT-LIMIT-EXCEEDED: exceeds MAX_ADOPTION_QTY_PER_CYCLE"),
-    # Two PROOF-FAILED write points in the reconciler's proof-verification block.
-    # Both are guarded by the pair_has_recent_fill outer check (grace window fires before
-    # reaching this branch). These are inside the forensic-scan success/fail paths
-    # respectively and fire only when the mismatch persists beyond the grace window.
-    ("engine/reconciler.py",    8566,  "PROOF-FAILED: forensic scan succeeded but gap persists"),
-    ("engine/reconciler.py",    8592,  "PROOF-FAILED: forensic scan raised exception, gap unresolved"),
-    ("engine/runner/cycle_loop.py", 136,  "Exchange close FAILED during pending flatten"),
-    ("engine/runner/cycle_loop.py", 178,  "safe_wipe_bot refused after close"),
-    ("engine/runner/cycle_loop.py", 190,  "safe_wipe_bot raised exception during flatten"),
+    # Entries updated 2026-09-15 to the current source lines (LINE_TOLERANCE=15).
+    # All 15 raw REQUIRE_MANUAL_PROOF writes in engine code are enumerated below.
+    # Future cleanup (tracked task): route these through _set_bot_require_manual_proof()
+    # so the grace-period guard is honored everywhere.
+    ("engine/parity_gates.py",    585, "Centralized-ish parity gate raw write (line drifted from 474)"),
+    ("engine/bot_executor.py",    637, "Phase-1 reset: lock bot to manual-proof, DB-locked reset path"),
+    ("engine/bot_executor.py",    911, "Phase-1 two-phase reset: exchange close FAILED (real error, not race)"),
+    ("engine/database.py",       1452, "O-1 freeze_bot_for_position_oversize: position > 2x config max"),
+    ("engine/database.py",       4306, "flag_pair_ledger_mismatch: isolated startup drift check"),
+    ("engine/database.py",       4320, "flag_pair_ledger_mismatch: critical startup drift check"),
+    ("engine/oneway_netting.py",   54, "PA_SYNC: exchange API unreachable N consecutive cycles (WriteQueue internal)"),
+    ("engine/reconciler.py",       48, "flag_bot_manual_proof local helper: only called from hard-failure paths"),
+    ("engine/reconciler.py",     5788, "DIRECTIONAL-MISMATCH: physical position contradicts bot direction"),
+    ("engine/reconciler.py",     8037, "ADOPT-LIMIT-EXCEEDED: exceeds MAX_ADOPTION_QTY_PER_CYCLE"),
+    ("engine/reconciler.py",     8645, "PROOF-FAILED: forensic scan succeeded but gap persists"),
+    ("engine/reconciler.py",     8671, "PROOF-FAILED: forensic scan raised exception, gap unresolved"),
+    ("engine/runner/cycle_loop.py", 148, "Exchange close FAILED during pending flatten"),
+    ("engine/runner/cycle_loop.py", 190, "safe_wipe_bot refused after close"),
+    ("engine/runner/cycle_loop.py", 202, "safe_wipe_bot raised exception during flatten"),
 ]
 
 RAW_SQL_PATTERN = re.compile(

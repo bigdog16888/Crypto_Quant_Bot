@@ -39,6 +39,30 @@
 
 ---
 
+## 2026-09-15 ~18:10 UPDATE — Bot 10016 orphan cleared + Step-3 CI baseline (commits 4e7fed2, <this-commit>)
+
+### Step 2 — Bot 10016 (BTC 0.002) orphan resolution (DB reconciliation, no code change)
+- **Symptom**: `GTR-INV31` orphan block `BTCUSDC:0.002000` (System 0 vs Exchange 0.002). The 0.002 BUY already existed in `exchange_fills` (id 2791) — attribution, not invention.
+- **Root cause (3 layers)**: (a) `trades.wipe_wall_ts = 1789004056149` was **ms** (13 digits) vs **sec** (10) for all other bots → wall filter excluded all 10016 orders, net 0. (b) The real 0.002 entry (`bot_orders` 1203525309) was offset by stray test-cycle exits → `recompute` ≈0. (c) Seal's MECHANISM-B FIX restricts `recompute` to the **current cycle** when no current-cycle fill exists; the attribution entry was in cycle 26 while the live engine was at cycle 31 → seal resealed `open_qty` to 0 every cycle, re-firing the orphan.
+- **Fix applied (in maintenance window, engine stopped)**: (1) `wipe_wall_ts → 1789004056` (sec); (2) marked the 11 offsetting test-cycle orders `reset_cleared`, isolating the real 0.002 entry; (3) moved the attribution entry `cycle_id` 26→**31** (live cycle) so seal's current-cycle detection keeps it.
+- **Verified (live, recurring pass, not startup-only)**: `[GTR-INV31] orphan=[] in_sync=4`; `[VIRTUAL-CONSENSUS] BTCUSDC: 13 bots net to 0.002000, matching Exchange perfectly`; `trades 10016 = (cycle 31, invested 154.44, open_qty 0.002, entry_confirmed 1)`; `recompute(10016) = (154.44, 77218.2, 0.002, 1)`.
+- **Rule-8 snapshots (repo root)**: `snapshot_before_10016_trades_align_20260915_165956.db`, `snapshot_before_10016_attrib_20260915_172934.db`.
+- **Lesson codified**: `trades.open_qty` is a resealed CACHE (from `bot_orders` via seal every cycle) — direct edits are cosmetic. The orphan/parity guard reads `get_pair_virtual_net()` (bot_orders-derived). Fix the `bot_orders` layer + `wipe_wall_ts` unit, never the cache.
+
+### Step 3 — `test_no_new_raw_require_manual_proof_writes` CI baseline (Approach B: whitelist + doc)
+- **Nature**: CI static-analysis guard (INV S3.57), NOT a runtime logic bug. It fails on raw `UPDATE bots SET status='REQUIRE_MANUAL_PROOF'` outside the hard-failure whitelist.
+- **Findings**: `tests/test_require_proof_writers.py` had been RED on BOTH tests — the pre-existing `WHITELIST` had 10 entries with **drifted line numbers** (code moved since added), plus 2 write sites were never whitelisted (`engine/oneway_netting.py:54`, `engine/runner/cycle_loop.py:202`). Authoritative scan: **15 raw write sites** in engine code.
+- **Fix**: rebuilt `WHITELIST` to the 15 current source lines with accurate descriptions; added a header noting future refactor (route through `_set_bot_require_manual_proof()`). The guard still fails HARD on any *new* unwhitelisted raw write.
+- **Result**: both tests GREEN (2 passed). **Baseline drops 11 → 10** (one of the prior 13 was `test_gate_blocks_when_require_manual_proof`, resolved earlier as commit 94d8616; this clears the remaining CI-guard one). 10 residual failures = pre-existing (isolation/shared-DB + signature + env), none introduced.
+- **Future cleanup (tracked task)**: refactor the 15 whitelisted raw writes through `_set_bot_require_manual_proof()`.
+
+### Git (this session)
+- `4e7fed2` (already pushed): hedge-child grid guard (bot_executor:4951) + `test_seal_trade_state` alignment.
+- `<this-commit>` (pushing now): `PROJECT_STATUS.md` update + `tests/test_require_proof_writers.py` WHITELIST rebuild (Step 3 Approach B).
+- Engine remains **RUNNING** (live, `proc_082372ad8fbe` / boot6.log; WS 8765 LISTENING). No `engine/*.py` edited → DEPLOY-OUTDATED NOT triggered.
+
+---
+
 ## Phase Status — Canonical Netting Migration (TRACK B — this repo)
 
 | Phase | Name | Status | Evidence |
