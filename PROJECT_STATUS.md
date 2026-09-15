@@ -39,7 +39,7 @@
 
 ---
 
-## 2026-09-15 ~18:10 UPDATE — Bot 10016 orphan cleared + Step-3 CI baseline (commits 4e7fed2, <this-commit>)
+## 2026-09-15 ~18:10 UPDATE — Bot 10016 orphan cleared + Step-3 CI baseline (commits 4e7fed2, 99f5a27)
 
 ### Step 2 — Bot 10016 (BTC 0.002) orphan resolution (DB reconciliation, no code change)
 - **Symptom**: `GTR-INV31` orphan block `BTCUSDC:0.002000` (System 0 vs Exchange 0.002). The 0.002 BUY already existed in `exchange_fills` (id 2791) — attribution, not invention.
@@ -58,7 +58,7 @@
 
 ### Git (this session)
 - `4e7fed2` (already pushed): hedge-child grid guard (bot_executor:4951) + `test_seal_trade_state` alignment.
-- `<this-commit>` (pushing now): `PROJECT_STATUS.md` update + `tests/test_require_proof_writers.py` WHITELIST rebuild (Step 3 Approach B).
+- `99f5a27` (already pushed): `PROJECT_STATUS.md` update + `tests/test_require_proof_writers.py` WHITELIST rebuild (Step 3 Approach B).
 - Engine remains **RUNNING** (live, `proc_082372ad8fbe` / boot6.log; WS 8765 LISTENING). No `engine/*.py` edited → DEPLOY-OUTDATED NOT triggered.
 
 ---
