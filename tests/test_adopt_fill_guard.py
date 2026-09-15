@@ -33,6 +33,7 @@ from engine.parity_gates import (
     get_exchange_signed_net,
 )
 from engine.exchange_interface import ExchangeInterface
+from config.settings import config
 from engine.database import get_connection
 
 # ---------------------------------------------------------------------------
@@ -231,11 +232,12 @@ def test_concurrent_fill_guard_thread_safety(monkeypatch):
 
 
 def test_gate_blocks_when_require_manual_proof(monkeypatch, caplog):
-    """A bot in ``require_manual_proof`` state must block new entries via the gate.
-    
-    Note: gate_trading_allowed checks pair parity FIRST. If pair parity fails,
-    it returns the parity reason and sets the bot to require_manual_proof.
-    The test verifies that trading is blocked (regardless of which specific reason).
+    """A bot in REQUIRE_MANUAL_PROOF status must be frozen (blocked from trading).
+
+    The bot-level freeze gate is ``config.is_bot_frozen`` (config/settings.py:166),
+    NOT ``gate_trading_allowed`` -- that function is a *pair-parity* gate and ignores
+    bot status. is_bot_frozen returns True for REQUIRE_MANUAL_PROOF (DB-driven exclusion)
+    and for STARTUP_EXCLUDED_BOT_IDS (config-driven). This test verifies the status path.
     """
     import random
     conn = get_connection()
@@ -243,18 +245,13 @@ def test_gate_blocks_when_require_manual_proof(monkeypatch, caplog):
     # Create a bot entry with the flag. Use a unique random ID to avoid conflicts.
     test_bot_id = random.randint(300000, 999999)
     cur.execute(
-        "INSERT INTO bots (id, name, pair, direction, bot_type, status) VALUES (?, 'test hedge', 'BTC/USDC:USDC', 'SHORT', 'hedge_child', 'require_manual_proof')",
+        "INSERT INTO bots (id, name, pair, direction, bot_type, status) VALUES (?, 'test hedge', 'BTC/USDC:USDC', 'SHORT', 'hedge_child', 'REQUIRE_MANUAL_PROOF')",
         (test_bot_id,)
     )
 
-    # The guard itself is used indirectly by ``gate_trading_allowed``.
-    with caplog.at_level(logging.ERROR):
-        allowed, reason = gate_trading_allowed(bot_id=test_bot_id, pair='BTC/USDC:USDC', exchange=ExchangeInterface())
-
-    # Trading should be blocked (False returned)
-    assert not allowed
-    # The reason will be the pair parity mismatch since that's checked first
-    assert "Pair parity gate" in reason
-    # Ensure a log entry was emitted.
-    error_logs = [r.message for r in caplog.records if r.levelno >= logging.ERROR]
-    assert any("PAIR-PARITY-GATE" in msg for msg in error_logs)
+    # is_bot_frozen is the bot-level status gate (DB-driven REQUIRE_MANUAL_PROOF).
+    # Production writes the status uppercase (parity_gates.py:585); the gate compares
+    # against the exact uppercase constant, so the test uses the canonical value.
+    assert config.is_bot_frozen(test_bot_id, 'REQUIRE_MANUAL_PROOF') is True
+    # Sanity: a Scanning bot with the same id (status not set) is NOT frozen.
+    assert config.is_bot_frozen(test_bot_id, 'Scanning') is False
