@@ -172,6 +172,11 @@ def test_seal_trade_state_clears_fill_claims_and_increments_cycle(memory_db):
                    (10018, '147779440', 'ws', int(time.time())))
     cursor.execute("INSERT INTO fill_claims (bot_id, order_id, caller, claimed_at) VALUES (?, ?, ?, ?)",
                    (10018, 'STEP_1_151', 'step_lock_ws', int(time.time())))
+    # MECHANISM-B: seal only increments cycle_id when the current cycle has real
+    # entry/grid fills. Seed a current-cycle (cycle_id=151) filled entry so the
+    # increment path is legitimately exercised (last exit is entry, not tp).
+    cursor.execute("INSERT INTO bot_orders (bot_id, cycle_id, order_type, status, filled_amount, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                   (10018, 151, 'entry', 'filled', 0.002, int(time.time())))
     memory_db.commit()
     
     with patch('engine.database.get_connection', return_value=memory_db), \
@@ -187,5 +192,8 @@ def test_seal_trade_state_clears_fill_claims_and_increments_cycle(memory_db):
         assert row_trade[1] == 0.0  # Reset
         assert row_trade[2] == 0.0  # Reset
         
+        # Fix 4 (2026-09-04): fill_claims are intentionally RETAINED across seals
+        # (dedup history must survive so late/re-delivered fills can't double-credit).
+        # The old contract asserted claims==0 (delete-on-seal); production no longer does.
         claims = cursor.execute("SELECT count(*) FROM fill_claims WHERE bot_id = 10018").fetchone()[0]
-        assert claims == 0  # Claims deleted
+        assert claims == 2  # Claims retained across seal (Fix 4)

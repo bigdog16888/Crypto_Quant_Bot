@@ -4948,7 +4948,7 @@ class BotExecutor:
                  exchange_min_notional = prec.get('min_notional', None)
                  if exchange_min_notional is None:
                      exchange_min_notional = 100.0 if (getattr(config, 'TESTNET', False) or getattr(config, 'DEMO_TRADING', False)) else 5.0
-                 if bot_config.get('base_size', 0) < exchange_min_notional:
+                 if bot_config.get('bot_type') != 'hedge_child' and bot_config.get('base_size', 0) < exchange_min_notional:
                      logger.error(f"⛔ CONFIG ERROR [{pair}]: Configured base_size=${bot_config.get('base_size',0):.2f} is below exchange minimum ${exchange_min_notional:.2f}. Halting grid.")
                      update_bot_error(bot_id, f"CONFIG ERROR: Base Size (${bot_config.get('base_size',0):.2f}) < Min Notional (${exchange_min_notional:.2f})")
                      return
