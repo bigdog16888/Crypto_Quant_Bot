@@ -71,10 +71,21 @@ def backup_database(dest_dir=None, keep: int = 20):
         path = os.path.join(
             dest_dir,
             f"crypto_bot_backup_{time.strftime('%Y%m%d_%H%M%S')}_{n}.db")
-    src = get_connection()
-    dest = sqlite3.connect(path)
-    src.backup(dest)
-    dest.close()
+    # Open a DEDICATED source connection (not the cached get_connection()) and
+    # checkpoint its WAL first, so the backup copy always reflects all committed
+    # data even when other cached connections hold un-checkpointed WAL frames
+    # (e.g. after init_db() created schema on a separate connection).
+    src = sqlite3.connect(database.DB_PATH, timeout=60.0)
+    try:
+        try:
+            src.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception:
+            pass
+        dest = sqlite3.connect(path)
+        src.backup(dest)
+        dest.close()
+    finally:
+        src.close()
     _prune_backups(dest_dir, keep)
     return path
 

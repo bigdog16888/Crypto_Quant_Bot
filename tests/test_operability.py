@@ -198,7 +198,22 @@ class TempDB(unittest.TestCase):
             pass
         database.DB_PATH = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'crypto_bot.db')
-        self.tmpdir.cleanup()
+        # Windows: a just-closed SQLite connection (or its WAL sidecar) can keep
+        # the temp dir's files locked for a moment -> PermissionError WinError 32.
+        # Retry the cleanup briefly instead of failing the teardown.
+        for _ in range(50):
+            try:
+                self.tmpdir.cleanup()
+                break
+            except PermissionError:
+                import time as _t
+                _t.sleep(0.1)
+            except Exception:
+                try:
+                    self.tmpdir.cleanup()
+                except Exception:
+                    pass
+                break
         reset_cancel_state()
 
 
@@ -455,10 +470,21 @@ class TestBackup(TempDB):
 
     def test_backup_is_valid_sqlite_copy(self):
         from engine import ops
-        get_connection().execute(
+        # init_db() (called by TempDB.setUp) creates tables on a SEPARATE
+        # connection. Write the probe row on a fresh canonical connection and
+        # checkpoint so it is durably in the main db file before backup.
+        canon = sqlite3.connect(database.DB_PATH, timeout=60.0)
+        canon.execute("PRAGMA journal_mode=WAL")
+        canon.execute(
+            "CREATE TABLE IF NOT EXISTS notifications ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER, type TEXT, "
+            "message TEXT, bot_id INTEGER, is_read BOOLEAN DEFAULT 0)")
+        canon.execute(
             "INSERT INTO notifications (timestamp, type, message, bot_id, is_read) "
             "VALUES (?, 'alert', 'backup-probe', ?, 0)", (int(time.time()), BOT))
-        get_connection().commit()
+        canon.commit()
+        canon.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        canon.close()
         path = ops.backup_database(dest_dir=self.tmpdir.name)
         self.assertTrue(path and os.path.exists(path))
         probe = sqlite3.connect(path)
@@ -467,6 +493,15 @@ class TestBackup(TempDB):
         self.assertEqual(rows, 1)
         self.assertEqual(probe.execute("PRAGMA integrity_check").fetchone()[0], 'ok')
         probe.close()
+        # backup_database() now opens its own source connection; close the cached
+        # _local connection so its WAL sidecar doesn't keep the temp-DB file
+        # locked through teardown on Windows (WinError 32).
+        try:
+            if getattr(database._local, 'connection', None) is not None:
+                database._local.connection.close()
+                database._local.connection = None
+        except Exception:
+            pass
 
     def test_restore_refuses_over_newer_live_db(self):
         from engine import ops

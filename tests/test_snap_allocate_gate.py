@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import engine.database as database
 from engine.database import get_connection, init_db, update_active_positions_snapshot
 from engine.parity_gates import forensic_adopt_allowed, qty_tolerance
+from config.settings import config as _settings_config
 
 
 class TestSnapAllocateGate(unittest.TestCase):
@@ -26,11 +27,16 @@ class TestSnapAllocateGate(unittest.TestCase):
         database._local = database.threading.local()
         init_db()
         self.conn = get_connection()
+        # Save forensic-adopt flag so no other test's mutation leaks in.
+        self._saved_forensic = getattr(_settings_config, 'ALLOW_FORENSIC_ADOPT', None)
 
     def tearDown(self):
         if self.conn:
             self.conn.close()
         shutil.rmtree(self.test_dir, ignore_errors=True)
+        # Restore forensic-adopt flag so this test doesn't leak state to others.
+        if self._saved_forensic is not None:
+            _settings_config.ALLOW_FORENSIC_ADOPT = self._saved_forensic
 
     def _insert_bot_full(self, bot_id, name, pair, norm_pair, direction,
                          status='IN TRADE', bot_type='standard', is_active=1,
@@ -152,11 +158,11 @@ class TestSnapAllocateGate(unittest.TestCase):
 
     def test_multi_bot_allowed_when_forensic_enabled(self):
         """Multi-bot split should work when forensic adoption is enabled."""
-        import config.settings as settings
-        settings.config.ALLOW_FORENSIC_ADOPT = True
+        _settings_config.ALLOW_FORENSIC_ADOPT = True
 
         # Setup: TWO bots with invested qty
         self._setup_longs([(1001, 'bot1', 1.0, 50000.0), (1002, 'bot2', 0.5, 50000.0)])
+        self.conn.commit()  # ensure both bots + orders are durable before snapshot
 
         # Snapshot with net matching: 1.5 LONG (1.0 + 0.5 = 1.5)
         mock_positions = [{
