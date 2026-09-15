@@ -1,22 +1,28 @@
 # PROJECT_STATUS.md — Crypto_Quant_Bot
 
-**Last updated: 2026-09-14 08:15** | **Engine: STOPPED** (no `run_engine.py` process; only Hermes/Streamlit daemons running). **Git: clean working tree at `711fd92`** (HEAD = origin/main, no uncommitted changes). **Live positions: 4 ACTIVE** (10016 BTC LONG 0.002 @ 78,543 cycle 21 ACTIVE; 100001 SOL SHORT 0.27 @ 102.27 cycle 48 ACTIVE; 10007 BNB SHORT 0.01 @ 717 cycle 26 ACTIVE; 10018 SUI LONG 118.7 @ 0.72 cycle 25 ACTIVE — gated at startup, isolated). All other bots IDLE/hedge_standby/REQUIRE_MANUAL_PROOF.
+**Last updated: 2026-09-14 ~23:50 (end of session)** | **Engine: STOPPED** (ENGINE_STOPPED_AT ~11:57). **Git: clean working tree at `f804981` on main, PUSHED to origin.** Live positions unchanged from morning (4 ACTIVE: 10016 BTC, 100001 SOL, 10007 BNB, 10018 SUI-gated). **New agents read `AGENTS.md` first.**
 
 ---
 
 ## 🎯 HANDOFF NOTE (read in 30 seconds)
 
-**Today we closed the BTC/USDC 0.008 phantom orphan (Decision A)** — exchange position was +0.008 LONG on demo FAPI, traced to 4 `unowned_position_alerts` rows summing −0.076 exchange vs −0.01 DB delta. No bot owned it. Closed via `close_unattributed_position()` on demo FAPI (order 1202905936), audit trail in `exchange_order_audit`. Exchange position now 0.
+**Tonight's session (evening) — two-tier health check shipped, clean:**
+- **Commit `e00c5ce`** — `engine/health.py` two-tier netting: tier-1 drift unchanged (auto-detected cycle_floor→now vs exchange); tier-2 NEW `ledger_imbalance` = full-history `exchange_fills` net vs exchange physical, per-pair fields `ledger_net/ledger_imbalance/ledger_diff_qty/ledger_diff_usd`, escalates `system_status` to MISMATCH. Also fixes `compute_bot_position(conn=None)` silently binding to the live DB instead of the passed `db_path`. RED→GREEN: `tests/test_ledger_imbalance.py` (was `ledger_imbalance=None`).
+- **Commit `3c5a097`** — `engine/ledger.py` dual-write to immutable `exchange_fills` log + `side=` param + **double-count guard** `_log_fill = not (delta <= 0 and is_cumulative)`. Proven reachable path: exit-type (tp) orders via WS-oid + catchup-CID bypass step-lock and saturation guard (entry-only) and use different `fill_claims` keys → both wrote rows → position ledger over-counted exits. RED proof captured two rows per fill pre-fix; GREEN post-fix (`tests/test_dual_write_guard.py`, 2 tests).
+- **Commit `f804981`** — postmortem + cleanup manifest (`docs/bugs/POSTMORTEM_HEALTH_WHACKAMOLE_20260914.md`): the evening's process failure (2h whack-a-mole, 127 scratch scripts, 20 backups, broken tree → restored from HEAD → one-shot patch landed first try) and the standing rules that came out of it (also codified in `AGENTS.md` §3).
+- **Data fix (operator-approved, no commit — DB)**: `exchange_fills` row 2609 `fill_ts` ms-epoch 1789004056149 → 1789004056 (2026-09-10 09:34:16). Verified rowcount=1, 0 ms-epoch rows remain.
 
-**Startup barrier passed** — 3 legacy drifts (SUI +118.7, SOL +0.15, BNB −0.01) isolated by plausibility gate (≤$100 threshold), engine started clean.
+**Also tonight: `AGENTS.md` created** (first-read rules for any agent: safety boundaries, raw-evidence rule, plan-first/execute-on-GO, one-shot patch discipline, repo hygiene, domain facts, open items) and **`docs/EXTERNAL_REVIEW_GUIDE.md`** for the online review agents the operator is bringing in. External reviewers: read `AGENTS.md` → `EXTERNAL_REVIEW_GUIDE.md` → this file.
 
-**Clean 20-minute trading loop run** (07:31–07:51) — zero crashes. Error log categorized: all errors benign (config gates blocking 25 test bots with invalid base_size/rsi_limit, symbol format mismatches on USDT vs USDC, stale order audits returning "does not exist"). No new/unexplained errors. Final parity confirmed: all 4 active positions match exchange exactly.
+**WARNING for next engine start:** the two-tier path has never run in production. Whitelisted migration-era orphans (BNBUSDC SHORT 0.04, SOLUSDC LONG 0.6, SUIUSDC LONG 202, XAUUSDT LONG 0.016) may legitimately trip tier-2 `ledger_imbalance` → MISMATCH on first start. **Expected, not a regression** — resolve via whitelist/manual proof, not by weakening the check.
 
-**Fixed `rsi_limit`/`base_size`/`martingale_multiplier` NULL crash** — test bots had NULL configs; `bot_executor.py` `float(None)` crashed cycle 5. Patch: null-coalesce to defaults (30.0 / 10.0 / 1.5). Pure defensive fix, zero trading logic touched. Pushed as `711fd92`.
+**Open follow-ups from tonight (do not lose):**
+1. `side=` caller-wiring — no production caller passes `side=` yet; all live dual-writes use inferred side (correct for verified hedge children, but unwired design intent).
+2. `test_gate_blocks_when_require_manual_proof` — fails identically at clean HEAD (pre-existing, needs root-cause).
 
-**Phase 5 incident replays executed** — ETH/LINK saga replay ✅, SUI cycle-sweep core ✅, SOL startup-wipe guard ✅, `position_ledger.py` unit tests 7/7 ✅. Primary path would have produced correct position at each incident.
+**Morning's work (unchanged, see below for detail):** BTC 0.008 phantom orphan closed (Decision A), rsi_limit NULL crash fixed (`711fd92`), clean 20-min run, Phase 5 replays ✅.
 
-**8 remaining real anomalies STILL OPEN** (not resolved by today's work):
+**8 remaining real anomalies STILL OPEN** (not resolved by tonight's work):
 1. XAU ORDER-SYNC credit loop (300× partial fill log, credit write swallowed)
 2. Stale-cycle_id on downtime-credit path (PRE-COMMIT-RESOLVE credits TP without advancing cycle_id → DEDUP wedge)
 3. LIVE_GUARD_INV30 marker-row double-count (100317 09-08)
@@ -26,15 +32,13 @@
 7. Retry-queue loser false alarm (step-lock winner credited, loser's "no DB row" check missed sibling claim)
 8. Flatten write path stores price=0.0 (forced-close realized P&L not computable from `bot_orders`)
 
-Only the BTC/USDC 0.008 orphan was closed today. The 3 legacy drifts (SUI/SOL/BNB) are gated/isolated, not fixed.
-
-**Engine STOPPED** — safe. No risky actions. Next session: decide on the 8 P1/P2 items or continue Phase 5→6 promotion. All docs updated, git clean, pushed.
+**Engine STOPPED — safe. No risky actions.** Next session: decide on the 8 P1/P2 items, wire the `side=` callers, or root-cause the pre-existing test failure. External review agents incoming — their priorities: `docs/EXTERNAL_REVIEW_GUIDE.md`.
 
 ---
 
 ## Live State 2026-09-14 (all verified)
 
-- **Git HEAD**: `711fd92` (null-coalesce fix for test-bot NULL configs) — up to date with origin/main
+- **Git HEAD**: `f804981` (docs: postmortem + cleanup manifest) — pushed to origin/main
 - **Working tree**: CLEAN — no uncommitted changes
 - **Engine process**: **NOT RUNNING** (verified — only Hermes/Streamlit processes)
 - **Live positions (exchange-verified)**:
