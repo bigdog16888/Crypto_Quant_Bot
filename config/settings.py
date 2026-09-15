@@ -178,7 +178,9 @@ class Config:
             return True
 
         # DB-driven exclusion (set by barrier/GTR when anomalies detected)
-        if bot_status == 'REQUIRE_MANUAL_PROOF':
+        # Case-insensitive: production writes uppercase, but a lowercase write must
+        # NOT silently bypass the freeze (latent bug, fixed 2026-09-15).
+        if (bot_status or '').upper() == 'REQUIRE_MANUAL_PROOF':
             return True
 
         return False

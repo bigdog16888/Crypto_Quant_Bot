@@ -255,3 +255,26 @@ def test_gate_blocks_when_require_manual_proof(monkeypatch, caplog):
     assert config.is_bot_frozen(test_bot_id, 'REQUIRE_MANUAL_PROOF') is True
     # Sanity: a Scanning bot with the same id (status not set) is NOT frozen.
     assert config.is_bot_frozen(test_bot_id, 'Scanning') is False
+
+
+def test_is_bot_frozen_case_insensitive(monkeypatch, caplog):
+    """REQUIRE_MANUAL_PROOF must freeze regardless of case (regression guard).
+
+    Latent bug 2026-09-15: is_bot_frozen did exact-case compare, so a lowercase
+    status string ('require_manual_proof') silently bypassed the freeze. The gate
+    must normalize case so any casing of REQUIRE_MANUAL_PROOF freezes the bot.
+    """
+    import random
+    test_bot_id = random.randint(300000, 999999)
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO bots (id, name, pair, direction, bot_type, status) VALUES (?, 'test hedge', 'BTC/USDC:USDC', 'SHORT', 'hedge_child', 'require_manual_proof')",
+        (test_bot_id,)
+    )
+    # Lowercase in DB + lowercase arg must still freeze.
+    assert config.is_bot_frozen(test_bot_id, 'require_manual_proof') is True
+    # Uppercase arg against lowercase DB status also freezes.
+    assert config.is_bot_frozen(test_bot_id, 'REQUIRE_MANUAL_PROOF') is True
+    # Unrelated status still not frozen.
+    assert config.is_bot_frozen(test_bot_id, 'Scanning') is False
