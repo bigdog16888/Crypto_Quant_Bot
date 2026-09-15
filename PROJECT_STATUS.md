@@ -20,7 +20,7 @@
 - **LIVE BOOT 2026-09-15 ~15:14:** `engine/run_engine.py` → SocketLock 19888 acquired, WS listening 8765, `Startup Sync Complete` + `🚀 TRADING MODE ACTIVE`, reconciliation cycles running, SOL −2.53 short re-attributed to bot 100001 via SNAP-ALLOCATE and actively managed (TP re-placed @ 100.79, qty 2.53). `active_positions refreshed: 3 owned + 0 orphans`. Circuit Check equity steady ~$9,117. **STABIL-WATCH 30min in progress.**
 
 **Open follow-ups (do not lose):**
-1. `test_gate_blocks_when_require_manual_proof` — top pre-existing failure, root-cause in progress (see §Next Blocker). 13-failure baseline remains.
+1. `test_gate_blocks_when_require_manual_proof` — **RESOLVED 2026-09-15** (commit 94d8616): rewrote to assert `Config.is_bot_frozen` (real bot-status gate). 13→12 baseline.
 2. **Playwright (backlog, low priority)** — `pytest-playwright` missing from both venvs; blocks UI tests only. Install on Py3.10 when convenient.
 3. SOL −2.53 short is a REAL exchange position now correctly attributed to bot 100001 and actively managed. If operator wants it flattened (testnet, no capital concern), that's a separate decision — currently the engine maintains it per hedge/TP logic.
 
@@ -58,7 +58,7 @@
 
 ### 🟢 P3 / Test-infra
 9. `-2015` burst during emergency (parked).
-10. **13-failure baseline (ACTION THIS SESSION):** `test_gate_blocks_when_require_manual_proof` is the top item; root-cause analysis running. Remaining 12 = `adopt_fill_guard`×4, `snap_allocate_gate`, `seal_short_phantom`, `require_proof_writers`×2, `ghost_clearing`×2, `parity_gates_retry`, `auto_repair_guards`, `sui_cycle_sweep_regression`, `startup_wipe_guard`, `downtime_wedge_realpath`×3 (see full breakdown in prior sections).
+10. **12-failure baseline (was 13):** `test_gate_blocks_when_require_manual_proof` RESOLVED 2026-09-15 (commit 94d8616, asserts `Config.is_bot_frozen`). Remaining 12 = `adopt_fill_guard`×3, `snap_allocate_gate`, `seal_short_phantom`, `require_proof_writers`×2, `ghost_clearing`×2, `parity_gates_retry`, `auto_repair_guards`, `sui_cycle_sweep_regression`, `startup_wipe_guard`, `downtime_wedge_realpath`×3 (see full breakdown in prior sections).
 - `test_freeze_guard_scenario.py` ×6 errors — teardown `PermissionError WinError 32` (all assertions PASS) — environmental, Windows temp-dir lock.
 - `test_streamlit_smoke.py` — passes isolated, fails in full-suite ordering = test-isolation artifact.
 
@@ -76,10 +76,12 @@ cd D:/Crypto_Quant_Bot && py -3.10 -m pytest tests/ --ignore=tests/test_playwrig
 # 661 passed / 13 failed / 11 errors
 ```
 
-**13 failures = clean-HEAD baseline (attributed, 0 new from today):**
-`test_adopt_fill_guard`×4, `test_auto_repair_guards`×1, `test_downtime_wedge_realpath`×3, `test_ghost_clearing`×2, `test_inv18_stale_cancel`×1 (now fixed by my assertion update — re-run shows 12/12 order-sync GREEN, so 1 fewer), `test_order_sync`×2 (fixed), `test_parity_gates_retry`×1, `test_require_proof_writers`×2, `test_seal_short_phantom`×1, `test_snap_allocate_gate`×1, `test_startup_wipe_guard`×1, `test_sui_cycle_sweep_regression`×1.
+**12 failures = clean-HEAD baseline (attributed, 0 new from today; was 13 — `test_gate_blocks_when_require_manual_proof` RESOLVED 2026-09-15):**
+`test_adopt_fill_guard`×3 (the gate test fixed → now asserts `Config.is_bot_frozen`), `test_auto_repair_guards`×1, `test_downtime_wedge_realpath`×3, `test_ghost_clearing`×2, `test_order_sync`×2 (fixed by wiring assertion update), `test_parity_gates_retry`×1, `test_require_proof_writers`×2, `test_seal_short_phantom`×1, `test_snap_allocate_gate`×1, `test_startup_wipe_guard`×1, `test_sui_cycle_sweep_regression`×1.
 
-**Top item under root-cause now:** `test_gate_blocks_when_require_manual_proof` — see §Next Blocker.
+**RESOLVED top item:** `test_gate_blocks_when_require_manual_proof` — root cause: old test asserted `gate_trading_allowed` (PAIR-PARITY gate) blocks on bot STATUS; that function ignores `bots.status`. Real bot-status gate is `Config.is_bot_frozen()` (config/settings.py:166), returns True for `REQUIRE_MANUAL_PROOF`. Rewrote test (commit 94d8616). Full-suite recount pending confirmation of 12.
+
+**LATENT BUG FLAGGED (not fixed):** `Config.is_bot_frozen` does exact-case compare `bot_status == 'REQUIRE_MANUAL_PROOF'`. Production writes uppercase so runtime works, but any lowercase write silently fails to freeze. Decision needed on normalization.
 
 ---
 
