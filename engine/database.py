@@ -5055,16 +5055,31 @@ def add_manual_whitelist(pair: str, side: str, qty: float):
         logger.error(f"Failed to add manual whitelist for {pair}: {e}")
 
 def get_manual_whitelists(pair: str = None) -> List[Dict]:
-    """Retrieve all active manual whitelists, optionally filtered by pair."""
+    """Retrieve active manual whitelists, matching `pair` in ANY format.
+
+    Single canonical definition (2026-09-15): this module historically carried
+    TWO get_manual_whitelists defs (~5057 + ~5762) — the later silently shadowed
+    the former, and BOTH matched `pair` byte-exact only. Callers pass the
+    NORMALIZED key (e.g. 'XAUUSDT') while rows are stored canonical
+    ('XAU/USDT:USDT'), so lookups silently missed and whitelists never applied
+    (verified RED 2026-09-15: get_manual_whitelists('XAUUSDT') -> []).
+    This def normalizes both sides so any stored/queried format resolves.
+    Returns [{'id', 'pair', 'side', 'qty'}].
+    """
     try:
         conn = get_connection()
-        cursor = conn.cursor()
-        if pair:
-            cursor.execute("SELECT pair, side, qty, created_at FROM manual_whitelists WHERE pair = ?", (pair,))
-        else:
-            cursor.execute("SELECT pair, side, qty, created_at FROM manual_whitelists")
-        rows = cursor.fetchall()
-        return [{'pair': r[0], 'side': r[1], 'qty': float(r[2]), 'created_at': r[3]} for r in rows]
+        c = conn.cursor()
+        c.execute("SELECT id, pair, side, qty FROM manual_whitelists")
+        rows = c.fetchall()
+        if pair is None:
+            return [{"id": r[0], "pair": r[1], "side": r[2], "qty": float(r[3] or 0)} for r in rows]
+        from engine.exchange_interface import normalize_symbol
+        norm = normalize_symbol(pair).upper()
+        return [
+            {"id": r[0], "pair": r[1], "side": r[2], "qty": float(r[3] or 0)}
+            for r in rows
+            if normalize_symbol(r[1]).upper() == norm
+        ]
     except Exception as e:
         logger.error(f"Failed to fetch manual whitelists: {e}")
         return []
@@ -5758,22 +5773,6 @@ def add_manual_whitelist(pair: str, side: str, qty: float):
     except Exception as e:
         logger.error(f"❌ Failed to add manual whitelist: {e}")
         return False
-
-def get_manual_whitelists(pair: str = None) -> List[Dict]:
-    """Retrieves all active manual whitelists, optionally filtered by pair."""
-    try:
-        conn = get_connection()
-        c = conn.cursor()
-        if pair:
-            c.execute("SELECT id, pair, side, qty FROM manual_whitelists WHERE pair=?", (pair,))
-        else:
-            c.execute("SELECT id, pair, side, qty FROM manual_whitelists")
-        
-        rows = c.fetchall()
-        return [{"id": r[0], "pair": r[1], "side": r[2], "qty": r[3]} for r in rows]
-    except Exception as e:
-        logger.error(f"❌ Failed to fetch manual whitelists: {e}")
-        return []
 
 def remove_manual_whitelist(whitelist_id: int):
     """Removes a specific whitelist entry."""
