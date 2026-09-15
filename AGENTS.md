@@ -174,9 +174,12 @@ landed cleanly in one reviewed patch. Full account:
 
 ## Open items (do not silently "resolve")
 
-1. `credit_fill()` signature lacks `side=` parameter; design intent was to track fill
-   side explicitly — either add the param or remove the open item. Current state:
-   side is inferred from order_type/cumulative logic, not passed by callers.
+1. side= caller-wiring: RESOLVED 2026-09-15 — `credit_fill()` HAS `side=`
+   (ledger.py:243/274, commit 3c5a097); 7 of 8 call sites pass the real exchange
+   side (137/174 pre-existing since 37a95e2, 5 wired 09-15: TP-SYNC 1862,
+   ENTRY-RETRO 2846, FILL-HEAL 4418/4452, CANCEL-SWEEP 1374). ENTRY-ANCHOR 2632
+   stays on inference by design (documented inline). Verify:
+   tests/test_explicit_side_wiring.py (explicit side beats inference end-to-end).
 2. `test_gate_blocks_when_require_manual_proof` — fails identically at clean HEAD;
    pre-existing, needs root-cause.
 3. 8 P1/P2 anomalies in PROJECT_STATUS.md (XAU ORDER-SYNC loop, stale-cycle_id
