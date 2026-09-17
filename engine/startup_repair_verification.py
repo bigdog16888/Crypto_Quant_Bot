@@ -175,7 +175,7 @@ def _pair_has_unexplained_orphan(pair: str, physical_net: float, exchange) -> bo
             "SELECT bo.client_order_id, bo.filled_amount, bo.order_type "
             "FROM bot_orders bo "
             "WHERE bo.bot_id = ? AND bo.cycle_id = ? "
-            "  AND bo.status IN ('filled','partially_filled','closed') "
+            "  AND bo.status IN ('open','new','placing','cancelling','filled') "
             "  AND bo.filled_amount > 0 "
             "  AND bo.order_type IN ('entry','grid','adoption','adoption_add','carry') "
             "  AND bo.created_at >= ? "
@@ -272,7 +272,7 @@ def _mismatch_explainable_by_cid(pair: str, virtual: float, physical: float,
             "SELECT bo.client_order_id, bo.amount, bo.order_type "
             "FROM bot_orders bo "
             "WHERE bo.bot_id = ? "
-            "  AND bo.status IN ('open','new','placing','cancelling') "
+            "  AND bo.status IN ('open','new','placing','cancelling','filled') "
             "  AND bo.client_order_id LIKE 'CQB_%'",
             (bot_id,)
         ).fetchall()

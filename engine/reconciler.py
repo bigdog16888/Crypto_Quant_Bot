@@ -1222,6 +1222,88 @@ class StateReconciler:
 
 
 
+# 1.7. 🚀 CREDIT FILLED-BUT-UNCREDITED ORDERS
+        # Find bot_orders rows with status=filled/partially_filled/closed that have
+        # filled_amount > 0 but no corresponding exchange_fills entry.
+        # These are fills that the DB recorded as filled but never credited to the ledger.
+        _credit_conn = get_connection()
+        _credit_cur = _credit_conn.cursor()
+
+        # Find filled bot_orders without exchange_fills record
+        _credit_cur.execute("""
+            SELECT bo.id, bo.bot_id, bo.order_id, bo.client_order_id, bo.filled_amount,
+                   bo.price, bo.order_type, bo.step, bo.cycle_id, b.pair
+            FROM bot_orders bo
+            JOIN bots b ON bo.bot_id = b.id
+            WHERE bo.status IN ('open', 'filled', 'partially_filled', 'closed')
+              AND bo.filled_amount > 0
+              AND (bo.order_id NOT IN (SELECT exchange_order_id FROM exchange_fills WHERE exchange_order_id IS NOT NULL)
+                   AND bo.client_order_id NOT IN (SELECT client_order_id FROM exchange_fills WHERE client_order_id IS NOT NULL AND client_order_id != ''))
+        """)
+        uncredited_fills = _credit_cur.fetchall()
+
+        for (bo_id, bot_id, order_id, client_cid, filled_qty, avg_price, order_type, step, cycle_id, pair) in uncredited_fills:
+            if pair_filter and _nsym(pair) != pair_filter:
+                continue
+            from engine.ledger import credit_fill, seal_trade_state
+            # Determine side from order_type for TP/exit orders
+            fill_side = None
+            if order_type in ('tp', 'take_profit', 'exit', 'dust_close', 'close'):
+                # TP/exit side is opposite of bot direction
+                _b_row = _credit_cur.execute("SELECT direction FROM bots WHERE id = ?", (bot_id,)).fetchone()
+                if _b_row:
+                    bot_dir = _b_row[0].upper()
+                    fill_side = 'SELL' if bot_dir == 'LONG' else 'BUY'
+            elif order_type in ('entry', 'grid', 'adoption', 'adoption_add'):
+                _b_row = _credit_cur.execute("SELECT direction FROM bots WHERE id = ?", (bot_id,)).fetchone()
+                if _b_row:
+                    bot_dir = _b_row[0].upper()
+                    fill_side = 'BUY' if bot_dir == 'LONG' else 'SELL'
+
+            logger.info(f"🩹 [CREDIT-UNCREDITED] Bot {bot_id} {order_type} cid={client_cid} order_id={order_id} crediting {filled_qty:.6f}")
+            credit_fill(
+                bot_id=bot_id,
+                order_id=str(order_id),
+                cumulative_qty=filled_qty,
+                avg_price=avg_price,
+                order_type=order_type,
+                is_cumulative=True,
+                caller='reconciler-uncredited',
+                side=fill_side
+            )
+            seal_trade_state(bot_id)
+            stats['total'] = stats.get('total', 0) + 1
+            if order_type in ('tp', 'take_profit', 'exit'):
+                stats['tp_fills'] = stats.get('tp_fills', 0) + 1
+            elif order_type in ('entry', 'grid'):
+                stats['entry_fills'] = stats.get('entry_fills', 0) + 1
+            else:
+                stats['grid_fills'] = stats.get('grid_fills', 0) + 1
+
+
+            # Write to exchange_fills audit log
+            from engine.database import record_exchange_fill
+            _pair_row = _credit_cur.execute("SELECT pair FROM bots WHERE id = ?", (bot_id,)).fetchone()
+            _symbol = _pair_row[0] if _pair_row else 'UNKNOWN'
+            _fill_ts = int(time.time())
+            record_exchange_fill(
+                conn=_credit_conn,
+                exchange_order_id=str(order_id),
+                client_order_id=client_cid or '',
+                symbol=_symbol,
+                side=fill_side,
+                qty=filled_qty,
+                price=avg_price,
+                fill_ts=_fill_ts,
+                source='reconciler-uncredited',
+                bot_id=bot_id,
+                order_type=order_type,
+                step=step,
+                cycle_id=cycle_id,
+            )
+
+        # 1.6. 🚀 HISTORY-BASED ORPHAN DETECTION
+        # 1.6. 🚀 HISTORY-BASED ORPHAN DETECTION
         # 1.6. 🚀 HISTORY-BASED ORPHAN DETECTION
 
         # For any pair where physical position > virtual, scan 48h of exchange order history
