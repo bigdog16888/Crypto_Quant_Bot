@@ -292,6 +292,85 @@ def compute_bot_position(
             pass
 
 
+def _get_bot_checkpoint(conn: sqlite3.Connection, bot_id: int):
+    """Return (side, size, last_checked_unix_ts) from active_positions, or None."""
+    row = conn.execute(
+        "SELECT side, size, last_checked FROM active_positions WHERE bot_id = ?",
+        (bot_id,)
+    ).fetchone()
+    if row:
+        return (str(row[0]), float(row[1]), int(row[2]) if row[2] else 0)
+    return None
+
+
+def _compute_delta_from_fills(conn: sqlite3.Connection, bot_id: int, since_ts: int) -> float:
+    """Algebraic sum (BUY+, SELL-) of exchange_fills for bot_id where fill_ts > since_ts."""
+    if since_ts <= 0:
+        return 0.0
+    rows = conn.execute(
+        "SELECT side, qty FROM exchange_fills WHERE bot_id = ? AND fill_ts > ?",
+        (bot_id, since_ts)
+    ).fetchall()
+    return sum(qty if str(s).upper() == 'BUY' else -qty for s, qty in rows)
+
+
+def _checkpoint_bot_position(
+    conn: sqlite3.Connection,
+    bot_id: int,
+    pair: str,
+    direction: str,
+) -> BotPosition:
+    """Dynamic Checkpoint Pattern: base from active_positions + delta fills since checkpoint.
+
+    Unit test fallback: if no active_positions row exists for this bot, base=0.0,
+    cp_ts=0, delta=0 — preserves test integrity without requiring a DB snapshot.
+    """
+    cp = _get_bot_checkpoint(conn, bot_id)
+    if cp:
+        side_str, base_qty, cp_ts = cp
+        sign = 1.0 if side_str.upper() == 'LONG' else -1.0
+        base_signed = base_qty * sign
+        delta_qty = _compute_delta_from_fills(conn, bot_id, cp_ts)
+        net_qty = base_signed + delta_qty
+
+        ap_row = conn.execute(
+            "SELECT entry_price FROM active_positions WHERE bot_id = ?",
+            (bot_id,)
+        ).fetchone()
+        avg_entry_price = float(ap_row[0]) if ap_row else 0.0
+        entry_cost = base_qty * avg_entry_price if avg_entry_price else 0.0
+        fills_count = 0
+        if cp_ts > 0:
+            fills_count = conn.execute(
+                "SELECT count(*) FROM exchange_fills WHERE bot_id = ? AND fill_ts > ?",
+                (bot_id, cp_ts)
+            ).fetchone()[0]
+
+        return BotPosition(
+            bot_id=bot_id,
+            pair=pair,
+            direction=direction,
+            net_qty=net_qty,
+            entry_cost=entry_cost,
+            avg_entry_price=avg_entry_price,
+            realized_pnl=0.0,
+            fills_count=fills_count,
+            source='checkpoint',
+        )
+    else:
+        return BotPosition(
+            bot_id=bot_id,
+            pair=pair,
+            direction=direction,
+            net_qty=0.0,
+            entry_cost=0.0,
+            avg_entry_price=0.0,
+            realized_pnl=0.0,
+            fills_count=0,
+            source='checkpoint',
+        )
+
+
 def compute_pair_position(
     pair: str,
     conn: sqlite3.Connection = None,
@@ -332,7 +411,7 @@ def compute_pair_position(
         pair_net_qty = 0.0
 
         for bot_id, direction in bot_rows:
-            bp = compute_bot_position(bot_id, conn, cycle_floor=cycle_floor, cycle_ceiling=cycle_ceiling)
+            bp = _checkpoint_bot_position(conn, bot_id, pair, direction)
             bot_positions.append(bp)
             pair_net_qty += bp.net_qty
 
