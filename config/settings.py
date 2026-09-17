@@ -110,8 +110,8 @@ class Config:
 
         # Pair parity: max |virtual - exchange| qty before blocking trade / cycle reset
         self.PAIR_PARITY_QTY_TOLERANCE = float(os.getenv("PAIR_PARITY_QTY_TOLERANCE", "0.002"))
-        # Forensic/anonymous WS adopt — off by default (proof-only ledger)
-        self.ALLOW_FORENSIC_ADOPT = os.getenv("ALLOW_FORENSIC_ADOPT", "False").lower() == "true"
+        # Forensic/anonymous WS adopt — on by default for testnet/demo (pair-level checkpoint write)
+        self.ALLOW_FORENSIC_ADOPT = os.getenv("ALLOW_FORENSIC_ADOPT", "True").lower() == "true"
         # Testnet: when exchange net is 0 but ledger is not, safe-wipe bots (no market order)
         _purge_default = "True" if self.TESTNET else "False"
         self.TESTNET_PURGE_PHANTOM_LEDGER = os.getenv(

@@ -570,6 +570,19 @@ class StartupMixin:
                                         if _p not in [_gp[0] for _gp in _genuine_anomalies]:
                                             _clean_pairs.append((_p, _v, _ph, _d))
 
+                                    # Also count fleet-wide pairs NOT in _critical at all as clean
+                                    # (the _clean_pairs list above only covers pairs that made it into
+                                    # the mismatch list — pairs in perfect parity are invisible to it)
+                                    _critical_pair_norms = set(
+                                        normalize_symbol(_p).upper() for _p, _, _, _ in _critical
+                                    )
+                                    for _fp in conn.execute(
+                                        "SELECT DISTINCT pair FROM bots WHERE is_active=1"
+                                    ).fetchall():
+                                        _fp_norm = normalize_symbol(_fp[0]).upper()
+                                        if _fp_norm not in _critical_pair_norms:
+                                            _clean_pairs.append((_fp[0], 0.0, 0.0, 0.0))
+
                                     if config.TESTING_MODE:
                                         logger.warning("⚠️ [STARTUP-BARRIER-FAIL] Genuine anomaly detected on startup, but TESTING_MODE is active. Bypassing strict exit.")
                                     elif _clean_pairs:
