@@ -542,23 +542,63 @@ class StartupMixin:
                                 logger.info(f"✅ [STARTUP-BARRIER] {_p}: self-healed to parity. Cleared.")
 
                 if _genuine_anomalies:
-                    if config.TESTING_MODE:
-                        logger.warning("⚠️ [STARTUP-BARRIER-FAIL] Genuine anomaly detected on startup, but TESTING_MODE is active. Bypassing strict exit.")
-                    else:
-                        # Block start and raise error to abort startup
-                        _foreign_hint = ""
-                        if _foreign:
-                            _foreign_hint = (
-                                " Foreign (non-bot) symbols present on exchange: "
-                                + ", ".join(f"{_r}({_n:+.4f})" for _r, _nm, _n in _foreign)
-                                + ". If these are testnet/demo reset seed rows, clear or ignore them per "
-                                "docs/OPERATOR_MISMATCH_RUNBOOK.md before restarting."
-                            )
-                        raise RuntimeError(
-                            f"Startup parity verification FAILED for {len(_genuine_anomalies)} genuine-anomaly pair(s). "
-                            f"{_foreign_hint}"
-                            "Engine cannot start in a mismatched state. Run scripts/run_startup_heal.py or resolve manually."
-                        )
+                                    # TRUE PAIR-LEVEL QUARANTINE: Instead of global crash, flag only
+                                    # the anomalous pairs and allow clean pairs to proceed.
+                                    _quarantined_pairs = []
+                                    _clean_pairs = []
+
+                                    # Separate critical mismatches into quarantined vs clean
+                                    _all_critical_pairs = set(_p for _p, _v, _ph, _d in _critical)
+
+                                    for _p, _v, _ph, _d in _genuine_anomalies:
+                                        _quarantined_pairs.append((_p, _v, _ph, _d))
+                                        # Flag all active bots on this pair as REQUIRE_MANUAL_PROOF
+                                        _norm = normalize_symbol(_p).upper()
+                                        _pair_bots = [r[0] for r in conn.execute(
+                                            "SELECT id FROM bots WHERE is_active=1 AND (pair=? OR normalized_pair=?)",
+                                            (_p, _norm)).fetchall()]
+                                        for _bid in _pair_bots:
+                                            conn.execute(
+                                                "UPDATE bots SET status='REQUIRE_MANUAL_PROOF' WHERE id=? AND status IN ('Scanning','ACTIVE','IN TRADE')",
+                                                (_bid,)
+                                            )
+                                            logger.critical(f"🔒 [QUARANTINE] Pair {_p}: Bot {_bid} set to REQUIRE_MANUAL_PROOF (delta={_d:+.6f})")
+                                        conn.commit()
+
+                                    # Determine clean pairs (those in _critical but not in _genuine_anomalies)
+                                    for _p, _v, _ph, _d in _critical:
+                                        if _p not in [_gp[0] for _gp in _genuine_anomalies]:
+                                            _clean_pairs.append((_p, _v, _ph, _d))
+
+                                    if config.TESTING_MODE:
+                                        logger.warning("⚠️ [STARTUP-BARRIER-FAIL] Genuine anomaly detected on startup, but TESTING_MODE is active. Bypassing strict exit.")
+                                    elif _clean_pairs:
+                                        # At least one clean pair exists — proceed with quarantined pairs isolated
+                                        logger.critical(
+                                            f"⚠️ [STARTUP-QUARANTINE] {len(_quarantined_pairs)} pair(s) quarantined: "
+                                            f"{', '.join(f'{p}(delta={d:+.2f})' for p, v, ph, d in _quarantined_pairs)}. "
+                                            f"{len(_clean_pairs)} clean pair(s) proceeding to TRADING MODE ACTIVE."
+                                        )
+                                        logger.warning(
+                                            f"🔒 Quarantined pairs: {', '.join(_qp[0] for _qp in _quarantined_pairs)}. "
+                                            f"Clean pairs: {', '.join(_cp[0] for _cp in _clean_pairs)}."
+                                        )
+                                        # Continue past barrier — clean pairs will trade, quarantined stay frozen
+                                    else:
+                                        # ZERO clean pairs — full block as before
+                                        _foreign_hint = ""
+                                        if _foreign:
+                                            _foreign_hint = (
+                                                " Foreign (non-bot) symbols present on exchange: "
+                                                + ", ".join(f"{_r}({_n:+.4f})" for _r, _nm, _n in _foreign)
+                                                + ". If these are testnet/demo reset seed rows, clear or ignore them per "
+                                                "docs/OPERATOR_MISMATCH_RUNBOOK.md before restarting."
+                                            )
+                                        raise RuntimeError(
+                                            f"Startup parity verification FAILED for {len(_genuine_anomalies)} genuine-anomaly pair(s). "
+                                            f"{_foreign_hint}"
+                                            "Engine cannot start in a mismatched state. Run scripts/run_startup_heal.py or resolve manually."
+                                        )
                 elif _critical:
                     logger.info("✅ [STARTUP-BARRIER] All critical mismatches were routine CID-traceable drift and self-healed. Startup barrier cleared.")
                 else:
