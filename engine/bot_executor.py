@@ -3215,6 +3215,34 @@ class BotExecutor:
 
                         else:
                             # Iterate step S from hedge_trigger to parent_step
+                            # ── A3 FIX: Aggregate under-hedge detection (XAUUSDT gap root cause) ──
+                            # Sum parent filled amounts across ALL post-trigger steps (hedge_trigger+1 to parent_step)
+                            # and compare to child's total open_qty. The per-step loop below only catches
+                            # individual step gaps, but if the child is behind at multiple steps, the aggregate
+                            # drift may not be caught by per-step checks alone.
+                            total_parent_hedgeable = 0.0
+                            for S in range(hedge_trigger + 1, parent_step + 1):
+                                parent_step_row = _hc_enforce_conn.execute(
+                                    """SELECT COALESCE(SUM(filled_amount), 0.0) FROM bot_orders
+                                    WHERE bot_id = ? AND cycle_id = ? AND step = ?
+                                    AND order_type IN ('entry', 'grid')
+                                    AND status IN ('filled', 'partially_filled')
+                                    AND filled_amount > 0""",
+                                    (parent_id, parent_cycle_id, S)
+                                ).fetchone()
+                                total_parent_hedgeable += float(parent_step_row[0]) if parent_step_row else 0.0
+
+                            if child_open_qty + 1e-8 < total_parent_hedgeable:
+                                drift = total_parent_hedgeable - child_open_qty
+                                logger.warning(
+                                    f"[INV-30-A3] Under-hedged: child {bot_id} needs +{drift:.6f} {pair}. "
+                                    f"Parent hedgeable={total_parent_hedgeable:.6f}, child={child_open_qty:.6f}. "
+                                    f"Drift={drift:.6f}. Per-step catch-up will be attempted."
+                                )
+                                # Note: Per-step catch-up logic below will place individual catch-up orders.
+                                # B3 (idempotent hedge order placement) would enable aggregate catch-up here.
+                            # ────────────────────────────────────────────────────────────────────────
+
                             # checking saturation independently per step
                             for S in range(hedge_trigger, parent_step + 1):
                                 child_step = S - hedge_trigger + 1
