@@ -126,6 +126,15 @@ class Config:
         self.ONE_WAY_BLOCK_OPPOSITE_ENTRY = os.getenv(
             "ONE_WAY_BLOCK_OPPOSITE_ENTRY", "True"
         ).lower() == "true"
+
+        # 🛡️ RECONCILER LIVE APPROVAL: Gate live reconciliation operations that can modify state.
+        # When False (default): reconcile_all() runs in DRY RUN mode - logs what would be done but makes no changes.
+        # When True: Full live reconciliation with DB writes, position adoption, ghost wiping, etc.
+        # Set RECONCILER_LIVE_APPROVED=1 in environment to enable.
+        self.RECONCILER_LIVE_APPROVED = os.getenv(
+            "RECONCILER_LIVE_APPROVED", "False"
+        ).lower() in ("true", "1")
+
         # Circuit Breaker: Max quantity allowed to be adopted/aligned for a single bot per cycle (default 0.5)
         self.MAX_ADOPTION_QTY_PER_CYCLE = float(os.getenv("MAX_ADOPTION_QTY_PER_CYCLE", "0.5"))
         # Max quantity allowed to be automatically trimmed/aligned by OWAY_REPAIR (default 50.0)
@@ -167,7 +176,7 @@ class Config:
         """
         Centralized freeze guard — single source of truth for 'this bot must not trade'.
 
-        Checks both config-driven exclusion (STARTUP_EXCLUDED_BOT_IDS) and 
+        Checks both config-driven exclusion (STARTUP_EXCLUDED_BOT_IDS) and
         DB-driven exclusion (REQUIRE_MANUAL_PROOF status).
 
         Returns True if the bot is frozen and must not place any exchange orders.

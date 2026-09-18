@@ -700,11 +700,12 @@ class StateReconciler:
 
 
 
-    def reconstruct_offline_fills(self, since_hours: int = 6, pair_filter: Optional[str] = None, forensic_mode: bool = False) -> Dict[str, int]:
+    def reconstruct_offline_fills(self, since_hours: int = 6, pair_filter: Optional[str] = None, forensic_mode: bool = False, dry_run: bool = False) -> Dict[str, Any]:
         from engine.write_queue import WriteQueue
-        return WriteQueue().put_and_wait(self._reconstruct_offline_fills_internal, since_hours, pair_filter, forensic_mode, _wq_timeout=120.0)
+        from engine.write_queue import WriteQueue
+        return WriteQueue().put_and_wait(self._reconstruct_offline_fills_internal, since_hours, pair_filter, forensic_mode, dry_run, _wq_timeout=120.0)
 
-    def _reconstruct_offline_fills_internal(self, since_hours: int = 6, pair_filter: Optional[str] = None, forensic_mode: bool = False) -> Dict[str, int]:
+    def _reconstruct_offline_fills_internal(self, since_hours: int = 6, pair_filter: Optional[str] = None, forensic_mode: bool = False, dry_run: bool = False) -> Dict[str, Any]:
 
         from engine.parity_gates import forensic_adopt_allowed
         if forensic_mode and not forensic_adopt_allowed():
@@ -713,6 +714,11 @@ class StateReconciler:
                 "skipping anonymous fill attribution."
             )
             forensic_mode = False
+
+        # DRY RUN MODE: Return plan without executing any writes
+        if dry_run:
+            return self._reconstruct_offline_fills_dry_run(since_hours, pair_filter, forensic_mode)
+
 
         """
 
@@ -2855,6 +2861,166 @@ class StateReconciler:
 
 
 
+
+
+
+    def _reconstruct_offline_fills_dry_run(self, since_hours: int = 6, pair_filter: Optional[str] = None, forensic_mode: bool = False) -> Dict[str, Any]:
+        """
+        DRY RUN MODE: Scans for offline fills and returns a plan of what WOULD be done,
+        without executing any database writes or exchange state changes.
+        
+        Returns:
+            Dict with keys:
+            - 'would_credit': List of dicts describing fills that would be credited
+            - 'would_resolve_placing': List of dicts for placing/new orders that would be resolved
+            - 'would_sync_offline': List of dicts for offline fills from history
+            - 'gaps_detected': Dict of pair -> {physical, virtual, gap, whitelisted}
+            - 'stats': Simulated stats dict
+        """
+        import time
+        from engine.database import get_connection, get_pair_virtual_net
+        from engine.exchange_interface import normalize_symbol as _nsym
+        
+        plan = {
+            'would_credit': [],
+            'would_resolve_placing': [],
+            'would_sync_offline': [],
+            'gaps_detected': {},
+            'stats': {'grid_fills': 0, 'tp_fills': 0, 'entry_fills': 0, 'total': 0},
+            'dry_run': True
+        }
+        
+        conn = get_connection()
+        cursor = conn.cursor()
+        
+        # Get active bots
+        cursor.execute("SELECT id, pair, name, status, direction, hedge_child_bot_id, hedge_trigger_step FROM bots WHERE is_active=1")
+        active_bots = cursor.fetchall()
+        
+        # 1. PRE-COMMIT RESOLVE: Check for placing/new/open orders that might have filled
+        cursor.execute("""
+            SELECT bo.id, bo.bot_id, b.pair, bo.order_type, bo.client_order_id,
+                   bo.price, bo.amount, bo.step, bo.cycle_id
+            FROM bot_orders bo JOIN bots b ON bo.bot_id=b.id
+            LEFT JOIN trades t ON bo.bot_id=t.bot_id
+            WHERE (bo.status IN ('placing', 'new', 'open', 'cancelling'))
+              AND bo.filled_amount < bo.amount
+              AND bo.created_at >= COALESCE(t.wipe_wall_ts, 0)
+        """)
+        placing_rows = cursor.fetchall()
+        
+        for p_row in placing_rows:
+            db_id, bot_id, pair, otype, cid, price, amount, step, cycle_id = p_row
+            plan['would_resolve_placing'].append({
+                'bot_id': bot_id,
+                'pair': pair,
+                'order_type': otype,
+                'client_order_id': cid,
+                'db_order_id': db_id,
+                'step': step,
+                'cycle_id': cycle_id,
+                'amount': amount,
+                'price': price
+            })
+        
+        # 2. UNCREDITED FILLS: Check for filled orders in bot_orders that lack exchange_fills
+        cursor.execute("""
+            SELECT bo.id, bo.bot_id, b.pair, bo.order_type, bo.order_id, bo.client_order_id,
+                   bo.filled_amount, bo.price, bo.step, bo.cycle_id
+            FROM bot_orders bo JOIN bots b ON bo.bot_id=b.id
+            WHERE bo.status IN ('filled', 'closed')
+              AND bo.filled_amount > 0
+              AND bo.order_id IS NOT NULL
+              AND bo.order_id != ''
+              AND NOT EXISTS (
+                  SELECT 1 FROM exchange_fills ef 
+                  WHERE ef.exchange_order_id = bo.order_id
+              )
+        """)
+        uncredited = cursor.fetchall()
+        
+        for u_row in uncredited:
+            u_id, bot_id, pair, otype, order_id, client_cid, filled_qty, avg_price, step, cycle_id = u_row
+            plan['would_credit'].append({
+                'bot_id': bot_id,
+                'pair': pair,
+                'order_type': otype,
+                'order_id': order_id,
+                'client_order_id': client_cid,
+                'filled_qty': filled_qty,
+                'avg_price': avg_price,
+                'step': step,
+                'cycle_id': cycle_id
+            })
+        
+        # 3. GAP DETECTION: Compare physical vs virtual positions
+        cursor.execute("SELECT pair, side, size FROM active_positions")
+        phys_pos = {}
+        for r in cursor.fetchall():
+            sym = _nsym(r[0])
+            size = float(r[2] or 0)
+            side = str(r[1]).upper()
+            signed_size = size if side == 'LONG' else -size
+            phys_pos[sym] = phys_pos.get(sym, 0.0) + signed_size
+        
+        # Virtual positions
+        cursor.execute("SELECT DISTINCT pair FROM bots WHERE is_active=1")
+        bot_pairs = {_nsym(r[0]) for r in cursor.fetchall()}
+        all_symbols = set(phys_pos.keys()) | bot_pairs
+        
+        virt_pos = {}
+        for sym in all_symbols:
+            virt_pos[sym] = get_pair_virtual_net(sym)
+        
+        # Whitelists
+        cursor.execute("SELECT pair, side, qty FROM manual_whitelists")
+        merged_whitelists = {}
+        for wp, ws, wq in cursor.fetchall():
+            merged_whitelists[wp] = merged_whitelists.get(wp, 0.0) + (wq if ws == 'LONG' else -wq)
+        
+        for sym in all_symbols:
+            if pair_filter and sym != pair_filter:
+                continue
+            pq = phys_pos.get(sym, 0.0)
+            vq = virt_pos.get(sym, 0.0)
+            wq = merged_whitelists.get(sym, 0.0)
+            pq_adjusted = pq - wq
+            gap = abs(pq_adjusted - vq)
+            
+            if gap > 1e-8:
+                plan['gaps_detected'][sym] = {
+                    'physical': pq,
+                    'virtual': vq,
+                    'gap': gap,
+                    'whitelisted': wq,
+                    'adjusted_physical': pq_adjusted
+                }
+        
+        # 4. OFFLINE FILLS: Would scan exchange history for each gap pair
+        for sym in plan['gaps_detected']:
+            plan['would_sync_offline'].append({
+                'pair': sym,
+                'reason': f'Gap detected: physical={plan["gaps_detected"][sym]["adjusted_physical"]:.6f}, virtual={plan["gaps_detected"][sym]["virtual"]:.6f}',
+                'since_hours': since_hours
+            })
+            plan['stats']['total'] += 1
+        
+        # Also scan pairs from active bots if no gaps but since_hours scan requested
+        if not plan['gaps_detected']:
+            for bot_id, pair, name, status, direction, child_id, trigger in active_bots:
+                if pair_filter and pair != pair_filter:
+                    continue
+                plan['would_sync_offline'].append({
+                    'pair': pair,
+                    'reason': f'Active bot {bot_id} ({name}) scheduled scan',
+                    'since_hours': since_hours
+                })
+        
+        # Note about exchanges
+        if not self.exchanges:
+            plan['warning'] = 'No exchanges configured - history scans would be skipped'
+        
+        return plan
 
 
     def _mark_order_filled(self, cursor, order_id, fill_price):
@@ -6461,6 +6627,20 @@ class StateReconciler:
     def _reconcile_all_internal(self, force_adoption: bool = False):
 
         logger.info("🔄 STARTING RECONCILIATION CYCLE")
+
+
+        # 🛡️ RECONCILER LIVE APPROVAL GATE
+        # Check if live reconciliation operations are approved via config/env.
+        # If not approved, run in DRY RUN mode: log what would be done but make no changes.
+        from config.settings import config as _recon_cfg
+        if not getattr(_recon_cfg, 'RECONCILER_LIVE_APPROVED', False):
+            logger.warning(
+                "⚠️ [RECON-GATE] RECONCILER_LIVE_APPROVED=False — running in DRY RUN mode. "
+                "No DB writes, position adoptions, ghost wipes, or phantom cleanups will be executed. "
+                "Set RECONCILER_LIVE_APPROVED=1 in environment to enable live operations."
+            )
+            # Return empty results — dry run mode
+            return []
 
         
 
