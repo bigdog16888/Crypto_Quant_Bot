@@ -887,6 +887,43 @@ def _seal_trade_state_internal(
     main_open_qty = max(0.0, qty)
     has_real_position = abs(qty) > 1e-8
 
+    # ── A2 FLAG: Detect active_positions / bot_orders mismatch ────────────────
+    # Scenario: offline fill reconstruction updated active_positions (correct exchange position)
+    # but bot_orders has no fills (wiped/reset). seal_trade_state would write 0 to trades.
+    # FIX: Do NOT auto-write. Instead, flag for manual review via bots.notes.
+    if main_open_qty <= 1e-8:
+        try:
+            conn_ap = get_connection()
+            row_ap = conn_ap.execute(
+                "SELECT size, entry_price, side FROM active_positions WHERE bot_id = ?",
+                (bot_id,)
+            ).fetchone()
+            if row_ap:
+                ap_size = float(row_ap[0] or 0)
+                ap_entry = float(row_ap[1] or 0)
+                ap_side = str(row_ap[2] or '').upper()
+                if ap_size > 1e-8:
+                    # MISMATCH DETECTED: active_positions has position, bot_orders has no fills
+                    # Flag for manual review — do NOT auto-adopt
+                    existing_notes = conn_ap.execute(
+                        "SELECT COALESCE(notes, '') FROM bots WHERE id = ?", (bot_id,)
+                    ).fetchone()
+                    existing = existing_notes[0] if existing_notes else ''
+                    flag = f"[MANUAL-REVIEW] A2 mismatch: active_positions has {ap_size:.6f} @ {ap_entry:.6f} ({ap_side}) but bot_orders has no fills. Review required."
+                    new_notes = (existing + ' ' + flag).strip() if existing else flag
+                    conn_ap.execute("UPDATE bots SET notes = ? WHERE id = ?", (new_notes, bot_id))
+                    conn_ap.commit()
+                    logger.warning(
+                        f"[SEAL-A2-FLAG] Bot {bot_id}: Mismatch flagged for manual review — "
+                        f"active_positions={ap_size:.6f} @ {ap_entry:.6f} ({ap_side}), "
+                        f"bot_orders empty. NOT auto-adopting."
+                    )
+        except Exception as _a2_err:
+            logger.warning(f"[SEAL-A2-FLAG] Bot {bot_id}: mismatch check failed (non-fatal): {_a2_err}")
+    # ──────────────────────────────────────────────────────────────────────────────
+
+
+
 
     try:
         conn = get_connection()
