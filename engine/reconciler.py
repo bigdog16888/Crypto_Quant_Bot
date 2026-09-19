@@ -616,8 +616,6 @@ class StateReconciler:
 
         """
 
-        from engine.database import update_active_positions_snapshot
-
         all_positions = []
 
         self._startup_snapshot = {}
@@ -649,20 +647,6 @@ class StateReconciler:
             except Exception as e:
 
                 logger.error(f"[SNAPSHOT] Failed to fetch positions for {mt}: {e}")
-
-
-
-        # Atomic DB write — single source of truth for the UI immediately at startup
-
-        try:
-
-            update_active_positions_snapshot(all_positions)
-
-            logger.info(f"✅ [SNAPSHOT] Active positions table updated atomically ({len(all_positions)} total).")
-
-        except Exception as e:
-
-            logger.error(f"[SNAPSHOT] Failed to write DB snapshot: {e}")
 
 
 
