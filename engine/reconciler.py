@@ -8374,7 +8374,7 @@ class StateReconciler:
 
                     if true_qty > 0:
 
-                        cursor.execute("UPDATE bots SET status='IN TRADE' WHERE id=? AND status IN ('Scanning', '🟢 SCANNING', 'REQUIRE_MANUAL_PROOF')", (bot_id,))
+                        cursor.execute("UPDATE bots SET status='IN TRADE' WHERE id=? AND is_active=1 AND status IN ('Scanning', '🟢 SCANNING', 'REQUIRE_MANUAL_PROOF')", (bot_id,))
 
                         sync_trades_from_orders(bot_id)
 
@@ -8704,7 +8704,7 @@ class StateReconciler:
 
                                         cursor.execute(
 
-                                            "UPDATE bots SET status='IN TRADE' WHERE id=? AND status IN ('Scanning','🟢 SCANNING','REQUIRE_MANUAL_PROOF')",
+                                            "UPDATE bots SET status='IN TRADE' WHERE id=? AND is_active=1 AND status IN ('Scanning','🟢 SCANNING','REQUIRE_MANUAL_PROOF')",
 
                                             (b_info['bot_id'],)
 

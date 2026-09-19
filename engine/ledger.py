@@ -801,6 +801,29 @@ def _seal_trade_state_internal(
     try:
         conn = get_connection()
 
+        # ── is_active guard: skip sealing for inactive bots ─────────────────────
+        # Bots with is_active=0 are explicitly stopped by the operator and must not
+        # have their status flipped to 'IN TRADE' or trades table modified by seal.
+        # This prevents the pre-snapshot seal loop (cycle_loop.py:572) from
+        # reactivating paused bots that have residual active_positions rows.
+        # FAIL CLOSED: if the is_active lookup itself fails, skip the seal — do NOT
+        # fall through to unguarded behavior.
+        try:
+            is_active_row = conn.execute(
+                "SELECT is_active FROM bots WHERE id = ?", (bot_id,)
+            ).fetchone()
+            if is_active_row and is_active_row[0] == 0:
+                logger.info(
+                    f"[SEAL] Bot {bot_id}: is_active=0 — skipping seal (bot is explicitly stopped). "
+                    f"Preserving existing status and trades state."
+                )
+                return {}
+        except Exception as _ia_err:
+            logger.warning(f"[SEAL] Bot {bot_id}: is_active check failed (non-fatal) — skipping seal: {_ia_err}")
+            return {}
+        # ────────────────────────────────────────────────────────────────────────
+
+
         # ── Bootstrap position_side from bot config ─────────────────────────────
         # After a clean reset, trades.position_side=NULL which causes recompute to
         # default to 'LONG' and exclude all SHORT bot_orders → invested always=0.

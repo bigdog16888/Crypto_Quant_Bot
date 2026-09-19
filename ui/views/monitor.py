@@ -595,7 +595,7 @@ def _bot_positions_fragment():
                     o for o in physical_orders_for_bot.get(bid, [])
                     if o.get('order_type') == 'tp' or 'TP' in str(o.get('clientOrderId') or '')
                 )
-                if not has_tp and bot_inv > 0.01 and str(row.get('status','')).upper() == 'IN TRADE':
+                if not has_tp and bot_inv > 0.01 and str(row.get('status','')).upper() == 'IN TRADE' and int(row.get('is_active', 1)) == 1:
                     dur_days = 0.0
                     try:
                         from engine.database import get_connection as _gc_dur
@@ -1632,11 +1632,17 @@ VALUES ({target_bot_id}, 'adoption', 'filled', {abs(shortfall)}, {abs(shortfall)
                         conn_write.commit()
                         
                         # Reseal the trade state to update trades.open_qty
+                        # is_active guard: adoption dropdown already filters is_active=1, but double-check
                         from engine.ledger import seal_trade_state
-                        seal_trade_state(target_bot_id, force_recompute=True)
-                        
+                        from engine.database import get_connection as _gc_check
+                        with _gc_check() as _conn_check:
+                            _ia = _conn_check.execute("SELECT is_active FROM bots WHERE id=?", (target_bot_id,)).fetchone()
+                            if _ia and _ia[0] == 1:
+                                seal_trade_state(target_bot_id, force_recompute=True)
+                            else:
+                                logger.warning(f"[UI-ADOPTION] Bot {target_bot_id} is_active={_ia[0] if _ia else 'N/A'} -- skipping seal.")
+
                         st.success(f"Position successfully adopted for {bot_name}!")
-                        time.sleep(0.5)
                         st.rerun()
             with col2:
                 if st.button("Dismiss Alert", key=f"dismiss_{alert_id}"):

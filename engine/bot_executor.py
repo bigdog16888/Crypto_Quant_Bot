@@ -4121,13 +4121,17 @@ class BotExecutor:
         # We must promote it to `IN TRADE` immediately so its maintenance logic (TP/Grid)
         # is mathematically sound and the UI stops flashing "STRAY ORDERS".
         if bot_status['total_invested'] > 0.01 and bot_status['current_step'] == 0:
-            logger.warning(f"🔧 {name}: Residue detected (${bot_status['total_invested']:.2f}). Promoting to IN TRADE for professional management.")
-            from engine.ledger import seal_trade_state as _sts_prom
-            _new_state = _sts_prom(bot_id)
-            if _new_state:
-                bot_status.update(_new_state) # Sync local state for this cycle
-                # Re-calculate direction if needed
-                direction = bot_status.get('direction', 'LONG').upper()
+            # is_active guard: don't promote explicitly stopped bots
+            if not bot_status.get('is_active', 1):
+                logger.info(f"🔧 {name}: Residue detected but bot is is_active=0 — skipping promotion.")
+            else:
+                logger.warning(f"🔧 {name}: Residue detected (${bot_status['total_invested']:.2f}). Promoting to IN TRADE for professional management.")
+                from engine.ledger import seal_trade_state as _sts_prom
+                _new_state = _sts_prom(bot_id)
+                if _new_state:
+                    bot_status.update(_new_state) # Sync local state for this cycle
+                    # Re-calculate direction if needed
+                    direction = bot_status.get('direction', 'LONG').upper()
 
 
             pass
