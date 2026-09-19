@@ -579,13 +579,6 @@ class CycleLoopMixin:
                         logger.warning(f"⚠️ [PRE-SNAP-SEAL] Seal loop failed (non-fatal): {_seal_ex}")
                     # ────────────────────────────────────────────────────────────────
 
-                    # Fix 4: Write active_positions snapshot EVERY cycle so UI always has fresh data
-                    try:
-                        from engine.database import update_active_positions_snapshot
-                        update_active_positions_snapshot(snap_pos)
-                    except Exception as _snap_ex:
-                        logger.warning(f"⚠️ [active_positions] Failed to write snapshot: {_snap_ex}")
-
                     # POSITION MONITORING: Throttle to every 10 cycles (~50s)
                     # FLAG-ONLY: No state mutations. Reconciler handles all decisions with evidence.
                     if self.cycle_count % 10 != 0:
