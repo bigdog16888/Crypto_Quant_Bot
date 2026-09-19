@@ -1,6 +1,6 @@
 # PROJECT_STATUS.md — Crypto_Quant_Bot
 
-**Last updated: 2026-09-15 ~15:20 (session) | Engine: RUNNING (live, STABIL-WATCH 30min) @ port 19888 (SocketLock PID 3372) + WS 8765. Git: 3 commits ahead of origin/main, NOT YET PUSHED. New agents read `AGENTS.md` first.**
+**Last updated: 2026-09-19 ~16:15 (session) | Engine: STOPPED (operator decision, explicit go-ahead required). Git: 13 commits ahead of origin/main (HEAD 78f5600). New agents read `AGENTS.md` first.**
 
 ---
 
@@ -36,10 +36,10 @@
 
 ---
 
-## Live State 2026-09-15 (verified at boot + STABIL-WATCH)
+## Live State 2026-09-19 (verified at session start, engine STOPPED)
 
-- **Git HEAD**: `08a5303` (AGENTS.md open-item RESOLVED) — LOCAL; 3 commits ahead of origin/main
-- **Engine process**: **RUNNING** (SocketLock 19888 PID 3372, WS 8765, background `proc_a1511fabcd0f`) — STABIL-WATCH active
+- **Git HEAD**: `78f5600` (cycle_id_filter_fix applied) — LOCAL; 13 commits ahead of origin/main
+- **Engine process**: **STOPPED** (operator decision — explicit go-ahead required to start)
 - **Startup barrier**: CLEARED (`[8/8] All pairs verified in perfect parity`)
 - **Tier-2 health (at boot)**: all pairs clean (0 ledger_imbalance) post-reconciliation
 - **Active positions (exchange-verified)**: after clean baseline, all pairs flat except SOL −2.53 (bot 100001, managed). 23 bots: 1 IN TRADE + 13 Scanning + 9 hedge_standby.
@@ -201,6 +201,45 @@ Resolved the uncoordinated W1/W2/W4 writer race that opened the Option 1 investi
 - **All Option-1-related tests pass** in full suite (snap_allocate_gate, hedge_lifecycle, startup_barrier_race).
 - **is_active guard (`d4f8fad`)** untouched — no changes to it in any of the 7 modified files.
 
+### Precondition Resolution: HANDOFF §239 "DO NOT START ENGINE UNTIL FIXED" (2026-09-19)
+The HANDOFF precondition referenced the `d4f8fad` `is_active` guard rollout (6 sites across 4 files). **Re-verified after Option 1 landed** via:
+1. `git show` on Option 1 commits `8623161` (reconciler.py) and `bcfe8f3` (monitor.py) — confirmed edits were in `capture_startup_snapshot()` and manual sync handler, **not** in `heal_pair_drift()` or alert/adoption handlers.
+2. Raw grep + targeted reads of all 6 guard sites at current line numbers (`ledger.py:804-823`, `reconciler.py:8361`, `reconciler.py:8691`, `bot_executor.py:4124-4126`, `monitor.py:598`, `monitor.py:1639-1643`) — all patterns intact with context.
+3. No regression — Option 1 touched zero of the 4 files containing the guard logic in the guard methods.
+
+**Status: RESOLVED** — engine is now safe from paused-bot reactivation via seal/reconciler paths. Other hold-off reasons (8 P1/P2 anomalies, `cycle_id_filter_fix` unapplied, B3 unapplied, Track B tests incomplete) remain open per AGENTS.md.
+
+### 2026-09-19 LATE UPDATE — 7th is_active Guard Site Fixed (COMMIT 2b94ecb)
+**Gap found:** The `d4f8fad` rollout covered 6 sites but missed `_signal_hedge_child_entry()` — the hedge child entry order placement path in `bot_executor.py`. This function is called from three independent stacks:
+- `process_bot()` → `maintain_orders()` (protected by top-level is_active check)
+- `reconciler.py` offline/history reconstruction (lines 2084, 2731) — **bypasses process_bot()**
+- `ledger.py` real-time fill crediting (line 715) — **bypasses process_bot()**
+
+**Fix:** Added `is_active` guard inside `_signal_hedge_child_entry()` itself (lines 5475-5485). Defense in depth now protects all three call stacks.
+
+**Verification:** 55 `test_hedge_lifecycle.py` tests pass; 4 `_signal_hedge_child_entry` specific tests pass. `py_compile` clean.
+
+**Note:** The HANDOFF §239 `seal_trade_state` `is_active` guard is a **separate, still-open issue** (OPEN ITEM 2026-09-19 in HANDOFF). This fix only covers the hedge entry placement path.
+
+### 2026-09-19 EVENING UPDATE — 8th is_active Guard Site Fixed (COMMIT 732db57)
+**Gap found:** The `sync_trades_from_orders()` function in `engine/database.py` (line 4849+) writes `bots.status = 'IN TRADE'` without checking `is_active`. This function is called from the pre-snapshot seal loop in `cycle_loop.py:572` which already filters by `is_active=1` at line 433, but the function itself lacked defense-in-depth for any other callers.
+
+**Fix:** Added `is_active` guard at the start of `sync_trades_from_orders()` (lines 4852-4872). FAIL CLOSED pattern: if the `is_active` lookup fails, skip the sync entirely — do NOT fall through to unguarded behavior. Moved `conn = get_connection()` earlier to support the guard.
+
+**Verification:** All relevant tests pass (test_sync_trades_from_orders_preserves_pending_hedge_close, test_database.py, test_bot_lifecycle.py, test_startup_barrier_race.py). `py_compile` clean.
+
+**Note:** This is the 8th is_active guard site. The 7 sites from `d4f8fad` + 2b94ecb + 732db57 now cover:
+1. `ledger.py:804-823` — `seal_trade_state()` is_active check
+2. `reconciler.py:8361` — promotion SQL `WHERE is_active=1`
+3. `reconciler.py:8691` — promotion SQL `WHERE is_active=1`
+4. `bot_executor.py:4124-4126` — `maintain_orders()` is_active check
+5. `monitor.py:598` — manual seal is_active check
+6. `monitor.py:1639-1643` — manual seal is_active check
+7. `bot_executor.py:5475-5485` — `_signal_hedge_child_entry()` is_active guard
+8. `database.py:4852-4872` — `sync_trades_from_orders()` is_active guard
+
+**Remaining gap:** `get_active_bots()` in `runner/__init__.py:414` returns ALL bots (misleading name). Two callers (`startup.py:54`, `shutdown.py:111`) may need the unfiltered list. Not changed globally to avoid breaking those callers — instead, the cycle_loop pre-snapshot seal loop already filters at line 433, and `sync_trades_from_orders` now has its own guard.
+
 ### Design Notes
 - **1D (W1 owner-lookup via `bots.pair` vs `normalized_pair`): REJECTED.** Concrete trace with bot 10019 (`XAU/USDT:USDT` in DB) showed current `normalized_pair`-based query is already correct. Future pair-matching changes need same trace-before-trust discipline.
 - **Option B (W1 handles startup partial-data properly):** DEFERRED deliberately. Documented in this handoff — not forgotten, but scope exceeds this rollout.
@@ -209,3 +248,33 @@ Resolved the uncoordinated W1/W2/W4 writer race that opened the Option 1 investi
 ### Next Steps
 - Option 1 core consolidation **complete**. No further writer-map work needed unless a new use case emerges.
 - Remaining P1/P2 anomalies (XAU ORDER-SYNC loop, stale-cycle_id, INV30, etc.) from prior backlog unchanged.
+
+---
+
+## 2026-09-19 UPDATE — cycle_id_filter_fix Applied (COMMIT 78f5600)
+
+### Summary
+Fixed the root-cause bug in `recompute_invested_from_orders()` that caused bots 10008 (SOL) and 10018 (SUI) to accumulate orphan exchange positions. The bug: when computing the **current cycle** (`cycle_id=None`), the function applied `wipe_wall_ts` (a cycle-boundary timestamp) as a `created_at` floor filter, excluding valid fills that landed in the current cycle before the wall timestamp.
+
+### Changes (`engine/database.py` — commit `78f5600`)
+1. **Primary fix**: For `cycle_id=None` (live cycle), `effective_wall_ts = 0` → all fills in the target cycle included regardless of timestamp. Historical cycles (`cycle_id` explicit) still use `wipe_wall_ts` correctly.
+2. **Explicit cycle_id support**: Caller-passed `cycle_id` now respected as `target_cycle` (was silently overwritten to `trades.cycle_id`).
+3. **Formula step guard**: `_calculate_formula_step` only applied for live cycle (`cycle_id=None`); historical cycles return actual max step from fills.
+4. **CARRY pass restructured**: For explicit `cycle_id`, early return **before** the CARRY query — CARRY is a current-cycle bridging concept; historical cycles have no CARRY residues (CARRY orders are entry fills in the cycle they carry INTO, caught by PASS 1).
+
+### Verification
+- **py_compile**: clean (exit code 0)
+- **Direct recompute tests**: 114 passed across 5 test files:
+  - `test_ledger_integrity.py`: 33/33 passed
+  - `test_database.py`: 20/20 passed (includes `test_recompute_includes_prior_fills_after_adoption_wall`, `test_recompute_with_null_step_below_wipe_wall`)
+  - `test_hedge_lifecycle.py`: 55/55 passed
+  - `test_parity_gates_retry.py`: 6/6 passed
+  - `test_stale_whitelist_cleanup.py`: 5/6 passed (1 pre-existing failure in dry-run mode, confirmed identical with/without fix via `git stash` comparison)
+- **Zero regressions** — all test names identical pre/post
+
+### Critical Note — Does NOT Resolve Bots 10008/10018 By Itself
+This patch **fixes the mechanism that caused the orphans** (the wipe_wall_ts filter on current cycle). However:
+- Bots 10008 (SOL, 0.23 units) and 10018 (SUI, 58.6 units) remain `is_active=0`, `status=STOPPED` with orphan exchange positions
+- The exchange positions are real and need explicit operator resolution (attribution + ledger alignment)
+- This fix ensures that **if/when** those bots are restarted or the orphans are resolved, `recompute_invested_from_orders` will return correct virtual positions instead of zero
+- The resolution decision for 10008/10018 is still open and requires its own explicit conversation (unchanged from before)
