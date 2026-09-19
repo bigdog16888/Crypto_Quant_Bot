@@ -4524,6 +4524,14 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None, *, cycle_f
             logger.warning(f"[RECOMPUTE] Bot {bot_id}: cycle_id is NULL. Returning zero to prevent phantom accumulation.")
             return (0.0, 0.0, 0.0, 0)
             
+        # CRITICAL FIX: If caller explicitly passes cycle_id, use it as target_cycle
+        # This allows computing position for a specific cycle without wipe_wall_ts interference
+        if cycle_id is not None:
+            target_cycle = cycle_id
+            logger.debug(f"[RECOMPUTE] Bot {bot_id}: Using explicit cycle_id={cycle_id} as target_cycle")
+        else:
+            target_cycle = row_trade[0]
+
         wall_ts = int(row_trade[2] or 0)
 
         # 🚀 [v3.8.1 HEDGE CHILD DIRECTION AWARENESS]
@@ -4571,6 +4579,15 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None, *, cycle_f
         if cycle_floor < target_cycle:
             wall_ts = 0
 
+        # CRITICAL FIX: When computing for current cycle (cycle_id=None), do NOT apply wipe_wall_ts
+        # to the target_cycle itself -- only to historical cycles < target_cycle.
+        # The wipe_wall_ts belongs to the cycle boundary, not the current cycle's fills.
+        if cycle_id is None:
+            # Current cycle: include ALL fills in target_cycle regardless of timestamp
+            effective_wall_ts = 0
+        else:
+            effective_wall_ts = wall_ts
+
         # 1. Fetch all entry fills (increasing position)
         cursor.execute(f"""
             SELECT bo.step, bo.price, bo.filled_amount
@@ -4586,7 +4603,7 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None, *, cycle_f
               AND bo.order_type IN ('entry', 'grid', 'adoption', 'adoption_add', 'carry')
               AND (? = 0 OR bo.created_at >= ?)
             ORDER BY bo.created_at ASC;
-        """, (bot_id, cycle_floor, target_cycle, bot_side, wall_ts, wall_ts))
+        """, (bot_id, cycle_floor, target_cycle, bot_side, effective_wall_ts, effective_wall_ts))
         
         buys = [
             {'step': r[0], 'price': float(r[1]), 'qty': float(r[2])}
@@ -4608,7 +4625,7 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None, *, cycle_f
               AND bo.order_type IN ('adoption_reduce', 'tp', 'close', 'dust_close', 'sl', 'flatten_close')
               AND (? = 0 OR bo.created_at >= ?)
             ORDER BY bo.created_at ASC;
-        """, (bot_id, cycle_floor, target_cycle, bot_side, wall_ts, wall_ts))
+        """, (bot_id, cycle_floor, target_cycle, bot_side, effective_wall_ts, effective_wall_ts))
         
         sells = [float(r[0]) for r in cursor.fetchall()]
         total_sold = sum(sells)
@@ -4641,8 +4658,13 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None, *, cycle_f
             max_step = max((ab['step'] or 0) for ab in active_buys) if active_buys else 0
             
             # Use formula to check if step needs refinement (e.g. carry trades)
-            if total_invested > 0:
-                max_step = _calculate_formula_step(bot_id, total_invested, max_step, cursor, target_cycle)
+            # CRITICAL FIX: When computing for explicit cycle_id (not current),
+            # the max_step should reflect the actual highest step in that cycle,
+            # not be overridden by formula step calculation which assumes current cycle.
+            if cycle_id is None:
+                # Only apply formula step refinement for current cycle computation
+                if total_invested > 0:
+                    max_step = _calculate_formula_step(bot_id, total_invested, max_step, cursor, target_cycle)
             
             # 🚀 V3.3.1: WIPE AUDIT INTEGRATION
             from .reconciler_wipe_audit import _check_recompute_for_suspects
@@ -4655,7 +4677,13 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None, *, cycle_f
 
             return (total_invested, avg_price, total_qty, max_step)
 
-        # PASS 2: Check for CARRY residues
+        # PASS 2: Check for CARRY residues (only for current cycle)
+        if cycle_id is not None:
+            # Explicit cycle computation: PASS 1 already captured all entry/exit fills including CARRY entries.
+            # If PASS 1 returned zero, the historical cycle's net position is genuinely zero.
+            # No CARRY residue logic applies to historical cycles.
+            return (0.0, 0.0, 0.0, 0)
+
         carry_row = cursor.execute("""
             SELECT COALESCE(SUM(filled_amount), 0.0)
             FROM bot_orders
