@@ -703,7 +703,7 @@ class TestTicket9SnapshotWriter(unittest.TestCase):
             'contracts': -44.7,  # Negative for SHORT in one-way mode
             'entryPrice': 2.20,
         }]
-        update_active_positions_snapshot(mock_positions)
+        update_active_positions_snapshot(mock_positions, force_write=True)
         
         row = self.conn.execute(
             "SELECT bot_id FROM active_positions WHERE pair='XRPUSDC' AND side='SHORT'"
@@ -723,7 +723,7 @@ class TestTicket9SnapshotWriter(unittest.TestCase):
             'contracts': -44.7,
             'entryPrice': 2.20,
         }]
-        update_active_positions_snapshot(mock_positions)
+        update_active_positions_snapshot(mock_positions, force_write=True)
         
         orphans = self.conn.execute(
             "SELECT COUNT(*) FROM active_positions WHERE bot_id=0"
@@ -1851,8 +1851,8 @@ class TestHedgeSyncAndPriceAccuracy(unittest.TestCase):
         ]
         from engine.database import update_active_positions_snapshot
         update_active_positions_snapshot([
-            {'symbol': 'XRP/USDC:USDC', 'side': 'long', 'contracts': 10.0, 'entryPrice': 1.1609}
-        ])
+                    {'symbol': 'XRP/USDC:USDC', 'side': 'long', 'contracts': 10.0, 'entryPrice': 1.1609}
+                ], force_write=True)
         
         # Mock historical closed orders fetched from exchange
         mock_exchange.fetch_closed_orders.return_value = [

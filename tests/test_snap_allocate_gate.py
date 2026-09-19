@@ -121,7 +121,7 @@ class TestSnapAllocateGate(unittest.TestCase):
             'contracts': 1.0,
             'entryPrice': 50000.0,
         }]
-        update_active_positions_snapshot(mock_positions)
+        update_active_positions_snapshot(mock_positions, force_write=True)
         
         # Check active_positions
         cursor = self.conn.cursor()
@@ -147,7 +147,7 @@ class TestSnapAllocateGate(unittest.TestCase):
             'contracts': 1.5,
             'entryPrice': 50000.0,
         }]
-        update_active_positions_snapshot(mock_positions)
+        update_active_positions_snapshot(mock_positions, force_write=True)
         
         # Check active_positions - should be EMPTY (blocked, falls through to mismatch path)
         cursor = self.conn.cursor()
@@ -171,7 +171,7 @@ class TestSnapAllocateGate(unittest.TestCase):
             'contracts': 1.5,  # This should be the SUM of both bots' qty
             'entryPrice': 50000.0,
         }]
-        update_active_positions_snapshot(mock_positions)
+        update_active_positions_snapshot(mock_positions, force_write=True)
 
         # Check active_positions - should have BOTH bots
         cursor = self.conn.cursor()
@@ -199,7 +199,7 @@ class TestSnapAllocateGate(unittest.TestCase):
             'contracts': 1.0,
             'entryPrice': 50000.0,
         }]
-        update_active_positions_snapshot(mock_positions)
+        update_active_positions_snapshot(mock_positions, force_write=True)
         
         # Check active_positions - falls through to mismatch path, assigns to active bot 1001
         cursor = self.conn.cursor()
@@ -226,7 +226,7 @@ class TestSnapAllocateGate(unittest.TestCase):
             'contracts': -1.0,
             'entryPrice': 50000.0,
         }]
-        update_active_positions_snapshot(mock_positions)
+        update_active_positions_snapshot(mock_positions, force_write=True)
         
         # Check active_positions
         cursor = self.conn.cursor()
@@ -255,7 +255,7 @@ class TestSnapAllocateGate(unittest.TestCase):
             'contracts': 1.001,  # exchange reports combined
             'entryPrice': 50000.0,
         }]
-        update_active_positions_snapshot(mock_positions)
+        update_active_positions_snapshot(mock_positions, force_write=True)
         
         # Check active_positions - ONLY bot1 should get the position
         cursor = self.conn.cursor()
