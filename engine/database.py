@@ -2828,8 +2828,8 @@ def upsert_active_position_for_bot(bot_id: int, pair: str, direction: str, avg_f
 def clear_active_position_for_bot(bot_id: int, pair: str = None, cursor=None) -> None:
     """
     Remove the active_positions row(s) for this bot when it resets after TP/close.
-    If cursor is provided, uses it directly (caller manages transaction).
-    Otherwise, manages its own transaction.
+    SOFT-CLEAR (v3.6): Sets size=0 instead of DELETE to preserve row identity.
+    W1 (update_full_snapshot) will overwrite on next cycle.
     """
     try:
         if cursor:
@@ -2837,25 +2837,36 @@ def clear_active_position_for_bot(bot_id: int, pair: str = None, cursor=None) ->
             if pair:
                 from engine.exchange_interface import normalize_symbol
                 clean_pair = normalize_symbol(pair)
-                cursor.execute("DELETE FROM active_positions WHERE bot_id = ? AND pair = ?", (bot_id, clean_pair))
+                # Soft-clear: set size=0, keep row for W1 to overwrite
+                cursor.execute(
+                    "UPDATE active_positions SET size=0, last_updated=? WHERE bot_id=? AND pair=?",
+                    (int(time.time()), bot_id, clean_pair)
+                )
             else:
-                cursor.execute("DELETE FROM active_positions WHERE bot_id = ?", (bot_id,))
+                # Soft-clear all positions for this bot
+                cursor.execute(
+                    "UPDATE active_positions SET size=0, last_updated=? WHERE bot_id=?",
+                    (int(time.time()), bot_id)
+                )
         else:
             conn = get_connection()
-            conn.execute("BEGIN IMMEDIATE")
+            # No transaction needed — single row UPDATE
             if pair:
                 from engine.exchange_interface import normalize_symbol
                 clean_pair = normalize_symbol(pair)
-                conn.execute("DELETE FROM active_positions WHERE bot_id = ? AND pair = ?", (bot_id, clean_pair))
+                conn.execute(
+                    "UPDATE active_positions SET size=0, last_updated=? WHERE bot_id=? AND pair=?",
+                    (int(time.time()), bot_id, clean_pair)
+                )
             else:
-                conn.execute("DELETE FROM active_positions WHERE bot_id = ?", (bot_id,))
-            conn.commit()
+                conn.execute(
+                    "UPDATE active_positions SET size=0, last_updated=? WHERE bot_id=?",
+                    (int(time.time()), bot_id)
+                )
+            # No commit needed — autocommit mode
         logger.debug(f"[ACTIVE-POS] Bot {bot_id}: cleared active_positions for pair={pair or 'all'}")
     except Exception as e:
         logger.error(f"[ACTIVE-POS] Failed to clear active_positions for bot {bot_id}: {e}")
-        if not cursor:
-            try: conn.rollback()
-            except: pass
 
 
 
