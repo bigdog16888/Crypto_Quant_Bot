@@ -5472,13 +5472,25 @@ class BotExecutor:
         parent_trigger = int(row[1] or 0) if row[1] else 0
         child_step = max(1, parent_step - parent_trigger + 1)
 
+        # NEW: is_active guard — paused hedge children must not receive entry signals
+        child_active_row = conn.execute(
+            "SELECT is_active, name FROM bots WHERE id = ?", (child_bot_id,)
+        ).fetchone()
+        if child_active_row and child_active_row[0] == 0:
+            child_name = child_active_row[1] if child_active_row[1] else str(child_bot_id)
+            logger.warning(
+                f"[HEDGE-SIGNAL] Child {child_name} (bot_id={child_bot_id}) is paused (is_active=0). "
+                f"Blocking hedge entry signal from parent {parent_name}."
+            )
+            return False
+
         # Synchronize child bot's trades cycle_id with the parent's cycle_id
         # Carry forward unfilled/open orders from old cycle if position is still active
         # INV-31: route the cycle-sync writes through the WriteQueue worker thread.
         from engine.write_queue import WriteQueue
         _sync_updated, _sync_old_cycle, _sync_open_qty, _sync_carried = WriteQueue().put_and_wait(
             _hedge_cycle_sync_internal, child_bot_id, parent_cycle_id
-        )
+            )
         if _sync_carried:
             logger.warning(
                 f"⚠️ [HEDGE-CYCLE-CARRY] Child {child_bot_id} trades.cycle_id updated {_sync_old_cycle} → {parent_cycle_id} "
