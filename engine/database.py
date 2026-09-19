@@ -4849,11 +4849,32 @@ def sync_trades_from_orders(bot_id: int) -> bool:
     """
     QTY_EPSILON = 1e-6  # float addition rounding tolerance in units (not dollars)
 
+    conn = get_connection()
     try:
+        # 🛡️ is_active guard: skip sealing for inactive bots
+        # Bots with is_active=0 are explicitly stopped by the operator and must not
+        # have their status flipped to 'IN TRADE' or trades table modified by sync.
+        # This prevents the pre-snapshot seal loop (cycle_loop.py:572) from
+        # reactivating paused bots that have residual active_positions rows.
+        # FAIL CLOSED: if the is_active lookup itself fails, skip the sync — do NOT
+        # fall through to unguarded behavior.
+        try:
+            is_active_row = conn.execute(
+                "SELECT is_active FROM bots WHERE id = ?", (bot_id,)
+            ).fetchone()
+            if is_active_row and is_active_row[0] == 0:
+                logger.info(
+                    f"[SYNC] Bot {bot_id}: is_active=0 — skipping sync (bot is explicitly stopped). "
+                    f"Preserving existing status and trades state."
+                )
+                return False
+        except Exception as _ia_err:
+            logger.warning(f"[SYNC] Bot {bot_id}: is_active check failed (non-fatal) — skipping sync: {_ia_err}")
+            return False
+
         recomputed_cost, recomputed_avg, recomputed_qty, recomputed_step = recompute_invested_from_orders(bot_id)
         main_open_qty = max(0.0, recomputed_qty)
 
-        conn = get_connection()
         cursor = conn.cursor()
         row = cursor.execute(
             "SELECT total_invested, avg_entry_price, current_step, cycle_phase, open_qty FROM trades WHERE bot_id = ?",
