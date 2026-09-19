@@ -280,3 +280,40 @@ This patch **fixes the mechanism that caused the orphans** (the wipe_wall_ts fil
 - The exchange positions are real and need explicit operator resolution (attribution + ledger alignment)
 - This fix ensures that **if/when** those bots are restarted or the orphans are resolved, `recompute_invested_from_orders` will return correct virtual positions instead of zero
 - The resolution decision for 10008/10018 is still open and requires its own explicit conversation (unchanged from before)
+
+---
+
+## 2026-09-19 EVENING UPDATE — Track B Fill-Crediting Audit Complete
+
+### Summary
+Read-only audit of the fill-crediting pipeline across all 8 call stacks. Three idempotency guards verified operational:
+1. **fill_claims singleton** (INV-20) — `INSERT OR IGNORE` on `(bot_id, order_id)`
+2. **Step saturation guard** (INV-30) — synthetic `STEP_{step}_{cycle}` key + capacity check
+3. **Dual-write guard** (ledger.py:631) — `not (delta <= 0 and is_cumulative)` suppresses cumulative replays
+
+**Two findings requiring fixes:**
+
+| # | Finding | Severity | Location | Fix |
+|---|---------|----------|----------|-----|
+| 1 | **Reconciler double dual-write** — `credit_fill()` already logs to `exchange_fills`, then reconciler directly calls `record_exchange_fill()` again with same params. If `fill_ts` differs, duplicate exchange_fills entries → double-counted position. | MEDIUM | `reconciler.py:1279-1293` | Remove lines 1275-1293 (direct `record_exchange_fill` call) |
+| 2 | **Side inference in adoption/healing** — `parity_gates.py:1135` (orphan adoption) and `database.py:2173` (race guard) omit `side=` param. `credit_fill` infers from bot direction, but physical position may have opposite direction. | LOW | `parity_gates.py:1135`, `database.py:2173` | Add `side=exch_order.get('side', '')` to both calls |
+
+**Accepted risk:** fill_claims cross-ID gap (WS uses exchange_order_id, reconciler may use client_order_id). Defense-in-depth (step lock, dual-write guard, MAX protection, bot_orders OR lookup) makes double-credit practically impossible.
+
+### Test Status
+- All 115 fill-crediting related tests PASS (test_ledger_integrity.py 33, test_hedge_lifecycle.py 55, test_adopt_fill_guard.py 5, test_explicit_side_wiring.py 1, test_bot_lifecycle.py 1, test_database.py 20)
+- Missing test coverage: reconciler double-write, adoption opposite-direction, cross-ID fill_claims
+
+### Next Actions (Next Session)
+1. Apply Finding 1 fix (remove reconciler double-write)
+2. Apply Finding 2 fix (add side= to adoption/race guard)
+3. Add tests for both findings
+4. Proceed to Track C (remaining P1/P2 anomalies)
+
+---
+
+## Next Steps
+- Option 1 core consolidation **complete**. No further writer-map work needed unless a new use case emerges.
+- Remaining P1/P2 anomalies (XAU ORDER-SYNC loop, stale-cycle_id, INV30, etc.) from prior backlog unchanged.
+- Part 2 (Track B) audit complete — two fixes queued for next session.
+- Part 3 (Track C) will address remaining open anomalies.
