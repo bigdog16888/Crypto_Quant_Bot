@@ -240,6 +240,8 @@ The HANDOFF precondition referenced the `d4f8fad` `is_active` guard rollout (6 s
 
 **Remaining gap:** `get_active_bots()` in `runner/__init__.py:414` returns ALL bots (misleading name). Two callers (`startup.py:54`, `shutdown.py:111`) may need the unfiltered list. Not changed globally to avoid breaking those callers — instead, the cycle_loop pre-snapshot seal loop already filters at line 433, and `sync_trades_from_orders` now has its own guard.
 
+**⚠️ DEFENSE-IN-DEPTH NOTE:** `resolve_net_mismatch()` (reconciler.py:4627) promotes `Scanning→IN TRADE` when virtual consensus matches physical — it has **no independent is_active check**. It is currently safe because all upstream write paths to `trades.total_invested` are guarded (8 sites above). If a 9th write path is ever added without an is_active guard, this function becomes a reactivation vector. Future changes adding writes to `trades` must audit this dependency.
+
 ### Design Notes
 - **1D (W1 owner-lookup via `bots.pair` vs `normalized_pair`): REJECTED.** Concrete trace with bot 10019 (`XAU/USDT:USDT` in DB) showed current `normalized_pair`-based query is already correct. Future pair-matching changes need same trace-before-trust discipline.
 - **Option B (W1 handles startup partial-data properly):** DEFERRED deliberately. Documented in this handoff — not forgotten, but scope exceeds this rollout.
