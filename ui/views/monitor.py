@@ -1699,7 +1699,7 @@ def render_monitor_view():
                 with st.spinner("Syncing exchange..."):
                     ex = ExchangeInterface()
                     pos = ex.fetch_positions()
-                    update_active_positions_snapshot(pos)
+                    update_active_positions_snapshot(pos, force_write=True)
                 # Force health refresh so operator sees immediate updated state
                 st.session_state["_force_health_refresh"] = True
                 st.toast("✅ Active positions synchronized")
