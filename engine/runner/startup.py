@@ -119,7 +119,6 @@ class StartupMixin:
             # NOTE: reconstruct_offline_fills is called ONCE in startup_sync().
             # Removed duplicate call here (Phase 2 architecture — single offline-fill pass).
 
-
             # 6. WebSocket Stream Initialization moved to explicit startup or run_cycle
             # Logic moved to ensure reliable background thread management
 
@@ -419,7 +418,7 @@ class StartupMixin:
             logger.info("📡 [STARTUP-BARRIER] [6/8] Priming active_positions snapshot (SNAP-ALLOCATE)...")
             _snap = parity_ex.fetch_positions()
             if _snap is not None:
-                update_active_positions_snapshot(_snap)
+                update_active_positions_snapshot(_snap, force_write=True)
                 logger.info(f"✅ [STARTUP-BARRIER] SNAP-ALLOCATE primed successfully ({len(_snap)} positions).")
             else:
                 logger.warning("⚠️ [STARTUP-BARRIER] Could not retrieve position snapshot; using database cached snapshot.")
@@ -665,7 +664,7 @@ class StartupMixin:
                 try:
                     _fresh_snap = parity_ex.fetch_positions()
                     if _fresh_snap is not None:
-                        update_active_positions_snapshot(_fresh_snap)
+                        update_active_positions_snapshot(_fresh_snap, force_write=True)
                 except Exception as _snap_w_err:
                     logger.warning(f"⚠️ Post-warmup snapshot refresh failed: {_snap_w_err}")
 

@@ -3226,14 +3226,24 @@ def cleanup_pending_orders(exchange):
 _EMPTY_SNAP_COUNTER = 0
 _EMPTY_SNAP_THRESHOLD = 3  # Allow clearing after 3 consecutive empty snapshots
 
-def update_active_positions_snapshot(positions: list):
+# ============================================================================
+# DEPRECATED WRITER: update_active_positions_snapshot (W2)
+# ============================================================================
+# Single-writer design (Option 1): only update_full_snapshot (W1 in cycle_loop)
+# writes active_positions. W2 remains for STARTUP BOOTSTRAP ONLY — caller must
+# pass force_write=True. All other paths (reconciler, monitor, cycle loop)
+# MUST use get_active_positions_snapshot() (read-only) or rely on W1.
+# Future: Option B (W1 accepts partial data) will eliminate this exception.
+# ============================================================================
+
+def update_active_positions_snapshot(positions: list, force_write: bool = False):
     """
     Updates the active_positions table with the latest snapshot from the exchange.
     This is the AUTHORITATIVE physical reality view for the monitor and reconciler.
 
-    ══════════════════════════════════════════════════════════════════════
+    ═══════════════════════════════════════════════════════════════════════
     RULE #1 — ONE-WAY MODE ACCOUNT (read this before touching this code)
-    ══════════════════════════════════════════════════════════════════════
+    ═══════════════════════════════════════════════════════════════════════
     This Binance account is configured in ONE-WAY MODE, not hedge mode.
 
     What that means on the exchange:
@@ -3255,6 +3265,15 @@ def update_active_positions_snapshot(positions: list):
     - Bot ownership (bot_id) assigned by lookup; unowned positions get bot_id=0.
     """
     global _EMPTY_SNAP_COUNTER
+
+    # W2 GUARD: No-op unless explicitly forced (startup bootstrap only)
+    if not force_write:
+        logger.debug(
+            f"[W2-DISABLED] update_active_positions_snapshot called with {len(positions) if positions else 0} positions. "
+            f"Ignoring — use update_full_snapshot (W1) or get_active_positions_snapshot() instead."
+        )
+        return
+
     conn = None
     try:
         conn = get_connection()
@@ -5635,6 +5654,37 @@ def get_last_filled_order(bot_id):
         if row: return {'price': row[0], 'amount': row[1], 'step': row[2], 'timestamp': row[3]}
     except: pass
     return None
+
+
+def get_active_positions_snapshot(conn=None) -> list:
+    """
+    Read-only getter for active_positions table.
+    Returns list of dicts: [{bot_id, pair, side, size, entry_price, last_checked}]
+    This is the single source of truth; writers route through W1 only.
+    """
+    if conn is None:
+        conn = get_connection()
+    try:
+        cursor = conn.execute("""
+            SELECT bot_id, pair, side, size, entry_price, last_checked
+            FROM active_positions
+            ORDER BY bot_id, pair, side
+        """)
+        return [
+            {
+                'bot_id': row[0],
+                'pair': row[1],
+                'side': row[2],
+                'size': float(row[3] or 0),
+                'entry_price': float(row[4] or 0),
+                'last_checked': row[5],
+            }
+            for row in cursor.fetchall()
+        ]
+    except Exception as e:
+        logger.error(f"[ACTIVE-POS-READ] Failed to read snapshot: {e}")
+        return []
+
 
 # Module-level counter for update_full_snapshot (separate from update_active_positions_snapshot)
 _FULL_SNAP_EMPTY_COUNTER = 0
