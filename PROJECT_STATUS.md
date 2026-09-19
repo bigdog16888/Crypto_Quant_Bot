@@ -171,3 +171,41 @@ git log --oneline -8
 ---
 
 **End of 2026-09-15 session. Engine live and clean. 3 commits staged local, push pending. STABIL-WATCH + test root-cause in progress.**
+
+---
+
+## 2026-09-19 UPDATE — Option 1 Single-Writer Consolidation (COMPLETE)
+
+### Summary
+Resolved the uncoordinated W1/W2/W4 writer race that opened the Option 1 investigation. The active_positions table now has **one canonical writer (W1 — `update_full_snapshot`)** plus **two explicit, reviewed exceptions**, both gated behind `force_write=True`:
+
+| Writer | Role | Gate |
+|--------|------|------|
+| **W1** (`update_full_snapshot`) | Single source of truth — runs every cycle, full replacement | None (always writes) |
+| **Startup** (`engine/runner/startup.py` ×2) | Bootstrap — writes before first cycle | `force_write=True` |
+| **Manual UI Sync** (`ui/views/monitor.py`) | Operator-initiated explicit sync | `force_write=True` |
+| **W2 default** | No-op (deprecation guard) | `force_write=False` default |
+| **W4** (`clear_active_position_for_bot`) | Soft-clear (UPDATE size=0, keep row) | Always writes (DELETE→UPDATE) |
+
+**Commits (6):**
+- `2007093` — 1A: getter + 1B: W2 guard + startup `force_write=True`
+- `793b14a` — Remove W2 from `cycle_loop.py` (redundant with W1)
+- `7541bc5` — 1C: W4 soft-clear (DELETE → UPDATE size=0)
+- `8623161` — Remove W2 from `reconciler.py` (startup overwrites, periodic redundant)
+- `bcfe8f3` — Manual sync `force_write=True` (concurrency-safe with W1 via SQLite WAL)
+- `dfd9aa7` — Test fixes: 9 W2 calls → `force_write=True` (snap_allocate_gate 6, hedge_lifecycle 3)
+
+### Verification
+- **Pre/post test comparison (stash-diff at `d4f8fad` vs HEAD):** 21 failures + 11 errors — **identical test names**. Option 1 introduced **zero new failures**.
+- **Full suite (Py3.10, excl. playwright):** 661 passed / 21 failed / 11 errors / 4 subtests passed.
+- **All Option-1-related tests pass** in full suite (snap_allocate_gate, hedge_lifecycle, startup_barrier_race).
+- **is_active guard (`d4f8fad`)** untouched — no changes to it in any of the 7 modified files.
+
+### Design Notes
+- **1D (W1 owner-lookup via `bots.pair` vs `normalized_pair`): REJECTED.** Concrete trace with bot 10019 (`XAU/USDT:USDT` in DB) showed current `normalized_pair`-based query is already correct. Future pair-matching changes need same trace-before-trust discipline.
+- **Option B (W1 handles startup partial-data properly):** DEFERRED deliberately. Documented in this handoff — not forgotten, but scope exceeds this rollout.
+- **Reconciler W2 removal:** The startup W2 write is immediately overwritten by startup.py's own `force_write=True` call; periodic refresh is redundant with W1's every-cycle write. Removed entirely, not replaced with getter.
+
+### Next Steps
+- Option 1 core consolidation **complete**. No further writer-map work needed unless a new use case emerges.
+- Remaining P1/P2 anomalies (XAU ORDER-SYNC loop, stale-cycle_id, INV30, etc.) from prior backlog unchanged.
