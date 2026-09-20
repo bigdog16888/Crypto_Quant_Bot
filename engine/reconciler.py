@@ -3820,7 +3820,7 @@ class StateReconciler:
 
                 try:
 
-                    from .reconciler_wipe_audit import audit_bot_wipes
+                    from .reconciler_wipe_audit import _audit_bot_wipes
 
                     with get_connection() as conn:
 
@@ -3828,7 +3828,7 @@ class StateReconciler:
 
                         for bot_obj in bots:
 
-                            audit = audit_bot_wipes(cur, bot_obj.bot_id, pair_normalized, global_diff)
+                            audit = _audit_bot_wipes(cur, bot_obj.bot_id, pair_normalized, global_diff)
 
                             if audit.probable_cause_match:
 
