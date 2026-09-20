@@ -2178,7 +2178,8 @@ def _reset_bot_after_tp_public_internal(bot_id, exit_price, direction=None, acti
                                     avg_price=float(_detail.get('average', 0) or 0),
                                     order_type=str(_otype or 'grid').lower(),
                                     is_cumulative=True,
-                                    caller='race_guard'
+                                    caller='race_guard',
+                                    side=_detail.get('side', ''),  # REAL EXCHANGE SIDE
                                 )
                         except Exception as _e_race:
                             logger.warning(f"[RACE-GUARD] Bot {bot_id}: could not check order {_ex_oid}: {_e_race}")

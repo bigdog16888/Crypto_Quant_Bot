@@ -1139,6 +1139,7 @@ def _try_adopt_orphan_exchange_to_ledger(
             avg_price=avg,
             order_type='adoption',
             is_cumulative=True,
+            side=o.get('side', ''),  # REAL EXCHANGE SIDE
         ):
             credited_total += filled
             credited_cids.append(cid)
