@@ -157,6 +157,13 @@ def _fill_credited_by_sibling(bot_id: int, order_id: str, client_id: str, qty: f
     step-lock winner had already credited; pair parity was green 3s later).
     Only returns True when the credit ACTUALLY landed on the row — a claim
     without the fill (crash mid-commit) keeps retrying and escalates normally.
+
+    Extended: Also check for step-lock auto_closed siblings — if another order
+    in the same step/cycle was credited and this order was auto_closed as a
+    result (notes contain 'STEP_SATURATED'), this is NOT a failed credit —
+    it's correct GTX chase handling. Other auto_closed reasons (TP cascade
+    race guard, bot reset/reconcile) do NOT stand down — those are legitimate
+    orders that may still fill on exchange.
     """
     try:
         from engine.database import get_connection
@@ -167,6 +174,17 @@ def _fill_credited_by_sibling(bot_id: int, order_id: str, client_id: str, qty: f
             (bot_id, str(order_id), str(client_id) if client_id else str(order_id)),
         ).fetchone()
         if not claimed:
+            # Check for step-lock auto_closed sibling: another order in same step/cycle
+            # that was credited, causing this order to be auto_closed with STEP_SATURATED notes
+            our_row = conn.execute(
+                "SELECT step, cycle_id, status, notes FROM bot_orders WHERE bot_id=? AND (order_id=? OR client_order_id=?)",
+                (bot_id, str(order_id), str(client_id) if client_id else str(order_id))
+            ).fetchone()
+            if our_row and our_row[0] is not None and our_row[1] is not None:
+                step, cycle_id, our_status, our_notes = our_row
+                # Only stand down if auto_closed DUE TO step-saturation (sibling credited)
+                if str(our_status) == 'auto_closed' and our_notes and str(our_notes).startswith('STEP_SATURATED'):
+                    return True
             return False
         row = conn.execute(
             "SELECT filled_amount, status FROM bot_orders "
