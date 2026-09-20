@@ -453,7 +453,8 @@ class StateReconciler:
                             avg_price=fill_price,
                             order_type='tp',
                             is_cumulative=True,
-                            fill_ts=fill_ts
+                            fill_ts=fill_ts,
+                            side=order.get('side', '')  # REAL EXCHANGE SIDE
                         )
                         
                         if credited:
@@ -572,7 +573,8 @@ class StateReconciler:
                             avg_price=fill_price,
                             order_type=order_type.lower(),
                             is_cumulative=True,
-                            fill_ts=fill_ts
+                            fill_ts=fill_ts,
+                            side=order.get('side', '')  # REAL EXCHANGE SIDE
                         )
                         if credited:
                             seal_trade_state(bot_id)
@@ -1236,19 +1238,31 @@ class StateReconciler:
             if pair_filter and _nsym(pair) != pair_filter:
                 continue
             from engine.ledger import credit_fill, seal_trade_state
-            # Determine side from order_type for TP/exit orders
+            # Determine side: prefer real exchange side from exchange_fills,
+            # fallback to bot-direction inference (with warning) since this
+            # reconciliation pass has no exchange API access.
             fill_side = None
-            if order_type in ('tp', 'take_profit', 'exit', 'dust_close', 'close'):
-                # TP/exit side is opposite of bot direction
-                _b_row = _credit_cur.execute("SELECT direction FROM bots WHERE id = ?", (bot_id,)).fetchone()
-                if _b_row:
-                    bot_dir = _b_row[0].upper()
-                    fill_side = 'SELL' if bot_dir == 'LONG' else 'BUY'
-            elif order_type in ('entry', 'grid', 'adoption', 'adoption_add'):
-                _b_row = _credit_cur.execute("SELECT direction FROM bots WHERE id = ?", (bot_id,)).fetchone()
-                if _b_row:
-                    bot_dir = _b_row[0].upper()
-                    fill_side = 'BUY' if bot_dir == 'LONG' else 'SELL'
+            _ex_fill = _credit_cur.execute(
+                "SELECT side FROM exchange_fills WHERE exchange_order_id = ? LIMIT 1",
+                (str(order_id),)
+            ).fetchone()
+            if _ex_fill and _ex_fill[0]:
+                fill_side = _ex_fill[0]
+            else:
+                # Fallback: infer from bot direction (matches original bot_orders credit)
+                # Limitation: exchange API not available in DB-only reconciliation pass.
+                # For hedge children with opposite physical side, this infers wrong.
+                if order_type in ('tp', 'take_profit', 'exit', 'dust_close', 'close'):
+                    _b_row = _credit_cur.execute("SELECT direction FROM bots WHERE id = ?", (bot_id,)).fetchone()
+                    if _b_row:
+                        bot_dir = _b_row[0].upper()
+                        fill_side = 'SELL' if bot_dir == 'LONG' else 'BUY'
+                elif order_type in ('entry', 'grid', 'adoption', 'adoption_add'):
+                    _b_row = _credit_cur.execute("SELECT direction FROM bots WHERE id = ?", (bot_id,)).fetchone()
+                    if _b_row:
+                        bot_dir = _b_row[0].upper()
+                        fill_side = 'BUY' if bot_dir == 'LONG' else 'SELL'
+                logger.warning(f"[CREDIT-UNCREDITED] Bot {bot_id} order {order_id}: using inferred side '{fill_side}' (no exchange_fills record; exchange API unavailable)")
 
             logger.info(f"🩹 [CREDIT-UNCREDITED] Bot {bot_id} {order_type} cid={client_cid} order_id={order_id} crediting {filled_qty:.6f}")
             credit_fill(
@@ -2795,7 +2809,8 @@ class StateReconciler:
                                     avg_price=fill_price,
                                     order_type=order_type.lower(),
                                     is_cumulative=True,
-                                    fill_ts=fill_ts
+                                    fill_ts=fill_ts,
+                                    side=ex_order.get('side', '')  # REAL EXCHANGE SIDE
                                 )
                                 if credited:
                                     if order_type.upper() == 'TP':
@@ -8204,6 +8219,7 @@ class StateReconciler:
                                         ),
                                         order_type=str(row[3] or 'grid').lower(),
                                         is_cumulative=True,
+                                        side=ex_order.get('side', '')  # REAL EXCHANGE SIDE
                                     )
 
                             except: continue
