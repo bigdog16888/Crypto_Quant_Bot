@@ -15,11 +15,10 @@ from unittest.mock import MagicMock, patch
 # Add root to sys.path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import pytest
 from engine.database import (
     init_db, 
     update_martingale_step,
-    get_connection,
-    DB_PATH
 )
 
 def test_database_initialization():
@@ -90,16 +89,15 @@ def test_update_martingale_step_exists():
     
     print("✅ update_martingale_step function test passed")
 
-def test_update_martingale_step_upsert():
+def test_update_martingale_step_upsert(temp_db):
     """Test that update_martingale_step does UPSERT (INSERT or UPDATE)"""
     print("\n🧪 Test 3: update_martingale_step UPSERT logic...")
     
     test_bot_id = 9999
     test_pair = "TEST/USDC"
     
-    # Use real connection but cleanup after
-    conn = get_connection()
-    cursor = conn.cursor()
+    # Use temp_db fixture connection
+    cursor = temp_db.cursor()
     
     try:
         cursor.execute("DELETE FROM bots WHERE id = ?", (test_bot_id,))
@@ -110,7 +108,7 @@ def test_update_martingale_step_upsert():
         
         # Delete any existing trade record
         cursor.execute("DELETE FROM trades WHERE bot_id = ?", (test_bot_id,))
-        conn.commit()
+        temp_db.commit()
         
         # Test 3.1: First call should INSERT new record
         success = update_martingale_step(test_bot_id, 0, 1000.0, 50000.0, 51000.0)
@@ -137,7 +135,7 @@ def test_update_martingale_step_upsert():
         # Cleanup
         cursor.execute("DELETE FROM bots WHERE id = ?", (test_bot_id,))
         cursor.execute("DELETE FROM trades WHERE bot_id = ?", (test_bot_id,))
-        conn.commit()
+        temp_db.commit()
     
     print("✅ update_martingale_step UPSERT test passed")
 
