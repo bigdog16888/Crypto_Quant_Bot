@@ -1084,6 +1084,8 @@ class ExchangeInterface:
                          'average': raw_avg if raw_avg > 0 else raw_price,
                          'price': raw_price,
                          'clientOrderId': res.get('clientOrderId', ''),
+                         'side': res.get('side', '').upper(),
+                         'positionSide': res.get('positionSide', ''),
                      }
                  return None
                  
