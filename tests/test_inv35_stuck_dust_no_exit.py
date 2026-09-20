@@ -23,47 +23,9 @@ from unittest.mock import MagicMock, patch
 # Fixture
 # ---------------------------------------------------------------------------
 
-@pytest.fixture()
-def temp_db(tmp_path):
-    db_path = str(tmp_path / "test.db")
-    conn = sqlite3.connect(db_path)
-    
-    # Clone schema from production DB (crypto_bot.db) in the project root
-    # This prevents test failures when the database schema changes in other updates.
-    prod_db_path = os.path.join(r"c:\Users\Gionie\Documents\GitHub\Crypto_Quant_Bot", "crypto_bot.db")
-    prod_conn = sqlite3.connect(prod_db_path)
-    for row in prod_conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"):
-        if row[0]:
-            conn.execute(row[0])
-    prod_conn.close()
-    
-    # Insert bot 10018 (sui long, LONG)
-    conn.execute(
-        "INSERT INTO bots (id, name, pair, normalized_pair, direction, is_active, status) "
-        "VALUES (10018, 'sui long', 'SUI/USDC:USDC', 'SUIUSDC', 'LONG', 1, 'ACTIVE')"
-    )
-    conn.execute(
-        "INSERT INTO trades (bot_id, open_qty, total_invested, avg_entry_price, "
-        "current_step, cycle_id, cycle_phase, position_side) "
-        "VALUES (10018, 0.5, 0.185, 0.37, 4, 155, 'PARTIAL_CLOSE_PENDING', 'LONG')"
-    )
-    ts = int(time.time())
-    for oid, otype, status, amt, price in [
-        ('E1',  'entry', 'filled',    146.3, 0.37),
-        ('TP1', 'tp',    'cancelled',   9.0, 0.40),
-        ('TP2', 'tp',    'cancelled',  51.4, 0.39),
-        ('TP3', 'tp',    'filled',     85.4, 0.38),
-    ]:
-        conn.execute(
-            "INSERT INTO bot_orders "
-            "(bot_id, order_type, order_id, step, status, amount, filled_amount, "
-            " price, client_order_id, cycle_id, created_at, position_side) "
-            "VALUES (10018, ?, ?, 4, ?, ?, ?, ?, ?, 155, ?, 'LONG')",
-            (otype, oid, status, amt, amt, price, f"CQB_10018_{oid}", ts - 3600)
-        )
-    conn.commit()
-    conn.close()
-    return db_path
+# Use conftest's temp_db fixture (autouse session temp DB + function-scoped isolation)
+# No local fixture needed - the conftest fixture provides a temp DB with full schema
+# initialized via engine.database.init_db(). Tests receive a sqlite3.Connection.
 
 
 # ---------------------------------------------------------------------------
@@ -75,7 +37,7 @@ def test_partial_close_escalates_to_stuck_dust_no_exit(temp_db):
     A1: ReduceOnly rejection + detect_bot_ghost=False => cycle_phase must become
     STUCK_DUST_NO_EXIT. Exercises the new escalation path in bot_executor.py.
     """
-    conn = sqlite3.connect(temp_db)
+    conn = temp_db
     mock_exchange = MagicMock()
     mock_exchange.create_order.side_effect = Exception(
         "ReduceOnly Order is rejected (-2022)"
@@ -120,7 +82,7 @@ def test_reconciler_dust_chaser_escalation(temp_db):
     A2: Reconciler dust-chaser exception path must set STUCK_DUST_NO_EXIT.
     Exercises the new escalation path in reconciler.py L4236-4254.
     """
-    conn = sqlite3.connect(temp_db)
+    conn = temp_db
     cursor = conn.cursor()
     
     # Simulate a failed dust chaser placement exception
@@ -155,7 +117,7 @@ def test_safe_wipe_bot_manual_close_refuses_without_exchange(temp_db):
     B1: action_label='MANUAL_CLOSE' with exchange=None must always return False.
     Cannot verify flatness without a live exchange object.
     """
-    conn = sqlite3.connect(temp_db)
+    conn = temp_db
     conn.execute(
         "UPDATE trades SET cycle_phase='STUCK_DUST_NO_EXIT' WHERE bot_id=10018"
     )
@@ -190,7 +152,7 @@ def test_safe_wipe_bot_manual_close_refuses_when_exchange_non_flat(temp_db):
         {"symbol": "SUI/USDC:USDC", "side": "long", "contracts": 0.5}
     ]
 
-    conn = sqlite3.connect(temp_db)
+    conn = temp_db
     conn.execute(
         "UPDATE trades SET cycle_phase='STUCK_DUST_NO_EXIT' WHERE bot_id=10018"
     )
@@ -235,7 +197,7 @@ def test_safe_wipe_bot_manual_close_succeeds_when_exchange_flat(temp_db):
     ]
     mock_exchange.fetch_ticker.return_value = {"last": 0.37}
 
-    conn = sqlite3.connect(temp_db)
+    conn = temp_db
     conn.execute(
         "UPDATE trades SET cycle_phase='STUCK_DUST_NO_EXIT' WHERE bot_id=10018"
     )
