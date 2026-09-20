@@ -20,24 +20,52 @@ from unittest.mock import MagicMock, patch
 
 
 # ---------------------------------------------------------------------------
-# Fixture
+# Fixtures
 # ---------------------------------------------------------------------------
 
-# Use conftest's temp_db fixture (autouse session temp DB + function-scoped isolation)
-# No local fixture needed - the conftest fixture provides a temp DB with full schema
-# initialized via engine.database.init_db(). Tests receive a sqlite3.Connection.
+@pytest.fixture
+def inv35_test_data(temp_db):
+    """Set up bot 10018 with trades and bot_orders for INV-35 tests."""
+    conn = temp_db
+    ts = int(time.time())
+    
+    # Insert bot 10018 (sui long, LONG)
+    conn.execute(
+        "INSERT INTO bots (id, name, pair, normalized_pair, direction, is_active, status) "
+        "VALUES (10018, 'sui long', 'SUI/USDC:USDC', 'SUIUSDC', 'LONG', 1, 'ACTIVE')"
+    )
+    conn.execute(
+        "INSERT INTO trades (bot_id, open_qty, total_invested, avg_entry_price, "
+        "current_step, cycle_id, cycle_phase, position_side) "
+        "VALUES (10018, 0.5, 0.185, 0.37, 4, 155, 'PARTIAL_CLOSE_PENDING', 'LONG')"
+    )
+    for oid, otype, status, amt, price in [
+        ('E1',  'entry', 'filled',    146.3, 0.37),
+        ('TP1', 'tp',    'cancelled',   9.0, 0.40),
+        ('TP2', 'tp',    'cancelled',  51.4, 0.39),
+        ('TP3', 'tp',    'filled',     85.4, 0.38),
+    ]:
+        conn.execute(
+            "INSERT INTO bot_orders "
+            "(bot_id, order_type, order_id, step, status, amount, filled_amount, "
+            " price, client_order_id, cycle_id, created_at, position_side) "
+            "VALUES (10018, ?, ?, 4, ?, ?, ?, ?, ?, 155, ?, 'LONG')",
+            (otype, oid, status, amt, amt, price, f"CQB_10018_{oid}", ts - 3600)
+        )
+    conn.commit()
+    return conn
 
 
 # ---------------------------------------------------------------------------
 # Test A -- Escalation
 # ---------------------------------------------------------------------------
 
-def test_partial_close_escalates_to_stuck_dust_no_exit(temp_db):
+def test_partial_close_escalates_to_stuck_dust_no_exit(inv35_test_data):
     """
     A1: ReduceOnly rejection + detect_bot_ghost=False => cycle_phase must become
     STUCK_DUST_NO_EXIT. Exercises the new escalation path in bot_executor.py.
     """
-    conn = temp_db
+    conn = inv35_test_data
     mock_exchange = MagicMock()
     mock_exchange.create_order.side_effect = Exception(
         "ReduceOnly Order is rejected (-2022)"
@@ -77,12 +105,12 @@ def test_partial_close_escalates_to_stuck_dust_no_exit(temp_db):
     conn.close()
 
 
-def test_reconciler_dust_chaser_escalation(temp_db):
+def test_reconciler_dust_chaser_escalation(inv35_test_data):
     """
     A2: Reconciler dust-chaser exception path must set STUCK_DUST_NO_EXIT.
     Exercises the new escalation path in reconciler.py L4236-4254.
     """
-    conn = temp_db
+    conn = inv35_test_data
     cursor = conn.cursor()
     
     # Simulate a failed dust chaser placement exception
@@ -112,12 +140,12 @@ def test_reconciler_dust_chaser_escalation(temp_db):
 # Test B -- Recovery: safe_wipe_bot MANUAL_CLOSE guards
 # ---------------------------------------------------------------------------
 
-def test_safe_wipe_bot_manual_close_refuses_without_exchange(temp_db):
+def test_safe_wipe_bot_manual_close_refuses_without_exchange(inv35_test_data):
     """
     B1: action_label='MANUAL_CLOSE' with exchange=None must always return False.
     Cannot verify flatness without a live exchange object.
     """
-    conn = temp_db
+    conn = inv35_test_data
     conn.execute(
         "UPDATE trades SET cycle_phase='STUCK_DUST_NO_EXIT' WHERE bot_id=10018"
     )
@@ -142,7 +170,7 @@ def test_safe_wipe_bot_manual_close_refuses_without_exchange(temp_db):
     conn.close()
 
 
-def test_safe_wipe_bot_manual_close_refuses_when_exchange_non_flat(temp_db):
+def test_safe_wipe_bot_manual_close_refuses_when_exchange_non_flat(inv35_test_data):
     """
     B2: Must refuse if live fetch_positions() still shows a non-zero position.
     Catches operator timing errors (close placed but not yet settled).
@@ -152,7 +180,7 @@ def test_safe_wipe_bot_manual_close_refuses_when_exchange_non_flat(temp_db):
         {"symbol": "SUI/USDC:USDC", "side": "long", "contracts": 0.5}
     ]
 
-    conn = temp_db
+    conn = inv35_test_data
     conn.execute(
         "UPDATE trades SET cycle_phase='STUCK_DUST_NO_EXIT' WHERE bot_id=10018"
     )
@@ -185,7 +213,7 @@ def test_safe_wipe_bot_manual_close_refuses_when_exchange_non_flat(temp_db):
     conn.close()
 
 
-def test_safe_wipe_bot_manual_close_succeeds_when_exchange_flat(temp_db):
+def test_safe_wipe_bot_manual_close_succeeds_when_exchange_flat(inv35_test_data):
     """
     B3: Wiping with action_label='MANUAL_CLOSE' and flat live exchange must
     succeed when bypass_ledger_guard=True is provided.
@@ -197,7 +225,7 @@ def test_safe_wipe_bot_manual_close_succeeds_when_exchange_flat(temp_db):
     ]
     mock_exchange.fetch_ticker.return_value = {"last": 0.37}
 
-    conn = temp_db
+    conn = inv35_test_data
     conn.execute(
         "UPDATE trades SET cycle_phase='STUCK_DUST_NO_EXIT' WHERE bot_id=10018"
     )
