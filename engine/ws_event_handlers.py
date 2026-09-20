@@ -299,7 +299,8 @@ def _drain_pending_fills() -> None:
                 order_type=otype,
                 is_cumulative=True,
                 fill_ts=fill_ts,
-                caller='pending_fill_exhausted'
+                caller='pending_fill_exhausted',
+                side=pf.get('side', '')  # REAL EXCHANGE SIDE
             )
         except Exception as _e_cred:
             logger.error(f"[PENDING-FILL-EXHAUSTED] Best-effort credit_fill failed for order {order_id}: {_e_cred}")
@@ -539,7 +540,8 @@ def _attribute_anonymous_fill(event: Dict):
             order_type=f"manual_close_attr_{otype}",
             is_cumulative=True,
             fill_ts=fill_ts,
-            caller='anonymous_adopt'
+            caller='anonymous_adopt',
+            side=side  # REAL EXCHANGE SIDE (from event)
         )
         
         if not credited:
