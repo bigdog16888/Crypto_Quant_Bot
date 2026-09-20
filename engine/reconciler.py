@@ -1222,7 +1222,7 @@ class StateReconciler:
         # Find filled bot_orders without exchange_fills record
         _credit_cur.execute("""
             SELECT bo.id, bo.bot_id, bo.order_id, bo.client_order_id, bo.filled_amount,
-                   bo.price, bo.order_type, bo.step, bo.cycle_id, b.pair
+                   bo.price, bo.order_type, bo.step, bo.cycle_id, bo.filled_at, b.pair
             FROM bot_orders bo
             JOIN bots b ON bo.bot_id = b.id
             WHERE bo.status IN ('open', 'filled', 'partially_filled', 'closed')
@@ -1232,7 +1232,7 @@ class StateReconciler:
         """)
         uncredited_fills = _credit_cur.fetchall()
 
-        for (bo_id, bot_id, order_id, client_cid, filled_qty, avg_price, order_type, step, cycle_id, pair) in uncredited_fills:
+        for (bo_id, bot_id, order_id, client_cid, filled_qty, avg_price, order_type, step, cycle_id, filled_at, pair) in uncredited_fills:
             if pair_filter and _nsym(pair) != pair_filter:
                 continue
             from engine.ledger import credit_fill, seal_trade_state
@@ -1259,7 +1259,8 @@ class StateReconciler:
                 order_type=order_type,
                 is_cumulative=True,
                 caller='reconciler-uncredited',
-                side=fill_side
+                side=fill_side,
+                fill_ts=filled_at if filled_at and filled_at > 0 else 0,
             )
             seal_trade_state(bot_id)
             stats['total'] = stats.get('total', 0) + 1
@@ -1270,27 +1271,6 @@ class StateReconciler:
             else:
                 stats['grid_fills'] = stats.get('grid_fills', 0) + 1
 
-
-            # Write to exchange_fills audit log
-            from engine.database import record_exchange_fill
-            _pair_row = _credit_cur.execute("SELECT pair FROM bots WHERE id = ?", (bot_id,)).fetchone()
-            _symbol = _pair_row[0] if _pair_row else 'UNKNOWN'
-            _fill_ts = int(time.time())
-            record_exchange_fill(
-                conn=_credit_conn,
-                exchange_order_id=str(order_id),
-                client_order_id=client_cid or '',
-                symbol=_symbol,
-                side=fill_side,
-                qty=filled_qty,
-                price=avg_price,
-                fill_ts=_fill_ts,
-                source='reconciler-uncredited',
-                bot_id=bot_id,
-                order_type=order_type,
-                step=step,
-                cycle_id=cycle_id,
-            )
 
         # 1.6. 🚀 HISTORY-BASED ORPHAN DETECTION
         # 1.6. 🚀 HISTORY-BASED ORPHAN DETECTION
