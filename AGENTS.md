@@ -92,6 +92,36 @@ in the same commit. One concern per commit — never bundle fix + data change + 
 
 ---
 
+## Non-Negotiable Rules (1–13, binding — tighten and extend Standing Rules 1–13)
+
+**1. Approval Gate:** Only a standalone "approved" message authorizes ANY write (edits, git add/commit/stash/checkout/reset, DB writes, scripts, tests). Analysis turns contain ZERO writes. If unsure, treat as write. End turn at "awaiting approval".
+
+**2. Live DB Isolation:** Never open crypto_bot.db except `sqlite3 file:...?mode=ro`. Never run pytest or import engine.* against the main repo or live DB. Snapshot first.
+
+**3. Raw Evidence Only:** Paste tool output verbatim. Never retype, turn into a table, or write "already pasted above". Re-paste the exact block or write "not done".
+
+**4. No Fabricated Output:** Never present unrun output. Label anything reconstructed or illustrative as such.
+
+**5. No Memory Claims on External Systems:** Never state facts about Binance, ccxt, or any library from memory. Cite a code line (`git show HEAD:path` + sed line) or a captured sample, or write "unverified".
+
+**6. Source Labeling:** Label every source: HEAD (`git show HEAD:path`), working tree, or worktree. Never call a working-tree paste "HEAD".
+
+**7. Hash/Number Integrity:** If numbers or hashes differ between turns, say so and stop. Never claim they are equal or adjust one to fit.
+
+**8. "Fixed" Definition:** "Fixed" means: fails before, passes after, output shown. A `side=` kwarg is not proof the value is populated; trace where it comes from.
+
+**9. Complete Sweep:** After "fixed N instances": repo-wide AST + grep including aliases, wrappers, and kwargs; one file:line per hit from a single command at a stated commit; list every excluded site with its reason.
+
+**10. Scope Discipline:** Change only what was approved. Deferred or design-only sites are off-limits. No new behavior (such as a new `fetch_order` call) inside "wiring" fixes and no unrelated edits.
+
+**11. Correction Protocol:** When corrected: one line of acknowledgment, re-run a command to verify, fix it everywhere. Do not "retract" by asserting the opposite without new evidence.
+
+**12. Pre-Send Audit:** Before sending: list your claims; for each, name the raw block that supports it; delete any claim without one.
+
+**13. Engine Startup Code = Write:** Any command that could execute engine startup code (`init_db`, `heal_zombie_bots`, `auto_create_hedge`, `backup_database`, `reconstruct_offline_fills`, `engine.run_engine`) is a write and needs "approved", however small the script looks. Plain-script runs (e.g., `python tests/test_all_functions.py`) that import `engine.database` or call `init_db()` count — they open the live DB, run migrations, create backups, and mutate state.
+
+---
+
 ## Safety boundaries (never crossed without explicit operator sign-off)
 
 1. Never modify/delete/reset rows in `crypto_bot.db` or any production DB outside
