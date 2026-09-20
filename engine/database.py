@@ -4547,34 +4547,40 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None, *, cycle_f
 
         # Determine the cycle floor
         if cycle_floor is None:
-            # Auto-detection orphan scan: find the lowest cycle_id < target_cycle with unbalanced status
-            # Note: virtual_netting and legacy_netting are permanently excluded from exit order types
-            cursor.execute("""
-                SELECT cycle_id,
-                       SUM(CASE WHEN order_type IN ('entry','grid','adoption','adoption_add','carry') THEN filled_amount ELSE 0.0 END) AS entry_qty,
-                       SUM(CASE WHEN order_type IN ('tp','close','dust_close','sl','adoption_reduce','flatten_close') THEN filled_amount ELSE 0.0 END) AS exit_qty
-                FROM bot_orders
-                WHERE bot_id = ?
-                  AND cycle_id < ?
-                  AND cycle_id IS NOT NULL
-                  AND (position_side = ? OR position_side IS NULL OR position_side = 'BOTH' OR position_side = '')
-                  AND (
-                      status IN ('filled', 'closed', 'auto_closed', 'hedge_exited', 'partially_filled')
-                      OR (status IN ('canceled', 'cancelled', 'cancelling') AND filled_amount > 0)
-                  )
-                  AND filled_amount > 0
-                  AND (? = 0 OR created_at >= ?)
-                GROUP BY cycle_id
-                HAVING (entry_qty - exit_qty) > 1e-6
-                ORDER BY cycle_id ASC
-                LIMIT 1
-            """, (bot_id, target_cycle, bot_side, wall_ts, wall_ts))
-            row_floor = cursor.fetchone()
-            if row_floor:
-                cycle_floor = row_floor[0]
-                logger.info(f"[RECOMPUTE] Bot {bot_id}: Auto-detected cycle_floor={cycle_floor} due to unbalanced older cycle.")
-            else:
+            # If explicit cycle_id was passed, isolate to that cycle only.
+            # Historical cycle computation should NOT auto-detect floor —
+            # it should compute the net position FOR that specific cycle.
+            if cycle_id is not None:
                 cycle_floor = target_cycle
+            else:
+                # Auto-detection orphan scan: find the lowest cycle_id < target_cycle with unbalanced status
+                # Note: virtual_netting and legacy_netting are permanently excluded from exit order types
+                cursor.execute("""
+                    SELECT cycle_id,
+                           SUM(CASE WHEN order_type IN ('entry','grid','adoption','adoption_add','carry') THEN filled_amount ELSE 0.0 END) AS entry_qty,
+                           SUM(CASE WHEN order_type IN ('tp','close','dust_close','sl','adoption_reduce','flatten_close') THEN filled_amount ELSE 0.0 END) AS exit_qty
+                    FROM bot_orders
+                    WHERE bot_id = ?
+                      AND cycle_id < ?
+                      AND cycle_id IS NOT NULL
+                      AND (position_side = ? OR position_side IS NULL OR position_side = 'BOTH' OR position_side = '')
+                      AND (
+                          status IN ('filled', 'closed', 'auto_closed', 'hedge_exited', 'partially_filled')
+                          OR (status IN ('canceled', 'cancelled', 'cancelling') AND filled_amount > 0)
+                      )
+                      AND filled_amount > 0
+                      AND (? = 0 OR created_at >= ?)
+                    GROUP BY cycle_id
+                    HAVING (entry_qty - exit_qty) > 1e-6
+                    ORDER BY cycle_id ASC
+                    LIMIT 1
+                """, (bot_id, target_cycle, bot_side, wall_ts, wall_ts))
+                row_floor = cursor.fetchone()
+                if row_floor:
+                    cycle_floor = row_floor[0]
+                    logger.info(f"[RECOMPUTE] Bot {bot_id}: Auto-detected cycle_floor={cycle_floor} due to unbalanced older cycle.")
+                else:
+                    cycle_floor = target_cycle
 
         if cycle_floor < target_cycle:
             wall_ts = 0
