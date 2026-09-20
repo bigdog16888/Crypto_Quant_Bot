@@ -4553,7 +4553,10 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None, *, cycle_f
             if cycle_id is not None:
                 cycle_floor = target_cycle
             else:
-                # Auto-detection orphan scan: find the lowest cycle_id < target_cycle with unbalanced status
+                # Auto-detection orphan scan: find the lowest cycle_id < target_cycle with unbalanced status.
+                # First try WITH wipe_wall_ts (correct for normal live cycle where wipe_wall_ts marks current cycle boundary).
+                # If that finds nothing AND target_cycle has no fills above wipe_wall_ts, retry WITHOUT wipe_wall_ts
+                # (handles case where trades.cycle_id advanced past the actual position cycle, e.g. bot 10008).
                 # Note: virtual_netting and legacy_netting are permanently excluded from exit order types
                 cursor.execute("""
                     SELECT cycle_id,
@@ -4576,6 +4579,46 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None, *, cycle_f
                     LIMIT 1
                 """, (bot_id, target_cycle, bot_side, wall_ts, wall_ts))
                 row_floor = cursor.fetchone()
+                if not row_floor and wall_ts > 0:
+                    # Fallback: only if target_cycle itself has NO fills above wipe_wall_ts.
+                    # This handles cases where trades.cycle_id advanced past the actual position cycle
+                    # (bot 10008: target_cycle=39 has no fills, but cycle 20 has the position).
+                    # Does NOT fallback when target_cycle has valid fills (test case: cycle 10 has fills).
+                    cursor.execute("""
+                        SELECT 1 FROM bot_orders
+                        WHERE bot_id = ?
+                          AND cycle_id = ?
+                          AND filled_amount > 0
+                          AND status IN ('filled', 'closed', 'auto_closed', 'hedge_exited', 'partially_filled')
+                          AND (? = 0 OR created_at >= ?)
+                        LIMIT 1
+                    """, (bot_id, target_cycle, wall_ts, wall_ts))
+                    target_has_fills = cursor.fetchone() is not None
+                    
+                    if not target_has_fills:
+                        # Retry without wipe_wall_ts filter
+                        cursor.execute("""
+                            SELECT cycle_id,
+                                   SUM(CASE WHEN order_type IN ('entry','grid','adoption','adoption_add','carry') THEN filled_amount ELSE 0.0 END) AS entry_qty,
+                                   SUM(CASE WHEN order_type IN ('tp','close','dust_close','sl','adoption_reduce','flatten_close') THEN filled_amount ELSE 0.0 END) AS exit_qty
+                            FROM bot_orders
+                            WHERE bot_id = ?
+                              AND cycle_id < ?
+                              AND cycle_id IS NOT NULL
+                              AND (position_side = ? OR position_side IS NULL OR position_side = 'BOTH' OR position_side = '')
+                              AND (
+                                  status IN ('filled', 'closed', 'auto_closed', 'hedge_exited', 'partially_filled')
+                                  OR (status IN ('canceled', 'cancelled', 'cancelling') AND filled_amount > 0)
+                              )
+                              AND filled_amount > 0
+                            GROUP BY cycle_id
+                            HAVING (entry_qty - exit_qty) > 1e-6
+                            ORDER BY cycle_id ASC
+                            LIMIT 1
+                        """, (bot_id, target_cycle, bot_side))
+                        row_floor = cursor.fetchone()
+                        if row_floor:
+                            logger.info(f"[RECOMPUTE] Bot {bot_id}: Fallback auto-detection (no wall_ts) found cycle_floor={row_floor[0]}")
                 if row_floor:
                     cycle_floor = row_floor[0]
                     logger.info(f"[RECOMPUTE] Bot {bot_id}: Auto-detected cycle_floor={cycle_floor} due to unbalanced older cycle.")
@@ -4585,14 +4628,10 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None, *, cycle_f
         if cycle_floor < target_cycle:
             wall_ts = 0
 
-        # CRITICAL FIX: When computing for current cycle (cycle_id=None), do NOT apply wipe_wall_ts
-        # to the target_cycle itself -- only to historical cycles < target_cycle.
-        # The wipe_wall_ts belongs to the cycle boundary, not the current cycle's fills.
-        if cycle_id is None:
-            # Current cycle: include ALL fills in target_cycle regardless of timestamp
-            effective_wall_ts = 0
-        else:
-            effective_wall_ts = wall_ts
+        # CRITICAL FIX: wipe_wall_ts is a boundary timestamp from a LATER reset.
+        # It should NOT filter fills within the target_cycle (whether current or historical).
+        # Only cycles STRICTLY BELOW target_cycle are subject to the wall.
+        effective_wall_ts = 0
 
         # 1. Fetch all entry fills (increasing position)
         cursor.execute(f"""
