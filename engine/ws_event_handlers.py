@@ -354,62 +354,6 @@ def get_pending_cancel_after_tp() -> set:
 _notified_fills_max_size = 10000
 
 
-def _attribute_orphan_fill(bot_id: int, order_id: str, client_id: str, qty: float, price: float, order_type: str, fill_ts: int, symbol: str):
-    """
-    Handles fills for CQB_ orders that are missing from bot_orders DB.
-    Forensic adopt is disabled by default — flags REQUIRE_MANUAL_PROOF instead.
-    """
-    from engine.parity_gates import forensic_adopt_allowed, flag_orphan_fill_manual_proof
-    if not forensic_adopt_allowed():
-        flag_orphan_fill_manual_proof(bot_id, order_id, symbol, qty, 'orphan_ws')
-        return False
-
-    logger.warning(f"🕵️ [ORPHAN-RECOVERY] Bot {bot_id}: Order {order_id}/{client_id} missing from DB. Adopting forensically.")
-    try:
-        from engine.database import get_connection
-        from engine.ledger import seal_trade_state, credit_fill
-        
-        # Get bot's current cycle/step to anchor the adoption
-        conn = get_connection()
-        bot_info = conn.execute("""
-            SELECT t.cycle_id, t.current_step, b.direction 
-            FROM trades t 
-            JOIN bots b ON b.id = t.bot_id 
-            WHERE t.bot_id = ?
-        """, (bot_id,)).fetchone()
-        cycle_id = bot_info[0] if bot_info else -1
-        step = bot_info[1] if bot_info else 0
-        direction = bot_info[2] if bot_info else 'LONG'
-        conn.close()
-        
-        # side from direction
-        side = 'LONG' if direction == 'LONG' else 'SHORT'
-            
-        # Insert the missing row via credit_fill (which uses WriteQueue internally)
-        credited = credit_fill(
-            bot_id=bot_id,
-            order_id=order_id,
-            cumulative_qty=qty,
-            avg_price=price,
-            order_type=f"forensic_adoption_{order_type.lower()}",
-            is_cumulative=True,
-            fill_ts=fill_ts,
-            caller='orphan_recovery'
-        )
-        
-        if not credited:
-            logger.error(f"[ORPHAN-RECOVERY] credit_fill failed for bot {bot_id} order {order_id}")
-            return False
-        
-        # Now that the row exists, seal the trade state via WriteQueue
-        WriteQueue().put_and_wait(seal_trade_state, bot_id)
-        logger.info(f"✅ [ORPHAN-RECOVERY] Bot {bot_id}: Adopted {qty:.6f} @ {price:.4f}. Ledger truth restored.")
-        return True
-    except Exception as e:
-        logger.error(f"❌ [ORPHAN-RECOVERY] Failed to adopt orphan fill for bot {bot_id}: {e}")
-        return False
-
-
 def _attribute_anonymous_fill(event: Dict):
     """
     Handle anonymous fills (non-CQB tagged) from WebSocket.
