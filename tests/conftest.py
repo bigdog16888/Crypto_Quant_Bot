@@ -1,79 +1,147 @@
 import os
 import sys
+import sqlite3
+from pathlib import Path
 
-# Set TESTING_MODE environment variable so that config.settings initializes it correctly for all unit tests.
+# CRITICAL: Set PYTEST_RUNNING BEFORE any engine imports
+# This must be the very first thing in conftest.py
+os.environ["PYTEST_RUNNING"] = "1"
 os.environ["TESTING_MODE"] = "True"
 
-# Set PYTEST_RUNNING so that engine/database.py skips backup_database(),
-# closes init connections, and skips heal_zombie_bots/auto_create_hedge
-# during test runs (these are startup-only operations that lock temp DBs).
-os.environ["PYTEST_RUNNING"] = "1"
+# Hard guard: block any connection to the live crypto_bot.db
+_LIVE_DB = Path(r"D:\Crypto_Quant_Bot\crypto_bot.db").resolve()
+_ORIG_CONNECT = sqlite3.connect
 
-# Ensure WriteQueue bypass is active before any engine import.
-# Under pytest, WriteQueue.__init__ already sets _bypass=True because
-# 'pytest' is in sys.modules naturally. We additionally force it at class level
-# and drop any pre-existing singleton so no worker thread ever starts during tests.
+def _GUARDED_CONNECT(path, *args, **kwargs):
+    is_live = False
+    try:
+        if isinstance(path, (str, os.PathLike)):
+            p = Path(str(path).replace('file:', '').split('?')[0]).resolve()
+            is_live = (p == _LIVE_DB)
+    except Exception:
+        is_live = False
+
+    if is_live and 'mode=ro' not in str(path).lower():
+        raise RuntimeError(f"LIVE DB WRITE BLOCKED by test isolation guard: {path}")
+
+    return _ORIG_CONNECT(path, *args, **kwargs)
+
+sqlite3.connect = _GUARDED_CONNECT
+
 import engine.write_queue as wq_module
 wq_module.WriteQueue._bypass = True
 wq_module.WriteQueue._instance = None
 
 # ---------------------------------------------------------------------------
 # Cross-test DB connection isolation (Step 6, 2026-09-15).
-#
-# engine.database.get_connection() caches a SQLite connection in the module-global
-# `database._local` thread-local keyed on `database.DB_PATH`, and opens it in WAL
-# mode. Several tests point DB_PATH at a temp dir then `rmtree` it in teardown
-# WITHOUT closing/resetting `_local`. On Windows the still-open connection keeps
-# the `-wal`/`-shm` files locked (PermissionError WinError 32), and the NEXT test
-# that reuses the dead cached connection hits "unable to open database file" /
-# "NoneType has no attribute cursor". This cascaded and broke tests that pass in
-# isolation (test_ghost_clearing x2, test_snap_allocate_gate, test_streamlit_smoke).
-#
-# Fix: an autouse fixture that, around EVERY test, snapshots + restores
-# `database.DB_PATH` and force-closes/clears the cached `_local` connection so no
-# dead or locked handle ever leaks across tests. Non-invasive: test-only, no engine
-# code changed.
-# ---------------------------------------------------------------------------
+# ...
 import threading
-import engine.database as _ed
+import engine.database as _ed_lazy
 
 import pytest
 
 
 @pytest.fixture(autouse=True, scope="function")
 def _isolate_db_connections():
-    # Save prior global state (in case an earlier test left it mutated).
+    # Lazy import AFTER env vars are set and guard is installed
+    import engine.database as _ed
     saved_path = _ed.DB_PATH
 
-    # Clear any cached connection from a previous test before this one starts.
     _force_close_cached_conn()
 
     yield
 
-    # After the test: force-close the cached connection and reset the thread-local
-    # so the next test cannot inherit a dead/locked handle.
     _force_close_cached_conn()
-    _ed.DB_PATH = saved_path
+    # Restore only if not overridden by temp_db fixture
+    if _ed.DB_PATH == saved_path:
+        _ed.DB_PATH = saved_path
 
 
 def _force_close_cached_conn():
-    local = getattr(_ed, "_local", None)
-    if local is None:
+    try:
+        # Safely close any active connection before resetting
+        conn = getattr(_ed_lazy._local, 'connection', getattr(_ed_lazy._local, 'conn', None))
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        _ed_lazy._local = threading.local()
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Session-scoped temp DB redirect — autouse for ALL tests
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="session", autouse=True)
+def _temp_db_redirect(tmp_path_factory):
+    """Redirect engine.database.DB_PATH to a temp file for the entire test session."""
+    import engine.database as _ed
+    temp_dir = tmp_path_factory.mktemp("db")
+    temp_db_path = temp_dir / "test_session.db"
+    _ed.DB_PATH = str(temp_db_path)
+    # Force re-init on the temp DB
+    _force_close_cached_conn()
+    _ed.init_db()
+    yield
+    # Cleanup handled by tmp_path_factory
+
+
+# ---------------------------------------------------------------------------
+# Function-scoped temp DB fixture for tests needing explicit connection
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def temp_db(monkeypatch, tmp_path, request):
+    """
+    Creates a temporary SQLite database with full schema initialized.
+    Returns the sqlite3.Connection to the temp DB.
+
+    Tests that need isolation from production DB should use this fixture
+    (add `temp_db` parameter). Tests marked @pytest.mark.no_db skip this.
+    """
+    # Allow opt-out for pure mock/unit tests
+    if request.node.get_closest_marker("no_db"):
+        yield None
         return
-    conn = getattr(local, "connection", None)
-    if conn is not None:
-        try:
-            conn.close()
-        except Exception:
-            pass
-    # Wipe the cached connection + its path marker unconditionally.
+
+    db_file = tmp_path / f"test_{request.node.name}.db"
+    db_path = str(db_file)
+
+    # Patch the module-level DB_PATH to the temp file
+    import engine.database as _ed
+    monkeypatch.setattr(_ed, "DB_PATH", db_path, raising=False)
+
+    _force_close_cached_conn()
+
+    # Initialize schema on the temp DB
     try:
-        local.connection = None
-        local.connection_db_path = None
-    except Exception:
-        pass
-    # Defensive: replace the thread-local entirely so no stale attribute lingers.
+        _ed.init_db(db_path)
+    except TypeError:
+        _ed.init_db()
+
+    conn = _ed.get_connection()
+
     try:
-        _ed._local = threading.local()
-    except Exception:
-        pass
+        yield conn
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        _force_close_cached_conn()
+
+
+@pytest.fixture
+def temp_db_path(temp_db):
+    """Return the temp DB path string for tests that need it directly."""
+    if temp_db is None:
+        return None
+    cursor = temp_db.execute("PRAGMA database_list")
+    for row in cursor.fetchall():
+        if row[1] == "main":
+            return row[2]
+    return None
