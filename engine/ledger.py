@@ -491,7 +491,7 @@ def _credit_fill_internal(
                     "WHERE bot_id = ? AND step = ? AND cycle_id = ? "
                     "AND order_type IN ('entry','grid','adoption_add','adoption','forensic_adoption_add') "
                     "AND filled_amount > 0 "
-                    "AND status NOT IN ('reset_cleared','auto_closed','cancelled','canceled','failed','rejected') "
+                    "AND status NOT IN ('reset_cleared','auto_closed','cancelled','canceled','failed','rejected','reconciliation') "
                     "AND id != ?",
                     (bot_id, row_step, row_cycle, db_id)
                 ).fetchone()[0] or 0.0

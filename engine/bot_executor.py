@@ -742,7 +742,7 @@ def _maintain_live_guard_recon_internal(
         "(bot_id, step, order_type, order_id, price, amount, status, "
         " created_at, client_order_id, updated_at, notes, cycle_id, "
         " filled_amount, position_side) "
-        "VALUES (?, ?, 'entry', ?, ?, ?, 'filled', ?, ?, ?, "
+        "VALUES (?, ?, 'entry', ?, ?, ?, 'reconciliation', ?, ?, ?, "
         " 'Live-guard INV30 DB sync: hedge already present on exchange.', "
         " ?, ?, ?)",
         (
@@ -757,6 +757,11 @@ def _maintain_live_guard_recon_internal(
             corrected_qty,
             position_side
         )
+    )
+    # Ensure status is 'reconciliation' (LIVE_GUARD_INV30 markers should not trigger step saturation)
+    conn.execute(
+        "UPDATE bot_orders SET status='reconciliation' WHERE client_order_id = ?",
+        (recon_cid,)
     )
     conn.commit()
 

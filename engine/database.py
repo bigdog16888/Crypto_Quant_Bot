@@ -4641,11 +4641,11 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None, *, cycle_f
               AND bo.cycle_id >= ? AND bo.cycle_id <= ?
               AND (bo.position_side = ? OR bo.position_side IS NULL OR bo.position_side = 'BOTH' OR bo.position_side = '')
               AND (
-                  bo.status IN ('filled', 'closed', 'auto_closed', 'hedge_exited', 'partially_filled')
-                  OR (bo.status IN ('canceled', 'cancelled', 'cancelling') AND bo.filled_amount > 0)
-              )
-              AND bo.filled_amount > 0
-              AND bo.order_type IN ('entry', 'grid', 'adoption', 'adoption_add', 'carry')
+                                bo.status IN ('filled', 'closed', 'auto_closed', 'hedge_exited', 'partially_filled', 'reconciliation')
+                                OR (bo.status IN ('canceled', 'cancelled', 'cancelling') AND bo.filled_amount > 0)
+                            )
+                            AND bo.filled_amount > 0
+                            AND bo.order_type IN ('entry', 'grid', 'adoption', 'adoption_add', 'carry')
               AND (? = 0 OR bo.created_at >= ?)
             ORDER BY bo.created_at ASC;
         """, (bot_id, cycle_floor, target_cycle, bot_side, effective_wall_ts, effective_wall_ts))
@@ -4663,11 +4663,11 @@ def recompute_invested_from_orders(bot_id: int, cycle_id: int = None, *, cycle_f
               AND bo.cycle_id >= ? AND bo.cycle_id <= ?
               AND (bo.position_side = ? OR bo.position_side IS NULL OR bo.position_side = 'BOTH' OR bo.position_side = '')
               AND (
-                  bo.status IN ('filled', 'closed', 'auto_closed', 'hedge_exited', 'partially_filled')
-                  OR (bo.status IN ('canceled', 'cancelled', 'cancelling') AND bo.filled_amount > 0)
-              )
-              AND bo.filled_amount > 0
-              AND bo.order_type IN ('adoption_reduce', 'tp', 'close', 'dust_close', 'sl', 'flatten_close')
+                                bo.status IN ('filled', 'closed', 'auto_closed', 'hedge_exited', 'partially_filled', 'reconciliation')
+                                OR (bo.status IN ('canceled', 'cancelled', 'cancelling') AND bo.filled_amount > 0)
+                            )
+                            AND bo.filled_amount > 0
+                            AND bo.order_type IN ('adoption_reduce', 'tp', 'close', 'dust_close', 'sl', 'flatten_close')
               AND (? = 0 OR bo.created_at >= ?)
             ORDER BY bo.created_at ASC;
         """, (bot_id, cycle_floor, target_cycle, bot_side, effective_wall_ts, effective_wall_ts))
