@@ -461,6 +461,7 @@ class ExchangeInterface:
                         'id': o['orderId'],
                         'symbol': o['symbol'],
                         'side': o['side'].lower(),
+                        'positionSide': o.get('positionSide', ''),
                         'price': float(o['price']),
                         'amount': float(o['origQty']),
                         'clientOrderId': o['clientOrderId'],
@@ -498,6 +499,7 @@ class ExchangeInterface:
                                 'id': o['orderId'],
                                 'symbol': o['symbol'],
                                 'side': o['side'].lower(),
+                                'positionSide': o.get('positionSide', ''),
                                 'price': float(o['avgPrice'] if float(o.get('avgPrice', 0)) > 0 else o['price']),
                                 'amount': float(o['executedQty']), # Use executedQty for fills
                                 'clientOrderId': o['clientOrderId'],
