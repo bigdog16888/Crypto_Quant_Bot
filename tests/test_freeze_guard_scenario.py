@@ -120,9 +120,35 @@ class TestFreezeGuardBlocksRuntimePaths:
     def teardown_method(self):
         import engine.database
         engine.database.DB_PATH = self._orig_db_path
-        if os.path.exists(self.db_path):
-            os.remove(self.db_path)
-        os.rmdir(self.temp_dir)
+
+        # Close any open connection on self (if tests store one)
+        if hasattr(self, 'conn') and self.conn:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+
+        # Flush thread-local cached connections in engine.database
+        try:
+            from tests.conftest import _force_close_cached_conn
+            _force_close_cached_conn()
+        except Exception:
+            pass
+
+        # Windows-safe cleanup: retry with small delay if file is still locked
+        import time
+        for _ in range(3):
+            try:
+                if os.path.exists(self.db_path):
+                    os.remove(self.db_path)
+                break
+            except PermissionError:
+                time.sleep(0.1)
+
+        try:
+            os.rmdir(self.temp_dir)
+        except (OSError, PermissionError):
+            pass
 
     def test_is_bot_frozen_returns_true_for_excluded_and_manual_proof(self):
             """Unit test for the guard function itself."""
