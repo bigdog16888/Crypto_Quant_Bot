@@ -84,4 +84,7 @@ engine.heartbeat
 backups/
 
 # Test snapshots directory
-snapshots/archive/
+snapshots/
+
+# Root archive directory
+archive/
