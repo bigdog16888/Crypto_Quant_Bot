@@ -114,34 +114,51 @@ def _make_db(bot_qtys, active_positions=None, unconfirmed_bots=None):
             created_at INTEGER
         )
     """)
-    
+    conn.execute("""
+        CREATE TABLE exchange_fills (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            bot_id INTEGER,
+            exchange_order_id TEXT,
+            client_order_id TEXT,
+            qty REAL,
+            price REAL,
+            side TEXT,
+            order_type TEXT,
+            timestamp INTEGER,
+            cycle_id INTEGER,
+            step INTEGER,
+            is_cumulative INTEGER DEFAULT 0,
+            notes TEXT
+        )
+    """)
+
     for bot_id, qty in bot_qtys:
         direction = "LONG" if bot_id == 101 else "SHORT"
         name = f"Bot{bot_id}"
         pair = "BTC/USDC"
         normalized_pair = "BTCUSDC"
-        
+
         # Insert bot order (entry order)
         conn.execute("""
-            INSERT INTO bot_orders 
+            INSERT INTO bot_orders
             (bot_id, order_type, filled_amount, amount, price, status, cycle_id, position_side)
             VALUES (?, 'entry', ?, ?, 100.0, 'filled', 1, ?)
         """, (bot_id, qty, qty, direction))
-        
+
         # Insert bot
         conn.execute("""
             INSERT INTO bots (id, name, pair, normalized_pair, direction, is_active, status)
             VALUES (?, ?, ?, ?, ?, 1, 'ACTIVE')
         """, (bot_id, name, pair, normalized_pair, direction))
-        
+
         # Insert trade
         confirmed = 0 if bot_id in unconfirmed_bots else 1
         conn.execute("""
-            INSERT INTO trades 
+            INSERT INTO trades
             (bot_id, cycle_id, total_invested, entry_confirmed, position_side, avg_entry_price, target_tp_price, current_step, basket_start_time, wipe_wall_ts, open_qty, cycle_phase)
             VALUES (?, 1, ?, ?, ?, 100.0, 101.0, 1, 1000, 0, ?, 'ACTIVE')
         """, (bot_id, qty * 100.0, confirmed, direction, qty))
-        
+
     if active_positions:
         for pair, side, size in active_positions:
             conn.execute(

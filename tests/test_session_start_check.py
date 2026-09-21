@@ -58,8 +58,12 @@ def test_marked_done_no_alert_exit0():
     m = _load_module()
     tmp = tempfile.NamedTemporaryFile(
         "w", suffix=".md", dir=tempfile.gettempdir(), delete=False, encoding="utf-8")
-    text = open(STATUS, encoding="utf-8").read().replace(
-        "[DONE:pending]", "[DONE:2026-07-21]", 1)
+    # Synthetic markdown with all past dates marked DONE
+    text = """## Dated reminders (authoritative)
+- 2026-07-21: tencent-hy3-free model retired [DONE:2026-07-21]
+- 2026-07-28: laguna-m.1 model retired [DONE:2026-07-28]
+- 2026-10-15: future unexpired reminder
+"""
     tmp.write(text)
     tmp.close()
     m.STATUS_PATH = tmp.name

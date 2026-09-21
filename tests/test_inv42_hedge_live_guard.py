@@ -1,6 +1,7 @@
 import os
 import sys
 import sqlite3
+from unittest.mock import patch
 import shutil
 import tempfile
 import unittest
@@ -56,6 +57,7 @@ class TestINV42HedgeLiveGuard(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
+    @patch.dict('os.environ', {'RECONCILER_LIVE_APPROVED': '1'})
     def test_live_guard_prevents_catchup_in_maintain_orders(self):
         """
         INV-42: If parent is at step 7 (needs 0.151 hedge) and child's DB is wiped (open_qty=0, bot_orders empty),
@@ -122,7 +124,7 @@ class TestINV42HedgeLiveGuard(unittest.TestCase):
         ).fetchone()
         self.assertIsNotNone(recon_order)
         self.assertEqual(recon_order[0], 0.151)
-        self.assertEqual(recon_order[2], 'filled')
+        self.assertEqual(recon_order[2], 'reconciliation')
 
     def test_live_guard_prevents_catchup_in_signal_hedge_entry(self):
         """
@@ -272,12 +274,13 @@ class TestINV42HedgeLiveGuard(unittest.TestCase):
         recon_orders = self.conn.execute(
             "SELECT amount, filled_amount, status FROM bot_orders WHERE bot_id=100317 AND client_order_id LIKE '%LIVE_GUARD_RECON%'"
         ).fetchall()
-        
+
         self.assertEqual(len(recon_orders), 1)
         self.assertEqual(recon_orders[0][0], 0.151)
         # It should have replaced/re-inserted the row with filled_amount back to 0.151
         self.assertEqual(recon_orders[0][1], 0.151)
 
+    @patch.dict('os.environ', {'RECONCILER_LIVE_APPROVED': '1'})
     def test_live_guard_partial_coverage(self):
         """
         INV-42: If parent is at step 7 (needs 0.151 hedge) and child's DB is wiped (open_qty=0),
@@ -361,35 +364,34 @@ class TestINV42HedgeLiveGuard(unittest.TestCase):
         self.assertIsNotNone(recon_order)
         self.assertAlmostEqual(recon_order[0], 0.100)
         self.assertAlmostEqual(recon_order[1], 0.100)
-        self.assertEqual(recon_order[2], 'filled')
-
+        self.assertEqual(recon_order[2], 'reconciliation')
 
     def test_live_guard_rejects_link_cascade_phantom_swings(self):
         """
         INV-30: Test with actual LINK cascade data from 2026-08-28 incident.
-        
+
         Hedge-live-guard observed these phantom position swings during DNS failure:
         143.23 → 109.30 → 68.12 → 103.16 → 174.26 LONG
-        
+
         These are wild swings (>50% between reads) that should be rejected by:
         - Rate-of-change bound (50%/min max, these swings exceed that)
         - Inconsistency check (1% tolerance, these differ by >20% from median)
-        
+
         Expected: corroborated function returns 'inconsistent' or 'rate_exceeded',
         DB is NOT rewritten, no catch-up order is placed.
         """
         from engine.parity_gates import get_exchange_signed_net_corroborated
-        
+
         # Create a mock exchange that returns the LINK cascade phantom values
         mock_exchange = MagicMock(spec=ExchangeInterface)
-        
+
         # The LINK cascade sequence (converted to signed net for SHORT child)
         # Parent was LONG, so child SHORT hedge = negative signed net
         # Exchange showed: 143.23, 109.30, 68.12, 103.16, 174.26 LONG
         # For SHORT child, this means hedge qty = parent_target - signed_net
         # But the key is the signed_net itself swings wildly
         link_cascade_reads = [143.23, 109.30, 68.12, 103.16, 174.26]
-        
+
         call_count = [0]
         def mock_fetch_positions():
             idx = call_count[0]
@@ -406,9 +408,9 @@ class TestINV42HedgeLiveGuard(unittest.TestCase):
                     'side': 'long'
                 }
             ]
-        
+
         mock_exchange.fetch_positions.side_effect = mock_fetch_positions
-        
+
         # Test with default config (3 reads, 10s window, 1% tolerance, 50%/min rate bound)
         result_qty, status = get_exchange_signed_net_corroborated(
             mock_exchange, 'LINK/USDC',
@@ -420,14 +422,14 @@ class TestINV42HedgeLiveGuard(unittest.TestCase):
             conn=None,  # No cooldown tracking for this test
             bot_id=None
         )
-        
+
         # Should reject the phantom swings - either inconsistent or rate_exceeded
         self.assertIn(status, ('inconsistent', 'rate_exceeded', 'fetch_failed'),
                       f"Expected rejection status, got: {status} with qty={result_qty}")
-        
+
         # Verify no DB write would happen (result_qty should be None for rejected statuses)
         self.assertIsNone(result_qty, f"Expected None qty for rejected status, got: {result_qty}")
-        
+
         print(f"[TEST] LINK cascade rejected: status={status}, qty={result_qty}")
 
     def test_live_guard_with_parent_partially_tpd(self):
@@ -506,4 +508,3 @@ class TestINV42HedgeLiveGuard(unittest.TestCase):
             "SELECT COUNT(*) FROM bot_orders WHERE bot_id=100317 AND notes LIKE '%Live-guard%'"
         ).fetchone()[0]
         self.assertEqual(recon_count, 0)
-

@@ -77,7 +77,7 @@ def test_global_flatten_skips_require_manual_proof(memory_db):
     # Run resolve_net_mismatch through mock of safe_wipe_bot
     with patch('engine.reconciler.safe_wipe_bot') as mock_wipe:
         reconciler.resolve_net_mismatch(bot_states, positions={}, all_orders={})
-        
+       
         # Verify safe_wipe_bot was NOT called on this bot
         mock_wipe.assert_not_called()
 
@@ -108,7 +108,7 @@ def test_adopt_from_physical_positions_skips_when_in_sync(memory_db):
     mock_exchange.fetch_my_trades.return_value = [
         {'id': 63258796, 'order': '116621111', 'orderId': 116621111, 'symbol': 'XRPUSDC', 'side': 'buy', 'price': 1.3368, 'amount': 17.2, 'clientOrderId': 'CQB_10017_GRID_60_3', 'timestamp': 1779824066763}
     ]
-    
+   
     exchanges = {'future': mock_exchange}
     reconciler = StateReconciler(exchanges)
 
@@ -144,7 +144,7 @@ def test_global_flatten_skips_gated_bots(memory_db):
     ]
     mock_exchange.get_last_price.return_value = 1.0
     mock_exchange.fetch_open_orders.return_value = []
-    
+   
     exchanges = {'future': mock_exchange}
     reconciler = StateReconciler(exchanges)
 
@@ -161,11 +161,11 @@ def test_global_flatten_skips_gated_bots(memory_db):
          patch.object(reconciler, '_align_memory_to_ledger') as mock_align, \
          patch.object(mock_exchange, 'create_order') as mock_create_order, \
          patch('engine.reconciler.flag_bot_manual_proof') as mock_flag:
-        
+       
         reconciler.resolve_net_mismatch(bot_states, positions={'SOL/USDC:USDC': [
             ExchangePosition(symbol='SOL/USDC:USDC', side='LONG', size=40.0, entry_price=1.0, mark_price=1.0, unrealized_pnl=0.0)
         ]}, all_orders={})
-        
+       
         # Verify flag_bot_manual_proof was called on this bot
         mock_flag.assert_called_once_with(10018, reason='Global flatten blocked — bot is gated')
         # Verify flatten order was NOT placed
@@ -193,7 +193,7 @@ def test_b4_forensic_proof_prevents_flatten(memory_db):
     ]
     mock_exchange.get_last_price.return_value = 1.0
     mock_exchange.fetch_open_orders.return_value = []
-    
+   
     exchanges = {'future': mock_exchange}
     reconciler = StateReconciler(exchanges)
 
@@ -223,11 +223,11 @@ def test_b4_forensic_proof_prevents_flatten(memory_db):
     with patch.object(reconciler, 'reconstruct_offline_fills') as mock_recon, \
          patch.object(reconciler, '_align_memory_to_ledger') as mock_align, \
          patch.object(mock_exchange, 'create_order') as mock_create_order:
-        
+       
         reconciler.resolve_net_mismatch(bot_states, positions={'SOL/USDC:USDC': [
             ExchangePosition(symbol='SOL/USDC:USDC', side='LONG', size=40.0, entry_price=1.0, mark_price=1.0, unrealized_pnl=0.0)
         ]}, all_orders=all_orders)
-        
+       
         # Verify flatten order was NOT placed because b4_ran prevented it
         mock_create_order.assert_not_called()
 
@@ -269,7 +269,7 @@ def test_adopt_from_physical_positions_rejects_pre_wall_fills(memory_db):
             'timestamp': (now - 3600) * 1000
         }
     ]
-    
+   
     exchanges = {'future': mock_exchange}
     reconciler = StateReconciler(exchanges)
 
@@ -318,7 +318,7 @@ def test_adopt_from_physical_positions_accepts_post_wall_fills(memory_db):
             'timestamp': now * 1000
         }
     ]
-    
+   
     exchanges = {'future': mock_exchange}
     reconciler = StateReconciler(exchanges)
 
@@ -344,7 +344,7 @@ def test_adopt_from_physical_positions_skips_on_recent_tp_grace(memory_db):
         open_qty=0.5,
         status="IN TRADE"
     )
-    
+   
     # Insert a recent TP fill (within 600s)
     now = int(time.time())
     memory_db.execute(
@@ -359,7 +359,7 @@ def test_adopt_from_physical_positions_skips_on_recent_tp_grace(memory_db):
     mock_exchange.fetch_positions.return_value = []
     # Mock exchange fetch_my_trades has no post-wall/new fills to adopt
     mock_exchange.fetch_my_trades.return_value = []
-    
+   
     exchanges = {'future': mock_exchange}
     reconciler = StateReconciler(exchanges)
 
@@ -371,28 +371,28 @@ def test_adopt_from_physical_positions_skips_on_recent_tp_grace(memory_db):
     assert status['status'] == "IN TRADE"
 
 
-def test_auto_clear_manual_proof_when_pair_matches(memory_db):
+def test_auto_clear_manual_proof_when_pair_matches(memory_db, monkeypatch):
     # 1. Seed a standard bot that is gated with REQUIRE_MANUAL_PROOF (no active position)
     _seed_bot(
-        memory_db, 
-        bot_id=10018, 
-        name="sui long", 
-        pair="SUI/USDC:USDC", 
-        direction="LONG", 
-        total_invested=0.0, 
-        open_qty=0.0, 
+        memory_db,
+        bot_id=10018,
+        name="sui long",
+        pair="SUI/USDC:USDC",
+        direction="LONG",
+        total_invested=0.0,
+        open_qty=0.0,
         status="REQUIRE_MANUAL_PROOF"
     )
-    
+
     # 2. Seed a hedge child bot that is gated
     _seed_bot(
-        memory_db, 
-        bot_id=100318, 
-        name="sui long_hedge", 
-        pair="SUI/USDC:USDC", 
-        direction="SHORT", 
-        total_invested=0.0, 
-        open_qty=0.0, 
+        memory_db,
+        bot_id=100318,
+        name="sui long_hedge",
+        pair="SUI/USDC:USDC",
+        direction="SHORT",
+        total_invested=0.0,
+        open_qty=0.0,
         status="REQUIRE_MANUAL_PROOF"
     )
     memory_db.execute("UPDATE bots SET bot_type = 'hedge_child' WHERE id = 100318")
@@ -400,13 +400,13 @@ def test_auto_clear_manual_proof_when_pair_matches(memory_db):
 
     # 3. Seed an active bot with active position but gated
     _seed_bot(
-        memory_db, 
-        bot_id=100002, 
-        name="short eth", 
-        pair="ETH/USDC:USDC", 
-        direction="SHORT", 
-        total_invested=100.0, 
-        open_qty=0.5, 
+        memory_db,
+        bot_id=100002,
+        name="short eth",
+        pair="ETH/USDC:USDC",
+        direction="SHORT",
+        total_invested=100.0,
+        open_qty=0.5,
         status="REQUIRE_MANUAL_PROOF"
     )
     memory_db.execute(
@@ -421,13 +421,18 @@ def test_auto_clear_manual_proof_when_pair_matches(memory_db):
     mock_exchange.fetch_positions.return_value = [
         {'symbol': 'ETH/USDC:USDC', 'contracts': -0.5, 'side': 'short', 'entryPrice': 200.0}
     ]
-    
+
+    # Enable live reconciliation for this test (monkeypatch guarantees teardown)
+    # Must patch the config object directly since it's imported at module level
+    from config import settings as config_module
+    monkeypatch.setattr(config_module.config, 'RECONCILER_LIVE_APPROVED', True)
+    monkeypatch.setenv('RECONCILER_LIVE_APPROVED', '1')
     exchanges = {'future': mock_exchange}
     reconciler = StateReconciler(exchanges)
-    
+
     # Run reconcile_all (which runs the auto-clear check)
     reconciler.reconcile_all()
-    
+
     # Assert standard bot status changed back to Scanning
     status_sui = database.get_bot_status(10018)
     assert status_sui['status'] == "Scanning"
@@ -439,8 +444,3 @@ def test_auto_clear_manual_proof_when_pair_matches(memory_db):
     # Assert standard bot with active position changed back to IN TRADE
     status_eth = database.get_bot_status(100002)
     assert status_eth['status'] == "IN TRADE"
-
-
-
-
-

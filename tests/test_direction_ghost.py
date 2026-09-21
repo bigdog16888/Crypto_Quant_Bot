@@ -30,6 +30,7 @@ def _make_in_memory_db(bot_qtys, pairs=None):
     conn.execute("""
         CREATE TABLE bots (
             id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
             pair TEXT,
             normalized_pair TEXT,
             direction TEXT,
@@ -41,18 +42,38 @@ def _make_in_memory_db(bot_qtys, pairs=None):
     conn.execute("""
         CREATE TABLE trades (
             bot_id INTEGER PRIMARY KEY,
-            cycle_id INTEGER DEFAULT 1
+            cycle_id INTEGER DEFAULT 1,
+            open_qty REAL DEFAULT 0,
+            total_invested REAL DEFAULT 0,
+            avg_entry_price REAL DEFAULT 0,
+            entry_confirmed BOOLEAN DEFAULT 0,
+            current_step INTEGER DEFAULT 0,
+            basket_start_time INTEGER DEFAULT 0,
+            position_side TEXT DEFAULT 'LONG',
+            wipe_wall_ts INTEGER DEFAULT 0,
+            cycle_start_time INTEGER DEFAULT 0
         )
     """)
     conn.execute("""
         CREATE TABLE bot_orders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             bot_id INTEGER,
+            step INTEGER DEFAULT 0,
             order_type TEXT,
-            filled_amount REAL,
-            amount REAL DEFAULT 0.0,
-            status TEXT,
-            cycle_id INTEGER
+            order_id TEXT,
+            price REAL DEFAULT 0,
+            amount REAL DEFAULT 0,
+            filled_amount REAL DEFAULT 0,
+            status TEXT DEFAULT 'open',
+            created_at INTEGER,
+            client_order_id TEXT,
+            updated_at INTEGER DEFAULT 0,
+            notes TEXT,
+            wipe_proof_source TEXT,
+            wipe_proof_snapshot TEXT,
+            cycle_id INTEGER DEFAULT 1,
+            position_side TEXT DEFAULT 'BOTH',
+            filled_at INTEGER DEFAULT 0
         )
     """)
     conn.execute("""
@@ -66,13 +87,34 @@ def _make_in_memory_db(bot_qtys, pairs=None):
             last_checked INTEGER
         )
     """)
+    conn.execute("""
+        CREATE TABLE exchange_fills (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            exchange_order_id TEXT NOT NULL,
+            client_order_id TEXT,
+            symbol TEXT NOT NULL,
+            side TEXT NOT NULL,
+            qty REAL NOT NULL,
+            price REAL NOT NULL,
+            fee REAL DEFAULT 0,
+            fee_asset TEXT,
+            fill_ts INTEGER NOT NULL,
+            source TEXT NOT NULL,
+            bot_id INTEGER,
+            order_type TEXT,
+            step INTEGER,
+            cycle_id INTEGER,
+            raw_json TEXT,
+            created_at INTEGER NOT NULL
+        )
+    """)
     from engine.exchange_interface import normalize_symbol
     for i, pair in enumerate(pairs):
         bot_id = bot_qtys[i][0] if i < len(bot_qtys) else 10000 + i
         conn.execute(
-            "INSERT INTO bots (id, pair, normalized_pair, direction, is_active, status, config) "
-            "VALUES (?, ?, ?, 'LONG', 1, 'In Trade', '{}')",
-            (bot_id, pair, normalize_symbol(pair))
+            "INSERT INTO bots (id, name, pair, normalized_pair, direction, is_active, status, config) "
+            "VALUES (?, ?, ?, ?, 'LONG', 1, 'In Trade', '{}')",
+            (bot_id, f"Test_Bot_{bot_id}", pair, normalize_symbol(pair))
         )
         conn.execute(
             "INSERT INTO trades (bot_id, cycle_id) VALUES (?, 1)",

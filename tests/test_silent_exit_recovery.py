@@ -208,6 +208,8 @@ def test_flat_position_guard_a_consecutive_counts(memory_db):
     reconciler = StateReconciler(exchanges={'future': mock_exchange})
 
     # Cycle 1: flat snapshot count -> 1. Should defer.
+    import config.settings as settings
+    settings.config.RECONCILER_LIVE_APPROVED = True
     with patch('config.settings.config.REQUIRE_HUMAN_APPROVAL', False):
         reconciler.reconcile_all()
         assert reconciler._flat_snapshots_counts.get(NORM_PAIR) == 1

@@ -76,6 +76,10 @@ def insert_test_fills(conn):
     conn.execute("INSERT INTO bots (id, name, pair, direction, status) VALUES (1002, 'test_long_eth', 'ETH/USDT:USDT', 'LONG', 'IN_TRADE')")
     conn.commit()
 
+    # Add active_positions entry for bot 1002 (ETH pair) so checkpoint works
+    conn.execute("INSERT INTO active_positions (bot_id, pair, side, size, entry_price, last_checked) VALUES (1002, 'ETH/USDT:USDT', 'LONG', 1.0, 3000.0, 2000000)")
+    conn.commit()
+
 
 class TestPositionLedger:
     

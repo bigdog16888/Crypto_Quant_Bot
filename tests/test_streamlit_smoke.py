@@ -106,9 +106,13 @@ def test_app_imports():
         traceback.print_exc()
         return False
 
-def test_database_views():
+def test_database_views(temp_db):
     """Test database queries used by views."""
     print("\n2. Testing database queries for views...")
+    
+    # Ensure schema is initialized on the temp DB
+    from engine.database import init_db
+    init_db()
     
     from engine.database import (
         get_all_bots, get_bot_params, get_bot_status,

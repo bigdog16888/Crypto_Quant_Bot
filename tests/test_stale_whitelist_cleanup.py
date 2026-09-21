@@ -214,6 +214,9 @@ def test_reconciler_auto_clears_stale_whitelists(memory_db):
     Verify that if a manual whitelist is present in the database but the physical and virtual nets
     are already aligned, the reconciler pass automatically deletes the whitelist row and logs the cleanup.
     """
+    # Enable live mode for this test so whitelist cleanup runs
+    import os
+    os.environ['RECONCILER_LIVE_APPROVED'] = '1'
     # Insert a manual whitelist for BTCUSDC (LONG, 0.004)
     memory_db.execute("""
         INSERT INTO manual_whitelists (pair, side, qty, created_at)
@@ -223,6 +226,12 @@ def test_reconciler_auto_clears_stale_whitelists(memory_db):
 
     # Instantiate reconciler
     StateReconciler._last_global_offline_scan = 0.0
+    
+    # Force config reload to pick up RECONCILER_LIVE_APPROVED=1
+    import importlib
+    from config import settings
+    importlib.reload(settings)
+    
     recon = StateReconciler()
 
     # Mock exchanges to return aligned physical and virtual positions.
@@ -243,8 +252,15 @@ def test_reconciler_auto_clears_stale_whitelists(memory_db):
         INSERT INTO bot_orders (bot_id, order_type, order_id, client_order_id, price, amount, filled_amount, status, cycle_id, step, position_side)
         VALUES (10016, 'entry', 'e_long_1', 'CQB_10016_ENTRY_1', 60000.0, 0.05, 0.05, 'filled', 1, 1, 'LONG')
     """)
+    # Also insert physical position into active_positions for whitelist cleanup to read
+    memory_db.execute("""
+        INSERT INTO active_positions (bot_id, pair, side, size, entry_price, last_checked)
+        VALUES (10016, 'BTC/USDC:USDC', 'LONG', 0.05, 60000.0, 1782363852)
+    """)
     memory_db.commit()
 
+    # Ensure live_approved is True on the instance (config reload timing issue)
+    recon.live_approved = True
     with patch.object(recon, 'validate_individual_bots', return_value=[]):
         recon.reconcile_all()
 
