@@ -915,8 +915,15 @@ def _seal_trade_state_internal(
     # but bot_orders has no fills (wiped/reset). seal_trade_state would write 0 to trades.
     # FIX: Do NOT auto-write. Instead, flag for manual review via bots.notes.
     if main_open_qty <= 1e-8:
+        # Use the caller's connection if provided (seal_trade_state passes conn via WriteQueue).
+        # If not provided (direct call), get a thread-local connection and do NOT close it —
+        # the thread-local manager owns the lifecycle. This avoids Windows handle leaks.
+        # NOTE: _seal_trade_state_internal receives `conn` from WriteQueue.put_and_wait.
+        # Since we don't have `conn` in scope here, we check if we're in a WriteQueue context
+        # by attempting to use the thread-local connection directly.
         try:
-            conn_ap = get_connection()
+            from engine.database import get_connection
+            conn_ap = get_connection()  # Thread-local, caller/framework manages close
             row_ap = conn_ap.execute(
                 "SELECT size, entry_price, side FROM active_positions WHERE bot_id = ?",
                 (bot_id,)
@@ -926,24 +933,24 @@ def _seal_trade_state_internal(
                 ap_entry = float(row_ap[1] or 0)
                 ap_side = str(row_ap[2] or '').upper()
                 if ap_size > 1e-8:
-                    # MISMATCH DETECTED: active_positions has position, bot_orders has no fills
-                    # Flag for manual review — do NOT auto-adopt
                     existing_notes = conn_ap.execute(
                         "SELECT COALESCE(notes, '') FROM bots WHERE id = ?", (bot_id,)
                     ).fetchone()
                     existing = existing_notes[0] if existing_notes else ''
                     flag = f"[MANUAL-REVIEW] A2 mismatch: active_positions has {ap_size:.6f} @ {ap_entry:.6f} ({ap_side}) but bot_orders has no fills. Review required."
-                    new_notes = (existing + ' ' + flag).strip() if existing else flag
-                    conn_ap.execute("UPDATE bots SET notes = ? WHERE id = ?", (new_notes, bot_id))
-                    conn_ap.commit()
-                    logger.warning(
-                        f"[SEAL-A2-FLAG] Bot {bot_id}: Mismatch flagged for manual review — "
-                        f"active_positions={ap_size:.6f} @ {ap_entry:.6f} ({ap_side}), "
-                        f"bot_orders empty. NOT auto-adopting."
-                    )
+                    # Idempotent: only append if not already present
+                    if flag not in existing:
+                        new_notes = (existing + ' ' + flag).strip() if existing else flag
+                        conn_ap.execute("UPDATE bots SET notes = ? WHERE id = ?", (new_notes, bot_id))
+                        conn_ap.commit()
+                        logger.warning(
+                            f"[SEAL-A2-FLAG] Bot {bot_id}: Mismatch flagged for manual review — "
+                            f"active_positions={ap_size:.6f} @ {ap_entry:.6f} ({ap_side}), "
+                            f"bot_orders empty. NOT auto-adopting."
+                        )
         except Exception as _a2_err:
             logger.warning(f"[SEAL-A2-FLAG] Bot {bot_id}: mismatch check failed (non-fatal): {_a2_err}")
-    # ──────────────────────────────────────────────────────────────────────────────
+        # ──────────────────────────────────────────────────────────────────────────────
 
 
 

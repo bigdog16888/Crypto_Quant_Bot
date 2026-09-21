@@ -796,7 +796,7 @@ class StateReconciler:
 
         # 1. Identify pairs to scan (Active Bots + Open Orders)
 
-        conn = get_connection()
+        conn = _gc()
 
         cursor = conn.cursor()
 
@@ -820,7 +820,7 @@ class StateReconciler:
 
         # We will restrict this later using absolute mathematical gap verification.
 
-        # pairs_to_check = set([b[1] for b in active_bots] + order_pairs)
+        pairs_to_check = set([b[1] for b in active_bots] + order_pairs)
 
         
 
@@ -878,7 +878,7 @@ class StateReconciler:
 
         # in this session — this runs every reconciler pass so no restart is ever needed.
 
-        _heal_conn = get_connection()
+        _heal_conn = _gc()
 
         _heal_cur = _heal_conn.cursor()
 
@@ -948,7 +948,7 @@ class StateReconciler:
 
         # This ensures the ledger is 100% accurate before parity checks run.
 
-        _place_conn = get_connection()
+        _place_conn = _gc()
 
         _place_cur = _place_conn.cursor()
 
@@ -1218,7 +1218,7 @@ class StateReconciler:
         # Find bot_orders rows with status=filled/partially_filled/closed that have
         # filled_amount > 0 but no corresponding exchange_fills entry.
         # These are fills that the DB recorded as filled but never credited to the ledger.
-        _credit_conn = get_connection()
+        _credit_conn = _gc()
         _credit_cur = _credit_conn.cursor()
 
         # Find filled bot_orders without exchange_fills record
@@ -1298,7 +1298,7 @@ class StateReconciler:
 
         try:
 
-            _oh_conn = get_connection()
+            _oh_conn = _gc()
 
             _oh_cur = _oh_conn.cursor()
 
@@ -1349,6 +1349,29 @@ class StateReconciler:
             _oh_cur.execute("SELECT pair, side, qty FROM manual_whitelists")
 
             raw_whitelists = _oh_cur.fetchall()
+
+            # 🧹 STALE WHITELIST CLEANUP (only in live mode, only when physical == virtual)
+            # Runs AFTER the dry-run gate so it respects RECONCILER_LIVE_APPROVED.
+            # Uses the cached physical snapshot from this cycle to avoid N+1 API calls.
+            if getattr(self, 'live_approved', False):
+                try:
+                    from engine.database import get_connection as _gc_local, get_pair_virtual_net
+                    cleanup_conn = _gc_local()
+                    for wp, ws, wq in raw_whitelists:
+                        # Physical net for this pair from phys_pos dict (already computed in this scope)
+                        wp_norm = _nsym(wp)
+                        phys_net = phys_pos.get(wp_norm, 0.0)
+                        # Virtual net from DB
+                        virt_net = get_pair_virtual_net(wp)
+                        # Only clear if reconciled (|phys - virt| <= tolerance)
+                        if abs(phys_net - virt_net) <= 0.002:
+                            cleanup_conn.execute(
+                                "DELETE FROM manual_whitelists WHERE pair = ? AND side = ? AND qty = ?",
+                                (wp, ws, wq)
+                            )
+                    cleanup_conn.commit()
+                except Exception as _wl_e:
+                    logger.warning(f"[WHITELIST-CLEANUP] Failed: {_wl_e}")
 
             merged_whitelists = {}
 
@@ -1435,7 +1458,7 @@ class StateReconciler:
                 # invisible to standard recompute, causing a phantom gap.  Heal via
                 # seal_trade_state(cycle_floor=...) before spending API quota.
                 try:
-                    _heal_conn = get_connection()
+                    _heal_conn = _gc()
                     _heal_bots = _heal_conn.execute(
                         "SELECT t.bot_id, t.cycle_id FROM trades t "
                         "JOIN bots b ON b.id = t.bot_id "
@@ -1495,7 +1518,7 @@ class StateReconciler:
 
                         hist = sorted(hist, key=lambda x: x.get('timestamp') or 0)
 
-                        _oi_conn = get_connection(); _oi_cur = _oi_conn.cursor()
+                        _oi_conn = _gc(); _oi_cur = _oi_conn.cursor()
 
                         for o in hist:
 
@@ -2212,7 +2235,7 @@ class StateReconciler:
 
                     
 
-            conn = get_connection()
+            conn = _gc()
 
             cursor = conn.cursor()
 
@@ -4751,9 +4774,7 @@ class StateReconciler:
                               )
                               continue  # Skip global flatten action this cycle
 
-                          # Guard A: Require 3 consecutive flat snapshots before acting
-                          if not hasattr(self, '_flat_snapshots_counts'):
-                              self._flat_snapshots_counts = {}
+                          # Guard A: Require 3 consecutive flat snapshots before acting (initialized in __init__)
                           self._flat_snapshots_counts[pair] = self._flat_snapshots_counts.get(pair, 0) + 1
                           if self._flat_snapshots_counts[pair] < 3:
                               logger.warning(
@@ -4859,8 +4880,6 @@ class StateReconciler:
 
                       continue # Skip following check as bot state handled
                   else:
-                      if not hasattr(self, '_flat_snapshots_counts'):
-                          self._flat_snapshots_counts = {}
                       self._flat_snapshots_counts[pair] = 0
 
                   
@@ -6618,8 +6637,11 @@ class StateReconciler:
                 "No DB writes, position adoptions, ghost wipes, or phantom cleanups will be executed. "
                 "Set RECONCILER_LIVE_APPROVED=1 in environment to enable live operations."
             )
+            # Store live_approved flag for downstream gating
+            self.live_approved = False
             # Return empty results — dry run mode
             return []
+        self.live_approved = True
 
         
 
