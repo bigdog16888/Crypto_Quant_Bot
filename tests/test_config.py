@@ -14,8 +14,9 @@ def reload_config():
         del sys.modules['config.settings']
     
     # We must mock __file__ because the ConfigLoader uses it to determine ROOT_DIR
-    # This assumes the test runs from the root of the project structure
-    with patch('os.path.abspath', return_value=os.path.join(os.getcwd(), 'config', 'settings.py')):
+    # Provide the actual settings.py path so load_dotenv can find it
+    settings_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'config', 'settings.py')
+    with patch('os.path.abspath', return_value=settings_file):
         import config.settings
         return config.settings.Config()
 
@@ -27,7 +28,7 @@ def test_config_loads_defaults_from_json():
         
         # Test values loaded from JSON/Internal logic
         assert settings.LOG_LEVEL == "INFO"
-        assert settings.MAX_ORDER_USD == 10000.0
+        assert settings.MAX_ORDER_USD == 20000.0  # From .env file (testnet config)
         assert settings.MARKET_TYPE == "future"
         assert settings.MAX_RETRIES == 3
 

@@ -86,7 +86,10 @@ class MockExchange:
         return out
 
 
-def test_forensic_adopt_disabled_by_default():
+def test_forensic_adopt_disabled_by_default(memory_db, monkeypatch):
+    # Ensure clean config state
+    from config.settings import config
+    monkeypatch.setattr(config, "ALLOW_FORENSIC_ADOPT", False)
     assert forensic_adopt_allowed() is False
 
 

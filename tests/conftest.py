@@ -41,6 +41,13 @@ import engine.database as _ed_lazy
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def reset_forensic_config(monkeypatch):
+    """Reset ALLOW_FORENSIC_ADOPT to False between every test to prevent config bleed."""
+    from config.settings import config
+    monkeypatch.setattr(config, "ALLOW_FORENSIC_ADOPT", False)
+
+
 @pytest.fixture(autouse=True, scope="function")
 def _isolate_db_connections():
     # Lazy import AFTER env vars are set and guard is installed

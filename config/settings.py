@@ -1,7 +1,13 @@
 import os
 from dotenv import load_dotenv
 
-load_dotenv()
+# Find .env from project root regardless of working directory
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DOTENV_PATH = os.path.join(PROJECT_ROOT, ".env")
+if os.path.exists(DOTENV_PATH):
+    load_dotenv(DOTENV_PATH)
+else:
+    load_dotenv()
 
 
 class Config:

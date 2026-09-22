@@ -537,106 +537,106 @@ class TestDatabase(unittest.TestCase):
 
 
     def test_full_restore_and_align_preserves_non_aligned_active_bot_fills(self):
-        """Test that full_restore_and_align.py preserves non-aligned active bot fills using the oldest_fill logic."""
-        import shutil
-        import sqlite3
-        from unittest.mock import patch, MagicMock
-        
-        test_backup_path = os.path.join(self.test_dir, "test_backup_bot.db")
-        
-        # Setup a mock DB on self.db_path using the true database schema
-        database.init_db()
-        conn = database.get_connection()
-        try:
-            # Bot A: to be aligned (e.g. 10008)
-            conn.execute("INSERT INTO bots (id, name, status, direction, pair) VALUES (10008, 'sol bot', 'Scanning', 'LONG', 'SOL/USDC:USDC')")
-            conn.execute("INSERT INTO trades (bot_id, cycle_id, open_qty, wipe_wall_ts, position_side, current_step) VALUES (10008, 1, 0.0, 0, 'LONG', 0)")
-            
-            # Bot B: unrelated active bot (e.g. 10022) with existing legitimate fills in its cycle
-            conn.execute("INSERT INTO bots (id, name, status, direction, pair) VALUES (10022, 'short btc', 'Scanning', 'SHORT', 'BTC/USDC:USDC')")
-            conn.execute("INSERT INTO trades (bot_id, cycle_id, open_qty, wipe_wall_ts, position_side, current_step) VALUES (10022, 1, 0.0, 0, 'SHORT', 0)")
-            
-            # Insert multiple entries for Bot B to compute a weighted average
-            conn.execute("""
-                INSERT INTO bot_orders (bot_id, cycle_id, step, order_type, price, amount, filled_amount, status, created_at, updated_at, position_side)
-                VALUES (10022, 1, 1, 'entry', 60000.0, 0.002, 0.002, 'filled', 1000, 1000, 'SHORT')
-            """)
-            conn.execute("""
-                INSERT INTO bot_orders (bot_id, cycle_id, step, order_type, price, amount, filled_amount, status, created_at, updated_at, position_side)
-                VALUES (10022, 1, 2, 'grid', 59000.0, 0.004, 0.004, 'filled', 1010, 1010, 'SHORT')
-            """)
-            conn.execute("""
-                INSERT INTO bot_orders (bot_id, cycle_id, step, order_type, price, amount, filled_amount, status, created_at, updated_at, position_side)
-                VALUES (10022, 1, 3, 'grid', 58000.0, 0.008, 0.008, 'filled', 1020, 1020, 'SHORT')
-            """)
-            conn.commit()
-        finally:
+            """Test that full_restore_and_align.py preserves non-aligned active bot fills using the oldest_fill logic."""
+            import shutil
+            import sqlite3
+            from unittest.mock import patch, MagicMock
+
+            test_backup_path = os.path.join(self.test_dir, "test_backup_bot.db")
+
+            # Setup a mock DB on self.db_path using the true database schema
+            database.init_db()
+            conn = database.get_connection()
+            try:
+                # Bot A: to be aligned (e.g. 10008)
+                conn.execute("INSERT INTO bots (id, name, status, direction, pair) VALUES (10008, 'sol bot', 'Scanning', 'LONG', 'SOL/USDC:USDC')")
+                conn.execute("INSERT INTO trades (bot_id, cycle_id, open_qty, wipe_wall_ts, position_side, current_step) VALUES (10008, 1, 0.0, 0, 'LONG', 0)")
+
+                # Bot B: unrelated active bot (e.g. 10022) with existing legitimate fills in its cycle
+                conn.execute("INSERT INTO bots (id, name, status, direction, pair) VALUES (10022, 'short btc', 'Scanning', 'SHORT', 'BTC/USDC:USDC')")
+                conn.execute("INSERT INTO trades (bot_id, cycle_id, open_qty, wipe_wall_ts, position_side, current_step) VALUES (10022, 1, 0.0, 0, 'SHORT', 0)")
+
+                # Insert multiple entries for Bot B to compute a weighted average
+                conn.execute("""
+                    INSERT INTO bot_orders (bot_id, cycle_id, step, order_type, price, amount, filled_amount, status, created_at, updated_at, position_side)
+                    VALUES (10022, 1, 1, 'entry', 60000.0, 0.002, 0.002, 'filled', 1000, 1000, 'SHORT')
+                """)
+                conn.execute("""
+                    INSERT INTO bot_orders (bot_id, cycle_id, step, order_type, price, amount, filled_amount, status, created_at, updated_at, position_side)
+                    VALUES (10022, 1, 2, 'grid', 59000.0, 0.004, 0.004, 'filled', 1010, 1010, 'SHORT')
+                """)
+                conn.execute("""
+                    INSERT INTO bot_orders (bot_id, cycle_id, step, order_type, price, amount, filled_amount, status, created_at, updated_at, position_side)
+                    VALUES (10022, 1, 3, 'grid', 58000.0, 0.008, 0.008, 'filled', 1020, 1020, 'SHORT')
+                """)
+                conn.commit()
+            finally:
+                database.close_connection()
+
+            # Copy to backup path so the copy2 command works
+            shutil.copy2(self.db_path, test_backup_path)
+
+            # Load full_restore_and_align.py script content
+            script_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts", "full_restore_and_align.py")
+            with open(script_path, "r", encoding="utf-8") as f:
+                script_content = f.read()
+
+            # Replace file paths in script to use our temp paths
+            script_content = script_content.replace('live_db = "crypto_bot.db"', f'live_db = "{self.db_path.replace(chr(92), chr(47))}"')
+            script_content = script_content.replace('live_wal = "crypto_bot.db-wal"', 'live_wal = "dummy-wal"')
+            script_content = script_content.replace('live_shm = "crypto_bot.db-shm"', 'live_shm = "dummy-shm"')
+            script_content = script_content.replace('backup_db = "backups/crypto_bot.db.sui_recovery_backup"', f'backup_db = "{test_backup_path.replace(chr(92), chr(47))}"')
+
+            # Mock CCXT and safety exit checks
+            mock_ex = MagicMock()
+            mock_ex.fetch_positions.return_value = []
+
+            # Set up expected_positions to be empty in the script by mocking it out or letting it pass
+            with patch('engine.exchange_interface.ExchangeInterface', return_value=mock_ex), \
+                 patch('os.path.exists', return_value=False), \
+                 patch('sys.exit') as mock_exit:
+
+                # Execute the script content
+                globals_dict = {
+                    '__file__': script_path,
+                    'ExchangeInterface': lambda *args, **kwargs: mock_ex
+                }
+                exec(script_content, globals_dict)
+
+            # Clean up database connections opened by the script or test
+            if 'globals_dict' in locals():
+                if 'conn' in globals_dict:
+                    try:
+                        globals_dict['conn'].close()
+                    except Exception:
+                        pass
+                globals_dict.clear()
             database.close_connection()
-        
-        # Copy to backup path so the copy2 command works
-        shutil.copy2(self.db_path, test_backup_path)
-        
-        # Load full_restore_and_align.py script content
-        script_path = "scripts/full_restore_and_align.py"
-        with open(script_path, "r", encoding="utf-8") as f:
-            script_content = f.read()
-            
-        # Replace file paths in script to use our temp paths
-        script_content = script_content.replace('live_db = "crypto_bot.db"', f'live_db = "{self.db_path.replace(chr(92), chr(47))}"')
-        script_content = script_content.replace('live_wal = "crypto_bot.db-wal"', 'live_wal = "dummy-wal"')
-        script_content = script_content.replace('live_shm = "crypto_bot.db-shm"', 'live_shm = "dummy-shm"')
-        script_content = script_content.replace('backup_db = "backups/crypto_bot.db.sui_recovery_backup"', f'backup_db = "{test_backup_path.replace(chr(92), chr(47))}"')
-        
-        # Mock CCXT and safety exit checks
-        mock_ex = MagicMock()
-        mock_ex.fetch_positions.return_value = []
-        
-        # Set up expected_positions to be empty in the script by mocking it out or letting it pass
-        with patch('engine.exchange_interface.ExchangeInterface', return_value=mock_ex), \
-             patch('os.path.exists', return_value=False), \
-             patch('sys.exit') as mock_exit:
-             
-            # Execute the script content
-            globals_dict = {
-                '__file__': script_path,
-                'ExchangeInterface': lambda *args, **kwargs: mock_ex
-            }
-            exec(script_content, globals_dict)
-            
-        # Clean up database connections opened by the script or test
-        if 'globals_dict' in locals():
-            if 'conn' in globals_dict:
-                try:
-                    globals_dict['conn'].close()
-                except Exception:
-                    pass
-            globals_dict.clear()
-        database.close_connection()
-        
-        # Verify Bot B's trades row is preserved and automatically synced
-        conn = sqlite3.connect(self.db_path)
-        try:
-            row_b = conn.execute("SELECT wipe_wall_ts, open_qty, total_invested, avg_entry_price FROM trades WHERE bot_id = 10022").fetchone()
-            wall_ts_b = row_b[0]
-            open_qty_b = row_b[1]
-            total_invested_b = row_b[2]
-            avg_entry_price_b = row_b[3]
-        finally:
-            conn.close()
-        
-        self.assertEqual(wall_ts_b, 1000, "Bot B's wipe_wall_ts must be preserved to 1000 (oldest fill ts)")
-        
-        # Expected calculations:
-        # open_qty = 0.002 + 0.004 + 0.008 = 0.014
-        # total_invested = 0.002 * 60000.0 + 0.004 * 59000.0 + 0.008 * 58000.0 = 120.0 + 236.0 + 464.0 = 820.0
-        # avg_entry_price = 820.0 / 0.014 = 58571.42857142857
-        expected_qty = 0.014
-        expected_invested = 820.0
-        expected_price = 820.0 / 0.014
-        
-        self.assertAlmostEqual(open_qty_b, expected_qty, msg="trades.open_qty must be automatically updated by script global sync")
-        self.assertAlmostEqual(total_invested_b, expected_invested, msg="trades.total_invested must be automatically updated by script global sync")
-        self.assertAlmostEqual(avg_entry_price_b, expected_price, msg="trades.avg_entry_price must be automatically updated by script global sync")
+
+            # Verify Bot B's trades row is preserved and automatically synced
+            conn = sqlite3.connect(self.db_path)
+            try:
+                row_b = conn.execute("SELECT wipe_wall_ts, open_qty, total_invested, avg_entry_price FROM trades WHERE bot_id = 10022").fetchone()
+                wall_ts_b = row_b[0]
+                open_qty_b = row_b[1]
+                total_invested_b = row_b[2]
+                avg_entry_price_b = row_b[3]
+            finally:
+                conn.close()
+
+            self.assertEqual(wall_ts_b, 1000, "Bot B's wipe_wall_ts must be preserved to 1000 (oldest fill ts)")
+
+            # Expected calculations:
+            # open_qty = 0.002 + 0.004 + 0.008 = 0.014
+            # total_invested = 0.002 * 60000.0 + 0.004 * 59000.0 + 0.008 * 58000.0 = 120.0 + 236.0 + 464.0 = 820.0
+            # avg_entry_price = 820.0 / 0.014 = 58571.42857142857
+            expected_qty = 0.014
+            expected_invested = 820.0
+            expected_price = 820.0 / 0.014
+
+            self.assertAlmostEqual(open_qty_b, expected_qty, msg="trades.open_qty must be automatically updated by script global sync")
+            self.assertAlmostEqual(total_invested_b, expected_invested, msg="trades.total_invested must be automatically updated by script global sync")
+            self.assertAlmostEqual(avg_entry_price_b, expected_price, msg="trades.avg_entry_price must be automatically updated by script global sync")
 
 
     def test_nested_transaction_in_reset_bot(self):

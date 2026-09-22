@@ -8,6 +8,7 @@ import sys
 import tempfile
 import shutil
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -15,6 +16,7 @@ import engine.database as database
 from engine.database import get_connection, init_db, update_active_positions_snapshot
 from engine.parity_gates import forensic_adopt_allowed, qty_tolerance
 from config.settings import config as _settings_config
+import config.settings as settings
 
 
 class TestSnapAllocateGate(unittest.TestCase):
@@ -108,163 +110,153 @@ class TestSnapAllocateGate(unittest.TestCase):
 
     def test_single_contributor_passes_gate_when_forensic_disabled(self):
         """Single bot with invested qty should be assigned without forensic gate."""
-        import config.settings as settings
-        settings.config.ALLOW_FORENSIC_ADOPT = False
-        
-        # Setup: ONE bot with invested qty, one with zero
-        self._setup_longs([(1001, 'bot1', 1.0, 50000.0), (1002, 'bot2', 0.0, 0.0)])
-        
-        # Snapshot with net matching: 1.0 LONG
-        mock_positions = [{
-            'symbol': 'BTC/USDC:USDC',
-            'side': 'long',
-            'contracts': 1.0,
-            'entryPrice': 50000.0,
-        }]
-        update_active_positions_snapshot(mock_positions, force_write=True)
-        
-        # Check active_positions
-        cursor = self.conn.cursor()
-        rows = cursor.execute("SELECT bot_id, pair, side, size FROM active_positions WHERE pair='BTCUSDC'").fetchall()
-        
-        # Should have exactly 1 row assigned to bot1
-        self.assertEqual(len(rows), 1, f"Expected 1 active position, got {len(rows)}: {rows}")
-        self.assertEqual(rows[0][0], 1001, f"Expected bot_id=1001, got {rows[0][0]}")
-        self.assertEqual(rows[0][3], 1.0, f"Expected size=1.0, got {rows[0][3]}")
+        with patch.object(settings.config, "ALLOW_FORENSIC_ADOPT", False):
+            # Setup: ONE bot with invested qty, one with zero
+            self._setup_longs([(1001, 'bot1', 1.0, 50000.0), (1002, 'bot2', 0.0, 0.0)])
+            
+            # Snapshot with net matching: 1.0 LONG
+            mock_positions = [{
+                'symbol': 'BTC/USDC:USDC',
+                'side': 'long',
+                'contracts': 1.0,
+                'entryPrice': 50000.0,
+            }]
+            update_active_positions_snapshot(mock_positions, force_write=True)
+            
+            # Check active_positions
+            cursor = self.conn.cursor()
+            rows = cursor.execute("SELECT bot_id, pair, side, size FROM active_positions WHERE pair='BTCUSDC'").fetchall()
+            
+            # Should have exactly 1 row assigned to bot1
+            self.assertEqual(len(rows), 1, f"Expected 1 active position, got {len(rows)}: {rows}")
+            self.assertEqual(rows[0][0], 1001, f"Expected bot_id=1001, got {rows[0][0]}")
+            self.assertEqual(rows[0][3], 1.0, f"Expected size=1.0, got {rows[0][3]}")
 
     def test_multi_bot_blocked_when_forensic_disabled(self):
         """Multiple bots with invested qty should be blocked when forensic disabled."""
-        import config.settings as settings
-        settings.config.ALLOW_FORENSIC_ADOPT = False
-        
-        # Setup: TWO bots with invested qty
-        self._setup_longs([(1001, 'bot1', 1.0, 50000.0), (1002, 'bot2', 0.5, 50000.0)])
-        
-        # Snapshot with net matching: 1.5 LONG
-        mock_positions = [{
-            'symbol': 'BTC/USDC:USDC',
-            'side': 'long',
-            'contracts': 1.5,
-            'entryPrice': 50000.0,
-        }]
-        update_active_positions_snapshot(mock_positions, force_write=True)
-        
-        # Check active_positions - should be EMPTY (blocked, falls through to mismatch path)
-        cursor = self.conn.cursor()
-        rows = cursor.execute("SELECT bot_id, pair, side, size FROM active_positions WHERE pair='BTCUSDC'").fetchall()
-        
-        # With forensic disabled, multi-bot split is blocked - no active_positions inserted here
-        self.assertEqual(len(rows), 0, f"Expected 0 active positions (blocked), got {len(rows)}: {rows}")
+        with patch.object(settings.config, "ALLOW_FORENSIC_ADOPT", False):
+            # Setup: TWO bots with invested qty
+            self._setup_longs([(1001, 'bot1', 1.0, 50000.0), (1002, 'bot2', 0.5, 50000.0)])
+            
+            # Snapshot with net matching: 1.5 LONG
+            mock_positions = [{
+                'symbol': 'BTC/USDC:USDC',
+                'side': 'long',
+                'contracts': 1.5,
+                'entryPrice': 50000.0,
+            }]
+            update_active_positions_snapshot(mock_positions, force_write=True)
+            
+            # Check active_positions - should be EMPTY (blocked, falls through to mismatch path)
+            cursor = self.conn.cursor()
+            rows = cursor.execute("SELECT bot_id, pair, side, size FROM active_positions WHERE pair='BTCUSDC'").fetchall()
+            
+            # With forensic disabled, multi-bot split is blocked - no active_positions inserted here
+            self.assertEqual(len(rows), 0, f"Expected 0 active positions (blocked), got {len(rows)}: {rows}")
 
     def test_multi_bot_allowed_when_forensic_enabled(self):
         """Multi-bot split should work when forensic adoption is enabled."""
-        _settings_config.ALLOW_FORENSIC_ADOPT = True
-
-        # Setup: TWO bots with invested qty
-        self._setup_longs([(1001, 'bot1', 1.0, 50000.0), (1002, 'bot2', 0.5, 50000.0)])
-        self.conn.commit()  # ensure both bots + orders are durable before snapshot
-
-        # Snapshot with net matching: 1.5 LONG (1.0 + 0.5 = 1.5)
-        mock_positions = [{
-            'symbol': 'BTC/USDC:USDC',
-            'side': 'long',
-            'contracts': 1.5,  # This should be the SUM of both bots' qty
-            'entryPrice': 50000.0,
-        }]
-        update_active_positions_snapshot(mock_positions, force_write=True)
-
-        # Check active_positions - should have BOTH bots
-        cursor = self.conn.cursor()
-        rows = cursor.execute("SELECT bot_id, size FROM active_positions WHERE pair='BTCUSDC' ORDER BY bot_id").fetchall()
-
-        self.assertEqual(len(rows), 2, f"Expected 2 active positions, got {len(rows)}: {rows}")
-        self.assertEqual(rows[0][0], 1001)
-        self.assertEqual(rows[1][0], 1002)
-        # Size should be proportional to their quantities (1.0 and 0.5 out of 1.5 total)
-        self.assertAlmostEqual(rows[0][1], 1.0, places=4)  # 1.0/1.5 * 1.5 = 1.0
-        self.assertAlmostEqual(rows[1][1], 0.5, places=4)  # 0.5/1.5 * 1.5 = 0.5
+        with patch.object(_settings_config, "ALLOW_FORENSIC_ADOPT", True):
+            # Setup: TWO bots with invested qty
+            self._setup_longs([(1001, 'bot1', 1.0, 50000.0), (1002, 'bot2', 0.5, 50000.0)])
+            self.conn.commit()  # ensure both bots + orders are durable before snapshot
+            
+            # Snapshot with net matching: 1.5 LONG (1.0 + 0.5 = 1.5)
+            mock_positions = [{
+                'symbol': 'BTC/USDC:USDC',
+                'side': 'long',
+                'contracts': 1.5,  # This should be the SUM of both bots' qty
+                'entryPrice': 50000.0,
+            }]
+            update_active_positions_snapshot(mock_positions, force_write=True)
+            
+            # Check active_positions - should have BOTH bots
+            cursor = self.conn.cursor()
+            rows = cursor.execute("SELECT bot_id, size FROM active_positions WHERE pair='BTCUSDC' ORDER BY bot_id").fetchall()
+            
+            self.assertEqual(len(rows), 2, f"Expected 2 active positions, got {len(rows)}: {rows}")
+            self.assertEqual(rows[0][0], 1001)
+            self.assertEqual(rows[1][0], 1002)
+            # Size should be proportional to their quantities (1.0 and 0.5 out of 1.5 total)
+            self.assertAlmostEqual(rows[0][1], 1.0, places=4)  # 1.0/1.5 * 1.5 = 1.0
+            self.assertAlmostEqual(rows[1][1], 0.5, places=4)
+            # State restored automatically by patch
 
     def test_zero_contributors_falls_through(self):
         """Zero bots with invested qty should fall through to mismatch path (assigns to active bot)."""
-        import config.settings as settings
-        settings.config.ALLOW_FORENSIC_ADOPT = False
-        
-        # Setup: bots with 0 invested qty but bot 1001 is active
-        self._setup_longs([(1001, 'bot1', 0.0, 0.0), (1002, 'bot2', 0.0, 0.0)])
-        
-        # Snapshot with net matching
-        mock_positions = [{
-            'symbol': 'BTC/USDC:USDC',
-            'side': 'long',
-            'contracts': 1.0,
-            'entryPrice': 50000.0,
-        }]
-        update_active_positions_snapshot(mock_positions, force_write=True)
-        
-        # Check active_positions - falls through to mismatch path, assigns to active bot 1001
-        cursor = self.conn.cursor()
-        rows = cursor.execute("SELECT bot_id, pair, side, size FROM active_positions WHERE pair='BTCUSDC'").fetchall()
-        
-        # Falls through to mismatch path which assigns to active bot (1001)
-        self.assertEqual(len(rows), 1, f"Expected 1 active position (mismatch path), got {len(rows)}: {rows}")
-        self.assertEqual(rows[0][0], 1001, f"Expected bot_id=1001 (active bot), got {rows[0][0]}")
-        self.assertEqual(rows[0][3], 1.0, f"Expected size=1.0, got {rows[0][3]}")
+        with patch.object(settings.config, "ALLOW_FORENSIC_ADOPT", False):
+            # Setup: bots with 0 invested qty but bot 1001 is active
+            self._setup_longs([(1001, 'bot1', 0.0, 0.0), (1002, 'bot2', 0.0, 0.0)])
+            
+            # Snapshot with net matching
+            mock_positions = [{
+                'symbol': 'BTC/USDC:USDC',
+                'side': 'long',
+                'contracts': 1.0,
+                'entryPrice': 50000.0,
+            }]
+            update_active_positions_snapshot(mock_positions, force_write=True)
+            
+            # Check active_positions - falls through to mismatch path, assigns to active bot 1001
+            cursor = self.conn.cursor()
+            rows = cursor.execute("SELECT bot_id, pair, side, size FROM active_positions WHERE pair='BTCUSDC'").fetchall()
+            
+            # Falls through to mismatch path which assigns to active bot (1001)
+            self.assertEqual(len(rows), 1, f"Expected 1 active position (mismatch path), got {len(rows)}: {rows}")
+            self.assertEqual(rows[0][0], 1001, f"Expected bot_id=1001 (active bot), got {rows[0][0]}")
+            self.assertEqual(rows[0][3], 1.0, f"Expected size=1.0, got {rows[0][3]}")
 
     def test_short_position_single_contributor(self):
         """SHORT position with single contributor should work (abs(qty) > tolerance)."""
-        import config.settings as settings
-        settings.config.ALLOW_FORENSIC_ADOPT = False
-        
-        # Setup: SHORT bot with invested qty, LONG bot with zero
-        self._setup_shorts([(2001, 'bot_short', 1.0, 50000.0)])
-        self._setup_longs([(2002, 'bot_long', 0.0, 0.0)])
-        
-        # Snapshot with SHORT net matching: -1.0 SHORT
-        mock_positions = [{
-            'symbol': 'BTC/USDC:USDC',
-            'side': 'short',
-            'contracts': -1.0,
-            'entryPrice': 50000.0,
-        }]
-        update_active_positions_snapshot(mock_positions, force_write=True)
-        
-        # Check active_positions
-        cursor = self.conn.cursor()
-        rows = cursor.execute("SELECT bot_id, side, size FROM active_positions WHERE pair='BTCUSDC'").fetchall()
-        
-        self.assertEqual(len(rows), 1, f"Expected 1 active position, got {len(rows)}: {rows}")
-        self.assertEqual(rows[0][0], 2001, f"Expected bot_id=2001, got {rows[0][0]}")
-        self.assertEqual(rows[0][1], 'SHORT', f"Expected SHORT, got {rows[0][1]}")
-        # For SHORT, size is stored as positive in active_positions, side='SHORT' indicates direction
-        self.assertEqual(abs(rows[0][2]), 1.0, f"Expected size magnitude=1.0, got {rows[0][2]}")
+        with patch.object(settings.config, "ALLOW_FORENSIC_ADOPT", False):
+            # Setup: SHORT bot with invested qty, LONG bot with zero
+            self._setup_shorts([(2001, 'bot_short', 1.0, 50000.0)])
+            self._setup_longs([(2002, 'bot_long', 0.0, 0.0)])
+            
+            # Snapshot with SHORT net matching: -1.0 SHORT
+            mock_positions = [{
+                'symbol': 'BTC/USDC:USDC',
+                'side': 'short',
+                'contracts': -1.0,
+                'entryPrice': 50000.0,
+            }]
+            update_active_positions_snapshot(mock_positions, force_write=True)
+            
+            # Check active_positions
+            cursor = self.conn.cursor()
+            rows = cursor.execute("SELECT bot_id, side, size FROM active_positions WHERE pair='BTCUSDC'").fetchall()
+            
+            self.assertEqual(len(rows), 1, f"Expected 1 active position, got {len(rows)}: {rows}")
+            self.assertEqual(rows[0][0], 2001, f"Expected bot_id=2001, got {rows[0][0]}")
+            self.assertEqual(rows[0][1], 'SHORT', f"Expected SHORT, got {rows[0][1]}")
+            # For SHORT, size is stored as positive in active_positions, side='SHORT' indicates direction
+            self.assertEqual(abs(rows[0][2]), 1.0, f"Expected size magnitude=1.0, got {rows[0][2]}")
 
     def test_tiny_qty_below_tolerance_excluded(self):
         """Bot with qty below qty_tolerance() should NOT be counted as contributor."""
-        import config.settings as settings
-        settings.config.ALLOW_FORENSIC_ADOPT = False
-        
-        # Setup: 
-        # - bot1: invested_qty = 1.0 (above tolerance 0.002) -> SHOULD be contributor
-        # - bot2: invested_qty = 0.001 (BELOW tolerance 0.002) -> should be EXCLUDED
-        self._setup_longs([(1001, 'bot1', 1.0, 50000.0), (1002, 'bot2', 0.001, 50000.0)])
-        
-        # Snapshot with net matching: 1.0 LONG (bot1's 1.0 + bot2's 0.001 ≈ 1.0)
-        mock_positions = [{
-            'symbol': 'BTC/USDC:USDC',
-            'side': 'long',
-            'contracts': 1.001,  # exchange reports combined
-            'entryPrice': 50000.0,
-        }]
-        update_active_positions_snapshot(mock_positions, force_write=True)
-        
-        # Check active_positions - ONLY bot1 should get the position
-        cursor = self.conn.cursor()
-        rows = cursor.execute("SELECT bot_id, size FROM active_positions WHERE pair='BTCUSDC' ORDER BY bot_id").fetchall()
-        
-        # Only bot1 (above tolerance) should be assigned - bot2 (0.001 < 0.002) excluded
-        self.assertEqual(len(rows), 1, f"Expected 1 active position (tiny bot excluded), got {len(rows)}: {rows}")
-        self.assertEqual(rows[0][0], 1001, f"Expected bot_id=1001 (above tolerance), got {rows[0][0]}")
-        self.assertEqual(rows[0][1], 1.0, f"Expected size=1.0 (bot1's share), got {rows[0][1]}")
+        with patch.object(settings.config, "ALLOW_FORENSIC_ADOPT", False):
+            # Setup: 
+            # - bot1: invested_qty = 1.0 (above tolerance 0.002) -> SHOULD be contributor
+            # - bot2: invested_qty = 0.001 (BELOW tolerance 0.002) -> should be EXCLUDED
+            self._setup_longs([(1001, 'bot1', 1.0, 50000.0), (1002, 'bot2', 0.001, 50000.0)])
+            
+            # Snapshot with net matching: 1.0 LONG (bot1's 1.0 + bot2's 0.001 ≈ 1.0)
+            mock_positions = [{
+                'symbol': 'BTC/USDC:USDC',
+                'side': 'long',
+                'contracts': 1.001,  # exchange reports combined
+                'entryPrice': 50000.0,
+            }]
+            update_active_positions_snapshot(mock_positions, force_write=True)
+            
+            # Check active_positions - ONLY bot1 should get the position
+            cursor = self.conn.cursor()
+            rows = cursor.execute("SELECT bot_id, size FROM active_positions WHERE pair='BTCUSDC' ORDER BY bot_id").fetchall()
+            
+            # Only bot1 (above tolerance) should be assigned - bot2 (0.001 < 0.002) excluded
+            self.assertEqual(len(rows), 1, f"Expected 1 active position (tiny bot excluded), got {len(rows)}: {rows}")
+            self.assertEqual(rows[0][0], 1001, f"Expected bot_id=1001 (above tolerance), got {rows[0][0]}")
+            self.assertEqual(rows[0][1], 1.0, f"Expected size=1.0 (bot1's share), got {rows[0][1]}")
 
 
 if __name__ == '__main__':

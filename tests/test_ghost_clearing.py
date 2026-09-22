@@ -1,4 +1,3 @@
-
 import unittest
 from unittest.mock import MagicMock, patch
 import sys
@@ -23,8 +22,8 @@ class TestGhostClearingHedged(unittest.TestCase):
         self.runner.exchanges = {'future': MagicMock()}
         self.mock_db = MagicMock()
         self.runner._reconciler = MagicMock()
-        
-    @patch('engine.database.get_connection')
+
+    @patch('engine.runner.cycle_loop.get_connection')
     @patch('engine.database.log_trade')
     @patch('engine.runner.normalize_symbol', side_effect=lambda x: x.replace('/', ''))
     def test_hedged_net_zero_no_reset(self, mock_norm, mock_log_trade, mock_get_conn):
@@ -34,7 +33,7 @@ class TestGhostClearingHedged(unittest.TestCase):
         Bot B: Short $269 on BTC/USDC
         System Net: -$4
         Exchange Net: -$4.50 (rounding difference)
-        
+
         Expected: NO reset occurs because diff ($0.50) is well within percentage tolerance.
         """
         # (id, name, pair, direction, strategy, config, invested, step, rsi, active, base_size, martingale_multiplier, status)
@@ -43,7 +42,7 @@ class TestGhostClearingHedged(unittest.TestCase):
             (10002, "Bot_Short", "BTC/USDC", "SHORT", "Martingale", '{"market_type": "future"}', 269.0, 1, 30.0, 1, 100.0, 1.0, "ACTIVE")
         ]
         self.runner.get_active_bots.return_value = bots
-        
+
         # Snapshots
         # Note: exchange net is -$4.50 (side='SHORT', qty-contracts * price = 4.50)
         snap_pos = [
@@ -51,27 +50,27 @@ class TestGhostClearingHedged(unittest.TestCase):
         ]
         self.runner.exchanges['future'].fetch_positions.return_value = snap_pos
         self.runner.exchanges['future'].fetch_open_orders.return_value = []
-        
+
         # We need to set cycle_count to a multiple of 10 to trigger adoption/ghost logic
         self.runner.cycle_count = 10
-        
+
         # Mock DB connection
         mock_conn = MagicMock()
         mock_get_conn.return_value = mock_conn
-        
+
         # Run cycle
         with patch.object(self.runner, '_bot_executor'):
             self.runner.run_cycle()
-            
+
         # Verify no DB updates for trade clear (no ghost-bust)
         # log_trade is called for actual trades, reset_bot calls log_trade with action='SYSTEM_FIX'
         for call in mock_log_trade.call_args_list:
             self.assertNotEqual(call[1].get('action'), 'SYSTEM_FIX')
-            
+
         print("✅ Success: Hedged positions near net-zero did not trigger false resets.")
 
 
-    @patch('engine.database.get_connection')
+    @patch('engine.runner.cycle_loop.get_connection')
     @patch('engine.database.log_trade')
     @patch('engine.runner.normalize_symbol', side_effect=lambda x: x.replace('/', ''))
     def test_real_ghost_reset(self, mock_norm, mock_log_trade, mock_get_conn):
