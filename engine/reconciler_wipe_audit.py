@@ -79,12 +79,22 @@ def _audit_bot_wipes(cursor, bot_id: int, symbol: str, exchange_gap: float) -> W
     return WipeAuditResult(bot_id, symbol, suspect_rows, total_qty, probable_cause)
 
 
+def _audit_bot_wipes_with_conn(bot_id: int, symbol: str, exchange_gap: float) -> WipeAuditResult:
+    """
+    Internal: public API adapter that provides its own DB connection.
+    Matches the pattern used by _check_recompute_for_suspects / check_recompute_for_suspects.
+    """
+    from engine.database import get_connection
+    with get_connection() as conn:
+        return _audit_bot_wipes(conn.cursor(), bot_id, symbol, exchange_gap)
+
+
 def audit_bot_wipes(bot_id: int, symbol: str, exchange_gap: float) -> WipeAuditResult:
     """
     Public API: audits a bot for unproved wipes. Uses WriteQueue.
     """
     from engine.write_queue import WriteQueue
-    return WriteQueue().put_and_wait(_audit_bot_wipes, bot_id, symbol, exchange_gap)
+    return WriteQueue().put_and_wait(_audit_bot_wipes_with_conn, bot_id, symbol, exchange_gap)
 
 
 def _system_wipe_health_check(cursor, active_bots: List[Any]) -> List[WipeAuditResult]:
