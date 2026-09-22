@@ -1892,7 +1892,25 @@ def handle_flatten(
                         actual_exit_price = avg_entry
 
         # --- Step 4: Log and reset ---
-        reset_price = actual_exit_price or 0.0
+        # Never silently use 0.0 — fetch market price as ultimate fallback
+        if actual_exit_price is None or actual_exit_price <= 0.0:
+            if exchange and hasattr(exchange, 'fetch_ticker'):
+                try:
+                    ticker = exchange.fetch_ticker(norm_pair)
+                    actual_exit_price = float(ticker.get('last') or ticker.get('close') or 0.0)
+                except Exception as e_ticker:
+                    logger.warning(f"[FLATTEN] Bot {bot_id}: Ticker fetch failed for fallback: {e_ticker}")
+                    actual_exit_price = avg_entry if avg_entry > 0.0 else 0.0
+            else:
+                actual_exit_price = avg_entry if avg_entry > 0.0 else 0.0
+
+        reset_price = actual_exit_price
+
+        if reset_price <= 0.0:
+            logger.error(
+                f"[FLATTEN] Bot {bot_id}: CRITICAL — all fallbacks exhausted, reset_price=0.0. "
+                f"Position may have been non-zero. Manual review required."
+            )
         try:
             log_trade(
                 bot_id=bot_id,
