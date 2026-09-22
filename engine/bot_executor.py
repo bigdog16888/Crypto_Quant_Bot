@@ -278,7 +278,37 @@ def sync_stale_open_orders(bot_id: int, exchange: ExchangeInterface, conn, max_a
                         f"[ORDER-SYNC] Bot {bot_name}: order {client_order_id} not found on exchange "
                         f"(treated as cancelled). Corrected in DB."
                     )
-                synced_count += 1
+                    # Credit any stranded partial fill before marking cancelled
+                    db_filled = float(filled_amount or 0)
+                    if db_filled > 0:
+                        try:
+                            # Determine fill side from order_type and bot direction
+                            direction_row = conn.execute("SELECT direction FROM bots WHERE id = ?", (bot_id,)).fetchone()
+                            bot_direction = direction_row[0] if direction_row else 'LONG'
+                            if order_type in ('entry', 'grid') and bot_direction == 'LONG':
+                                fill_side = 'BUY'
+                            elif order_type in ('entry', 'grid') and bot_direction == 'SHORT':
+                                fill_side = 'SELL'
+                            elif order_type in ('tp', 'close', 'sl') and bot_direction == 'LONG':
+                                fill_side = 'SELL'
+                            elif order_type in ('tp', 'close', 'sl') and bot_direction == 'SHORT':
+                                fill_side = 'BUY'
+                            else:
+                                fill_side = 'BUY'  # default
+                            credit_fill(
+                                bot_id=bot_id,
+                                order_id=order_id,
+                                cumulative_qty=db_filled,
+                                avg_price=float(price or 0),
+                                order_type=order_type,
+                                is_cumulative=True,
+                                caller='stale_sync_notfound_credit',
+                                side=fill_side,
+                            )
+                            logger.warning(f"[ORDER-SYNC] Bot {bot_name}: Credited stranded fill {db_filled} for {client_order_id}")
+                        except Exception as e_credit:
+                            logger.error(f"[ORDER-SYNC] Failed to credit stranded fill for {client_order_id}: {e_credit}")
+                    synced_count += 1
             else:
                 logger.error(f"❌ [ORDER-SYNC] Failed to fetch order status from exchange for order {order_id} bot {bot_name}: {e}")
 
@@ -4229,6 +4259,44 @@ class BotExecutor:
                     cancel_result = exchange.cancel_order(o['id'], pair)
                     if cancel_result is None:
                         # Confirmed already gone on the exchange — terminal in DB.
+                        # Check if DB has a stranded partial fill that was never credited
+                        from engine.database import get_connection
+                        conn = get_connection()
+                        db_row = conn.execute(
+                            "SELECT filled_amount, order_type FROM bot_orders WHERE order_id = ? AND bot_id = ?",
+                            (o['id'], bot_id)
+                        ).fetchone()
+                        db_filled = float(db_row[0] or 0) if db_row else 0.0
+                        if db_filled > 0:
+                            try:
+                                # Determine fill side from order_type and bot direction
+                                direction_row = conn.execute("SELECT direction FROM bots WHERE id = ?", (bot_id,)).fetchone()
+                                bot_direction = direction_row[0] if direction_row else 'LONG'
+                                order_type = db_row[1] if db_row else 'grid'
+                                if order_type in ('entry', 'grid') and bot_direction == 'LONG':
+                                    fill_side = 'BUY'
+                                elif order_type in ('entry', 'grid') and bot_direction == 'SHORT':
+                                    fill_side = 'SELL'
+                                elif order_type in ('tp', 'close', 'sl') and bot_direction == 'LONG':
+                                    fill_side = 'SELL'
+                                elif order_type in ('tp', 'close', 'sl') and bot_direction == 'SHORT':
+                                    fill_side = 'BUY'
+                                else:
+                                    fill_side = 'BUY'  # default
+                                from engine.ledger import credit_fill
+                                credit_fill(
+                                    bot_id=bot_id,
+                                    order_id=o['id'],
+                                    cumulative_qty=db_filled,
+                                    avg_price=float(o.get('price', 0) or 0),
+                                    order_type=order_type,
+                                    is_cumulative=True,
+                                    caller='stale_purge_notfound_credit',
+                                    side=fill_side,
+                                )
+                                logger.warning(f"[STALE-PURGE] Bot {name}: Credited stranded fill {db_filled} for {o.get('clientOrderId')}")
+                            except Exception as e_credit:
+                                logger.error(f"[STALE-PURGE] Failed to credit stranded fill for {o.get('clientOrderId')}: {e_credit}")
                         update_order_status(o['id'], 'cancelled', bot_id=bot_id, filled_qty=filled_qty)
                         logger.info(f"🔥 Stale order {o.get('clientOrderId')} confirmed already gone — marked cancelled.")
                     else:

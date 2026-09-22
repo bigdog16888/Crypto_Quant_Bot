@@ -32,8 +32,8 @@ WHITELIST = [
     # Future cleanup (tracked task): route these through _set_bot_require_manual_proof()
     # so the grace-period guard is honored everywhere.
     ("engine/parity_gates.py",    585, "Centralized-ish parity gate raw write (line drifted from 474)"),
-    ("engine/bot_executor.py",    637, "Phase-1 reset: lock bot to manual-proof, DB-locked reset path"),
-    ("engine/bot_executor.py",    911, "Phase-1 two-phase reset: exchange close FAILED (real error, not race)"),
+    ("engine/bot_executor.py",    667, "Phase-1 reset: lock bot to manual-proof, DB-locked reset path"),
+    ("engine/bot_executor.py",    946, "Phase-1 two-phase reset: exchange close FAILED (real error, not race)"),
     ("engine/database.py",       1452, "O-1 freeze_bot_for_position_oversize: position > 2x config max"),
     ("engine/database.py",       4337, "flag_pair_ledger_mismatch: isolated startup drift check (gate selected bots)"),
     ("engine/database.py",       4351, "flag_pair_ledger_mismatch: critical startup drift check (gate all bots)"),
