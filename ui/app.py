@@ -18,8 +18,9 @@ from ui.views.bot_creator import render_bot_creator_view
 from ui.views.bot_manager import render_bot_manager_view
 from ui.views.analytics import render_analytics_view
 
-# Load environment variables
-load_dotenv()
+# Load environment variables BEFORE importing config (already loaded at module import time,
+# but this ensures it's loaded for subprocess context too)
+load_dotenv(os.path.join(ROOT_DIR, ".env"))
 st.set_page_config(
     page_title="Crypto Quant Bot",
     page_icon="🤖",

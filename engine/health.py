@@ -109,9 +109,18 @@ def _compute_header_metrics(db_path: str, exchange_instance) -> Dict[str, Any]:
             try:
                 bal = exchange_instance.fetch_balance()
                 if bal:
-                    usdc = bal.get("USDC", {})
-                    result["futures_balance"] = float(usdc.get("free", 0) or 0)
-                    result["total_equity"] = float(usdc.get("total", 0) or 0)
+                    total_balance = 0.0
+                    free_balance = 0.0
+                    # fetch_balance returns {'total': {asset: amount}}
+                    totals = bal.get('total', {})
+                    for asset, amount in totals.items():
+                        total = float(amount or 0)
+                        free = total  # Binance futures returns total balance, free ≈ total for spot-like assets
+                        if asset in ('USDT', 'USDC', 'USD', 'BUSD', 'FDUSD'):
+                            total_balance += total
+                            free_balance += free
+                    result["futures_balance"] = free_balance
+                    result["total_equity"] = total_balance
             except Exception:
                 pass
 
@@ -198,19 +207,25 @@ def _compute_netting_status(
             # Get per-bot auto-detected cycle_floor using exchange_fills (authoritative ledger)
             # NOT bot_orders (which may have phantom fills with filled_at=0)
             bot_floors = {}
+            bot_has_fills = {}  # Track which bots have exchange_fills for tier-2
             target_cycle = 0
             for bot_info in pair_bot_map.get(p_key, []):
                 bot_id = bot_info["bot_id"]
-                # Only compute floor for bots that are actively trading (IN_TRADE or open_qty > 0)
-                # Scanning bots with open_qty=0 should not contribute to netting
-                bot_status = bot_info.get("status", "Scanning")
-                open_qty = bot_info.get("open_qty", 0.0)
-                is_active_trading = (bot_status == 'IN_TRADE' or abs(open_qty) > 0.0001)
-                
-                if is_active_trading:
-                    try:
-                        conn2 = sqlite3.connect(db_path, timeout=10)
-                        cursor = conn2.cursor()
+                # Check if bot has any exchange_fills (for tier-2 full-history ledger)
+                try:
+                    conn2 = sqlite3.connect(db_path, timeout=10)
+                    cursor = conn2.cursor()
+                    row_fills = cursor.execute(
+                        "SELECT COUNT(*) FROM exchange_fills WHERE bot_id = ?", (bot_id,)
+                    ).fetchone()
+                    bot_has_fills[bot_id] = (row_fills and row_fills[0] > 0)
+                    # Only compute floor for bots that are actively trading (IN_TRADE or open_qty > 0)
+                    # Scanning bots with open_qty=0 should not contribute to tier-1 netting
+                    bot_status = bot_info.get("status", "Scanning")
+                    open_qty = bot_info.get("open_qty", 0.0)
+                    is_active_trading = (bot_status == 'IN_TRADE' or abs(open_qty) > 0.0001)
+
+                    if is_active_trading:
                         row_trade = cursor.execute(
                             "SELECT cycle_id FROM trades WHERE bot_id = ?", (bot_id,)
                         ).fetchone()
@@ -245,17 +260,18 @@ def _compute_netting_status(
                             bot_floors[bot_id] = row_floor[0] if row_floor else target_cycle
                         else:
                             bot_floors[bot_id] = 0
-                        conn2.close()
-                    except Exception:
+                    else:
+                        # Scanning bots with open_qty=0 don't contribute to tier-1 netting
                         bot_floors[bot_id] = 0
-                else:
-                    # Scanning bots with open_qty=0 don't contribute to netting
+                    conn2.close()
+                except Exception:
                     bot_floors[bot_id] = 0
+                    bot_has_fills[bot_id] = False
 
             # Compute using per-bot floors
             # TWO-TIER CHECK:
             #   tier-1 (drift)  = net from auto-detected cycle_floor onward for ACTIVE bots only (current cycle window)
-            #   tier-2 (ledger) = net from cycle 0 onward but ONLY for bots that are actively trading (IN_TRADE or open_qty > 0)
+            #   tier-2 (ledger) = net from cycle 0 onward for ALL bots with exchange_fills
             # Both calls now use an explicit connection bound to THIS db_path.
             # The old conn=None fallback (get_connection()) silently bound every
             # caller to the live DB instead of the db_path passed in.
@@ -270,7 +286,7 @@ def _compute_netting_status(
                         bot_id = bot_info["bot_id"]
                         floor = bot_floors.get(bot_id, 0)
                         # Only use cycle_ceiling for bots that are actively trading (IN_TRADE or open_qty > 0)
-                        # Scanning bots with stale cycle_id should not contribute to netting
+                        # Scanning bots with stale cycle_id should not contribute to tier-1 netting
                         bot_status = bot_info.get("status", "Scanning")
                         open_qty = bot_info.get("open_qty", 0.0)
                         use_ceiling = (bot_status == 'IN_TRADE' or abs(open_qty) > 0.0001)
@@ -279,8 +295,8 @@ def _compute_netting_status(
                         ceiling = target_cycle if use_ceiling else None
                         bp = compute_bot_position(bot_id, conn=conn_pair, cycle_floor=floor, cycle_ceiling=ceiling)
                         total_net += bp.net_qty
-                        # Tier-2: only sum full history for bots that are actively trading
-                        if use_ceiling:
+                        # Tier-2: sum full history for ALL bots that have exchange_fills
+                        if bot_has_fills.get(bot_id, False):
                             bp_full = compute_bot_position(bot_id, conn=conn_pair, cycle_floor=0, cycle_ceiling=None)
                             total_net_full += bp_full.net_qty
                     # Tier-1 (drift): only pairs with active trading bots should have non-zero primary_net
@@ -617,6 +633,10 @@ def get_system_health(
     Dict with same structure as compute_system_health().
     """
     now = time.time()
+    if force_refresh:
+        # Invalidate module-level cache on force_refresh
+        _health_cache["data"] = None
+        _health_cache["ts"] = 0.0
     if not force_refresh:
         cached = _health_cache.get("data")
         if cached is not None and (now - _health_cache.get("ts", 0)) < _HEALTH_TTL_SECONDS:

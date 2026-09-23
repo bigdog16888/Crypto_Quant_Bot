@@ -212,6 +212,7 @@ def _header_metrics_fragment():
     st.caption(f"  ⚡ Header Sync: {time.strftime('%H:%M:%S')}")
 
     auto_refresh = st.session_state.get("auto_refresh_toggle", True)
+    force_refresh = st.session_state.pop("_force_health_refresh", False)
     wizard_active = any(bool(st.session_state.get(k)) for k in st.session_state
                         if k.startswith(("forensic_trades_", "adopt_force_sel_", "trade_sel_", "_confirm_")))
 
@@ -219,11 +220,29 @@ def _header_metrics_fragment():
     health_data = st.session_state.get("system_health_data")
     cached = st.session_state.get("cached_header_data")
 
-    if (not auto_refresh or wizard_active) and cached:
+    # On auto-refresh (run_every), main render doesn't re-run → we must fetch fresh health
+    # Also force refresh if auto_refresh just toggled ON (handled in main render)
+    needs_fresh = force_refresh or (auto_refresh and not cached)
+
+    if (not auto_refresh or wizard_active) and cached and not force_refresh:
         _render_header_ui(cached)
         return
 
     try:
+        # If no health_data from main render (e.g., on fragment auto-refresh), compute it
+        if needs_fresh or not health_data or not health_data.get("header_metrics"):
+            from engine.health import get_system_health
+            _ex = get_exchange_instance(global_config.MARKET_TYPE)
+            health_data = get_system_health(
+                db_path=global_config.PATHS['DB_FILE'],
+                exchange_instance=_ex,
+                norm_fn=_norm_universal,
+                qty_tolerance_fn=pair_qty_tolerance,
+                force_refresh=True,
+            )
+            st.session_state["system_health_data"] = health_data
+            st.caption(f"  🔍 DEBUG: header_metrics = {health_data.get('header_metrics', {})}")
+
         if health_data and health_data.get("header_metrics"):
             hm = health_data["header_metrics"]
             data = {
@@ -271,7 +290,7 @@ def _header_metrics_fragment():
                 fut_data = fetch_balance_cached('future')
                 if fut_data and 'total' in fut_data:
                     for asset, amount in fut_data['total'].items():
-                        if amount and amount > 0 and asset in ('USDT', 'USDC', 'USD', 'BUSD'):
+                        if amount and amount > 0 and asset in ('USDT', 'USDC', 'USD', 'BUSD', 'FDUSD'):
                             futures_balance += amount
             except Exception: pass
             data = {
