@@ -18,6 +18,7 @@ from engine.parity_gates import qty_tolerance as pair_qty_tolerance
 from config.settings import config as global_config
 from engine.exchange_interface import normalize_symbol as _norm_universal
 from engine.health import get_system_health as _get_system_health
+from engine.shutdown_control import is_engine_running
 
 # --- Performance Caching Wrappers ---
 @st.cache_resource(ttl=30, show_spinner=False)
@@ -202,6 +203,15 @@ def _render_header_ui(data):
     if tier2_status == "LEDGER_ADVISORY":
         st.caption("ℹ️ **LEDGER ARCHIVE ADVISORY** — Dormant bots have historical ledger imbalances (migration-era dust). Exchange parity is HEALTHY.")
 
+    # GTR (Global Trade Recovery) lock indicator — explicit, always visible.
+    _gtr_icon = data.get('gtr_icon', '⚪')
+    _gtr_state = data.get('gtr_state', 'UNKNOWN')
+    _gtr_detail = data.get('gtr_detail', '')
+    st.caption(
+        f"🛡️ **GTR Lock:** {_gtr_icon} {_gtr_state.upper()}"
+        f"{' — ' + _gtr_detail if _gtr_detail else ''}"
+    )
+
     if data['assets_breakdown']:
         with st.expander("💰 Detailed Asset Breakdown", expanded=False):
             st.table(pd.DataFrame(data['assets_breakdown']))
@@ -249,25 +259,47 @@ def _header_metrics_fragment():
             st.caption(f"  🔍 DEBUG: header_metrics = {health_data.get('header_metrics', {})}")
 
         if health_data and health_data.get("header_metrics"):
-                    hm = health_data["header_metrics"]
-                    data = {
-                        'total_equity':      hm.get('total_equity', 0.0),
-                        'futures_balance':   hm.get('futures_balance', 0.0),
-                        'global_pnl_usd':    hm.get('global_pnl_usd', 0.0),
-                        'total_invested_db': hm.get('total_invested_db', 0.0),
-                        'active_count':      hm.get('active_count', 0),
-                        'bots_in_trade':     hm.get('bots_in_trade', 0),
-                        'scanning_count':    hm.get('scanning_count', 0),
-                        'open_qty_notional': hm.get('open_qty_notional', 0.0),
-                        'assets_breakdown':  hm.get('assets_breakdown', []),
-                        'adoptions_today':   hm.get('adoptions_today', 0),
-                        'last_act_str':      hm.get('last_act_str', 'NO RECENT ACTIVITY'),
-                        # Status pill fields — sourced from health_data root, not header_metrics
-                        'system_status':     health_data.get('system_status', 'UNKNOWN'),
-                        'tier1_status':      health_data.get('tier1_status', health_data.get('system_status', 'UNKNOWN')),
-                        'tier2_status':      health_data.get('tier2_status', 'UNKNOWN'),
-                        'worst_gap_usd':     health_data.get('worst_gap_usd', 0.0),
-                    }
+            hm = health_data["header_metrics"]
+            # GTR lock state (GTR runs every 10 engine cycles; "locked" = a bot
+            # is in REQUIRE_MANUAL_PROOF / stuck cascade that GTR cannot auto-heal)
+            _mp_bots = health_data.get("manual_proof_bots", []) or []
+            _stuck_bots = health_data.get("stuck_cascade_bots", []) or []
+            _locked_count = len(set(_mp_bots) | set(_stuck_bots))
+            _engine_running, _engine_pid = is_engine_running()
+            if not _engine_running:
+                _gtr_state = "DISENGAGED"
+                _gtr_icon = "⚪"
+                _gtr_detail = "engine off — GTR not running"
+            elif _locked_count > 0:
+                _gtr_state = "LOCKED"
+                _gtr_icon = "🔴"
+                _gtr_detail = f"{_locked_count} bot(s) require manual proof / stuck"
+            else:
+                _gtr_state = "ACTIVE"
+                _gtr_icon = "🟢"
+                _gtr_detail = "running every 10 cycles (pid %s)" % _engine_pid
+            data = {
+                'total_equity':      hm.get('total_equity', 0.0),
+                'futures_balance':   hm.get('futures_balance', 0.0),
+                'global_pnl_usd':    hm.get('global_pnl_usd', 0.0),
+                'total_invested_db': hm.get('total_invested_db', 0.0),
+                'active_count':      hm.get('active_count', 0),
+                'bots_in_trade':     hm.get('bots_in_trade', 0),
+                'scanning_count':    hm.get('scanning_count', 0),
+                'open_qty_notional': hm.get('open_qty_notional', 0.0),
+                'assets_breakdown':  hm.get('assets_breakdown', []),
+                'adoptions_today':   hm.get('adoptions_today', 0),
+                'last_act_str':      hm.get('last_act_str', 'NO RECENT ACTIVITY'),
+                # Status pill fields — sourced from health_data root, not header_metrics
+                'system_status':     health_data.get('system_status', 'UNKNOWN'),
+                'tier1_status':      health_data.get('tier1_status', health_data.get('system_status', 'UNKNOWN')),
+                'tier2_status':      health_data.get('tier2_status', 'UNKNOWN'),
+                'worst_gap_usd':     health_data.get('worst_gap_usd', 0.0),
+                # GTR lock indicator
+                'gtr_state':         _gtr_state,
+                'gtr_icon':          _gtr_icon,
+                'gtr_detail':        _gtr_detail,
+            }
         else:
             # Fallback: compute locally if health_data not yet available
             conn = get_connection()
@@ -300,6 +332,7 @@ def _header_metrics_fragment():
                         if amount and amount > 0 and asset in ('USDT', 'USDC', 'USD', 'BUSD', 'FDUSD'):
                             futures_balance += amount
             except Exception: pass
+            _eng_running, _eng_pid = is_engine_running()
             data = {
                             'total_equity': futures_balance, 'futures_balance': futures_balance,
                             'global_pnl_usd': 0.0, 'total_invested_db': total_invested_db,
@@ -309,6 +342,10 @@ def _header_metrics_fragment():
                             'adoptions_today': adoptions_today, 'last_act_str': last_act_str,
                             # Fallback: status unknown until health_data is populated
                             'system_status': 'UNKNOWN', 'tier1_status': 'UNKNOWN', 'tier2_status': 'UNKNOWN', 'worst_gap_usd': 0.0,
+                            # GTR (fallback: engine state only, no health-derived lock info)
+                            'gtr_state': ('ACTIVE' if _eng_running else 'DISENGAGED'),
+                            'gtr_icon': ('🟢' if _eng_running else '⚪'),
+                            'gtr_detail': 'engine state only — health data pending',
                         }
 
         st.session_state["cached_header_data"] = data
