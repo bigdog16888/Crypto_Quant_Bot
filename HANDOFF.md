@@ -1,30 +1,29 @@
 # HANDOFF — Crypto_Quant_Bot
 
-**Session: 2026-09-23 | Engine: STOPPED | Git HEAD: d1a50a0 (52 ahead of origin/main)**
+**Window: NIGHT 2 (2026-09-23 → 09-24) | Engine: STOPPED (untouched) | Git HEAD: `953de15` (63 ahead of origin/main)**
 
 ---
 
-## TL;DR — What happened this session
+## TL;DR — What happened this window (NIGHT 2 autonomous mission)
 
-**5 commits, all reviewed & approved via explicit "approved" gate:**
+**2 of 3 tasks complete; Task 2 blocked on a disproven premise (evidence in `OVERNIGHT_REPORT_NIGHT2.md` §3).**
 
 | # | Work | Commit / Action | Status |
 |---|------|-----------------|--------|
-| Phase 3.1 | XAU ORDER-SYNC loop fixed — stranded fills credited on -2011 | `34cb543` | ✅ Done |
-| Phase 3.2 | handle_flatten price fallback chain hardened (4-level) | `34a3a34` | ✅ Done |
-| Phase 3.2 | audit_bot_wipes signature fixed + regression test | `68aa8bd` | ✅ Done |
-| Phase 3.3 | SUI orphan flattened (58.6 contracts) + XAU virtual drift healed | `6e5749d` (docs) | ✅ Done |
-| Phase 4 | 15-min dry-run soak test PASSED (148 cycles, 0 crashes, 0 drift) | `d1a50a0` | ✅ Done |
+| Task 1 | UI two-tier status: ribbon = tier-1 live parity (`🟢 HEALTHY`), tier-2 dust → `ℹ️ LEDGER ARCHIVE ADVISORY` caption | `9ba4cad` | ✅ Done |
+| Task 3 | GTR lock indicator in Live Monitor header (`🟢 ACTIVE` / `🔴 LOCKED` / `⚪ DISENGAGED`) | `953de15` | ✅ Done |
+| Task 2 | Archive migration-era phantom `bot_orders` | — | 🛑 **BLOCKED — premise wrong** |
 
-**KEY RESULT: 100% GREEN TEST SUITE — 703 passed, 0 failed, 2 skipped, 0 ERRORS**
+**Why Task 2 is blocked (proof chain, all read-only):**
+1. Tier-2 `ledger_imbalance` is computed from **`exchange_fills`** — `health.py:298-301` → `compute_bot_position()` → `position_ledger.py:94-98` (`FROM exchange_fills`). The `bot_has_fills` gate itself counts `exchange_fills` (`health.py:218-221`).
+2. **Zero unowned `bot_orders` rows exist** (`bot_id IS NULL` = 0; `bot_id` not in `bots` = 0).
+3. Tier-2 values reproduce **exactly** from full-history `exchange_fills` side-signed sums (ETH +8.097, LINK +454.84, XAU +0.105) — 0 duplicate fill groups.
+4. ⇒ Archiving `bot_orders` changes the tier-2 number by **nothing**. Zeroing it would require mutating the immutable `exchange_fills` log — forbidden (AGENTS.md safety #1) and wrong (residue is real closed history).
+5. **Correct fix (designed, NOT applied):** dormant-bots exclusion gate in `engine/health.py` — when ALL bots on a pair are `is_active=0` AND exchange physical=0, report residue as informational, not `ledger_imbalance`. Active-bot pairs keep strict tier-2. Needs diff + approval.
 
-**Test suite:** 703 passed, 0 failed, 2 skipped, **0 ERRORS** (100% GREEN)
+**New finding (not in task list):** SUIUSDC is a health blind spot — all 3 SUI bots are `is_active=0` + `open_qty=0`, so `health.py:165-168` excludes the pair from the tier-2 scan entirely despite 80+ fill rows (side-signed sum ≈ +335.9, exchange flat). Additionally forward-test grid order **`185035956` (11.8 SUI BUY) is `filled` on exchange** but has **no `exchange_fills` row** and a stale `open` `bot_orders` row. TP `185035955` already `canceled` on exchange. **Exchange flat, no resting orders, no live risk** — but the ledger over-states SUI history and the health check can never see it.
 
-**DB isolation guard VERIFIED:** write blocked, read-only passes, temp DB works
-
-**Engine:** STOPPED — explicit operator go-ahead required
-
-**Testnet bots 10008/10018:** PAUSED, `is_active=0`, `status=STOPPED`, orphan exchange positions CLEARED
+**Test suite: 703 passed, 0 failed, 2 skipped, 0 ERRORS** (fresh run at `953de15`, covers both UI commits).
 
 ---
 
@@ -32,52 +31,49 @@
 
 | Item | Status |
 |------|--------|
-| Engine | **STOPPED** — explicit operator go-ahead required |
-| Bots 10008 (SOL), 10018 (SUI) | **PAUSED / RESOLVED** — `is_active=0`, orphan exchange positions CLEARED |
-| is_active guard coverage | **8 sites** (swept, 65-site audit clean) |
-| `resolve_net_mismatch()` | **Dependency risk documented** — no independent is_active check; safe only while all 8 upstream writes guarded |
-| Startup barrier | **CLEARED** — 8/8 pairs perfect parity |
-| Tier-2 health | **CLEAN** — 0 ledger_imbalance |
-| DB isolation guard | **ACTIVE & VERIFIED** — live write blocked, mode=ro passes, temp DB works |
-| Finding 2 exchange layer | **RESOLVED `aac94fa`** — testnet fetch_order returns side/positionSide |
-| Phase 1 (test suite + UI) | **COMPLETE `ffbda87`** — 700 passed, Streamlit green, Playwright passing |
-| Phase 2 (P1 backlog) | **COMPLETE `68aa8bd`** — audit_bot_wipes fixed, retry-queue audited safe |
-| Phase 3 (testnet verification) | **COMPLETE** — XAU loop fixed, SUI flattened, XAU drift healed |
-| Phase 4 (soak test) | **COMPLETE `d1a50a0`** — 148 cycles, 0 crashes, 0 parity drift, clean shutdown |
+| Engine | **STOPPED** all night — explicit operator go-ahead required |
+| Live positions | **NONE** — full `fetch_positions()` scan returned zero non-zero positions |
+| Resting orders | **NONE** verified for SUI (TP canceled, grid filled+closed); no placements made all night |
+| Tier-1 parity | **HEALTHY** — worst_gap_usd = 0.0, 0 mismatched pairs |
+| Tier-2 | **LEDGER_ADVISORY** — 5 dormant pairs (LINK +454.84, SOL +52.81, ETH +8.097, BTC +0.02, XAU +0.105); now surfaced as amber advisory, not red MISMATCH |
+| DB writes this night | **ZERO** — all queries `mode=ro` |
+| Orders placed/canceled | **NONE** |
+| Safety gates | Untouched |
+| UI | streamlit at localhost:8501, read-only, live-verified via `scripts/tools/inspect_live_ui.py` |
 
 ---
 
 ## Open Items (next session starts here)
 
-### 1. Finding 2 — Side inference gap in parity_gates/database.py (P1)
-- **Problem**: `parity_gates.py:1135` (orphan adoption) and `database.py:2173` (race guard) call `credit_fill()` without `side=` param. Physical position may have opposite direction to bot's virtual.
-- **Note**: Exchange-layer fix (`aac94fa`) resolved the testnet wrapper; these two sites still need explicit `side=` wiring.
-- **Not started** — needs diff + test + approval
+### 1. Tier-2 dormant-bots exclusion gate (Task 2's correct remedy) — P2
+- `engine/health.py`: all-bots-`is_active=0` + physical=0 ⇒ informational, not `ledger_imbalance`.
+- Needs: diff → approval → apply → full suite. **Not started (no code written).**
 
-### 2. Test Infrastructure — archive/ directory (P3)
-- **Root-level `archive/` directory** — move or ignore.
+### 2. SUI blind spot + uncredited fill `185035956` — P2, decision needed
+- (a) Fold all-dormant pairs into the tier-2 gate fix (item 1) — surfaces SUI residue as advisory.
+- (b) Reconcile the missing 11.8 SUI fill via the tested forensic path (reconciler / offline-fill reconstruction) and refresh the stale `bot_orders` status.
+- Both touch DB/code → Rule-8 snapshot + approval required.
+
+### 3. Finding 2 — Side inference gap in parity_gates/database.py (P1, pre-existing)
+- `parity_gates.py:1135` + `database.py:2173` call `credit_fill()` without `side=`. Needs diff + test + approval. **Not started.**
+
+### 4. Repo hygiene — P3
+- ~34 untracked scratch files at repo root (`check_*.py`, `debug_*.py`, …) → `%LOCALAPPDATA%\Temp`. **Deletion needs approval.**
+- `AGENTS.md` working tree has a stale stage header (docs-only, uncommitted).
+
+### 5. Push decision
+- 63 commits ahead of origin/main, not pushed. Operator call.
 
 ---
 
-## Residual Risks (documented, not resolved)
-
-1. **`resolve_net_mismatch()` reactivation vector** — promotes `Scanning→IN TRADE` on virtual/physical match; no independent `is_active` check. Safe now (8 guarded upstream writes), but any 9th write path to `trades.total_invested` without `is_active` guard breaks this.
-
-2. **Bot 10008 `trades.cycle_id=39`** — wrong data, code workaround in place (`ad7e76e` respects explicit `cycle_id` and bypasses CARRY for historical). Data correction is separate Rule-8 action.
-
----
-
-## Key Files Modified This Session
+## Key Files Modified This Window
 
 ```
-engine/bot_executor.py                                 # XAU ORDER-SYNC fix (34cb543)
-engine/ledger.py                                       # handle_flatten fallback + Mechanism B restore (34a3a34, d1a50a0)
-engine/health.py                                       # Direction-aware cycle_floor auto-detection (d1a50a0)
-engine/reconciler_wipe_audit.py                        # audit_bot_wipes cursor adapter (68aa8bd)
-tests/test_reconciler_wipe_audit.py                    # Regression test for audit_bot_wipes (68aa8bd)
-scripts/flatten_sui_orphan.py                          # SUI orphan flattening script (new)
-OVERNIGHT_REPORT.md                                    # Overnight mission summary (6e5749d)
-PROJECT_STATUS.md, HANDOFF.md                          # This session docs (this commit)
+engine/health.py            # tier1_status/tier2_status split, no tier-2→MISMATCH escalation (9ba4cad)
+ui/views/monitor.py         # ribbon=tier1, LEDGER ARCHIVE ADVISORY caption, GTR lock indicator (9ba4cad, 953de15)
+OVERNIGHT_REPORT_NIGHT2.md  # full overnight deliverable (new, untracked)
+PROJECT_STATUS.md           # updated to NIGHT 2 state
+HANDOFF.md                  # this file
 ```
 
 ---
@@ -85,44 +81,28 @@ PROJECT_STATUS.md, HANDOFF.md                          # This session docs (this
 ## Commands for Next Session
 
 ```bash
-# Resume from clean state
 cd D:/Crypto_Quant_Bot
-git status                          # 52 commits ahead, clean working tree (only archive/ untracked)
+git log --oneline -5        # expect 953de15 at top, 63 ahead
+git status --short          # AGENTS.md modified; OVERNIGHT_REPORT_NIGHT2.md + scratch files untracked
 
-# Verify test baseline (tests/ dir only)
-python -m pytest tests/test_ledger_integrity.py tests/test_hedge_lifecycle.py tests/test_database.py tests/test_live_guard_inv30_saturation_guard.py tests/test_exchange_integration.py -v
-# Expect: all passed (111+ tests)
+# Live UI ground truth (after any UI/health edit — mandatory):
+python scripts/tools/inspect_live_ui.py
+# expect in DOM: "🟢 HEALTHY" ribbon, "ℹ️ LEDGER ARCHIVE ADVISORY", "🛡️ GTR Lock: ⚪ DISENGAGED"
 
-# Check engine state
+# Tier-2 source verification (read-only):
 python -c "
-from engine.database import get_connection
-c=get_connection()
-print(c.execute('SELECT id,is_active,status FROM bots WHERE id IN (10008,10018)').fetchall())
-"
-# Expect: both is_active=0, status=STOPPED
-
-# Verify DB isolation guard
-python -c "
-import os, sqlite3
-os.environ['PYTEST_RUNNING'] = '1'
-os.environ['TESTING_MODE'] = 'True'
-from tests.conftest import _GUARDED_CONNECT
-try:
-    _GUARDED_CONNECT('crypto_bot.db')
-    print('FAIL: write should be blocked')
-except RuntimeError as e:
-    print('PASS:', e)
-# Read-only
-conn = _GUARDED_CONNECT('file:D:/Crypto_Quant_Bot/crypto_bot.db?mode=ro', uri=True)
-print('PASS: read-only works')
-conn.close()
+import sys; sys.path.insert(0,'.')
+from config.settings import config
+from engine.exchange_interface import ExchangeInterface
+from engine.health import get_system_health as g
+ex = ExchangeInterface(config.MARKET_TYPE)
+h = g(db_path=config.PATHS['DB_FILE'], exchange_instance=ex, norm_fn=lambda s: __import__('engine.exchange_interface', fromlist=['normalize_symbol']).normalize_symbol(s), qty_tolerance_fn=lambda: 0.002, force_refresh=True)
+print('tier1:', h['tier1_status'], 'tier2:', h['tier2_status'])
 "
 
-# Review open items
-# 1. grep -n "audit_bot_wipes" engine/*.py
-# 2. grep -n "fill_claims" engine/ledger.py engine/reconciler.py
-# 3. grep -n "credit_fill" engine/parity_gates.py engine/database.py | grep -v "side="
-# 4. cat tests/test_inv35_stuck_dust_no_exit.py | head -40
+# Full suite (Python 3.10 target per Rule 9; 3.11 used this night — 703/703 green):
+python -m pytest tests/ --ignore=tests/test_playwright_ui.py -q --no-header
+# expect: 703 passed, 2 skipped
 ```
 
 ---
@@ -130,16 +110,16 @@ conn.close()
 ## Non-Negotiable Rules (from AGENTS.md, re-stated for next agent)
 
 1. **NO engine start** without explicit operator go-ahead
-2. **NO DB writes** without Rule-8 snapshot + approval
-3. **NO "fixed" claim** without raw output (git diff, pytest, query rows)
+2. **NO DB writes** without Rule-8 snapshot + approval (`exchange_fills` is immutable — never)
+3. **NO "fixed" claim** without raw output (git diff, pytest, query rows, live DOM)
 4. **Show diff → approval → apply → test** for every code change
 5. **Stop after 2 tool failures** on same action — report exact error, change approach
 6. **Item-by-item** — complete each numbered item, STOP, wait for approval before next
 7. **Raw or nothing** — paste tool output verbatim; never retype, tableize, or say "already pasted"
 8. **Evidence over summary** — every claim needs raw output shown
-9. **Root cause over patch** — find why, not just make symptom go away
+9. **Root cause over patch** — Task 2's premise failed exactly this way; verify the data path before building the remedy
 10. **Show before you act** — deletions, resets, credential changes get approval first
-11. **Say what you don't know** — guess dressed as fact is worse than "unconfirmed"
+11. **Say what you don't know** — "unconfirmed" beats a confident guess
 12. **Scope discipline** — change only what was approved
 13. **Engine startup = write** — any command that could run init_db/heal/backup needs approval
 
@@ -148,14 +128,12 @@ conn.close()
 ## Context Recovery
 
 If context is lost, recover with:
-- `session_search(query='20260920 conftest isolation guard', session_id='20260920_175230_93cb02')`
-- `session_search(query='aac94fa fetch_order side positionSide', session_id='20260920_175230_93cb02')`
-- `session_search(query='f694edf AGENTS.md rules 1-13', session_id='20260920_175230_93cb02')`
-- `session_search(query='20260921 zero errors freeze_guard teardown', session_id='20260921_071845_e8068695')`
-- `session_search(query='20260921 whitelist line drift exchange_fills', session_id='20260921_071845_e8068695')`
-- `session_search(query='20260922 phase1 phase2 complete 700 passed', session_id='20260922_102457_f7f30b')`
+- `session_search(query='NIGHT 2 tier-2 exchange_fills premise disproven', session_id='20260923_114638_a1ee0b')`
+- `session_search(query='9ba4cad tier-1 tier-2 ribbon LEDGER ADVISORY', session_id='20260923_114638_a1ee0b')`
+- `session_search(query='953de15 GTR lock indicator DISENGAGED', session_id='20260923_114638_a1ee0b')`
+- `session_search(query='185035956 SUI uncredited fill blind spot', session_id='20260923_114638_a1ee0b')`
 - `session_search(query='20260923 phase3 phase4 complete soak test', session_id='20260922_102457_f7f30b')`
 
 ---
 
-**End of handoff. Engine stopped. Next session: Finding 2 — side= wiring (2 sites in parity_gates.py + database.py).**
+**End of NIGHT 2 handoff. Engine stopped, exchange flat, zero DB writes, 703 green. Next: tier-2 dormant-bots gate diff → approval; SUI decision; Finding 2 side= wiring.**
