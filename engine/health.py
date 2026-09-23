@@ -159,10 +159,11 @@ def _compute_netting_status(
         ).fetchall()
 
         # Also get cycles per pair for exact-cycle compute_pair_position
+        # Only include bots that are IN_TRADE or have open_qty > 0 to avoid stale cycle_ids from Scanning bots
         cycle_rows = conn.execute(
             """SELECT b.id, t.cycle_id
                FROM bots b LEFT JOIN trades t ON b.id = t.bot_id
-               WHERE b.is_active = 1 AND t.total_invested > 0.01"""
+               WHERE b.is_active = 1 AND (b.status = 'IN_TRADE' OR (t.open_qty IS NOT NULL AND abs(t.open_qty) > 0.0001)) AND t.total_invested > 0.01"""
         ).fetchall()
 
         # Map pair -> current cycle (use max cycle for that pair)
@@ -197,53 +198,64 @@ def _compute_netting_status(
             # Get per-bot auto-detected cycle_floor using exchange_fills (authoritative ledger)
             # NOT bot_orders (which may have phantom fills with filled_at=0)
             bot_floors = {}
+            target_cycle = 0
             for bot_info in pair_bot_map.get(p_key, []):
                 bot_id = bot_info["bot_id"]
-                try:
-                    conn2 = sqlite3.connect(db_path, timeout=10)
-                    cursor = conn2.cursor()
-                    row_trade = cursor.execute(
-                        "SELECT cycle_id FROM trades WHERE bot_id = ?", (bot_id,)
-                    ).fetchone()
-                    if row_trade and row_trade[0]:
-                        target_cycle = row_trade[0]
-                        # Auto-detect cycle_floor from exchange_fills (same logic as recompute but on immutable ledger)
-                        row_bot = cursor.execute("SELECT direction FROM bots WHERE id = ?", (bot_id,)).fetchone()
-                        bot_dir = row_bot[0].upper() if row_bot else 'LONG'
-                        bot_side = bot_dir if bot_dir in ('LONG', 'SHORT') else 'LONG'
-                        # For SHORT bots: SELL = entry (opens position), BUY = exit (closes position)
-                        # For LONG bots: BUY = entry, SELL = exit
-                        if bot_dir == 'SHORT':
-                            entry_case = "CASE WHEN side = 'SELL' THEN qty ELSE 0.0 END"
-                            exit_case = "CASE WHEN side = 'BUY' THEN qty ELSE 0.0 END"
+                # Only compute floor for bots that are actively trading (IN_TRADE or open_qty > 0)
+                # Scanning bots with open_qty=0 should not contribute to netting
+                bot_status = bot_info.get("status", "Scanning")
+                open_qty = bot_info.get("open_qty", 0.0)
+                is_active_trading = (bot_status == 'IN_TRADE' or abs(open_qty) > 0.0001)
+                
+                if is_active_trading:
+                    try:
+                        conn2 = sqlite3.connect(db_path, timeout=10)
+                        cursor = conn2.cursor()
+                        row_trade = cursor.execute(
+                            "SELECT cycle_id FROM trades WHERE bot_id = ?", (bot_id,)
+                        ).fetchone()
+                        if row_trade and row_trade[0]:
+                            target_cycle = max(target_cycle, row_trade[0])
+                            # Auto-detect cycle_floor from exchange_fills (same logic as recompute but on immutable ledger)
+                            row_bot = cursor.execute("SELECT direction FROM bots WHERE id = ?", (bot_id,)).fetchone()
+                            bot_dir = row_bot[0].upper() if row_bot else 'LONG'
+                            bot_side = bot_dir if bot_dir in ('LONG', 'SHORT') else 'LONG'
+                            # For SHORT bots: SELL = entry (opens position), BUY = exit (closes position)
+                            # For LONG bots: BUY = entry, SELL = exit
+                            if bot_dir == 'SHORT':
+                                entry_case = "CASE WHEN side = 'SELL' THEN qty ELSE 0.0 END"
+                                exit_case = "CASE WHEN side = 'BUY' THEN qty ELSE 0.0 END"
+                            else:
+                                entry_case = "CASE WHEN side = 'BUY' THEN qty ELSE 0.0 END"
+                                exit_case = "CASE WHEN side = 'SELL' THEN qty ELSE 0.0 END"
+                            cursor.execute(f"""
+                                SELECT cycle_id,
+                                       SUM({entry_case}) AS entry_qty,
+                                       SUM({exit_case}) AS exit_qty
+                                FROM exchange_fills
+                                WHERE bot_id = ?
+                                  AND cycle_id < ?
+                                  AND cycle_id IS NOT NULL
+                                GROUP BY cycle_id
+                                HAVING (entry_qty - exit_qty) > 1e-6
+                                ORDER BY cycle_id ASC
+                                LIMIT 1
+                            """, (bot_id, target_cycle))
+                            row_floor = cursor.fetchone()
+                            bot_floors[bot_id] = row_floor[0] if row_floor else target_cycle
                         else:
-                            entry_case = "CASE WHEN side = 'BUY' THEN qty ELSE 0.0 END"
-                            exit_case = "CASE WHEN side = 'SELL' THEN qty ELSE 0.0 END"
-                        cursor.execute(f"""
-                            SELECT cycle_id,
-                                   SUM({entry_case}) AS entry_qty,
-                                   SUM({exit_case}) AS exit_qty
-                            FROM exchange_fills
-                            WHERE bot_id = ?
-                              AND cycle_id < ?
-                              AND cycle_id IS NOT NULL
-                            GROUP BY cycle_id
-                            HAVING (entry_qty - exit_qty) > 1e-6
-                            ORDER BY cycle_id ASC
-                            LIMIT 1
-                        """, (bot_id, target_cycle))
-                        row_floor = cursor.fetchone()
-                        bot_floors[bot_id] = row_floor[0] if row_floor else target_cycle
-                    else:
+                            bot_floors[bot_id] = 0
+                        conn2.close()
+                    except Exception:
                         bot_floors[bot_id] = 0
-                    conn2.close()
-                except Exception:
+                else:
+                    # Scanning bots with open_qty=0 don't contribute to netting
                     bot_floors[bot_id] = 0
 
             # Compute using per-bot floors
             # TWO-TIER CHECK:
-            #   tier-1 (drift)  = net from auto-detected cycle_floor onward (unchanged semantics)
-            #   tier-2 (ledger) = net from cycle 0 onward = FULL HISTORY (new)
+            #   tier-1 (drift)  = net from auto-detected cycle_floor onward for ACTIVE bots only (current cycle window)
+            #   tier-2 (ledger) = net from cycle 0 onward but ONLY for bots that are actively trading (IN_TRADE or open_qty > 0)
             # Both calls now use an explicit connection bound to THIS db_path.
             # The old conn=None fallback (get_connection()) silently bound every
             # caller to the live DB instead of the db_path passed in.
@@ -253,14 +265,26 @@ def _compute_netting_status(
                     total_net = 0.0
                     total_net_full = 0.0
                     conn_pair = sqlite3.connect(db_path, timeout=10)
+                    has_active_bot = False
                     for bot_info in pair_bot_map.get(p_key, []):
                         bot_id = bot_info["bot_id"]
                         floor = bot_floors.get(bot_id, 0)
-                        bp = compute_bot_position(bot_id, conn=conn_pair, cycle_floor=floor, cycle_ceiling=target_cycle)
+                        # Only use cycle_ceiling for bots that are actively trading (IN_TRADE or open_qty > 0)
+                        # Scanning bots with stale cycle_id should not contribute to netting
+                        bot_status = bot_info.get("status", "Scanning")
+                        open_qty = bot_info.get("open_qty", 0.0)
+                        use_ceiling = (bot_status == 'IN_TRADE' or abs(open_qty) > 0.0001)
+                        if use_ceiling:
+                            has_active_bot = True
+                        ceiling = target_cycle if use_ceiling else None
+                        bp = compute_bot_position(bot_id, conn=conn_pair, cycle_floor=floor, cycle_ceiling=ceiling)
                         total_net += bp.net_qty
-                        bp_full = compute_bot_position(bot_id, conn=conn_pair, cycle_floor=0, cycle_ceiling=None)
-                        total_net_full += bp_full.net_qty
-                    primary_nets[p_key] = total_net
+                        # Tier-2: only sum full history for bots that are actively trading
+                        if use_ceiling:
+                            bp_full = compute_bot_position(bot_id, conn=conn_pair, cycle_floor=0, cycle_ceiling=None)
+                            total_net_full += bp_full.net_qty
+                    # Tier-1 (drift): only pairs with active trading bots should have non-zero primary_net
+                    primary_nets[p_key] = total_net if has_active_bot else 0.0
                     ledger_nets[p_key] = total_net_full
                 else:
                     primary_nets[p_key] = 0.0

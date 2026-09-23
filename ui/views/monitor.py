@@ -20,7 +20,7 @@ from engine.exchange_interface import normalize_symbol as _norm_universal
 from engine.health import get_system_health as _get_system_health
 
 # --- Performance Caching Wrappers ---
-@st.cache_resource(ttl=3600, show_spinner=False)
+@st.cache_resource(ttl=30, show_spinner=False)
 def get_exchange_instance(market_type):
     """Singleton provider for ExchangeInterface to reuse connections."""
     return ExchangeInterface(market_type=market_type)
@@ -294,11 +294,12 @@ def _header_metrics_fragment():
 @st.fragment(run_every=5)
 def _bot_positions_fragment():
     auto_refresh = st.session_state.get("auto_refresh_toggle", True)
+    force_refresh = st.session_state.pop("_force_health_refresh", False)
     wizard_active = any(bool(st.session_state.get(k)) for k in st.session_state if k.startswith(("forensic_trades_", "adopt_force_sel_", "trade_sel_", "_confirm_")))
 
     # Retrieve cache if auto-refresh is off or wizard is active
     cached = st.session_state.get("cached_monitor_data")
-    if (not auto_refresh or wizard_active) and cached:
+    if (not auto_refresh or wizard_active) and cached and not force_refresh:
         df_pos_f, df_physical_f, market_orders_f, df_h_f, ex_err = cached
         st.caption(f"  ⚡ Grid Sync (Cached): {time.strftime('%H:%M:%S')}")
     else:
@@ -1724,10 +1725,13 @@ def render_monitor_view():
             st.session_state.pop("cached_header_data", None)
         st.session_state["_prev_auto_refresh"] = auto_refresh
     with _rn_col:
-        if st.button("🔄 Refresh Now", width="stretch"):
-            st.cache_data.clear()
-            st.session_state["_force_health_refresh"] = True
-            st.rerun()
+            if st.button("🔄 Refresh Now", width="stretch"):
+                st.cache_data.clear()
+                st.cache_resource.clear()
+                st.session_state.pop("cached_monitor_data", None)
+                st.session_state.pop("cached_header_data", None)
+                st.session_state["_force_health_refresh"] = True
+                st.rerun()
 
     # Detect if the Reconciler / Forensic Wizard is actively in use.
     wizard_active = any(bool(st.session_state[k]) for k in st.session_state if k.startswith(("forensic_trades_", "adopt_force_sel_", "trade_sel_", "_confirm_")))

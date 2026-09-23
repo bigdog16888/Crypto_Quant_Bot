@@ -113,11 +113,16 @@ class ExchangeInterface:
         })
         
         if config.TESTNET or config.DEMO_TRADING:
-            # Point CCXT to the demo server for public calls
+            # Point CCXT to the demo server for ALL calls (public + private)
             base_url = 'https://demo-fapi.binance.com'
             if not hasattr(exchange, 'urls'): exchange.urls = {'api': {}}
             exchange.urls['api']['fapiPublic'] = f"{base_url}/fapi/v1"
+            exchange.urls['api']['fapiPublicV2'] = f"{base_url}/fapi/v2"
+            exchange.urls['api']['fapiPublicV3'] = f"{base_url}/fapi/v3"
             exchange.urls['api']['fapi'] = base_url
+            exchange.urls['api']['fapiPrivate'] = f"{base_url}/fapi/v1"
+            exchange.urls['api']['fapiPrivateV2'] = f"{base_url}/fapi/v2"
+            exchange.urls['api']['fapiPrivateV3'] = f"{base_url}/fapi/v3"
             if not ExchangeInterface._hybrid_mode_logged:
                 self.logger.warning(f"🛡️ HYBRID RAW MODE ACTIVE (Demo FAPI)")
                 ExchangeInterface._hybrid_mode_logged = True
