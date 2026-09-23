@@ -155,7 +155,7 @@ def _compute_netting_status(
         rows = conn.execute(
             """SELECT b.id, b.name, b.pair, b.direction, t.open_qty, t.avg_entry_price, t.cycle_id
                FROM bots b LEFT JOIN trades t ON b.id = t.bot_id
-               WHERE b.is_active = 1"""
+               WHERE b.is_active = 1 OR (t.open_qty IS NOT NULL AND abs(t.open_qty) > 0.0001)"""
         ).fetchall()
 
         # Also get cycles per pair for exact-cycle compute_pair_position
@@ -256,7 +256,7 @@ def _compute_netting_status(
                     for bot_info in pair_bot_map.get(p_key, []):
                         bot_id = bot_info["bot_id"]
                         floor = bot_floors.get(bot_id, 0)
-                        bp = compute_bot_position(bot_id, conn=conn_pair, cycle_floor=floor)
+                        bp = compute_bot_position(bot_id, conn=conn_pair, cycle_floor=floor, cycle_ceiling=target_cycle)
                         total_net += bp.net_qty
                         bp_full = compute_bot_position(bot_id, conn=conn_pair, cycle_floor=0, cycle_ceiling=None)
                         total_net_full += bp_full.net_qty
