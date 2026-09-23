@@ -572,19 +572,34 @@ def compute_system_health(
     dust_bots: List[str] = order_health.get("dust_bots", [])
 
     # system_status priority: STARTING > CRITICAL > MISMATCH > WARNING > HEALTHY
+    # Tier-1 (drift): only mismatch_count matters for live exchange parity
+    # Tier-2 (ledger): ledger_imbalance is advisory only, does not affect top status
     if suppression:
         system_status = "STARTING"
+        tier1_status = "STARTING"
+        tier2_status = "STARTING"
     elif stuck_cascade_bots or manual_proof_bots or dust_bots:
-        # Stuck cascade, unresolved manual-proof, or STUCK_DUST_NO_EXIT are all
-        # engine-blocking conditions that cannot be auto-healed and require human
         system_status = "CRITICAL"
-    elif mismatch_count > 0 or any(v.get("ledger_imbalance") for v in netting.values()):
-        # Tier-2: full-history ledger imbalance also escalates to MISMATCH
+        tier1_status = "CRITICAL"
+        tier2_status = "CRITICAL"
+    elif mismatch_count > 0:
+        # Tier-1 drift detected - live exchange parity issue
         system_status = "MISMATCH"
+        tier1_status = "MISMATCH"
+        tier2_status = "MISMATCH" if any(v.get("ledger_imbalance") for v in netting.values()) else "HEALTHY"
+    elif any(v.get("ledger_imbalance") for v in netting.values()):
+        # Tier-2 ledger imbalance only - exchange parity is HEALTHY
+        system_status = "HEALTHY"
+        tier1_status = "HEALTHY"
+        tier2_status = "LEDGER_ADVISORY"
     elif order_health.get("status_color") == "red":
         system_status = "WARNING"
+        tier1_status = "WARNING"
+        tier2_status = "WARNING"
     else:
         system_status = "HEALTHY"
+        tier1_status = "HEALTHY"
+        tier2_status = "HEALTHY"
 
     return {
         "timestamp": now,
@@ -592,6 +607,8 @@ def compute_system_health(
         "startup_remaining_s": remaining,
         "engine_started_at": engine_started_at,
         "system_status": system_status,
+        "tier1_status": tier1_status,
+        "tier2_status": tier2_status,
         "worst_gap_usd": worst_gap,
         "mismatched_pair_count": mismatch_count,
         "netting_status_per_pair": netting,

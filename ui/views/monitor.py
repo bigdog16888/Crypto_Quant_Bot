@@ -174,18 +174,19 @@ def _fetch_fresh_monitor_data():
 
 def _render_header_ui(data):
     # ── Compact 5-tile single-row header ──────────────────────────────────────
-    # Tile 5 = live system status pill (STARTING/HEALTHY/WARNING/MISMATCH/CRITICAL)
-    # with worst-gap inline when non-zero.  Second bots-count row removed —
-    # that info is already visible per-row in the bot table below.
+    # Tile 5 = live system status pill (Tier-1: STARTING/HEALTHY/WARNING/MISMATCH/CRITICAL)
+    # with worst-gap inline when non-zero.
     _STATUS_ICONS = {
         'HEALTHY':  '🟢', 'WARNING': '🟡', 'MISMATCH': '🔴',
         'CRITICAL': '🔴', 'STARTING': '⏳',
     }
-    sys_status  = data.get('system_status', 'UNKNOWN')
+    # Use tier1_status for the top ribbon (live exchange parity)
+    tier1_status = data.get('tier1_status', data.get('system_status', 'UNKNOWN'))
+    tier2_status = data.get('tier2_status', 'UNKNOWN')
     worst_gap   = data.get('worst_gap_usd', 0.0)
-    icon        = _STATUS_ICONS.get(sys_status, '⚪')
+    icon        = _STATUS_ICONS.get(tier1_status, '⚪')
     gap_label   = f"  ·  Gap ${worst_gap:,.2f}" if worst_gap > 0.01 else ""
-    status_str  = f"{icon} {sys_status}{gap_label}"
+    status_str  = f"{icon} {tier1_status}{gap_label}"
 
     m1, m2, m3, m4, m5 = st.columns(5)
     with m1: st.metric("💰 Equity",   f"${data['total_equity']:,.2f}")
@@ -196,6 +197,10 @@ def _render_header_ui(data):
     with m5: st.metric("⚡ Status",   status_str,
                        help=f"In Trade: {data['bots_in_trade']}/{data['active_count']} | "
                             f"Adoptions(24h): {data['adoptions_today']}")
+
+    # Tier-2 Advisory Badge (if ledger imbalance exists)
+    if tier2_status == "LEDGER_ADVISORY":
+        st.caption("ℹ️ **LEDGER ARCHIVE ADVISORY** — Dormant bots have historical ledger imbalances (migration-era dust). Exchange parity is HEALTHY.")
 
     if data['assets_breakdown']:
         with st.expander("💰 Detailed Asset Breakdown", expanded=False):
@@ -244,23 +249,25 @@ def _header_metrics_fragment():
             st.caption(f"  🔍 DEBUG: header_metrics = {health_data.get('header_metrics', {})}")
 
         if health_data and health_data.get("header_metrics"):
-            hm = health_data["header_metrics"]
-            data = {
-                'total_equity':      hm.get('total_equity', 0.0),
-                'futures_balance':   hm.get('futures_balance', 0.0),
-                'global_pnl_usd':    hm.get('global_pnl_usd', 0.0),
-                'total_invested_db': hm.get('total_invested_db', 0.0),
-                'active_count':      hm.get('active_count', 0),
-                'bots_in_trade':     hm.get('bots_in_trade', 0),
-                'scanning_count':    hm.get('scanning_count', 0),
-                'open_qty_notional': hm.get('open_qty_notional', 0.0),
-                'assets_breakdown':  hm.get('assets_breakdown', []),
-                'adoptions_today':   hm.get('adoptions_today', 0),
-                'last_act_str':      hm.get('last_act_str', 'NO RECENT ACTIVITY'),
-                # Status pill fields — sourced from health_data root, not header_metrics
-                'system_status':     health_data.get('system_status', 'UNKNOWN'),
-                'worst_gap_usd':     health_data.get('worst_gap_usd', 0.0),
-            }
+                    hm = health_data["header_metrics"]
+                    data = {
+                        'total_equity':      hm.get('total_equity', 0.0),
+                        'futures_balance':   hm.get('futures_balance', 0.0),
+                        'global_pnl_usd':    hm.get('global_pnl_usd', 0.0),
+                        'total_invested_db': hm.get('total_invested_db', 0.0),
+                        'active_count':      hm.get('active_count', 0),
+                        'bots_in_trade':     hm.get('bots_in_trade', 0),
+                        'scanning_count':    hm.get('scanning_count', 0),
+                        'open_qty_notional': hm.get('open_qty_notional', 0.0),
+                        'assets_breakdown':  hm.get('assets_breakdown', []),
+                        'adoptions_today':   hm.get('adoptions_today', 0),
+                        'last_act_str':      hm.get('last_act_str', 'NO RECENT ACTIVITY'),
+                        # Status pill fields — sourced from health_data root, not header_metrics
+                        'system_status':     health_data.get('system_status', 'UNKNOWN'),
+                        'tier1_status':      health_data.get('tier1_status', health_data.get('system_status', 'UNKNOWN')),
+                        'tier2_status':      health_data.get('tier2_status', 'UNKNOWN'),
+                        'worst_gap_usd':     health_data.get('worst_gap_usd', 0.0),
+                    }
         else:
             # Fallback: compute locally if health_data not yet available
             conn = get_connection()
@@ -294,15 +301,15 @@ def _header_metrics_fragment():
                             futures_balance += amount
             except Exception: pass
             data = {
-                'total_equity': futures_balance, 'futures_balance': futures_balance,
-                'global_pnl_usd': 0.0, 'total_invested_db': total_invested_db,
-                'active_count': active_count, 'bots_in_trade': bots_in_trade,
-                'scanning_count': max(0, active_count - bots_in_trade),
-                'open_qty_notional': open_qty_notional, 'assets_breakdown': [],
-                'adoptions_today': adoptions_today, 'last_act_str': last_act_str,
-                # Fallback: status unknown until health_data is populated
-                'system_status': 'UNKNOWN', 'worst_gap_usd': 0.0,
-            }
+                            'total_equity': futures_balance, 'futures_balance': futures_balance,
+                            'global_pnl_usd': 0.0, 'total_invested_db': total_invested_db,
+                            'active_count': active_count, 'bots_in_trade': bots_in_trade,
+                            'scanning_count': max(0, active_count - bots_in_trade),
+                            'open_qty_notional': open_qty_notional, 'assets_breakdown': [],
+                            'adoptions_today': adoptions_today, 'last_act_str': last_act_str,
+                            # Fallback: status unknown until health_data is populated
+                            'system_status': 'UNKNOWN', 'tier1_status': 'UNKNOWN', 'tier2_status': 'UNKNOWN', 'worst_gap_usd': 0.0,
+                        }
 
         st.session_state["cached_header_data"] = data
         _render_header_ui(data)
