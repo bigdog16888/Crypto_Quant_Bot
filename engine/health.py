@@ -211,10 +211,18 @@ def _compute_netting_status(
                         row_bot = cursor.execute("SELECT direction FROM bots WHERE id = ?", (bot_id,)).fetchone()
                         bot_dir = row_bot[0].upper() if row_bot else 'LONG'
                         bot_side = bot_dir if bot_dir in ('LONG', 'SHORT') else 'LONG'
-                        cursor.execute("""
+                        # For SHORT bots: SELL = entry (opens position), BUY = exit (closes position)
+                        # For LONG bots: BUY = entry, SELL = exit
+                        if bot_dir == 'SHORT':
+                            entry_case = "CASE WHEN side = 'SELL' THEN qty ELSE 0.0 END"
+                            exit_case = "CASE WHEN side = 'BUY' THEN qty ELSE 0.0 END"
+                        else:
+                            entry_case = "CASE WHEN side = 'BUY' THEN qty ELSE 0.0 END"
+                            exit_case = "CASE WHEN side = 'SELL' THEN qty ELSE 0.0 END"
+                        cursor.execute(f"""
                             SELECT cycle_id,
-                                   SUM(CASE WHEN side = 'BUY' THEN qty ELSE 0.0 END) AS entry_qty,
-                                   SUM(CASE WHEN side = 'SELL' THEN qty ELSE 0.0 END) AS exit_qty
+                                   SUM({entry_case}) AS entry_qty,
+                                   SUM({exit_case}) AS exit_qty
                             FROM exchange_fills
                             WHERE bot_id = ?
                               AND cycle_id < ?
