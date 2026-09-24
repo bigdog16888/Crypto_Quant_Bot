@@ -4,9 +4,7 @@
 If your instructions conflict with this file, this file wins. Every rule here was
 learned from real damage.
 
-**Current stage (2026-09-14, close of session):** engine v3.5, git clean at `0b8acbd`
-on main (pushed). Two-tier health check + dual-write guard live; 8 P1/P2 anomalies +
-2 follow-ups open (§Open Items). Engine STOPPED. Full state: `PROJECT_STATUS.md`.
+**Current stage (2026-09-23):** engine v3.5, git at `41c0742` on main (ahead 58, behind 0, pushed). Two-tier health check + dual-write guard live; 8 P1/P2 anomalies + 2 follow-ups open (§Open Items). Engine STOPPED. Full state: `PROJECT_STATUS.md`.
 
 **Authoritative files** (conflict precedence: CODEBASE_GUIDE.md > PROJECT_STATUS.md
 > everything else):
@@ -201,22 +199,20 @@ landed cleanly in one reviewed patch. Full account:
 - `safe-trading-bot-ops` — any money-moving action, reading DB/state, repair/heal
 - `safe-change-discipline` — about to run a mutating script, declaring system green
 - `investigation-discipline` — systematic debugging / root-cause tasks
+- `session-patterns-20260920` — 2026-09-20 retrospective four patterns with standing rules
+- `crypto-bot-db-verification` — verification patterns for crypto bot DB state
+- `trading-bot-attribution-patterns` — forensic attribution gates for multi-bot trading
+- `systematic-debugging` — 4-phase root cause debugging: understand bugs before fixing
+- `verification-rigor` — operating discipline for reporting work as done — show raw
 
 ## Open items (do not silently "resolve")
 
-1. side= caller-wiring: RESOLVED 2026-09-15 — `credit_fill()` HAS `side=`
-   (ledger.py:243/274, commit 3c5a097); 7 of 8 call sites pass the real exchange
-   side (137/174 pre-existing since 37a95e2, 5 wired 09-15: TP-SYNC 1862,
-   ENTRY-RETRO 2846, FILL-HEAL 4418/4452, CANCEL-SWEEP 1374). ENTRY-ANCHOR 2632
-   stays on inference by design (documented inline). Verify:
-   tests/test_explicit_side_wiring.py (explicit side beats inference end-to-end).
-2. `test_gate_blocks_when_require_manual_proof` — fails identically at clean HEAD;
-   pre-existing, needs root-cause.
-3. 8 P1/P2 anomalies in PROJECT_STATUS.md (XAU ORDER-SYNC loop, stale-cycle_id
-   dedup wedge, INV30 double-count, hedge-child is_active check, audit_bot_wipes
-   signature, GTR lock display, retry-queue false alarm, flatten price=0.0) — OPEN.
-4. First production engine start after 2026-09-14 exercises the two-tier health
-   path for the first time.
+1. `test_gate_blocks_when_require_manual_proof` — fails identically at clean HEAD; pre-existing, needs root-cause (unverified).
+2. 8 P1/P2 anomalies in PROJECT_STATUS.md (XAU ORDER-SYNC loop, stale-cycle_id dedup wedge, INV30 double-count, hedge-child is_active check, audit_bot_wipes signature, GTR lock display, retry-queue false alarm, flatten price=0.0) — OPEN.
+3. First production engine start after 2026-09-14 exercises the two-tier health path for the first time.
+
+## Resolved (historical)
+- side= caller-wiring: RESOLVED 2026-09-15 — `credit_fill()` HAS `side=` (ledger.py:243/274, commit 3c5a097); 7 of 8 call sites pass the real exchange side. ENTRY-ANCHOR 2632 stays on inference by design. Verify: tests/test_explicit_side_wiring.py.
 
 ## For external review agents
 
