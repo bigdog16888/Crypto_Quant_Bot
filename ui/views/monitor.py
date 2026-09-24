@@ -1003,7 +1003,7 @@ def _bot_positions_fragment():
         indicator_cache_f = {} # Per-fragment local cache
         def extract_info(row):
             res = {
-                'Trigger': 'N/A', 'Orders': '0', 'TP_Price': 0.0,
+                'Trigger': 'N/A', 'TP | Grid': '', 'Orders': '0', 'TP_Price': 0.0,
                 'Grid_Price': 0.0, 'Grid_Amount': 0.0,
                 'Expected_Profit': 0.0, 'Expected_Profit_Str': '-', 'EE_Status': '-',
                 'TP_Price_Str': '-', 'Grid_Price_Str': '-',
@@ -1224,7 +1224,9 @@ def _bot_positions_fragment():
                                 parts.append(f"{grid_label} {grid_dist:.1f}% ({grid_signed:+.1f}%)")
 
                     if parts:
-                        res['Trigger'] = " | ".join(parts)
+                        # 'TP | Grid' column (below). 'Trigger' keeps the ENTRY light
+                        # so the Entry Trigger column is never stripped for in-trade bots.
+                        res['TP | Grid'] = " | ".join(parts)
                     else:
                         if row.get('bot_type') == 'hedge_child':
                             parent_id = row.get('parent_bot_id')
@@ -1234,15 +1236,15 @@ def _bot_positions_fragment():
                                 if not parent_rows.empty:
                                     parent_status = str(parent_rows.iloc[0]['status'])
                                     if "IN TRADE" in parent_status:
-                                        res['Trigger'] = f"Awaiting parent '{parent_name}' exit"
+                                        res['TP | Grid'] = f"Awaiting parent '{parent_name}' exit"
                                     else:
-                                        res['Trigger'] = "⚠️ NO ORDERS"
+                                        res['TP | Grid'] = "⚠️ NO ORDERS"
                                 else:
-                                    res['Trigger'] = "⚠️ NO ORDERS"
+                                    res['TP | Grid'] = "⚠️ NO ORDERS"
                             else:
-                                res['Trigger'] = "⚠️ NO ORDERS"
+                                res['TP | Grid'] = "⚠️ NO ORDERS"
                         else:
-                            res['Trigger'] = "⚠️ NO ORDERS"
+                            res['TP | Grid'] = "⚠️ NO ORDERS"
                 
                 # 3. Expected Profit
                 o_qty = _clean(row.get('open_qty'))
@@ -1314,7 +1316,9 @@ def _bot_positions_fragment():
 
         if not df_pos_f.empty:
             info_df = df_pos_f.apply(extract_info, axis=1, result_type='expand')
-            df_pos_f['TP | Grid'] = info_df['Trigger']
+            # 'TP | Grid' now comes from its own dedicated key (in-trade bots write
+            # the TP/grid heatmap there); 'Trigger' keeps the entry light untouched.
+            df_pos_f['TP | Grid'] = info_df['TP | Grid']
             df_pos_f['Active Orders'] = info_df['Orders']
             df_pos_f['Active TP'] = info_df['TP_Price_Str']
             df_pos_f['Next Grid'] = info_df['Grid_Price_Str']
@@ -1356,11 +1360,10 @@ def _bot_positions_fragment():
 
             df_pos_f['PnL'] = df_pos_f.apply(calc_unrealised, axis=1)
 
-            # Entry trigger (only meaningful for scanning bots)
-            df_pos_f['Entry Trigger'] = info_df['Trigger'].where(
-                ~df_pos_f['status'].str.contains('IN TRADE|DUST|HEDGE ACTIVE', na=False),
-                other=""
-            )
+            # Entry trigger light — always visible now. The TP/grid heatmap moved to
+            # its own 'TP | Grid' key inside extract_info, so in-trade bots keep
+            # their 🟢/🟡/⚪ entry condition here without being stripped.
+            df_pos_f['Entry Trigger'] = info_df['Trigger']
         else:
             for col in ['TP | Grid', 'Active Orders', 'Active TP', 'Next Grid', 'Exp $', 'EE', 'Ages (pos/cyc)', 'Total Invested', 'Open Qty', 'Avg Entry', 'PnL', 'Entry Trigger']:
                 df_pos_f[col] = pd.Series(dtype=object)
@@ -1370,7 +1373,7 @@ def _bot_positions_fragment():
                 'name', 'pair', 'status',
                 'Total Invested', 'Open Qty', 'Avg Entry', 'PnL',
                 'Exp $', 'EE', 'Ages (pos/cyc)',
-                'TP | Grid', 'Active TP', 'Next Grid',
+                'Entry Trigger', 'TP | Grid', 'Active TP', 'Next Grid',
             ]],
             column_config={
                 'name':            st.column_config.TextColumn('Bot',       width='small'),

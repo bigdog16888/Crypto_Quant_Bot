@@ -1505,7 +1505,10 @@ def proof_flatten_pair(
         return {**result, 'error': 'Could not read exchange positions'}
 
     tol = qty_tolerance()
-    if abs(net) > tol:
+    # Close ANY non-zero position (1e-6 >> floating-point noise, << tolerance).
+    # The old `abs(net) > tol` skipped the market close when |net| == tol,
+    # leaving residue that passed verify-flat but was non-zero.
+    if abs(net) > 1e-6:
         # close_side is always determined by the physical exchange net — this is the
         # authoritative source. proof_flatten_pair must close whatever the exchange holds,
         # regardless of what direction individual bots think they are.

@@ -320,77 +320,19 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 
-# Sidebar - Global Settings
-with st.sidebar:
-    st.header("⚙️ Global Settings")
-    st.divider()
-    
-    st.subheader("API Configuration")
-    
-    # Locate .env file robustly
-    dotenv_path = find_dotenv()
-    if not dotenv_path:
-        dotenv_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env')
-    
-    # Reload env to ensure fresh read
-    load_dotenv(dotenv_path, override=True)
+# ── Engine Control: 2s self-refreshing fragment ─────────────────────────────
+# Defined at module level and called from the sidebar. The run_every timer
+# makes Streamlit re-render the panel server-side every 2s and push the
+# update to the browser — no page reload / browser callback required. This
+# fixes the headless/idle-page case where Start/Stop state stayed stale
+# because the script only re-ran on browser interaction.
+EMERGENCY_FILE = config.PATHS["EMERGENCY_FILE"]
 
-    # Use config as primary, os.getenv as fallback
-    current_key = config.API_KEY if config.API_KEY else os.getenv("BINANCE_API_KEY", "")
-    current_secret = config.API_SECRET if config.API_SECRET else os.getenv("BINANCE_API_SECRET", "")
 
-    api_key = st.text_input("Binance API Key", value=current_key, type="password")
-    api_secret = st.text_input("Binance API Secret", value=current_secret, type="password")
-    
-    st.divider()
-    
-    if st.button("Apply Settings"):
-        if api_key and api_secret:
-            try:
-                # ⚠️ SAFETY GUARD: Only write plain ASCII strings.
-                # This prevents MagicMock objects (from tests) or corrupted
-                # values from ever reaching the .env file on disk.
-                _key_str = str(api_key).strip()
-                _sec_str = str(api_secret).strip()
-                _is_safe = (
-                    len(_key_str) >= 10
-                    and len(_sec_str) >= 10
-                    and _key_str.isprintable()
-                    and _sec_str.isprintable()
-                    and "<" not in _key_str  # reject MagicMock repr
-                    and "<" not in _sec_str
-                )
-                if not _is_safe:
-                    st.error("❌ Invalid key format — not saved. Check your credentials.")
-                else:
-                    # 1. Update .env file on disk
-                    set_key(dotenv_path, "BINANCE_API_KEY", _key_str)
-                    set_key(dotenv_path, "BINANCE_API_SECRET", _sec_str)
-
-                    # 2. Update current process environment
-                    os.environ["BINANCE_API_KEY"] = _key_str
-                    os.environ["BINANCE_API_SECRET"] = _sec_str
-
-                    # 3. Update global config object immediately (for UI components)
-                    config.API_KEY = _key_str
-                    config.API_SECRET = _sec_str
-
-                    st.success("✅ Credentials Saved!")
-
-                    # 4. Check if engine is running and warn
-                    if os.path.exists(config.PATHS["PID_FILE"]):
-                        st.warning("⚠️ Engine is running! Please RESTART Monitoring below to apply changes.")
-
-            except Exception as e:
-                st.error(f"Failed to save settings: {e}")
-        else:
-            st.error("❌ Key and Secret required.")
-
-    st.divider()
+@st.fragment(run_every="2s")
+def render_engine_control():
     st.header("🛠️ Engine Control")
     
-    EMERGENCY_FILE = config.PATHS["EMERGENCY_FILE"]
-
     from engine.shutdown_control import (
         is_engine_running,
         request_stop,
@@ -489,8 +431,77 @@ with st.sidebar:
             st.error("Engine force-killed.")
             st.rerun()
 
+
+# Sidebar - Global Settings
+with st.sidebar:
+    st.header("⚙️ Global Settings")
     st.divider()
     
+    st.subheader("API Configuration")
+    
+    # Locate .env file robustly
+    dotenv_path = find_dotenv()
+    if not dotenv_path:
+        dotenv_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env')
+    
+    # Reload env to ensure fresh read
+    load_dotenv(dotenv_path, override=True)
+
+    # Use config as primary, os.getenv as fallback
+    current_key = config.API_KEY if config.API_KEY else os.getenv("BINANCE_API_KEY", "")
+    current_secret = config.API_SECRET if config.API_SECRET else os.getenv("BINANCE_API_SECRET", "")
+
+    api_key = st.text_input("Binance API Key", value=current_key, type="password")
+    api_secret = st.text_input("Binance API Secret", value=current_secret, type="password")
+    
+    st.divider()
+    
+    if st.button("Apply Settings"):
+        if api_key and api_secret:
+            try:
+                # ⚠️ SAFETY GUARD: Only write plain ASCII strings.
+                # This prevents MagicMock objects (from tests) or corrupted
+                # values from ever reaching the .env file on disk.
+                _key_str = str(api_key).strip()
+                _sec_str = str(api_secret).strip()
+                _is_safe = (
+                    len(_key_str) >= 10
+                    and len(_sec_str) >= 10
+                    and _key_str.isprintable()
+                    and _sec_str.isprintable()
+                    and "<" not in _key_str  # reject MagicMock repr
+                    and "<" not in _sec_str
+                )
+                if not _is_safe:
+                    st.error("❌ Invalid key format — not saved. Check your credentials.")
+                else:
+                    # 1. Update .env file on disk
+                    set_key(dotenv_path, "BINANCE_API_KEY", _key_str)
+                    set_key(dotenv_path, "BINANCE_API_SECRET", _sec_str)
+
+                    # 2. Update current process environment
+                    os.environ["BINANCE_API_KEY"] = _key_str
+                    os.environ["BINANCE_API_SECRET"] = _sec_str
+
+                    # 3. Update global config object immediately (for UI components)
+                    config.API_KEY = _key_str
+                    config.API_SECRET = _sec_str
+
+                    st.success("✅ Credentials Saved!")
+
+                    # 4. Check if engine is running and warn
+                    if os.path.exists(config.PATHS["PID_FILE"]):
+                        st.warning("⚠️ Engine is running! Please RESTART Monitoring below to apply changes.")
+
+            except Exception as e:
+                st.error(f"Failed to save settings: {e}")
+        else:
+            st.error("❌ Key and Secret required.")
+
+    st.divider()
+    # Engine Start/Stop panel — 2s self-refreshing fragment (defined at module level)
+    render_engine_control()
+
     # Emergency Close All
     if 'show_emergency_confirm' not in st.session_state:
         st.session_state['show_emergency_confirm'] = False

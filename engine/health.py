@@ -293,8 +293,15 @@ def _compute_netting_status(
                         if use_ceiling:
                             has_active_bot = True
                         ceiling = target_cycle if use_ceiling else None
-                        bp = compute_bot_position(bot_id, conn=conn_pair, cycle_floor=floor, cycle_ceiling=ceiling)
-                        total_net += bp.net_qty
+                        # Tier-1 (drift) only counts bots that HOLD A LIVE POSITION
+                        # (IN_TRADE or open_qty > tol). Idle bots (Scanning / hedge_standby /
+                        # STOPPED at step 0 with open_qty ~ 0) carry only migration-era
+                        # exchange_fills residue — their full-history net must NOT inflate
+                        # the live tier-1 drift. Zeroing the residual phantom 52.81 SOL /
+                        # 0.025 BTC drift introduced when re-activation re-included idle bots.
+                        if use_ceiling:
+                            bp = compute_bot_position(bot_id, conn=conn_pair, cycle_floor=floor, cycle_ceiling=ceiling)
+                            total_net += bp.net_qty
                         # Tier-2: sum full history for ALL bots that have exchange_fills
                         if bot_has_fills.get(bot_id, False):
                             bp_full = compute_bot_position(bot_id, conn=conn_pair, cycle_floor=0, cycle_ceiling=None)
