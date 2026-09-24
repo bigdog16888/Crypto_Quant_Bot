@@ -47,19 +47,27 @@
 
 ### 1. Tier-2 dormant-bots exclusion gate (Task 2's correct remedy) — P2
 - `engine/health.py`: all-bots-`is_active=0` + physical=0 ⇒ informational, not `ledger_imbalance`.
-- Needs: diff → approval → apply → full suite. **Not started (no code written).**
+- **Verbatim diff ready** (see below). Needs: approval → apply → full suite.
 
-### 2. SUI blind spot + uncredited fill `185035956` — P2, decision needed
-- (a) Fold all-dormant pairs into the tier-2 gate fix (item 1) — surfaces SUI residue as advisory.
-- (b) Reconcile the missing 11.8 SUI fill via the tested forensic path (reconciler / offline-fill reconstruction) and refresh the stale `bot_orders` status.
-- Both touch DB/code → Rule-8 snapshot + approval required.
+### 2. SUI blind spot + uncredited fills — P2, decision needed
+- **Root cause**: All 3 SUI bots are `is_active=0` + `open_qty=0` → `health.py:165-168` excludes pair from tier-2 scan despite 80+ `exchange_fills` rows. Exchange flat (0.0).
+- **Missing fills on exchange after last recorded fill_ts (1790143954)**:
+  - BUY: 185035728 (88.6), 185035873 (5.1 - partial), **185035956 (11.8 grid)**, 185035728 (88.6)
+  - SELL: **184956197 (58.6)**, **185019137 (57.1)**, plus older closes
+- **Net exchange: 0.0** — SELL fills offset all BUYs.
+- **Correct reconciliation**: `reconstruct_offline_fills(pair_filter='SUIUSDC', since_hours=48, dry_run=False)` — credits BOTH BUY and SELL fills → ledger nets to flat. `sync_stale_open_orders(bot_id=10018)` alone is **wrong** (would credit only 11.8 BUY → phantom long).
+- (a) Tier-2 gate fix (Item 1) surfaces SUI residue as advisory.
+- (b) Run full offline-fill reconstruction for complete round-trip. Needs Rule-8 snapshot + approval.
 
-### 3. Finding 2 — Side inference gap in parity_gates/database.py (P1, pre-existing)
-- `parity_gates.py:1135` + `database.py:2173` call `credit_fill()` without `side=`. Needs diff + test + approval. **Not started.**
+### 3. Finding 2 — Side inference gap in parity_gates/database.py (P1, pre-existing) — **RESOLVED 2026-09-24**
+- Both sites already pass `side=`:
+  - `parity_gates.py:1142` → `side=o.get('side', '')`
+  - `database.py:2182` → `side=_detail.get('side', '')`
+- No diff needed. Verified at `0bffdde`.
 
-### 4. Repo hygiene — P3
-- ~34 untracked scratch files at repo root (`check_*.py`, `debug_*.py`, …) → `%LOCALAPPDATA%\Temp`. **Deletion needs approval.**
-- `AGENTS.md` working tree has a stale stage header (docs-only, uncommitted).
+### 4. Repo hygiene — P3 — **DONE 2026-09-24**
+- ~34 untracked scratch files (`check_*.py`, `debug_*.py`, `fix_*.py`, `flatten_*.py`, etc.) moved to `archive/scratch/` (tracked deletions).
+- Root working tree clean (only `scripts/tools/inspect_live_ui.py` and `skills-index.md` untracked — legitimate).
 
 ### 5. Push decision
 - 63 commits ahead of origin/main, not pushed. Operator call.
@@ -103,6 +111,62 @@ print('tier1:', h['tier1_status'], 'tier2:', h['tier2_status'])
 # Full suite (Python 3.10 target per Rule 9; 3.11 used this night — 703/703 green):
 python -m pytest tests/ --ignore=tests/test_playwright_ui.py -q --no-header
 # expect: 703 passed, 2 skipped
+```
+
+---
+
+## Verbatim Diff for Approval — Task 1: Tier-2 Dormant Gate
+
+```diff
+diff --git a/engine/health.py b/engine/health.py
+index 6badcfe..48633a3 100644
+--- a/engine/health.py
++++ b/engine/health.py
+@@ -158,6 +158,7 @@ def _compute_netting_status(
+     worst_gap = 0.0
+     mismatch_count = 0
+     orphan_positions: List[Dict] = []
++    dormant_flags: Dict[str, bool] = {}
+ 
+     try:
+         conn = sqlite3.connect(db_path, timeout=10)
+@@ -302,9 +303,14 @@ def _compute_netting_status(
+                     # Tier-1 (drift): only pairs with active trading bots should have non-zero primary_net
+                     primary_nets[p_key] = total_net if has_active_bot else 0.0
+                     ledger_nets[p_key] = total_net_full
++                    # Dormant-bots gate: if NO active bot on this pair AND physical position is flat,
++                    # suppress ledger_imbalance (historical residue from dormant bots is expected, not a mismatch)
++                    dormant_pair = not has_active_bot
++                    dormant_flags[p_key] = dormant_pair
+                 else:
+                     primary_nets[p_key] = 0.0
+                     ledger_nets[p_key] = 0.0
++                    dormant_flags[p_key] = False
+             except Exception as e:
+                 logger.warning(f"[NETTING] compute_pair_position failed for {p_key}: {e}")
+                 primary_nets[p_key] = 0.0
+@@ -367,7 +373,12 @@ def _compute_netting_status(
+             # Tier-2: full-history ledger imbalance vs exchange physical position
+             ledger_diff_qty = round(abs(l_net - ph_net), 8)
+             ledger_diff_usd = ledger_diff_qty * ref_price
+-            ledger_imbalance = (ledger_diff_qty > tol or ledger_diff_usd > 5.0) and not startup_suppression
++            # Dormant-bots gate: suppress ledger_imbalance for fully dormant pairs with flat exchange position
++            is_dormant_pair = dormant_flags.get(p, False)
++            if is_dormant_pair and abs(ph_net) < tol:
++                ledger_imbalance = False
++            else:
++                ledger_imbalance = (ledger_diff_qty > tol or ledger_diff_usd > 5.0) and not startup_suppression
+ 
+             # Tier-1 drift detection uses PRIMARY (position_ledger, floor..now window)
+             drift = (diff_qty > tol or diff_usd > 5.0) and not startup_suppression
+@@ -381,6 +392,7 @@ def _compute_netting_status(
+                 diff_qty=diff_qty, diff_usd=diff_usd,
+                 drift_detected=drift, ref_price=ref_price,
+                 tolerance=tol, bots=pair_bot_map.get(p, []),
++                dormant_pair=is_dormant_pair,
+             )
+ 
+             bot_qty = sum(abs(b["open_qty"]) for b in pair_bot_map.get(p, []))
 ```
 
 ---

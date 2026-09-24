@@ -339,6 +339,27 @@ def _compute_netting_status(
                 logger.warning(f"[health] fetch_positions failed: {ex}")
 
         tol = qty_tolerance_fn()
+        # Dormant-bots gate (approved spec): a pair is "all-dormant" when EVERY bot
+        # on the pair has is_active=0 AND open_qty ~ 0. Pairs that are all-dormant
+        # with a flat exchange position carry only historical residue — tier-2
+        # ledger_imbalance on them is informational, never a MISMATCH escalation.
+        # Pairs with any active bot (is_active=1) or open_qty > 0 stay strict.
+        pair_all_dormant: Dict[str, bool] = {}
+        try:
+            conn_d = sqlite3.connect(db_path, timeout=10)
+            for bot_pair, is_active, open_qty in conn_d.execute(
+                """SELECT b.pair, b.is_active, COALESCE(t.open_qty, 0.0)
+                   FROM bots b LEFT JOIN trades t ON b.id = t.bot_id"""
+            ):
+                pk = norm_fn(bot_pair or '')
+                if not pk:
+                    continue
+                dormant_bot = (int(is_active or 0) == 0) and (abs(float(open_qty or 0.0)) <= 0.0001)
+                pair_all_dormant[pk] = pair_all_dormant.get(pk, True) and dormant_bot
+            conn_d.close()
+        except Exception as e:
+            logger.warning(f"[health] dormant-pair scan failed (non-fatal): {e}")
+
         for p in sorted(set(primary_nets) | set(physical_nets)):
             # Primary net used for drift/orphan detection
             p_net = primary_nets.get(p, 0.0)
@@ -367,7 +388,15 @@ def _compute_netting_status(
             # Tier-2: full-history ledger imbalance vs exchange physical position
             ledger_diff_qty = round(abs(l_net - ph_net), 8)
             ledger_diff_usd = ledger_diff_qty * ref_price
-            ledger_imbalance = (ledger_diff_qty > tol or ledger_diff_usd > 5.0) and not startup_suppression
+            # Dormant-bots gate (approved spec): suppress ledger_imbalance only when
+            # ALL bots on the pair are is_active=0 AND flat (open_qty ~ 0) and the
+            # exchange physical position is flat. Active pairs (any bot is_active=1
+            # or open_qty > 0) keep strict tier-2 mismatch checks.
+            is_dormant_pair = pair_all_dormant.get(p, False)
+            if is_dormant_pair and abs(ph_net) < tol:
+                ledger_imbalance = False
+            else:
+                ledger_imbalance = (ledger_diff_qty > tol or ledger_diff_usd > 5.0) and not startup_suppression
 
             # Tier-1 drift detection uses PRIMARY (position_ledger, floor..now window)
             drift = (diff_qty > tol or diff_usd > 5.0) and not startup_suppression
@@ -381,6 +410,7 @@ def _compute_netting_status(
                 diff_qty=diff_qty, diff_usd=diff_usd,
                 drift_detected=drift, ref_price=ref_price,
                 tolerance=tol, bots=pair_bot_map.get(p, []),
+                dormant_pair=is_dormant_pair,
             )
 
             bot_qty = sum(abs(b["open_qty"]) for b in pair_bot_map.get(p, []))

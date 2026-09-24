@@ -98,13 +98,15 @@
 
 ### 🔴 URGENT / P1 (money-path)
 
-1. **Finding 2 — Side inference gap in parity_gates/database.py** — `parity_gates.py:1135` (orphan adoption) and `database.py:2173` (race guard) call `credit_fill()` without `side=` param. Physical position may have opposite direction to bot's virtual. **OPEN** — needs diff + test + approval.
+1. **Finding 2 — Side inference gap in parity_gates/database.py** — **RESOLVED 2026-09-24**. Both sites already pass `side=`:
+   - `parity_gates.py:1142` → `side=o.get('side', '')`
+   - `database.py:2182` → `side=_detail.get('side', '')`
+   No diff needed. Verified at `0bffdde`.
 
 ### 🟡 P2 / Important
 
-- Finding 2 above.
-- **Task 2 remnant — tier-2 dormant-bots gate (NIGHT 2, designed not applied)**: `engine/health.py` should not flag `ledger_imbalance` when ALL bots on a pair are `is_active=0` AND exchange physical=0 (residue is provably closed history). Active-bot pairs keep strict tier-2. Needs diff + approval.
-- **SUI blind spot + uncredited fill (NIGHT 2)**: all-dormant SUIUSDC pair is excluded from the tier-2 scan (health.py:165-168) despite 80+ fills; grid order `185035956` (11.8 SUI BUY, filled on exchange) has no `exchange_fills` row and a stale `open` `bot_orders` row. Decision: (a) surface via the tier-2 gate fix, (b) reconcile the fill via tested forensic path. Exchange flat — no live risk.
+- **Task 2 remnant — tier-2 dormant-bots gate (NIGHT 2, designed not applied)**: `engine/health.py` should not flag `ledger_imbalance` when ALL bots on a pair are `is_active=0` AND exchange physical=0 (residue is provably closed history). Active-bot pairs keep strict tier-2. **Diff ready for approval** (see HANDOFF).
+- **SUI blind spot + uncredited fill (NIGHT 2)**: all-dormant SUIUSDC pair excluded from tier-2 scan (health.py:165-168) despite 80+ fills; grid order `185035956` (11.8 SUI BUY, filled on exchange) has no `exchange_fills` row and stale `open` `bot_orders` row. **Exchange flat (0.0)** — SELL fills (orders 184956197, 185019137) offset all BUYs. Correct path: `reconstruct_offline_fills(pair_filter='SUIUSDC')` to credit BOTH BUY and SELL fills → net flat. Decision needed.
 
 ### 🟢 P3 / Test-infra
 
