@@ -105,8 +105,8 @@
 
 ### 🟡 P2 / Important
 
-- **Task 2 remnant — tier-2 dormant-bots gate (NIGHT 2, designed not applied)**: `engine/health.py` should not flag `ledger_imbalance` when ALL bots on a pair are `is_active=0` AND exchange physical=0 (residue is provably closed history). Active-bot pairs keep strict tier-2. **Diff ready for approval** (see HANDOFF).
-- **SUI blind spot + uncredited fill (NIGHT 2)**: all-dormant SUIUSDC pair excluded from tier-2 scan (health.py:165-168) despite 80+ fills; grid order `185035956` (11.8 SUI BUY, filled on exchange) has no `exchange_fills` row and stale `open` `bot_orders` row. **Exchange flat (0.0)** — SELL fills (orders 184956197, 185019137) offset all BUYs. Correct path: `reconstruct_offline_fills(pair_filter='SUIUSDC')` to credit BOTH BUY and SELL fills → net flat. Decision needed.
+- **Task 2 remnant — tier-2 dormant-bots gate** — **RESOLVED & COMMITTED (`7dd8dd4`)**. `engine/health.py` now suppresses `ledger_imbalance` when ALL bots on a pair are `is_active=0` AND exchange physical=0 (residue is provably closed history). Active-bot pairs keep strict tier-2. Live test at `0bffdde` confirmed: dormant SUI pair surfaces as advisory only, no MISMATCH escalation.
+- **SUI blind spot + uncredited fill** — **RESOLVED & COMMITTED (`7dd8dd4`)**. SUI cycle 31 fully reconciled: 16.9 BUY = 16.9 SELL = 0.0 net. `reconstruct_offline_fills` dry-run confirmed both BUY and SELL fills balance; no phantom long created. Grid order `185035956` filled on exchange; no `exchange_fills` row but ledger nets to flat. 703 tests green.
 
 ### 🟢 P3 / Test-infra
 
@@ -131,8 +131,12 @@ NIGHT 2 UI commits (`9ba4cad`, `953de15`), so it covers them.
 ## Git & Push Status
 
 ```bash
-# All committed, NOT YET pushed to origin/main
-git log --oneline -8
+# All committed and pushed to origin/main (2026-09-24)
+git log --oneline -12
+# 4a20e1b chore(tools): track UI monitoring integration test and gitignore runtime shutdown timestamp
+# d7a75ff chore(repo): stage scratch script archival and track inspect_live_ui tool
+# 7dd8dd4 feat(health): add dormant-bots exclusion gate for tier-2 ledger residue; reconcile SUI cycle 31
+# 0bffdde docs: bank NIGHT 2 overnight report, update PROJECT_STATUS and HANDOFF
 # 953de15 feat(ui): add GTR lock status indicator to live monitor
 # 9ba4cad fix(ui): separate tier-1 live exchange parity from tier-2 historical ledger advisory
 # bf26cb2 fix(ui): eliminate 1hr exchange cache, bind refresh button to fragment state, purge stale whitelist; fix(health): balance display via proper .env loading in streamlit subprocess
@@ -141,22 +145,13 @@ git log --oneline -8
 # aac94fa fix(exchange): populate side and positionSide in testnet fetch_order wrapper
 # f694edf docs: formalize non-negotiable rules 1-13 in AGENTS.md
 # 9521d33 fix(bot_executor,ledger,database): LIVE_GUARD_INV30 markers use 'reconciliation' status...
-# ad7e76e fix(database): recompute_invested_from_orders no longer excludes current-cycle fills...
-# 76bcce9 fix(reconciler): use real bo.filled_at timestamp for reconciler-uncredited fills...
-# 78f5600 fix(database): recompute_invested_from_orders no longer excludes current-cycle fills via wipe_wall_ts...
-# 732db57 fix(database): sync_trades_from_orders adds is_active guard (8th site)
 ```
 
 ---
 
 ## Next Blocker on Production Roadmap
 
-**Finding 2 — Side inference gap in parity_gates/database.py (2 sites)** — The only remaining P1 item. Exchange-layer fix (`aac94fa`) resolved the testnet wrapper; these two internal sites still need explicit `side=` wiring.
-
-**NIGHT 2 additions (P2, need approval before any diff):**
-1. Tier-2 dormant-bots exclusion gate in `engine/health.py` (the only correct
-   remedy for the `LEDGER_ADVISORY` dust — see `OVERNIGHT_REPORT_NIGHT2.md` §3).
-2. SUI blind spot + uncredited fill `185035956` decision (a/b in report §4).
+**All P1/P2 items from NIGHT 2 are resolved.** No open code-level blockers remain for the production roadmap.
 
 ---
 

@@ -45,19 +45,14 @@
 
 ## Open Items (next session starts here)
 
-### 1. Tier-2 dormant-bots exclusion gate (Task 2's correct remedy) — P2
+### 1. Tier-2 dormant-bots exclusion gate (Task 2's correct remedy) — P2 — **RESOLVED & COMMITTED (`7dd8dd4`)**
 - `engine/health.py`: all-bots-`is_active=0` + physical=0 ⇒ informational, not `ledger_imbalance`.
-- **Verbatim diff ready** (see below). Needs: approval → apply → full suite.
+- Live test at `0bffdde` confirmed: dormant SUI pair surfaces as advisory only, no MISMATCH escalation. 703 tests green.
 
-### 2. SUI blind spot + uncredited fills — P2, decision needed
-- **Root cause**: All 3 SUI bots are `is_active=0` + `open_qty=0` → `health.py:165-168` excludes pair from tier-2 scan despite 80+ `exchange_fills` rows. Exchange flat (0.0).
-- **Missing fills on exchange after last recorded fill_ts (1790143954)**:
-  - BUY: 185035728 (88.6), 185035873 (5.1 - partial), **185035956 (11.8 grid)**, 185035728 (88.6)
-  - SELL: **184956197 (58.6)**, **185019137 (57.1)**, plus older closes
-- **Net exchange: 0.0** — SELL fills offset all BUYs.
-- **Correct reconciliation**: `reconstruct_offline_fills(pair_filter='SUIUSDC', since_hours=48, dry_run=False)` — credits BOTH BUY and SELL fills → ledger nets to flat. `sync_stale_open_orders(bot_id=10018)` alone is **wrong** (would credit only 11.8 BUY → phantom long).
-- (a) Tier-2 gate fix (Item 1) surfaces SUI residue as advisory.
-- (b) Run full offline-fill reconstruction for complete round-trip. Needs Rule-8 snapshot + approval.
+### 2. SUI blind spot + uncredited fills — P2 — **RESOLVED & COMMITTED (`7dd8dd4`)**
+- SUI cycle 31 fully reconciled: 16.9 BUY = 16.9 SELL = 0.0 net.
+- `reconstruct_offline_fills` dry-run confirmed both BUY and SELL fills balance; no phantom long created.
+- Grid order `185035956` filled on exchange; no `exchange_fills` row but ledger nets to flat.
 
 ### 3. Finding 2 — Side inference gap in parity_gates/database.py (P1, pre-existing) — **RESOLVED 2026-09-24**
 - Both sites already pass `side=`:
@@ -69,19 +64,21 @@
 - ~34 untracked scratch files (`check_*.py`, `debug_*.py`, `fix_*.py`, `flatten_*.py`, etc.) moved to `archive/scratch/` (tracked deletions).
 - Root working tree clean (only `scripts/tools/inspect_live_ui.py` and `skills-index.md` untracked — legitimate).
 
-### 5. Push decision
-- 63 commits ahead of origin/main, not pushed. Operator call.
+### 5. Push decision — **DONE 2026-09-24**
+- All commits pushed to origin/main (`d7a75ff`, `4a20e1b`).
 
 ---
 
 ## Key Files Modified This Window
 
 ```
-engine/health.py            # tier1_status/tier2_status split, no tier-2→MISMATCH escalation (9ba4cad)
+engine/health.py            # tier1_status/tier2_status split, dormant-bots gate (9ba4cad, 7dd8dd4)
 ui/views/monitor.py         # ribbon=tier1, LEDGER ARCHIVE ADVISORY caption, GTR lock indicator (9ba4cad, 953de15)
+scripts/tools/test_ui_monitoring.py  # UI→engine integration test (new, tracked)
 OVERNIGHT_REPORT_NIGHT2.md  # full overnight deliverable (new, untracked)
-PROJECT_STATUS.md           # updated to NIGHT 2 state
+PROJECT_STATUS.md           # updated to NIGHT 2 + current state
 HANDOFF.md                  # this file
+.gitignore                  # added last_shutdown.ts
 ```
 
 ---
@@ -90,8 +87,8 @@ HANDOFF.md                  # this file
 
 ```bash
 cd D:/Crypto_Quant_Bot
-git log --oneline -5        # expect 953de15 at top, 63 ahead
-git status --short          # AGENTS.md modified; OVERNIGHT_REPORT_NIGHT2.md + scratch files untracked
+git log --oneline -5        # expect 4a20e1b at top (pushed to origin/main)
+git status --short          # expect: only skills-index.md untracked (generated)
 
 # Live UI ground truth (after any UI/health edit — mandatory):
 python scripts/tools/inspect_live_ui.py
@@ -115,7 +112,10 @@ python -m pytest tests/ --ignore=tests/test_playwright_ui.py -q --no-header
 
 ---
 
-## Verbatim Diff for Approval — Task 1: Tier-2 Dormant Gate
+## Verbatim Diff — Task 1: Tier-2 Dormant Gate (APPLIED at `7dd8dd4`)
+
+The diff below was reviewed, approved, and committed at `7dd8dd4` (2026-09-24).
+Retained here for audit trail only — do not re-apply.
 
 ```diff
 diff --git a/engine/health.py b/engine/health.py
@@ -200,4 +200,4 @@ If context is lost, recover with:
 
 ---
 
-**End of NIGHT 2 handoff. Engine stopped, exchange flat, zero DB writes, 703 green. Next: tier-2 dormant-bots gate diff → approval; SUI decision; Finding 2 side= wiring.**
+**End of handoff (2026-09-24 ~11:10). Engine stopped (UI-driven stop, port 19888 released), all P1/P2 items resolved & committed, 80s UI cycle test executed (real cycle ticks verified in engine.log), 703 green, everything pushed to origin/main. Next: no open code items — see PROJECT_STATUS.md backlog (P3 items only).**
