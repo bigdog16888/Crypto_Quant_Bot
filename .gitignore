@@ -22,6 +22,7 @@ startup_error.log
 # Runtime files
 *.pid
 engine.pid
+last_shutdown.ts
 
 # IDEs
 .vscode/
