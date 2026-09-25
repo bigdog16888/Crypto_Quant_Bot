@@ -79,6 +79,17 @@ class ExchangeInterface:
             if ExchangeInterface._time_offset is None:
                 ExchangeInterface._time_offset = 0
 
+    def force_time_resync(self):
+        """Force time sync for ccxt signed requests. Call this if getting -1021 errors."""
+        try:
+            self.exchange.load_time_difference()
+            self.logger.info(f"🕒 Forced CCXT time sync: {self.exchange.options.get('timeDifference')}ms")
+            # Also sync the raw offset
+            self._sync_time_offset()
+        except Exception as e:
+            self.logger.warning(f"Forced time resync failed: {e}")
+            raise
+
     def _get_adjusted_timestamp(self) -> int:
         if ExchangeInterface._time_offset is None:
             self._sync_time_offset()
