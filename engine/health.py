@@ -107,31 +107,24 @@ def _compute_header_metrics(db_path: str, exchange_instance) -> Dict[str, Any]:
 
         if exchange_instance is not None:
             try:
-                # Use ccxt fetch_balance() for full info (includes unrealizedProfit per asset)
+                # Use ccxt fetch_balance() for wallet balance
                 bal = exchange_instance.exchange.fetch_balance()
+                wallet_balance = 0.0
                 if bal:
-                    wallet_balance = 0.0
-                    unrealized_pnl = 0.0
-                    # Binance futures: use info['assets'] for correct wallet/unrealized split
-                    info = bal.get('info', {})
-                    assets = info.get('assets', [])
-                    if assets:
-                        for a in assets:
-                            asset = a.get('asset')
-                            if asset in ('USDT', 'USDC', 'USD', 'BUSD', 'FDUSD'):
-                                wb = float(a.get('walletBalance', 0) or 0)
-                                up = float(a.get('unrealizedProfit', 0) or 0)
-                                wallet_balance += wb
-                                unrealized_pnl += up
-                    else:
-                        # Fallback: ccxt total = wallet (approximate)
-                        totals = bal.get('total', {})
-                        for asset, amount in totals.items():
-                            if asset in ('USDT', 'USDC', 'USD', 'BUSD', 'FDUSD'):
-                                wallet_balance += float(amount or 0)
+                    totals = bal.get('total', {})
+                    for asset, amount in totals.items():
+                        if asset in ('USDT', 'USDC', 'USD', 'BUSD', 'FDUSD'):
+                            wallet_balance += float(amount or 0)
                     result["futures_balance"] = wallet_balance
-                    result["total_equity"] = wallet_balance + unrealized_pnl
-                    result["global_pnl_usd"] = unrealized_pnl
+
+                # Sum live unrealized PnL directly from open positions (matches bot table)
+                pos = exchange_instance.exchange.fetch_positions()
+                live_upnl = sum(
+                    float(p.get('unrealizedPnl') or p.get('info', {}).get('unrealizedProfit') or 0.0)
+                    for p in pos if abs(float(p.get('contracts') or p.get('size') or 0.0)) > 1e-8
+                )
+                result["global_pnl_usd"] = live_upnl
+                result["total_equity"] = wallet_balance + live_upnl
 
                 # Fetch live positions for notional and margin used
                 pos = exchange_instance.exchange.fetch_positions()
