@@ -4237,6 +4237,18 @@ class BotExecutor:
             logger.warning(f"🧹 {name}: Found {len(stale_orders)} STALE orders from previous steps. Purging to sync with Step {current_step}...")
             for o in stale_orders:
                 try:
+                    # 🛡️ IDEMPOTENCY GUARD: Skip if already cancelled in DB (prevents -2011 spam)
+                    from engine.database import get_connection
+                    conn = get_connection()
+                    db_row = conn.execute(
+                        "SELECT status, filled_amount, order_type FROM bot_orders WHERE order_id = ? AND bot_id = ?",
+                        (o['id'], bot_id)
+                    ).fetchone()
+                    # NOTE: Do NOT close conn here — shared in tests; caller manages lifecycle
+                    if db_row and db_row[0] in ('cancelled', 'reset_cleared'):
+                        logger.info(f"⏭️ {name}: Skipping stale cancel for {o.get('clientOrderId')} — already {db_row[0]} in DB")
+                        continue
+
                     # 🛡️ PARTIAL-FILL GUARD: Never cancel a partially filled order as stale.
                     # A partial fill is real capital deployed on the exchange — cancelling it
                     # orphans that position. Only skip if there is a measurable fill.
