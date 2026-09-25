@@ -9,22 +9,27 @@ from engine.database import get_connection, get_all_bots
 from engine.exchange_interface import ExchangeInterface
 from engine.strategies.martingale_strategy import MartingaleStrategy
 from engine.parity_gates import get_exchange_signed_net, qty_tolerance
+from engine.health import get_system_health
 import pandas as pd
 import json
 import logging
 
 logger = logging.getLogger(__name__)
 
-
 @st.cache_data(ttl=15, show_spinner=False)
-def fetch_live_balance():
-    """Fetch live wallet balance from exchange."""
+def fetch_live_equity():
+    """Fetch live wallet equity from system health (uses info['assets'] parser for futures)."""
     try:
         ex = ExchangeInterface(market_type='future')
-        balance = ex.fetch_balance()
-        return float(balance.get('total', 0) or 0)
+        # Use the same DB path as the engine
+        db_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'crypto_bot.db')
+        health = get_system_health(db_path, ex, lambda x: x, lambda: 0.002, force_refresh=True)
+        header = health.get('header_metrics', {})
+        # Prefer total_equity, fallback to futures_balance
+        equity = header.get('total_equity') or header.get('futures_balance') or 0.0
+        return float(equity)
     except Exception as e:
-        logger.warning(f"Could not fetch live balance: {e}")
+        logger.warning(f"Could not fetch live equity: {e}")
         return 0.0
 
 
@@ -52,16 +57,16 @@ def render_calculator_view():
     col_bal1, col_bal2, col_bal3 = st.columns(3)
     
     with col_bal1:
-        # Live balance from exchange
-        live_balance = fetch_live_balance()
-        st.metric("Live Equity (Exchange)", f"${live_balance:,.2f}")
+        # Live balance from exchange (via system health info['assets'] parser)
+        live_equity = fetch_live_equity()
+        st.metric("Live Equity (Exchange)", f"${live_equity:,.2f}")
     
     with col_bal2:
         # User can override for planning
         plan_balance = st.number_input(
             "Planning Equity ($)", 
             min_value=0.0, 
-            value=live_balance if live_balance > 0 else 10000.0,
+            value=live_equity if live_equity > 0 else 10000.0,
             step=100.0,
             help="Override for what-if scenarios"
         )
