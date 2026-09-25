@@ -28,6 +28,9 @@ last_shutdown.ts
 .vscode/
 .idea/
 *.swp
+
+# Local skill index (per-session)
+skills-index.md
 *.swo
 *~
 
