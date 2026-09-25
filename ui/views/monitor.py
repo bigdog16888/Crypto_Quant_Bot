@@ -2001,8 +2001,48 @@ def render_monitor_view():
                 if market_orders:
                     df_orders = pd.DataFrame(market_orders)
 
-                    # 🚀 GHOST FILTER: Remove filled/terminal exchange artifacts (Binance testnet quirk)
-                    # Keep only orders with remaining > 0 and status not in terminal states
+                    # 🚀 GHOST FILTER v2: Cross-reference with bot_orders database truth
+                    # Remove orders that are cancelled/reset_cleared in DB, or from old cycles
+                    try:
+                        conn = get_connection()
+                        # Fetch all bot_orders with status and cycle_id for active bots
+                        db_orders = pd.read_sql("""SELECT client_order_id, status, cycle_id, bot_id 
+                                                 FROM bot_orders WHERE bot_id IN 
+                                                 (SELECT id FROM bots WHERE is_active = 1)""", conn)
+                        conn.close()
+                    
+                        if not db_orders.empty and 'clientOrderId' in df_orders.columns:
+                            # Merge exchange orders with DB truth
+                            df_orders = df_orders.merge(db_orders, left_on='clientOrderId', right_on='client_order_id', how='left', suffixes=('', '_db'))
+                            
+                            # Rename non-suffixed columns from db_orders (cycle_id, bot_id don't get suffix)
+                            if 'cycle_id' in df_orders.columns:
+                                df_orders.rename(columns={'cycle_id': 'cycle_id_db', 'bot_id': 'bot_id_db'}, inplace=True)
+                        
+                            # Get current cycle for each bot from trades
+                            conn = get_connection()
+                            bot_cycles = pd.read_sql("""SELECT bot_id, cycle_id as current_cycle 
+                                                      FROM trades WHERE bot_id IN 
+                                                      (SELECT id FROM bots WHERE is_active = 1)""", conn)
+                            conn.close()
+                        
+                            if not bot_cycles.empty:
+                                df_orders = df_orders.merge(bot_cycles, left_on='bot_id_db', right_on='bot_id', how='left')
+                            
+                                # Filter: keep only orders that are:
+                                # 1. NOT cancelled/reset_cleared in DB
+                                # 2. From current cycle (cycle_id >= current_cycle)
+                                mask = (
+                                    (~df_orders['status_db'].isin(['cancelled', 'reset_cleared'])) &
+                                    (df_orders['cycle_id_db'] >= df_orders['current_cycle'])
+                                )
+                                # For orders not in DB (orphan), keep them
+                                mask = mask | (df_orders['status_db'].isna())
+                                df_orders = df_orders[mask].drop(columns=['status_db', 'cycle_id_db', 'bot_id_db', 'current_cycle', 'client_order_id', 'bot_id'], errors='ignore')
+                    except Exception as e:
+                        pass  # Fail silently on ghost filter
+                    
+                    # Fallback: also filter by exchange status/remaining
                     if 'remaining' in df_orders.columns:
                         df_orders['_rem'] = pd.to_numeric(df_orders['remaining'], errors='coerce').fillna(0)
                     elif 'amount' in df_orders.columns:
