@@ -1,6 +1,6 @@
 # PROJECT_STATUS.md — Crypto_Quant_Bot
 
-**Last updated: 2026-09-24 ~04:30 (NIGHT 2 autonomous window) | Engine: STOPPED (untouched all night). Git: HEAD `953de15`, 63 commits ahead of origin/main. New agents read `AGENTS.md` first. Full overnight detail: `OVERNIGHT_REPORT_NIGHT2.md`.**
+**Last updated: 2026-09-25 13:30 | Engine: RUNNING (PID 3828, continuous forward-test) | Git: HEAD `7ddced3`, up to date with origin/main. New agents read `AGENTS.md` first.**
 
 ---
 
@@ -35,32 +35,31 @@
 
 ---
 
-## Live State 2026-09-23 (verified at session end, engine STOPPED)
+## Live State 2026-09-25 (verified: engine RUNNING, forward-test active)
 
-- **Git HEAD**: `d1a50a0` — LOCAL; 52 commits ahead of origin/main
-- **Engine process**: **STOPPED** (operator decision — explicit go-ahead required to start)
-- **Startup barrier**: CLEARED (all pairs verified in perfect parity)
-- **Tier-2 health (at boot)**: all pairs clean (0 ledger_imbalance) post-reconciliation
-- **Active positions (exchange-verified)**: after clean baseline, all pairs FLAT. SOL 0.23 dust handled via drift_note. XAU virtual=0.0 physical=0.0. BNB/BTC/SUI flat.
-- **Bots 10008 (SOL), 10018 (SUI)**: `is_active=0`, `status=STOPPED`, orphan exchange positions CLEARED
+- **Git HEAD**: `7ddced3` — SYNCED with origin/main
+- **Engine process**: **RUNNING** (PID 3828, SocketLock port 19888, continuous forward-test on Binance Testnet)
+- **Startup barrier**: CLEARED — all pairs verified in perfect parity (pair-level plausibility gate)
+- **Tier-1 health (live)**: **HEALTHY** — worst_gap_usd = 0.0, 0 mismatched pairs
+- **Tier-2 health (advisory)**: LEDGER_ADVISORY — dormant pairs only (LINK, SOL, ETH, BTC, XAU migration-era residue)
+- **Active positions (exchange-verified)**:
+  - **BTC/USDC:USDC**: +0.004 long (Bot 10016 cycle 31) — TP @ 85681.8, Grid @ 83934.0
+  - **XAU/USDT:USDT**: -0.017 short (Bot 10019 cycle 23) — Grid @ 4293.84
+  - **BNB/USDC:USDC**: FLAT (Bot 10007/100314 reset via canonical flatten)
 - **Test suite (Py3.11, excluding playwright)**: **703 passed, 0 failed, 2 skipped, 0 ERRORS** (100% GREEN)
-- **DB isolation guard**: VERIFIED — live write blocked, mode=ro passes, temp DB works
+- **DB isolation guard**: ACTIVE — verified write blocked, mode=ro passes, temp DB works
+- **UI**: streamlit at localhost:8501, live health data (PnL: -$1.86, Equity: $9,100.62)
 
----
-
-## 2026-09-23 Session Summary (this session)
+## 2026-09-23 → 25 Session Summary (this session)
 
 ### Commits this session (in order)
 
 | Hash | Message | Type |
 |------|---------|------|
-| `9ba4cad` | fix(ui): separate tier-1 live exchange parity from tier-2 historical ledger advisory | Code |
-| `953de15` | feat(ui): add GTR lock status indicator to live monitor | Code |
-| `34cb543` | fix(executor): credit stranded partial fills on terminal stale order purge | Code |
-| `34a3a34` | fix(ledger): harden handle_flatten price fallback chain against 0.0 exit prices | Code |
-| `68aa8bd` | fix(reconciler): resolve audit_bot_wipes signature mismatch with cursor adapter | Code + Test |
-| `6e5749d` | docs: bank overnight mission report and updated position audit | Docs |
-| `d1a50a0` | fix(health): make cycle_floor auto-detection direction-aware for SHORT bots | Code |
+| `8bb6411` | fix(engine): idempotency guards for stale/excess order purges to prevent re-credit loop and cancel spam | Code |
+| `4db3f98` | feat(reconciler): add verify-and-backfill self-healing for uncredited fills, achieving three-way parity ($0.00 gap) | Code |
+| `2f927de` | fix(health): dynamically sum unrealized PnL from live open positions in header metrics | Code |
+| `7ddced3` | fix(startup): pair-level plausibility gate for hedge bots, native SQLite backup, and reconciler side inference | Code + Test |
 
 ### Previous session commits (preserved)
 

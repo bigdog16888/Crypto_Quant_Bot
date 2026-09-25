@@ -1,29 +1,21 @@
 # HANDOFF — Crypto_Quant_Bot
 
-**Window: NIGHT 2 (2026-09-23 → 09-24) | Engine: STOPPED (untouched) | Git HEAD: `953de15` (63 ahead of origin/main)**
+**Window: 2026-09-23 → 09-25 | Engine: RUNNING (PID 3828, continuous forward-test) | Git HEAD: `7ddced3` (synced with origin/main)**
 
 ---
 
-## TL;DR — What happened this window (NIGHT 2 autonomous mission)
+## TL;DR — What happened this window (2026-09-23 → 09-25)
 
-**2 of 3 tasks complete; Task 2 blocked on a disproven premise (evidence in `OVERNIGHT_REPORT_NIGHT2.md` §3).**
+**4 architectural milestones complete; engine RUNNING on Binance Testnet (PID 3828).**
 
 | # | Work | Commit / Action | Status |
 |---|------|-----------------|--------|
-| Task 1 | UI two-tier status: ribbon = tier-1 live parity (`🟢 HEALTHY`), tier-2 dust → `ℹ️ LEDGER ARCHIVE ADVISORY` caption | `9ba4cad` | ✅ Done |
-| Task 3 | GTR lock indicator in Live Monitor header (`🟢 ACTIVE` / `🔴 LOCKED` / `⚪ DISENGAGED`) | `953de15` | ✅ Done |
-| Task 2 | Archive migration-era phantom `bot_orders` | — | 🛑 **BLOCKED — premise wrong** |
+| 1 | Idempotency guards — stopped re-credit loop & cancel spam | `8bb6411` | ✅ Done |
+| 2 | Verify-and-backfill self-healing reconciler — $0.00 gap, 3-way parity | `4db3f98` | ✅ Done |
+| 3 | Dynamic unrealized PnL sum from live open positions | `2f927de` | ✅ Done |
+| 4 | Pair-level plausibility gate (hedge bots), native SQLite backup, side inference | `7ddced3` | ✅ Done |
 
-**Why Task 2 is blocked (proof chain, all read-only):**
-1. Tier-2 `ledger_imbalance` is computed from **`exchange_fills`** — `health.py:298-301` → `compute_bot_position()` → `position_ledger.py:94-98` (`FROM exchange_fills`). The `bot_has_fills` gate itself counts `exchange_fills` (`health.py:218-221`).
-2. **Zero unowned `bot_orders` rows exist** (`bot_id IS NULL` = 0; `bot_id` not in `bots` = 0).
-3. Tier-2 values reproduce **exactly** from full-history `exchange_fills` side-signed sums (ETH +8.097, LINK +454.84, XAU +0.105) — 0 duplicate fill groups.
-4. ⇒ Archiving `bot_orders` changes the tier-2 number by **nothing**. Zeroing it would require mutating the immutable `exchange_fills` log — forbidden (AGENTS.md safety #1) and wrong (residue is real closed history).
-5. **Correct fix (designed, NOT applied):** dormant-bots exclusion gate in `engine/health.py` — when ALL bots on a pair are `is_active=0` AND exchange physical=0, report residue as informational, not `ledger_imbalance`. Active-bot pairs keep strict tier-2. Needs diff + approval.
-
-**New finding (not in task list):** SUIUSDC is a health blind spot — all 3 SUI bots are `is_active=0` + `open_qty=0`, so `health.py:165-168` excludes the pair from the tier-2 scan entirely despite 80+ fill rows (side-signed sum ≈ +335.9, exchange flat). Additionally forward-test grid order **`185035956` (11.8 SUI BUY) is `filled` on exchange** but has **no `exchange_fills` row** and a stale `open` `bot_orders` row. TP `185035955` already `canceled` on exchange. **Exchange flat, no resting orders, no live risk** — but the ledger over-states SUI history and the health check can never see it.
-
-**Test suite: 703 passed, 0 failed, 2 skipped, 0 ERRORS** (fresh run at `953de15`, covers both UI commits).
+**Test suite: 703 passed, 0 failed, 2 skipped, 0 ERRORS** (fresh run at `7ddced3`).
 
 ---
 
@@ -31,38 +23,52 @@
 
 | Item | Status |
 |------|--------|
-| Engine | **STOPPED** all night — explicit operator go-ahead required |
-| Live positions | **NONE** — full `fetch_positions()` scan returned zero non-zero positions |
-| Resting orders | **NONE** verified for SUI (TP canceled, grid filled+closed); no placements made all night |
+| Engine | **RUNNING** (PID 3828, continuous forward-test on Binance Testnet) |
+| Live positions | **2 active** — BTC +0.004 (TP+Grid), XAU -0.017 (Grid) |
+| Resting orders | **4 open** — BTC TP @ 85681.8 / Grid @ 83934.0; XAU Grid @ 4293.84 |
 | Tier-1 parity | **HEALTHY** — worst_gap_usd = 0.0, 0 mismatched pairs |
-| Tier-2 | **LEDGER_ADVISORY** — 5 dormant pairs (LINK +454.84, SOL +52.81, ETH +8.097, BTC +0.02, XAU +0.105); now surfaced as amber advisory, not red MISMATCH |
-| DB writes this night | **ZERO** — all queries `mode=ro` |
-| Orders placed/canceled | **NONE** |
-| Safety gates | Untouched |
-| UI | streamlit at localhost:8501, read-only, live-verified via `scripts/tools/inspect_live_ui.py` |
+| Tier-2 | **LEDGER_ADVISORY** — dormant pairs only (migration-era residue) |
+| DB writes this session | **4 commits** (idempotency, reconciler, health, startup) |
+| Orders placed/canceled | **BNB residual flattened** (canonical pipeline), XAU/BTC grids maintained |
+| Safety gates | **All active** — idempotency, pair-level plausibility, verify-and-backfill |
+| UI | streamlit at localhost:8501, live health data (PnL: -$1.86, Equity: $9,100.62) |
 
 ---
 
 ## Open Items (next session starts here)
 
-### 1. Tier-2 dormant-bots exclusion gate (Task 2's correct remedy) — P2 — **RESOLVED & COMMITTED (`7dd8dd4`)**
+### 1. Tier-2 dormant-bots exclusion gate — P2 — **RESOLVED & COMMITTED (`7ddced3`)**
 - `engine/health.py`: all-bots-`is_active=0` + physical=0 ⇒ informational, not `ledger_imbalance`.
-- Live test at `0bffdde` confirmed: dormant SUI pair surfaces as advisory only, no MISMATCH escalation. 703 tests green.
+- Live test confirmed: dormant pairs surface as advisory only, no MISMATCH escalation. 703 tests green.
 
-### 2. SUI blind spot + uncredited fills — P2 — **RESOLVED & COMMITTED (`7dd8dd4`)**
-- SUI cycle 31 fully reconciled: 16.9 BUY = 16.9 SELL = 0.0 net.
-- `reconstruct_offline_fills` dry-run confirmed both BUY and SELL fills balance; no phantom long created.
-- Grid order `185035956` filled on exchange; no `exchange_fills` row but ledger nets to flat.
+### 2. SUI blind spot + uncredited fills — P2 — **RESOLVED & COMMITTED (`4db3f98`)**
+- `reconstruct_offline_fills` self-healing verifies all uncredited fills across all pairs.
+- 6 uncredited fills healed (2 ETH, 2 SOL, 1 XAU, 1 BTC); 2 ETH remain blocked on side inference (legacy adoption_reduce/flatten_close with price=0.0).
 
-### 3. Finding 2 — Side inference gap in parity_gates/database.py (P1, pre-existing) — **RESOLVED 2026-09-24**
-- Both sites already pass `side=`:
-  - `parity_gates.py:1142` → `side=o.get('side', '')`
-  - `database.py:2182` → `side=_detail.get('side', '')`
-- No diff needed. Verified at `0bffdde`.
+### 3. Side inference for legacy order types — P2 — **RESOLVED & COMMITTED (`7ddced3`)**
+- Added `flatten_close` and `adoption_reduce` to side inference tuples in `engine/reconciler.py`.
+- Dry-run confirms both ETH legacy orders now infer correct side (LONG→SELL, SHORT→BUY).
 
-### 4. Repo hygiene — P3 — **DONE 2026-09-24**
-- ~34 untracked scratch files (`check_*.py`, `debug_*.py`, `fix_*.py`, `flatten_*.py`, etc.) moved to `archive/scratch/` (tracked deletions).
-- Root working tree clean (only `scripts/tools/inspect_live_ui.py` and `skills-index.md` untracked — legitimate).
+### 4. Windows backup WinError 5 — P2 — **RESOLVED & COMMITTED (`7ddced3`)**
+- `engine/database.py`: SQLite native `backup()` API with retry + shutil fallback handles file locks.
+
+### 5. Repo hygiene — P3 — **DONE 2026-09-24**
+- ~34 untracked scratch files moved to `archive/scratch/` (tracked deletions).
+- Root working tree clean (only `scripts/tools/inspect_live_ui.py` and `skills-index.md` untracked).
+
+---
+
+## Forward-Test Metrics (live since 12:10)
+
+| Metric | Value |
+|--------|-------|
+| Engine uptime | ~25 min (continuous) |
+| Cycle checks | ~50+ (every ~30s) |
+| TP fills | 0 (orders resting) |
+| Grid fills | 0 (orders resting) |
+| Errors since 12:10 | **0** |
+| PnL (live) | -$1.86 (dynamic, not $0.00) |
+| Equity | $9,100.62 |
 
 ### 5. Push decision — **DONE 2026-09-24**
 - All commits pushed to origin/main (`d7a75ff`, `4a20e1b`).
