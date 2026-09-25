@@ -3065,9 +3065,13 @@ def import_position_from_exchange(bot_id: int, pair: str, position_size: float, 
         logger.error(f"import_position_from_exchange failed for bot {bot_id}: {e}")
         return False, str(e)
 
-def get_all_bots(include_decommissioned=False):
-    conn = get_connection()
-    cursor = conn.cursor()
+def get_all_bots(conn=None, include_decommissioned: bool = False):
+    """
+    Returns all bots with trade data.
+    If include_decommissioned=False (default), filters out DECOMMISSIONED bots.
+    """
+    if conn is None:
+        conn = get_connection()
     query = """
         SELECT b.id, b.name, b.pair, b.is_active, b.strategy_type, 
                COALESCE(t.total_invested, 0), COALESCE(t.current_step, 0), 
@@ -3079,7 +3083,7 @@ def get_all_bots(include_decommissioned=False):
     if not include_decommissioned:
         query += " WHERE b.status != 'DECOMMISSIONED'"
     query += " ORDER BY b.pair, b.bot_type DESC, b.id"
-    cursor.execute(query)
+    cursor = conn.execute(query)
     bots = cursor.fetchall()
     logger.debug(f"[GET_ALL_BOTS] Query returned {len(bots)} bots from DB.")
     return bots
