@@ -107,6 +107,11 @@ def _compute_header_metrics(db_path: str, exchange_instance) -> Dict[str, Any]:
 
         if exchange_instance is not None:
             try:
+                # Ensure time sync for ccxt signed requests (fixes -1021 timestamp errors)
+                try:
+                    exchange_instance.exchange.load_time_difference()
+                except Exception:
+                    pass
                 # Use ccxt fetch_balance() for wallet balance
                 bal = exchange_instance.exchange.fetch_balance()
                 wallet_balance = 0.0
