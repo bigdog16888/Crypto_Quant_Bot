@@ -190,14 +190,21 @@ def _render_header_ui(data):
     status_str  = f"{icon} {tier1_status}{gap_label}"
 
     m1, m2, m3, m4, m5 = st.columns(5)
-    with m1: st.metric("💰 Equity",   f"${data['total_equity']:,.2f}")
-    with m2: st.metric("🏦 Balance",  f"${data['futures_balance']:,.2f}")
-    with m3: st.metric("📈 PnL",      f"${data['global_pnl_usd']:,.2f}")
-    with m4: st.metric("💼 Invested", f"${data['total_invested_db']:,.2f}",
-                       help="Sum of trades.total_invested across active bots (ledger exposure).")
+    with m1: st.metric("💰 Equity",   f"${data['total_equity']:,.2f}",
+                       help="Margin balance (wallet + unrealized PnL).")
+    with m2: st.metric("🏦 Balance",  f"${data['futures_balance']:,.2f}",
+                       help="Wallet balance (cash only, no unrealized PnL).")
+    with m3: st.metric("📈 PnL",      f"${data['global_pnl_usd']:,.2f}",
+                       help="Unrealized PnL = Equity - Balance.")
+    with m4: st.metric("💼 Notional",  f"${data.get('open_qty_notional', 0):,.2f}",
+                       help="Live position notional from exchange (sum |notional|).")
     with m5: st.metric("⚡ Status",   status_str,
                        help=f"In Trade: {data['bots_in_trade']}/{data['active_count']} | "
                             f"Adoptions(24h): {data['adoptions_today']}")
+
+    # Margin used (collateral locked)
+    if data.get('margin_used', 0) > 0:
+        st.caption(f"🔒 Margin Used: ${data['margin_used']:,.2f}")
 
     # Tier-2 Advisory Badge (if ledger imbalance exists)
     if tier2_status == "LEDGER_ADVISORY":

@@ -107,36 +107,49 @@ def _compute_header_metrics(db_path: str, exchange_instance) -> Dict[str, Any]:
 
         if exchange_instance is not None:
             try:
-                bal = exchange_instance.fetch_balance()
+                # Use ccxt fetch_balance() for full info (includes unrealizedProfit per asset)
+                bal = exchange_instance.exchange.fetch_balance()
                 if bal:
-                    total_balance = 0.0
-                    free_balance = 0.0
-                    # fetch_balance returns {'total': {asset: amount}}
-                    totals = bal.get('total', {})
-                    for asset, amount in totals.items():
-                        total = float(amount or 0)
-                        free = total  # Binance futures returns total balance, free ≈ total for spot-like assets
-                        if asset in ('USDT', 'USDC', 'USD', 'BUSD', 'FDUSD'):
-                            total_balance += total
-                            free_balance += free
-                    result["futures_balance"] = free_balance
-                    result["total_equity"] = total_balance
-            except Exception:
-                pass
+                    wallet_balance = 0.0
+                    unrealized_pnl = 0.0
+                    # Binance futures: use info['assets'] for correct wallet/unrealized split
+                    info = bal.get('info', {})
+                    assets = info.get('assets', [])
+                    if assets:
+                        for a in assets:
+                            asset = a.get('asset')
+                            if asset in ('USDT', 'USDC', 'USD', 'BUSD', 'FDUSD'):
+                                wb = float(a.get('walletBalance', 0) or 0)
+                                up = float(a.get('unrealizedProfit', 0) or 0)
+                                wallet_balance += wb
+                                unrealized_pnl += up
+                    else:
+                        # Fallback: ccxt total = wallet (approximate)
+                        totals = bal.get('total', {})
+                        for asset, amount in totals.items():
+                            if asset in ('USDT', 'USDC', 'USD', 'BUSD', 'FDUSD'):
+                                wallet_balance += float(amount or 0)
+                    result["futures_balance"] = wallet_balance
+                    result["total_equity"] = wallet_balance + unrealized_pnl
+                    result["global_pnl_usd"] = unrealized_pnl
 
-        # Assets breakdown
-        try:
-            if exchange_instance is not None:
-                bal = exchange_instance.fetch_balance()
-                assets = []
-                if bal:
-                    for asset, info in bal.items():
-                        free = float(info.get("free", 0) or 0)
-                        if free > 1e-8:
-                            assets.append({"asset": asset, "free": free})
-                result["assets_breakdown"] = assets
-        except Exception as e:
-            logger.warning(f"[health] header_metrics error: {e}")
+                # Fetch live positions for notional and margin used
+                pos = exchange_instance.exchange.fetch_positions()
+                live_notional = 0.0
+                margin_used = 0.0
+                if pos:
+                    for p in pos:
+                        amt = float(p.get('contracts', 0) or p.get('size', 0) or 0)
+                        if abs(amt) > 1e-8:
+                            notional = float(p.get('notional', 0) or 0)
+                            im = float(p.get('initialMargin', 0) or 0)
+                            live_notional += abs(notional)
+                            margin_used += im
+                result["open_qty_notional"] = live_notional
+                result["margin_used"] = margin_used
+
+            except Exception as e:
+                logger.warning(f"[health] header_metrics balance/pos fetch error: {e}")
     finally:
         if conn:
             conn.close()
