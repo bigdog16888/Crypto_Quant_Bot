@@ -1447,23 +1447,28 @@ def proof_flatten_pair(
     if not human_approved:
         return {'success': False, 'error': 'human_approved required for proof flatten'}
 
-    # 🛡️ FREEZE-GUARD: pair-level freeze check — frozen pairs must not be flattened
+    # Imports needed for the rest of the function
     from engine.database import get_connection, reset_bot_after_tp
-    _norm_fg = normalize_symbol(pair).upper()
-    _conn_fg = get_connection()
-    _pair_bots_fg = _conn_fg.execute(
-        "SELECT id, status FROM bots WHERE is_active=1 AND (normalized_pair=? OR pair=?)",
-        (_norm_fg, _norm_fg)
-    ).fetchall()
-    _frozen_on_pair = [
-        (b[0], b[1]) for b in _pair_bots_fg
-        if config.is_bot_frozen(b[0], b[1])
-    ]
-    if _frozen_on_pair:
-        logger.critical(
-            f"🛑 [FREEZE-GUARD] pair {pair} blocked from proof_flatten_pair: frozen bots {_frozen_on_pair}"
-        )
-        return {'success': False, 'error': f'pair {pair} has frozen bots: {_frozen_on_pair}'}
+
+    # 🛡️ FREEZE-GUARD: pair-level freeze check — frozen pairs must not be flattened
+    # Bypass when human_approved=True: an explicit operator intervention must always
+    # be allowed to close/flatten a position, even if bots are in REQUIRE_MANUAL_PROOF.
+    if not human_approved:
+        _norm_fg = normalize_symbol(pair).upper()
+        _conn_fg = get_connection()
+        _pair_bots_fg = _conn_fg.execute(
+            "SELECT id, status FROM bots WHERE is_active=1 AND (normalized_pair=? OR pair=?)",
+            (_norm_fg, _norm_fg)
+        ).fetchall()
+        _frozen_on_pair = [
+            (b[0], b[1]) for b in _pair_bots_fg
+            if config.is_bot_frozen(b[0], b[1])
+        ]
+        if _frozen_on_pair:
+            logger.critical(
+                f"🛑 [FREEZE-GUARD] pair {pair} blocked from proof_flatten_pair: frozen bots {_frozen_on_pair}"
+            )
+            return {'success': False, 'error': f'pair {pair} has frozen bots: {_frozen_on_pair}'}
 
     result: Dict[str, Any] = {
         'success': False,
