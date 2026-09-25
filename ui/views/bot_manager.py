@@ -371,13 +371,16 @@ def render_bot_manager_view():
     st.header("🤖 Bot Manager")
     st.caption("📊 Manage existing bots: Toggle Status, Edit Settings, or Delete. Hedge children are nested under parents.")
     
+    # Show Decommissioned checkbox
+    show_decommissioned = st.checkbox("Show Decommissioned Bots", value=False, key="show_decommissioned_bots")
+    
     st.divider()
     
     # Import config for default market type
     from config.settings import config
     
     # Fetch Data
-    bots = get_all_bots()
+    bots = get_all_bots(include_decommissioned=show_decommissioned)
     
     if not bots:
         st.info("No bots found. Go to 'Bot Creator' to deploy one.")
