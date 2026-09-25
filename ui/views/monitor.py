@@ -1994,59 +1994,79 @@ def render_monitor_view():
             st.warning(f"No market data available for {symbol} on {timeframe}.")
 
     with tab_history:
-        # --- Open Orders Section (Live from Exchange) ---
-        st.subheader("📋 Live Open Orders (from Exchange)")
-        try:
-             # Use the ALREADY FETCHED orders from parallel execution
-             if market_orders:
-                df_orders = pd.DataFrame(market_orders)
-                
-                # --- ENRICHMENT from DB ---
-                try:
-                    conn = get_connection()
-                    # Fetch notes for open orders to explain "Why"
-                    db_orders = pd.read_sql("SELECT client_order_id, notes FROM bot_orders WHERE status='open'", conn)
-                    conn.close()
-                    
-                    if not db_orders.empty and 'clientOrderId' in df_orders.columns:
-                        # Merge on Client Order ID
-                        df_orders = df_orders.merge(db_orders, left_on='clientOrderId', right_on='client_order_id', how='left')
-                        df_orders.rename(columns={'notes': 'Strategy/Logic'}, inplace=True)
+            # --- Open Orders Section (Live from Exchange) ---
+            st.subheader("📋 Live Open Orders (from Exchange)")
+            try:
+                # Use the ALREADY FETCHED orders from parallel execution
+                if market_orders:
+                    df_orders = pd.DataFrame(market_orders)
+
+                    # 🚀 GHOST FILTER: Remove filled/terminal exchange artifacts (Binance testnet quirk)
+                    # Keep only orders with remaining > 0 and status not in terminal states
+                    if 'remaining' in df_orders.columns:
+                        df_orders['_rem'] = pd.to_numeric(df_orders['remaining'], errors='coerce').fillna(0)
+                    elif 'amount' in df_orders.columns:
+                        df_orders['_rem'] = pd.to_numeric(df_orders['amount'], errors='coerce').fillna(0)
                     else:
-                        df_orders['Strategy/Logic'] = "N/A"
-                except Exception as e:
-                    pass # Fail silently on enrichment
+                        df_orders['_rem'] = 0
+                    if 'status' in df_orders.columns:
+                        df_orders['_st'] = df_orders['status'].astype(str).str.lower()
+                    else:
+                        df_orders['_st'] = ''
+                    df_orders = df_orders[
+                        (df_orders['_rem'] > 0) &
+                        (~df_orders['_st'].isin(['closed', 'filled', 'canceled', 'cancelled']))
+                    ].drop(columns=['_rem', '_st'], errors='ignore')
 
-                # Keep only relevant columns
-                cols_to_keep = ['symbol', 'side', 'type', 'price', 'amount', 'Strategy/Logic', 'clientOrderId']
-                df_orders = df_orders[[c for c in cols_to_keep if c in df_orders.columns]]
-                
-                # Formatter for price
-                if 'price' in df_orders.columns:
-                     df_orders['price'] = df_orders['price'].apply(lambda x: f"${x:,.2f}" if isinstance(x, (float, int)) else x)
-                     
-                st.dataframe(
-                    df_orders, 
-                    width="stretch",
-                    column_config={
-                        "Strategy/Logic": st.column_config.TextColumn("Strategy/Logic", width="medium")
-                    }
-                )
-             else:
-                st.info("No open orders found on the exchange for active bot pairs.")
-                
-        except Exception as e:
-            st.error(f"Could not load open orders: {e}")
+                    if df_orders.empty:
+                        st.info("No *active* open orders found on the exchange for active bot pairs.")
+                    else:
+                        # --- ENRICHMENT from DB ---
+                        try:
+                            conn = get_connection()
+                            # Fetch notes for open orders to explain "Why"
+                            db_orders = pd.read_sql("SELECT client_order_id, notes FROM bot_orders WHERE status='open'", conn)
+                            conn.close()
 
-        st.divider()
+                            if not db_orders.empty and 'clientOrderId' in df_orders.columns:
+                                # Merge on Client Order ID
+                                df_orders = df_orders.merge(db_orders, left_on='clientOrderId', right_on='client_order_id', how='left')
+                                df_orders.rename(columns={'notes': 'Strategy/Logic'}, inplace=True)
+                            else:
+                                df_orders['Strategy/Logic'] = "N/A"
+                        except Exception as e:
+                            pass # Fail silently on enrichment
 
-        # --- Recent Trade History (Added) ---
-        st.subheader("📜 Recent Activity Log")
-        st.caption("🧹 **Auto-Reconcile**: Normal startup cleanup of phantom ledger state & global flatten verification | ⚠️ **SYSTEM_WIPE**: Operator-initiated position wipe (requires review)")
-        try:
-            conn = get_connection()
-            # Fetch last 200 actions for deep scrolling
-            query_history = """
+                        # Keep only relevant columns
+                        cols_to_keep = ['symbol', 'side', 'type', 'price', 'amount', 'Strategy/Logic', 'clientOrderId']
+                        df_orders = df_orders[[c for c in cols_to_keep if c in df_orders.columns]]
+
+                        # Formatter for price
+                        if 'price' in df_orders.columns:
+                            df_orders['price'] = df_orders['price'].apply(lambda x: f"${x:,.2f}" if isinstance(x, (float, int)) else x)
+
+                        st.dataframe(
+                            df_orders,
+                            width="stretch",
+                            column_config={
+                                "Strategy/Logic": st.column_config.TextColumn("Strategy/Logic", width="medium")
+                            }
+                        )
+                else:
+                    st.info("No open orders found on the exchange for active bot pairs.")
+
+            except Exception as e:
+                st.error(f"Could not load open orders: {e}")
+
+            st.divider()
+
+            # --- Recent Trade History (Added) ---
+            st.subheader("📜 Recent Activity Log")
+            st.caption("🧹 **Auto-Reconcile**: Normal startup cleanup of phantom ledger state & global flatten verification | ⚠️ **SYSTEM_WIPE**: Operator-initiated position wipe (requires review)")
+            try:
+                conn = get_connection()
+                # Fetch last 200 actions for deep scrolling
+                query_history = """
                 SELECT 
                     datetime(timestamp, 'unixepoch', 'localtime') as Time,
                     action as Action,
@@ -2058,45 +2078,45 @@ def render_monitor_view():
                 FROM trade_history 
                 ORDER BY timestamp DESC 
                 LIMIT 200
-            """
-            df_hist = pd.read_sql_query(query_history, conn)
-            conn.close()
+                """
+                df_hist = pd.read_sql_query(query_history, conn)
+                conn.close()
             
-            if not df_hist.empty:
-                # Distinguish Auto-Reconcile from actual operator SYSTEM_WIPEs
-                def format_action(row):
-                    act = row['Action']
-                    details = str(row.get('Details') or '').lower()
-                    if act == 'SYSTEM_WIPE':
-                        # Default to loud SYSTEM_WIPE unless details confirm it was an automated background cleanup
-                        is_auto = any(term in details for term in ['auto', 'reconcile', 'startup', 'zombie', 'ghost'])
-                        is_manual = any(term in details for term in ['manual', 'operator', 'human', 'cleanup'])
-                        if is_auto and not is_manual:
-                            return '🧹 Auto-Reconcile'
-                        else:
-                            return '⚠️ SYSTEM_WIPE'
-                    return act
+                if not df_hist.empty:
+                    # Distinguish Auto-Reconcile from actual operator SYSTEM_WIPEs
+                    def format_action(row):
+                        act = row['Action']
+                        details = str(row.get('Details') or '').lower()
+                        if act == 'SYSTEM_WIPE':
+                            # Default to loud SYSTEM_WIPE unless details confirm it was an automated background cleanup
+                            is_auto = any(term in details for term in ['auto', 'reconcile', 'startup', 'zombie', 'ghost'])
+                            is_manual = any(term in details for term in ['manual', 'operator', 'human', 'cleanup'])
+                            if is_auto and not is_manual:
+                                return '🧹 Auto-Reconcile'
+                            else:
+                                return '⚠️ SYSTEM_WIPE'
+                        return act
 
                 
-                df_hist['Action'] = df_hist.apply(format_action, axis=1)
+                    df_hist['Action'] = df_hist.apply(format_action, axis=1)
 
-                # Format Price and PnL
-                df_hist['Price'] = df_hist['Price'].apply(lambda x: f"${x:,.2f}" if isinstance(x, (int, float)) else x)
-                df_hist['Realized PnL'] = df_hist['Realized PnL'].apply(lambda x: f"${x:,.2f}" if isinstance(x, (int, float)) and x != 0 else "-")
+                    # Format Price and PnL
+                    df_hist['Price'] = df_hist['Price'].apply(lambda x: f"${x:,.2f}" if isinstance(x, (int, float)) else x)
+                    df_hist['Realized PnL'] = df_hist['Realized PnL'].apply(lambda x: f"${x:,.2f}" if isinstance(x, (int, float)) and x != 0 else "-")
                 
-                st.dataframe(
+                    st.dataframe(
                     df_hist, 
                     width="stretch", 
                     hide_index=True,
                     column_config={
                         "Details": st.column_config.TextColumn("Details", width="large", help="Detailed logic/reasoning for this action")
                     }
-                )
-            else:
-                st.caption("No trade history available yet.")
+                    )
+                else:
+                    st.caption("No trade history available yet.")
                 
-        except Exception as e:
-            st.error(f"Error loading trade history: {e}")
+            except Exception as e:
+                st.error(f"Error loading trade history: {e}")
 
     # The header and bot grid now refresh via native @st.fragment decorators.
     if auto_refresh and not wizard_active:
