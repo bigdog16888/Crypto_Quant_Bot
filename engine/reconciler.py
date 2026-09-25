@@ -1218,6 +1218,17 @@ class StateReconciler:
         # Find bot_orders rows with status=filled/partially_filled/closed that have
         # filled_amount > 0 but no corresponding exchange_fills entry.
         # These are fills that the DB recorded as filled but never credited to the ledger.
+        #
+        # 🛡️ ARCHITECTURAL GUARANTEE (2026-09-25): this pass enforces the invariant
+        # "no fill is recorded in bot_orders without an exchange_fills audit row."
+        # credit_fill()'s MAX() guard (ledger.py:355) early-returns — and SKIPS the
+        # immutable dual-write (ledger.py:640) — whenever bot_orders.filled_amount is
+        # already at the credited value, which is exactly the state this pass finds
+        # (filled>0, no exchange_fills row, no fill_claims row). So the repair MUST
+        # verify the audit row exists afterwards and backfill it directly from the
+        # bot_orders audit row, using the real exchange side. After this pass:
+        # filled>0 ⟹ exchange_fills row (self-healing for any dropped WS packet,
+        # offline fill, or direct-write that bypassed credit_fill).
         _credit_conn = _gc()
         _credit_cur = _credit_conn.cursor()
 
@@ -1265,6 +1276,12 @@ class StateReconciler:
                 logger.warning(f"[CREDIT-UNCREDITED] Bot {bot_id} order {order_id}: using inferred side '{fill_side}' (no exchange_fills record; exchange API unavailable)")
 
             logger.info(f"🩹 [CREDIT-UNCREDITED] Bot {bot_id} {order_type} cid={client_cid} order_id={order_id} crediting {filled_qty:.6f}")
+            # credit_fill first: handles the normal case where bot_orders is still
+            # BEHIND (it advances filled_amount + open_qty AND dual-writes the
+            # immutable log). For rows already at exchange truth (filled_amount ==
+            # cumulative_qty — set by a direct status write that skipped the
+            # dual-write), the MAX() guard makes credit_fill a no-op and the
+            # audit row is NOT written — the verification + backfill below covers it.
             credit_fill(
                 bot_id=bot_id,
                 order_id=str(order_id),
@@ -1276,6 +1293,54 @@ class StateReconciler:
                 side=fill_side,
                 fill_ts=filled_at if filled_at and filled_at > 0 else 0,
             )
+            # 🛡️ VERIFY-AND-BACKFILL: the invariant is on the exchange_fills row,
+            # not on credit_fill's return value. If it's still missing, backfill it
+            # directly from the bot_orders audit row (same pass, same transaction
+            # family, same connection — no second API round-trip, no open_qty change
+            # because open_qty already reflects this fill).
+            _audit = _credit_cur.execute(
+                "SELECT 1 FROM exchange_fills WHERE exchange_order_id = ? OR (client_order_id = ? AND client_order_id != '') LIMIT 1",
+                (str(order_id), client_cid or '')
+            ).fetchone()
+            if _audit is None:
+                _fill_ts = int(filled_at) if filled_at and int(filled_at) > 0 else int(time.time())
+                _backfilled = False
+                if fill_side in ('BUY', 'SELL'):
+                    from engine.database import record_exchange_fill
+                    _backfilled = record_exchange_fill(
+                        conn=_credit_conn,
+                        exchange_order_id=str(order_id),
+                        client_order_id=client_cid or '',
+                        symbol=pair,
+                        side=fill_side,
+                        qty=float(filled_qty),
+                        price=float(avg_price or 0),
+                        fill_ts=_fill_ts,
+                        source='reconciler-uncredited',
+                        bot_id=bot_id,
+                        order_type=order_type,
+                        step=step,
+                        cycle_id=cycle_id,
+                    )
+                if _backfilled:
+                    # Restore the audit timestamp the direct write left at 0, so the
+                    # ledger is self-describing and future cycle-floor detection is right.
+                    _credit_cur.execute(
+                        "UPDATE bot_orders SET filled_at = ? WHERE id = ? AND (filled_at IS NULL OR filled_at = 0)",
+                        (_fill_ts, bo_id)
+                    )
+                    _credit_conn.commit()
+                    logger.warning(
+                        f"🛡️ [AUDIT-BACKFILL] Bot {bot_id} order {order_id} cid={client_cid}: "
+                        f"credit_fill no-op'd (MAX() skip) — backfilled immutable audit log "
+                        f"({fill_side} {filled_qty:.6f} @ {avg_price}, ts={_fill_ts}). Invariant restored."
+                    )
+                else:
+                    logger.error(
+                        f"🛡️ [AUDIT-BACKFILL-FAILED] Bot {bot_id} order {order_id} cid={client_cid}: "
+                        f"exchange_fills row still missing after credit_fill (side={fill_side}). "
+                        f"Tier-1 health will keep flagging this pair until resolved."
+                    )
             seal_trade_state(bot_id)
             stats['total'] = stats.get('total', 0) + 1
             if order_type in ('tp', 'take_profit', 'exit'):

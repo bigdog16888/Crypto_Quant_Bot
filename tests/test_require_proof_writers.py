@@ -27,7 +27,7 @@ LINE_TOLERANCE = 15
 
 WHITELIST = [
     # (relative posix path from repo root, approx line number, description)
-    # Entries updated 2026-09-15 to the current source lines (LINE_TOLERANCE=15).
+    # Entries updated 2026-09-25 to the current source lines (LINE_TOLERANCE=15).
     # All 15 raw REQUIRE_MANUAL_PROOF writes in engine code are enumerated below.
     # Future cleanup (tracked task): route these through _set_bot_require_manual_proof()
     # so the grace-period guard is honored everywhere.
@@ -39,10 +39,10 @@ WHITELIST = [
     ("engine/database.py",       4351, "flag_pair_ledger_mismatch: critical startup drift check (gate all bots)"),
     ("engine/oneway_netting.py",   54, "PA_SYNC: exchange API unreachable N consecutive cycles (WriteQueue internal)"),
     ("engine/reconciler.py",       48, "flag_bot_manual_proof local helper: only called from hard-failure paths"),
-    ("engine/reconciler.py",     6034, "DIRECTIONAL-MISMATCH: physical position contradicts bot direction"),
-    ("engine/reconciler.py",     8301, "ADOPT-LIMIT-EXCEEDED: exceeds MAX_ADOPTION_QTY_PER_CYCLE"),
-    ("engine/reconciler.py",     8935, "PROOF-FAILED: forensic scan succeeded but gap persists"),
-    ("engine/reconciler.py",     8909, "PROOF-FAILED: forensic scan raised exception, gap unresolved"),
+    ("engine/reconciler.py",     6099, "DIRECTIONAL-MISMATCH: physical position contradicts bot direction"),
+    ("engine/reconciler.py",     8366, "ADOPT-LIMIT-EXCEEDED: exceeds MAX_ADOPTION_QTY_PER_CYCLE"),
+    ("engine/reconciler.py",     8974, "PROOF-FAILED: forensic scan succeeded but gap persists"),
+    ("engine/reconciler.py",     9000, "PROOF-FAILED: forensic scan raised exception, gap unresolved"),
     ("engine/runner/startup.py",  561, "QUARANTINE: isolate pair with critical drift, gate bots on pair"),
     ("engine/runner/cycle_loop.py", 148, "Exchange close FAILED during pending flatten"),
     ("engine/runner/cycle_loop.py", 190, "safe_wipe_bot refused after close"),
