@@ -1260,20 +1260,23 @@ class StateReconciler:
             if _ex_fill and _ex_fill[0]:
                 fill_side = _ex_fill[0]
             else:
-                # Fallback: infer from bot direction (matches original bot_orders credit)
-                # Limitation: exchange API not available in DB-only reconciliation pass.
-                # For hedge children with opposite physical side, this infers wrong.
-                if order_type in ('tp', 'take_profit', 'exit', 'dust_close', 'close'):
-                    _b_row = _credit_cur.execute("SELECT direction FROM bots WHERE id = ?", (bot_id,)).fetchone()
-                    if _b_row:
-                        bot_dir = _b_row[0].upper()
-                        fill_side = 'SELL' if bot_dir == 'LONG' else 'BUY'
-                elif order_type in ('entry', 'grid', 'adoption', 'adoption_add'):
-                    _b_row = _credit_cur.execute("SELECT direction FROM bots WHERE id = ?", (bot_id,)).fetchone()
-                    if _b_row:
-                        bot_dir = _b_row[0].upper()
-                        fill_side = 'BUY' if bot_dir == 'LONG' else 'SELL'
-                logger.warning(f"[CREDIT-UNCREDITED] Bot {bot_id} order {order_id}: using inferred side '{fill_side}' (no exchange_fills record; exchange API unavailable)")
+                            # Fallback: infer from bot direction (matches original bot_orders credit)
+                            # Limitation: exchange API not available in DB-only reconciliation pass.
+                            # For hedge children with opposite physical side, this infers wrong.
+                            # Exit/reduce types: SELL for LONG, BUY for SHORT
+                            if order_type in ('tp', 'take_profit', 'exit', 'dust_close', 'close',
+                                              'flatten_close', 'adoption_reduce'):
+                                _b_row = _credit_cur.execute("SELECT direction FROM bots WHERE id = ?", (bot_id,)).fetchone()
+                                if _b_row:
+                                    bot_dir = _b_row[0].upper()
+                                    fill_side = 'SELL' if bot_dir == 'LONG' else 'BUY'
+                            # Entry/add types: BUY for LONG, SELL for SHORT
+                            elif order_type in ('entry', 'grid', 'adoption', 'adoption_add'):
+                                _b_row = _credit_cur.execute("SELECT direction FROM bots WHERE id = ?", (bot_id,)).fetchone()
+                                if _b_row:
+                                    bot_dir = _b_row[0].upper()
+                                    fill_side = 'BUY' if bot_dir == 'LONG' else 'SELL'
+                            logger.warning(f"[CREDIT-UNCREDITED] Bot {bot_id} order {order_id}: using inferred side '{fill_side}' (no exchange_fills record; exchange API unavailable)")
 
             logger.info(f"🩹 [CREDIT-UNCREDITED] Bot {bot_id} {order_type} cid={client_cid} order_id={order_id} crediting {filled_qty:.6f}")
             # credit_fill first: handles the normal case where bot_orders is still

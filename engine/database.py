@@ -264,8 +264,33 @@ def backup_database():
         backup_name = f"crypto_bot_backup_{timestamp}.db"
         backup_path = os.path.join(backup_dir, backup_name)
         
-        # Use shutil for safe copy
-        shutil.copy2(DB_PATH, backup_path)
+        # 🛡️ WINDOWS-SAFE COPY WITH RETRY (2026-09-25): On Windows, the DB file
+        # can be locked by the running engine (SQLite WAL/SHM). shutil.copy2
+        # fails with WinError 5. Use SQLite's own backup API via a temp connection
+        # which handles locks gracefully, with fallback to shutil + retry.
+        _copied = False
+        for attempt in range(3):
+            try:
+                import sqlite3
+                src = sqlite3.connect(DB_PATH)
+                dst = sqlite3.connect(backup_path)
+                src.backup(dst)
+                dst.close()
+                src.close()
+                _copied = True
+                break
+            except Exception as _bk_err:
+                if attempt < 2:
+                    time.sleep(0.5 * (attempt + 1))
+                else:
+                    logger.warning(f"⚠️ SQLite backup API failed ({_bk_err}), falling back to shutil")
+                    try:
+                        shutil.copy2(DB_PATH, backup_path)
+                        _copied = True
+                    except Exception as _cp_err:
+                        logger.warning(f"⚠️ shutil copy also failed ({_cp_err})")
+        if not _copied:
+            raise RuntimeError("All backup methods failed")
         logger.info(f"✅ Database backed up to: {backup_path}")
         
         # Cleanup old backups (keep last 10)
