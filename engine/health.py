@@ -111,10 +111,17 @@ def _compute_header_metrics(db_path: str, exchange_instance) -> Dict[str, Any]:
                 bal = exchange_instance.exchange.fetch_balance()
                 wallet_balance = 0.0
                 if bal:
-                    totals = bal.get('total', {})
-                    for asset, amount in totals.items():
-                        if asset in ('USDT', 'USDC', 'USD', 'BUSD', 'FDUSD'):
-                            wallet_balance += float(amount or 0)
+                    info = bal.get('info', {})
+                    assets = info.get('assets', [])
+                    if assets:
+                        for a in assets:
+                            if a.get('asset') in ('USDT', 'USDC', 'USD', 'BUSD', 'FDUSD'):
+                                wallet_balance += float(a.get('walletBalance', 0) or 0)
+                    else:
+                        totals = bal.get('total', {})
+                        for asset, amount in totals.items():
+                            if asset in ('USDT', 'USDC', 'USD', 'BUSD', 'FDUSD'):
+                                wallet_balance += float(amount or 0)
                     result["futures_balance"] = wallet_balance
 
                 # Sum live unrealized PnL directly from open positions (matches bot table)
