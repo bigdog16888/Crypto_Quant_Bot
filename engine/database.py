@@ -3068,7 +3068,15 @@ def import_position_from_exchange(bot_id: int, pair: str, position_size: float, 
 def get_all_bots():
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT b.id, b.name, b.pair, b.is_active, b.strategy_type, COALESCE(t.total_invested, 0), COALESCE(t.current_step, 0), b.last_error, b.last_error_time, b.status FROM bots b LEFT JOIN trades t ON b.id = t.bot_id")
+    cursor.execute("""
+        SELECT b.id, b.name, b.pair, b.is_active, b.strategy_type, 
+               COALESCE(t.total_invested, 0), COALESCE(t.current_step, 0), 
+               b.last_error, b.last_error_time, b.status,
+               b.bot_type, b.parent_bot_id, b.hedge_child_bot_id, b.direction, b.hedge_trigger_step
+        FROM bots b 
+        LEFT JOIN trades t ON b.id = t.bot_id
+        ORDER BY b.pair, b.bot_type DESC, b.id
+    """)
     bots = cursor.fetchall()
     logger.debug(f"[GET_ALL_BOTS] Query returned {len(bots)} bots from DB.")
     return bots
@@ -3155,57 +3163,158 @@ def update_active_positions(positions: List[Dict]):
         pass # conn.close() disabled for singleton safety
 
 def delete_bot(bot_id):
+    """
+    Legacy wrapper - calls decommission_bot with human_approved=False for backward compatibility.
+    Note: This will fail for bots with active positions/orders/children (safe default).
+    Use decommission_bot(bot_id, human_approved=True) for explicit decommission.
+    """
+    return decommission_bot(bot_id, human_approved=False)
+
+
+def decommission_bot(bot_id, human_approved=False):
+    """
+    Canonical safe bot decommission pipeline.
+    
+    Performs comprehensive safety checks and cascading cleanup:
+    1. Validates bot is flat (no active trade, no open orders, no live exchange position)
+    2. Checks for hedge children/parent relationships
+    3. Verifies no open exchange orders on Binance with bot's clientOrderId prefix
+    4. Requires explicit human_approved=True for actual decommission
+    5. Archives bot_orders, cleans fill_claims, cross_reduction_claims
+    6. Nullifies exchange_fills.bot_id (preserves audit trail)
+    7. Archives bot (status='DECOMMISSIONED', is_active=0) instead of hard delete
+    8. Triggers pair-level reconciliation
+    
+    Args:
+        bot_id: Bot ID to decommission
+        human_approved: Must be True for actual decommission (safety gate)
+    
+    Returns:
+        (success: bool, reason: str)
+    """
+    from engine.exchange_interface import ExchangeInterface
+    from engine.oneway_netting import reconcile_oneway_pair_open_qty
+    
     conn = get_connection()
+    
+    # 1. PRE-CHECKS
+    bot_row = conn.execute("""
+        SELECT id, name, pair, direction, bot_type, parent_bot_id, hedge_child_bot_id, 
+               is_active, status
+        FROM bots WHERE id = ?
+    """, (bot_id,)).fetchone()
+    
+    if not bot_row:
+        return False, "Bot not found"
+    
+    _, name, pair, direction, bot_type, parent_bot_id, hedge_child_bot_id, is_active, status = bot_row
+    
+    # 1a. No active trade (cached)
+    trade = conn.execute("SELECT total_invested FROM trades WHERE bot_id = ?", (bot_id,)).fetchone()
+    if trade and trade[0] > 0:
+        return False, f"Active trade (${trade[0]}). Flatten first."
+    
+    # 1b. No open internal orders
+    open_count = conn.execute(
+        "SELECT COUNT(*) FROM bot_orders WHERE bot_id = ? AND status = 'open'", (bot_id,)
+    ).fetchone()[0]
+    if open_count > 0:
+        return False, f"{open_count} open internal orders. Cancel first."
+
+    # 1c. No live exchange position (active_positions + live fetch)
+    exchange = ExchangeInterface(market_type="future")
+    try:
+        pos = exchange.fetch_positions()
+        for p in pos:
+            if abs(float(p.get('contracts') or 0)) > 1e-8 and p.get('symbol') == pair:
+                return False, f"Live {p['side']} position {p['contracts']} on {pair}. Close on exchange."
+    except Exception as e:
+        logger.warning(f"Could not fetch live positions for {pair}: {e}")
+    
+    # ALWAYS check active_positions table as secondary source of truth
+    cursor = conn.cursor()
+    cursor.execute("SELECT pair, side, size FROM active_positions WHERE ABS(size) > 0.000001")
+    for pos_pair, side, size in cursor.fetchall():
+        if pos_pair == pair:
+            return False, f"Live exchange position ({side} {size}) on {pair}. Close on exchange."
+
+    # 1d. No open exchange orders for this bot
+    try:
+        open_orders = exchange.fetch_open_orders(pair)
+        bot_oid_prefix = f"CQB_{bot_id}_"
+        bot_orders = [o for o in open_orders if o.get('clientOrderId', '').startswith(bot_oid_prefix)]
+        if bot_orders:
+            return False, f"{len(bot_orders)} open exchange orders. Cancel on exchange first."
+    except Exception as e:
+        logger.warning(f"Could not fetch open orders for {pair}: {e}")
+    
+    # 1e. Hedge child check
+    child = conn.execute(
+        "SELECT id FROM bots WHERE parent_bot_id = ? OR hedge_child_bot_id = ?", 
+        (bot_id, bot_id)
+    ).fetchone()
+    if child:
+        return False, f"Hedge child bot {child[0]} exists. Decommission child first."
+    
+    # 1f. Parent check (if this is a hedge child)
+    if bot_type == 'hedge_child':
+        if parent_bot_id:
+            return False, f"Parent bot {parent_bot_id} exists. Decommission parent first (or unlink)."
+    
+    # 2. HUMAN APPROVAL GATE
+    if not human_approved:
+        return False, "Requires explicit human_approved=True"
+    
+    # 3. CASCADING CLEANUP (atomic transaction)
     try:
         conn.execute("BEGIN IMMEDIATE")
-    except sqlite3.OperationalError:
-        pass
-    cursor = conn.cursor()
-    try:
-        # SAFETY CHECK 1: Check for Active Trade (trades cache)
-        cursor.execute("SELECT total_invested FROM trades WHERE bot_id = ?", (bot_id,))
-        trade = cursor.fetchone()
-        if trade and trade[0] > 0:
-            logger.warning(f"⚠️ BLOCKED DELETION: Bot {bot_id} has active trade (${trade[0]}). Close position first.")
-            return False
-
-        # SAFETY CHECK 2: Check for Open Orders
-        cursor.execute("SELECT COUNT(*) FROM bot_orders WHERE bot_id = ? AND status='open'", (bot_id,))
-        open_orders = cursor.fetchone()[0]
-        if open_orders > 0:
-            logger.warning(f"⚠️ BLOCKED DELETION: Bot {bot_id} has {open_orders} open orders. Cancel them first.")
-            return False
-
-        # SAFETY CHECK 3: Check active_positions table for live exchange exposure.
-        # This catches the case where the trades cache is stale (e.g. after an engine crash/restart)
-        # but the exchange still holds a real position for this bot's pair.
-        # The active_positions table is refreshed from the exchange on every engine tick and at startup,
-        # so it reflects reality even when the trades table has drifted to 0.
-        cursor.execute("SELECT pair FROM bots WHERE id = ?", (bot_id,))
-        bot_row = cursor.fetchone()
-        if bot_row:
-            bot_pair = str(bot_row[0] or '').replace('/', '').split(':')[0].upper()
-            cursor.execute("SELECT pair, side, size FROM active_positions WHERE ABS(size) > 0.000001")
-            positions = cursor.fetchall()
-            for pos_pair, side, size in positions:
-                norm_pos_pair = str(pos_pair or '').replace('/', '').split(':')[0].upper()
-                if norm_pos_pair == bot_pair:
-                    logger.warning(
-                        f"⚠️ BLOCKED DELETION: Bot {bot_id} (pair={bot_row[0]}) has a live exchange "
-                        f"position: {pos_pair} {side} size={size}. "
-                        f"Close the position on the exchange before deleting this bot."
-                    )
-                    return False
-
-        # Proceed with deletion if all safety checks pass
-        cursor.execute('DELETE FROM trade_history WHERE bot_id = ?', (bot_id,))
-        cursor.execute('DELETE FROM trades WHERE bot_id = ?', (bot_id,))
-        cursor.execute('DELETE FROM bots WHERE id = ?', (bot_id,))
+        
+        # 3a. Archive bot_orders (don't delete - audit trail)
+        conn.execute(
+            "UPDATE bot_orders SET status = 'archived_decommissioned' WHERE bot_id = ?", (bot_id,)
+        )
+        
+        # 3b. Delete fill_claims
+        conn.execute("DELETE FROM fill_claims WHERE bot_id = ?", (bot_id,))
+        
+        # 3c. Delete cross_reduction_claims
+        conn.execute(
+            "DELETE FROM cross_reduction_claims WHERE target_bot_id = ? OR source_bot_id = ?", 
+            (bot_id, bot_id)
+        )
+        
+        # 3d. Nullify exchange_fills.bot_id (preserve fills, remove attribution)
+        conn.execute("UPDATE exchange_fills SET bot_id = NULL WHERE bot_id = ?", (bot_id,))
+        
+        # 3e. Delete trade_history
+        conn.execute("DELETE FROM trade_history WHERE bot_id = ?", (bot_id,))
+        
+        # 3f. Delete trades
+        conn.execute("DELETE FROM trades WHERE bot_id = ?", (bot_id,))
+        
+        # 3g. Unlink parent/child references
+        conn.execute("UPDATE bots SET hedge_child_bot_id = NULL WHERE hedge_child_bot_id = ?", (bot_id,))
+        conn.execute("UPDATE bots SET parent_bot_id = NULL WHERE parent_bot_id = ?", (bot_id,))
+        
+        # 3h. Archive bot (soft delete)
+        conn.execute(
+            "UPDATE bots SET status = 'DECOMMISSIONED', is_active = 0 WHERE id = ?", (bot_id,)
+        )
+        
         conn.commit()
-        return True
+        
+        # 4. POST-DELETE: Pair-level reconciliation
+        try:
+            reconcile_oneway_pair_open_qty(exchange, pair)
+        except Exception as e:
+            logger.warning(f"Post-decommission reconciliation failed for {pair}: {e}")
+        
+        logger.info(f"✅ Bot {bot_id} ({name}) decommissioned cleanly")
+        return True, f"Bot {bot_id} decommissioned cleanly"
     except Exception as e:
-        logger.error(f"Error deleting bot {bot_id}: {e}")
-        return False
+        conn.rollback()
+        logger.error(f"Decommission failed for bot {bot_id}: {e}")
+        return False, f"Decommission failed: {e}"
 
 
 def confirm_order(db_id, exchange_order_id):

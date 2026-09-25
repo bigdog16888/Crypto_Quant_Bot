@@ -17,6 +17,7 @@ from ui.views.monitor import render_monitor_view
 from ui.views.bot_creator import render_bot_creator_view
 from ui.views.bot_manager import render_bot_manager_view
 from ui.views.analytics import render_analytics_view
+from ui.views.calculator import render_calculator_view
 
 # Load environment variables BEFORE importing config (already loaded at module import time,
 # but this ensures it's loaded for subprocess context too)
@@ -548,14 +549,13 @@ with st.sidebar:
     
     # Handle auto-navigation requests from other views
     nav_index = 0  # Default: Live Monitor
-    pages = ["📊 Live Monitor", "🏗️ Bot Creator", "🛠️ Bot Manager", "📈 Analytics"]
+    pages = ["📊 Live Monitor", "🏗️ Bot Creator", "🛠️ Bot Manager", "📈 Analytics", "🧮 Sizing Calculator"]
     
     if '_nav_to_monitor' in st.session_state and st.session_state['_nav_to_monitor']:
         nav_index = 0
         del st.session_state['_nav_to_monitor']
     elif '_nav_to_manager' in st.session_state and st.session_state['_nav_to_manager']:
         nav_index = 2
-        del st.session_state['_nav_to_manager']
     
     selected_page = st.radio(
         "Go to", 
@@ -573,17 +573,20 @@ with main_placeholder.container():
         # Clear Bot Manager specific state when leaving
         if 'editing_bot_id' in st.session_state:
             del st.session_state['editing_bot_id']
-            
+        
         render_monitor_view()
-
+    
     elif selected_page == "🏗️ Bot Creator":
         if 'editing_bot_id' in st.session_state:
             del st.session_state['editing_bot_id']
-            
+        
         render_bot_creator_view()
-
+    
     elif selected_page == "🛠️ Bot Manager":
         render_bot_manager_view()
-
+    
     elif selected_page == "📈 Analytics":
         render_analytics_view()
+    
+    elif selected_page == "🧮 Sizing Calculator":
+        render_calculator_view()
